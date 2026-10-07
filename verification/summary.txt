@@ -1,0 +1,36 @@
+rr verification — 2026-10-08
+
+Source: Clippy rust-1.99.0, 49e2f89a2605a9a340e04955fdbefa9803e6027a
+Compiler: rustc 1.99.0-nightly (84b36a78a 2026-08-06), nightly-2026-08-07
+Distribution: macOS arm64; dist/rr-macos-arm64
+
+PASS cargo fmt --all --check
+PASS cargo check
+PASS cargo clippy --all-targets --all-features -- -D warnings
+PASS cargo test -- --skip 5041_allow_dev_build
+  Includes 18 rr restriction tests and 4 rr CLI tests.
+  Upstream UI: 1839 passed / 6 ignored; TOML/config: 194 passed;
+  Cargo UI: 51 passed / 1 explicitly excluded.
+  Dogfood passed for all 9 upstream packages; remaining integration tests passed.
+PASS cargo build --locked --release --bin rr
+PASS relocated distribution smoke, with PATH containing no rustc/rustup/cargo,
+  no DYLD/RUST/CARGO/CLIPPY/SYSROOT environment overrides:
+  version/sysroot/init/check/lint/native build and execution/--extern/local
+  modules/alloc/required comment/rejection of attempts to lower rr rules.
+
+Unfiltered cargo test fails on one unchanged upstream fixture:
+  tests/ui-cargo/multiple_crate_versions/5041_allow_dev_build/Cargo.toml
+  nix 0.9.0 refers to NOTE_EXIT_REPARENTED, NOTE_REAP and daemon, absent in
+  the resolved libc 0.2.190 macOS API. Original failure is in all-tests.log.
+  No fixture or dependency source was patched to make this pass.
+
+The pinned compiler's release link reports native LLVM linker warnings about
++zcm/+zcz target features; the build succeeds. See release.log.
+
+Builds/downloads were isolated in a temporary Cargo home/target, now removed.
+Generated untracked fixture/package lockfiles and Python bytecode were removed;
+root Cargo.lock is intentionally retained to pin rr's development dependencies.
+The runnable distribution, compiler toolchain and verification logs are retained.
+
+2026-10-08: canonical bundle stripped to 296.33 MiB.
+Updated packaging script and relocated smoke passed; LLVM targets retained.

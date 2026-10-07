@@ -1,0 +1,40 @@
+# Rust 1.99 compiler and its private libraries are rebuilt together so rr can
+# statically link rustc_driver against the reduced LLVM ABI.
+change-id = "ignore"
+
+[build]
+build = "aarch64-apple-darwin"
+host = ["aarch64-apple-darwin"]
+target = ["aarch64-apple-darwin"]
+jobs = 2
+docs = false
+compiler-docs = false
+extended = false
+
+[llvm]
+download-ci-llvm = false
+targets = "AArch64"
+experimental-targets = ""
+link-shared = true
+optimize = true
+release-debuginfo = false
+assertions = false
+ninja = true
+link-jobs = 1
+
+[rust]
+download-rustc = false
+channel = "nightly"
+optimize = true
+debuginfo-level = 0
+debug-assertions = false
+incremental = false
+# Avoid a large whole-compiler LTO link on the standard 7 GiB Actions runner.
+lto = "off"
+codegen-backends = ["llvm"]
+omit-git-hash = false
+rpath = true
+
+[dist]
+compression-formats = ["gz"]
+compression-profile = "fast"

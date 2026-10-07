@@ -1,0 +1,12 @@
+2026-10-08: strip applied to canonical distribution, approved by user
+
+Before: 344653759 bytes (328.69 MiB)
+After: 310719728 bytes (296.33 MiB)
+Savings: 32.36 MiB
+
+Packaging now runs xcrun strip -S -x on rr, rustc_driver and LLVM, then ad-hoc
+re-signs each file. Dynamic exports, crate metadata and target support retained.
+The complete updated packaging script and relocated smoke checks passed.
+No Rust source or original installed toolchain files were changed.
+The main bundle is dist/rr-macos-arm64; duplicate experiment bundles were removed.
+Temporary packaging files were removed. See strip-package.log.
