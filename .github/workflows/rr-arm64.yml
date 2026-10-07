@@ -1,5 +1,6 @@
 name: Build rr with static driver and ARM64 LLVM
 
+# Full Rust/LLVM rebuilds run manually, rather than on every source push.
 on:
   workflow_dispatch:
 
