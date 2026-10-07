@@ -444,7 +444,7 @@ pub fn explain(name: &str) -> i32 {
 /// Register all lints and lint groups with the rustc lint store
 ///
 /// Used in `./src/driver.rs`.
-pub fn register_lint_passes(store: &mut rustc_lint::LintStore, conf: &'static Conf) {
+pub fn register_lint_passes(store: &mut rustc_lint::LintStore, conf: &'static Conf, include_cargo: bool) {
     for (old_name, new_name) in deprecated_lints::RENAMED {
         store.register_renamed(old_name, new_name);
     }
@@ -469,6 +469,11 @@ pub fn register_lint_passes(store: &mut rustc_lint::LintStore, conf: &'static Co
         store.register_early_lint_pass(Box::new(move || {
             Box::new(CombinedEarlyLintPass::new(conf, format_args.clone(), attrs.clone()))
         }));
+    }
+
+    // rr invokes rustc directly and must never spawn Cargo, even when its lints are enabled.
+    if include_cargo {
+        store.register_late_lint_pass(Box::new(move |_| Box::new(cargo::Cargo::new(conf))));
     }
 
     store.register_late_lint_pass(Box::new(move |tcx: TyCtxt<'_>| {
@@ -740,7 +745,6 @@ rustc_lint::late_lint_methods!(
         OnlyUsedInRecursion: only_used_in_recursion::OnlyUsedInRecursion = <only_used_in_recursion::OnlyUsedInRecursion>::default(),
         DbgMacro: dbg_macro::DbgMacro = dbg_macro::DbgMacro::new(conf),
         Write: write::Write = write::Write::new(conf, format_args.clone()),
-        Cargo: cargo::Cargo = cargo::Cargo::new(conf),
         EmptyWithBrackets: empty_with_brackets::EmptyWithBrackets = empty_with_brackets::EmptyWithBrackets::default(),
         UnnecessaryOwnedEmptyStrings: unnecessary_owned_empty_strings::UnnecessaryOwnedEmptyStrings = unnecessary_owned_empty_strings::UnnecessaryOwnedEmptyStrings,
         FormatPushString: format_push_string::FormatPushString = format_push_string::FormatPushString::new(format_args.clone()),
