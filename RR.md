@@ -150,14 +150,15 @@ The manual workflow `.github/workflows/rr-arm64.yml` runs on macOS 15 arm64.
 It fetches Rust commit 84b36a78a28a63f134171c670be1932ffa2485f8 and its exact LLVM
 submodule, builds stage2 Rust with LLVM.targets=AArch64, and compiles rr against
 that matching compiler. No prebuilt full LLVM or compiler driver is substituted.
-LLVM stays a shared library; rustc_driver is built as an rlib and linked into rr.
+LLVM and rustc_driver are statically linked into rr. System macOS libraries
+remain dynamic; core/alloc objects and metadata stay external as compiler inputs.
 The bootstrap artifact filter also retains private compiler rlibs, because
 metadata-only rustc-dev packages cannot support static linking.
 
 The workflow runs formatting, check, all-target/all-feature Clippy, tests and
 relocated standalone smoke checks before uploading a tar.gz artifact. It checks
-that rr has no dynamic rustc_driver dependency and LLVM has no excluded backend
-exports. The exact bootstrap configuration accompanies the artifact.
+that rr has only system dynamic dependencies and records the AArch64-only backend
+list from the built llvm-config. The exact bootstrap configuration accompanies the artifact.
 The compiler/LLVM build script refuses to run outside GitHub Actions.
 No persistent Actions build cache is configured; compiler build directories are
 on the ephemeral runner. Artifacts are kept for 14 days.

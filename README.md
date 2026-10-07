@@ -16,7 +16,7 @@ There is no Cargo interface or project manifest for rr programs.
 [Usage and exact policy](RR.md) · [Local verification](verification/summary.txt)
 
 The manual [GitHub Actions workflow](.github/workflows/rr-arm64.yml) rebuilds
-LLVM with only AArch64 and statically links the matching Rust compiler driver
+LLVM with only AArch64 and statically links LLVM and the matching Rust compiler driver
 into rr, then tests and packages a macOS arm64 artifact. Builds run in Actions.
 Cross compilation to excluded architectures is unavailable in that artifact.
 

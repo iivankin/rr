@@ -28,6 +28,11 @@ for rr_component in rustc rust-std rustc-dev; do
         --prefix="$rr_prefix" --disable-ldconfig
  done
 "$rr_prefix/bin/rustc" -vV
+# Record the backend list from the LLVM that bootstrap actually built.
+rr_llvm_config="$(find build -path '*/llvm/build/bin/llvm-config' -type f -print -quit)"
+test -n "$rr_llvm_config"
+"$rr_llvm_config" --targets-built > "$rr_prefix/llvm-targets.txt"
+test "$(cat "$rr_prefix/llvm-targets.txt")" = AArch64
 # Fail before building rr if the bootstrap change did not retain static objects.
 test -n "$(find "$rr_prefix/lib/rustlib/aarch64-apple-darwin/lib" -name 'librustc_driver-*.rlib' -print -quit)"
 cat >> "$GITHUB_ENV" <<ENV

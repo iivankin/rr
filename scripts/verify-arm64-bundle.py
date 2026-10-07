@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
-"""Verify the CI artifact embeds rustc_driver and exposes only AArch64 LLVM."""
+"""Verify the CI artifact embeds rustc_driver and its AArch64-only LLVM."""
 from pathlib import Path
 import subprocess
 import sys
 
 bundle = Path(sys.argv[1]).resolve()
 links = subprocess.check_output(["otool", "-L", str(bundle / "rr")], text=True)
-if "librustc_driver" in links or list((bundle / "lib").glob("librustc_driver*")):
-    raise SystemExit("rustc_driver is still dynamically linked")
-exports = subprocess.check_output(["nm", "-gU", str(bundle / "lib/libLLVM.dylib")], text=True)
-if "_LLVMInitializeAArch64Target" not in exports:
-    raise SystemExit("AArch64 backend missing")
-for backend in ("X86", "ARM", "RISCV", "WebAssembly", "AMDGPU", "NVPTX", "BPF"):
-    if f"_LLVMInitialize{backend}Target" in exports:
-        raise SystemExit(f"Unexpected LLVM backend: {backend}")
+if list(bundle.rglob("*.dylib")):
+    raise SystemExit("Unexpected compiler dylib in standalone bundle")
+for line in links.splitlines()[1:]:
+    dependency = line.strip().split(" (", 1)[0]
+    if not dependency.startswith(("/usr/lib/", "/System/Library/")):
+        raise SystemExit(f"Non-system dynamic dependency: {dependency}")
+# Static linking and stripping need not preserve LLVM's C entry-point names.
+# Use llvm-config's backend list, recorded from the pinned build before packaging.
+if (bundle / "llvm-targets.txt").read_text().strip() != "AArch64":
+    raise SystemExit("LLVM build does not contain exactly the AArch64 backend")
 size = sum(file.stat().st_size for file in bundle.rglob("*") if file.is_file())
-print(f"PASS static rustc_driver; AArch64-only LLVM; unpacked size {size / 1024**2:.2f} MiB")
+print(f"PASS static rustc_driver and LLVM; AArch64-only; unpacked size {size / 1024**2:.2f} MiB")
 print(links)
