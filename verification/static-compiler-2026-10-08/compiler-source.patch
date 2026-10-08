@@ -1,0 +1,32 @@
+diff --git a/compiler/rustc_driver/Cargo.toml b/compiler/rustc_driver/Cargo.toml
+index 51909719..fe36d0bb 100644
+--- a/compiler/rustc_driver/Cargo.toml
++++ b/compiler/rustc_driver/Cargo.toml
+@@ -4,7 +4,8 @@ version = "0.0.0"
+ edition = "2024"
+ 
+ [lib]
+-crate-type = ["dylib"]
++# rr embeds the compiler driver; do not export a separate compiler dylib.
++crate-type = ["rlib"]
+ 
+ [dependencies]
+ # tidy-alphabetical-start
+diff --git a/src/bootstrap/src/core/build_steps/compile.rs b/src/bootstrap/src/core/build_steps/compile.rs
+index 652e7975..57bf97ff 100644
+--- a/src/bootstrap/src/core/build_steps/compile.rs
++++ b/src/bootstrap/src/core/build_steps/compile.rs
+@@ -1173,10 +1173,9 @@ fn run(self, builder: &Builder<'_>) -> Self::Output {
+                     // so we need to distribute them as rlib to be able to use them.
+                     filename.ends_with(".rlib")
+                 } else {
+-                    // Distribute the rest of the rustc crates as rmeta files only to reduce
+-                    // the tarball sizes by about 50%. The object files are linked into
+-                    // librustc_driver.so, so it is still possible to link against them.
+-                    filename.ends_with(".rmeta")
++                    // rr statically links rustc_driver, so private compiler crates
++                    // need their object archives as well as separate type metadata.
++                    filename.ends_with(".rmeta") || filename.ends_with(".rlib")
+                 }
+             })),
+         );

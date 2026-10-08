@@ -1,0 +1,1 @@
+PASS: relocated bundle; no Rust/Cargo PATH or DYLD/SYSROOT overrides; init/check/lint/build/native execution/extern/local modules/alloc/restrictions

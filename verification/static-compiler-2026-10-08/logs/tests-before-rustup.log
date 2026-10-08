@@ -1,0 +1,187 @@
+   Compiling stable_deref_trait v1.2.1
+   Compiling writeable v0.6.4
+   Compiling serde_core v1.0.229
+   Compiling zerofrom v0.1.8
+   Compiling litemap v0.8.3
+   Compiling yoke v0.8.3
+   Compiling smallvec v1.16.2
+   Compiling once_cell v1.21.4
+   Compiling zerovec v0.11.8
+   Compiling zerotrie v0.2.5
+   Compiling utf8_iter v1.0.4
+   Compiling itoa v1.0.18
+   Compiling regex-syntax v0.8.11
+   Compiling icu_properties_data v2.3.0
+   Compiling tinystr v0.8.4
+   Compiling potential_utf v0.1.6
+   Compiling icu_collections v2.3.0
+   Compiling icu_locale_core v2.3.0
+   Compiling zmij v1.0.23
+   Compiling icu_normalizer_data v2.3.0
+   Compiling tracing-core v0.1.36
+   Compiling icu_provider v2.3.1
+   Compiling serde v1.0.229
+   Compiling cfg-if v1.0.5
+   Compiling bitflags v2.13.2
+   Compiling icu_normalizer v2.3.0
+   Compiling icu_properties v2.3.0
+   Compiling semver v1.0.28
+   Compiling serde_json v1.0.151
+   Compiling equivalent v1.0.2
+   Compiling winnow v1.0.4
+   Compiling lazy_static v1.5.1
+   Compiling hashbrown v0.17.1
+   Compiling pin-project-lite v0.2.17
+   Compiling either v1.19.0
+   Compiling indexmap v2.14.2
+   Compiling itertools v0.15.0
+   Compiling tracing v0.1.44
+   Compiling idna_adapter v1.2.2
+   Compiling toml_parser v1.1.3+spec-1.1.0
+   Compiling sharded-slab v0.1.7
+   Compiling thiserror v2.0.21
+   Compiling cargo-platform v0.3.1
+   Compiling rustc_apfloat v0.2.3+llvm-462a31f5a5ab
+   Compiling camino v1.2.6
+   Compiling libc v0.2.190
+   Compiling thread_local v1.1.10
+   Compiling toml_datetime v1.1.1+spec-1.1.0
+   Compiling percent-encoding v2.3.2
+   Compiling arrayvec v0.7.8
+   Compiling serde_spanned v1.1.1
+   Compiling anstyle v1.0.14
+   Compiling toml v1.1.6+spec-1.1.0
+   Compiling clippy_utils v0.1.99 (/Volumes/Storage/rr-build-2026-10-08/rr/clippy_utils)
+   Compiling form_urlencoded v1.2.2
+   Compiling tracing-subscriber v0.3.23
+   Compiling cargo_metadata v0.23.1
+   Compiling idna v1.1.0
+   Compiling aho-corasick v1.1.5
+   Compiling adler2 v2.0.1
+   Compiling tinyvec v1.13.3
+   Compiling utf8parse v0.2.2
+   Compiling gimli v0.32.3
+   Compiling owo-colors v4.4.0
+   Compiling regex-automata v0.4.18
+   Compiling unicode-normalization v0.1.25
+   Compiling anstyle-parse v0.2.7
+   Compiling miniz_oxide v0.8.9
+   Compiling tracing-error v0.2.1
+   Compiling url v2.5.8
+   Compiling addr2line v0.25.1
+   Compiling object v0.37.3
+   Compiling unicode-script v0.5.8
+   Compiling indenter v0.3.4
+   Compiling clippy_config v0.1.99 (/Volumes/Storage/rr-build-2026-10-08/rr/clippy_config)
+   Compiling quine-mc_cluskey v0.2.4
+   Compiling unicode-width v0.2.2
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling anstyle-query v1.1.5
+   Compiling declare_clippy_lint v0.1.99 (/Volumes/Storage/rr-build-2026-10-08/rr/declare_clippy_lint)
+   Compiling colorchoice v1.0.5
+   Compiling rustc-demangle v0.1.28
+   Compiling anstream v0.6.21
+   Compiling clippy_lints v0.1.99 (/Volumes/Storage/rr-build-2026-10-08/rr/clippy_lints)
+   Compiling backtrace v0.3.76
+   Compiling eyre v0.6.14
+   Compiling color-print v0.3.7
+   Compiling color-spantrace v0.3.0
+   Compiling thiserror v1.0.69
+   Compiling color-eyre v0.6.5
+   Compiling anyhow v1.0.104
+   Compiling portable-atomic v1.15.0
+   Compiling crossbeam-utils v0.8.23
+   Compiling console v0.16.6
+   Compiling bstr v1.13.1
+   Compiling unit-prefix v0.5.2
+   Compiling indicatif v0.18.6
+   Compiling crossbeam-channel v0.5.17
+   Compiling spanned v0.4.1
+   Compiling rustfix v0.8.7
+   Compiling annotate-snippets v0.11.5
+   Compiling regex v1.13.1
+   Compiling prettydiff v0.9.0
+   Compiling rustc_version v0.4.1
+   Compiling unicase v2.10.0
+   Compiling levenshtein v1.0.5
+   Compiling colored v3.1.1
+   Compiling pulldown-cmark-escape v0.11.0
+   Compiling same-file v1.0.6
+   Compiling comma v1.0.0
+   Compiling walkdir v2.5.0
+   Compiling pulldown-cmark v0.11.3
+   Compiling ui_test v0.30.7
+   Compiling askama v0.16.1
+   Compiling clippy v0.1.99 (/Volumes/Storage/rr-build-2026-10-08/rr)
+    Finished `test` profile [unoptimized] target(s) in 5m 56s
+     Running unittests src/driver.rs (/Volumes/Storage/rr-build-2026-10-08/rr-target/debug/build/clippy/1a3e64998a1616d4/out/clippy_driver-1a3e64998a1616d4)
+
+running 2 tests
+test driver_core::test_has_arg ... ok
+test driver_core::test_arg_value ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/rr.rs (/Volumes/Storage/rr-build-2026-10-08/rr-target/debug/build/clippy/aa5702965e8c95e9/out/rr-aa5702965e8c95e9)
+
+running 2 tests
+test driver_core::test_has_arg ... ok
+test driver_core::test_arg_value ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/check-fmt.rs (/Volumes/Storage/rr-build-2026-10-08/rr-target/debug/build/clippy/e9520cb75161425a/out/check_fmt-e9520cb75161425a)
+
+running 1 test
+test fmt ... FAILED
+
+failures:
+
+---- fmt stdout ----
+status: exit status: 101
+stdout: 
+stderr:     Updating crates.io index
+     Locking 67 packages to latest Rust 1.99.0-nightly compatible versions
+      Adding indoc v1.0.9 (available: v2.0.7)
+      Adding opener v0.8.5 (available: v0.9.0)
+ Downloading crates ...
+  Downloaded clap_lex v1.1.1
+  Downloaded clap v4.6.7
+  Downloaded clap_derive v4.6.7
+  Downloaded clap_builder v4.6.7
+   Compiling anstyle-parse v1.0.0
+   Compiling num-traits v0.2.19
+   Compiling syn v3.0.6
+   Compiling strsim v0.11.1
+   Compiling anstream v1.0.0
+   Compiling clap_lex v1.1.1
+   Compiling core-foundation-sys v0.8.7
+   Compiling heck v0.5.0
+   Compiling iana-time-zone v0.1.65
+   Compiling clap_builder v4.6.7
+   Compiling rustc-literal-escaper v0.0.8
+   Compiling opener v0.8.5
+   Compiling indoc v1.0.9
+   Compiling chrono v0.4.45
+   Compiling clap_derive v4.6.7
+   Compiling clap v4.6.7
+   Compiling clippy_dev v0.0.1 (/Volumes/Storage/rr-build-2026-10-08/rr/clippy_dev)
+    Finished `dev` profile [unoptimized] target(s) in 32.22s
+     Running `/Volumes/Storage/rr-build-2026-10-08/rr-target/debug/clippy_dev fmt --check`
+
+thread 'main' (12617379) panicked at clippy_dev/src/utils.rs:537:22:
+error running `rustup which rustfmt`: No such file or directory (os error 2)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+thread 'fmt' (12615916) panicked at tests/check-fmt.rs:23:5:
+Formatting check failed. Run `cargo dev fmt` to update formatting.
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    fmt
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 32.85s
+
+error: test failed, to rerun pass `--test check-fmt`

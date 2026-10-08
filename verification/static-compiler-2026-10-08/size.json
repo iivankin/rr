@@ -1,0 +1,17 @@
+{
+  "bundle_bytes": 227931672,
+  "bundle_mib": 217.3725814819336,
+  "previous_stock_bundle_bytes": 310719728,
+  "reduction_percent": 26.643965136323754,
+  "parts_bytes": {
+    "compiler-version.txt": 208,
+    "licenses": 16035072,
+    "rr": 131292224,
+    "bootstrap.toml": 957,
+    "README.md": 11079,
+    "llvm-targets.txt": 8,
+    "lib": 80592124
+  },
+  "archive_bytes": 75039831,
+  "archive_sha256": "92e14c0eaf38c8312abebdb2024585e38ed5bd9c00270f8b0ff3524d1e240397"
+}

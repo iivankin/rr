@@ -10,7 +10,9 @@ import tempfile
 if len(sys.argv) != 2:
     raise SystemExit("Usage: scripts/smoke-distribution.py DISTRIBUTION")
 source = Path(sys.argv[1]).resolve()
-with tempfile.TemporaryDirectory(prefix="rr-relocated-") as scratch:
+# An explicitly selected build volume must fail if unavailable, rather than
+# falling back to the system disk through tempfile's default directory search.
+with tempfile.TemporaryDirectory(prefix="rr-relocated-", dir=os.environ.get("TMPDIR")) as scratch:
     root = Path(scratch)
     bundle = root / "tool with spaces"
     shutil.copytree(source, bundle)

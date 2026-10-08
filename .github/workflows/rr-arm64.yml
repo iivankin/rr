@@ -17,8 +17,6 @@ env:
   CARGO_PROFILE_TEST_DEBUG: '0'
   CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: 'off'
   RUSTUP_TOOLCHAIN: nightly-2026-08-07
-  CARGO_PROFILE_RELEASE_LTO: thin
-  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
   CARGO_BUILD_JOBS: '6'
 
 jobs:
@@ -40,12 +38,17 @@ jobs:
       - name: Install Cargo and formatter for developing rr
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt
       - name: Build LLVM and matching static compiler in Actions
-        run: scripts/build-toolchain-actions.sh
+        run: scripts/build-toolchain.sh "$PWD/ci-rust" "$RUNNER_TEMP" "$RUNNER_TEMP/rr-toolchain"
       - name: Build rr and upstream lint driver with custom compiler
+        # Bootstrap controls compiler LTO through rr-bootstrap.toml. Apply the
+        # Cargo release profile only to rr, not to bootstrap's stage0 builds.
+        env:
+          CARGO_PROFILE_RELEASE_LTO: thin
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
         run: |
           echo "CARGO_TARGET_DIR=$RUNNER_TEMP/rr-target" >> "$GITHUB_ENV"
-          # Each embeds the compiler and LLVM. Link one executable at a time so
-          # their ThinLTO memory peaks do not overlap.
+          # The compiler-driver executables embed rustc and LLVM. Link one
+          # executable at a time so their ThinLTO memory peaks do not overlap.
           for rr_binary in rr clippy-driver cargo-clippy; do
             CARGO_TARGET_DIR="$RUNNER_TEMP/rr-target" cargo build --locked --release --bin "$rr_binary"
           done

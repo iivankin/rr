@@ -1,0 +1,2316 @@
+    Finished `test` profile [unoptimized] target(s) in 0.20s
+     Running unittests src/driver.rs (/Volumes/Storage/rr-build-2026-10-08/rr-target/debug/build/clippy/1a3e64998a1616d4/out/clippy_driver-1a3e64998a1616d4)
+
+running 2 tests
+test driver_core::test_has_arg ... ok
+test driver_core::test_arg_value ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/rr.rs (/Volumes/Storage/rr-build-2026-10-08/rr-target/debug/build/clippy/aa5702965e8c95e9/out/rr-aa5702965e8c95e9)
+
+running 2 tests
+test driver_core::test_has_arg ... ok
+test driver_core::test_arg_value ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/check-fmt.rs (/Volumes/Storage/rr-build-2026-10-08/rr-target/debug/build/clippy/e9520cb75161425a/out/check_fmt-e9520cb75161425a)
+
+running 1 test
+test fmt ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.82s
+
+     Running tests/compile-test.rs (/Volumes/Storage/rr-build-2026-10-08/rr-target/debug/build/clippy/414f29f5387cc0b8/out/compile_test-414f29f5387cc0b8)
+Building dependencies ... ok
+tests/ui/as_ptr_cast_mut_unfixable.rs ... ok
+tests/ui/as_pointer_underscore.rs ... ok
+tests/ui/as_underscore.rs ... ok
+tests/ui/as_ptr_cast_mut.rs ... ok
+tests/ui/approx_const.rs ... ok
+tests/ui/absurd-extreme-comparisons.rs ... ok
+tests/ui/asm_syntax_x86.rs ... ignored (in-test comment)
+tests/ui/as_pointer_underscore.fixed ... ok
+tests/ui/as_underscore.fixed ... ok
+tests/ui/asm_syntax_not_x86.rs ... ok
+tests/ui/as_underscore_unfixable.rs ... ok
+tests/ui/as_ptr_cast_mut.fixed ... ok
+tests/ui/assert_is_empty.rs ... ok
+tests/ui/assertions_on_constants.rs ... ok
+tests/ui/assertions_on_result_states.rs ... ok
+tests/ui/async_yields_async.rs ... ok
+tests/ui/assign_ops.rs ... ok
+tests/ui/assert_is_empty.fixed ... ok
+tests/ui/attrs.rs ... ok
+tests/ui/assigning_clones.rs ... ok
+tests/ui/assertions_on_result_states.fixed ... ok
+tests/ui/async_yields_async.fixed ... ok
+tests/ui/author.rs ... ok
+tests/ui/assign_ops.fixed ... ok
+tests/ui/assigning_clones.fixed ... ok
+tests/ui/bind_instead_of_map.rs ... ok
+tests/ui/await_holding_refcell_ref.rs ... ok
+tests/ui/await_holding_lock.rs ... ok
+tests/ui/blanket_clippy_restriction_lints.rs ... ok
+tests/ui/block_scrutinee.rs ... ok
+tests/ui/bind_instead_of_map_multipart.rs ... ok
+tests/ui/bind_instead_of_map.fixed ... ok
+tests/ui/block_scrutinee_2024.rs ... ok
+tests/ui/block_scrutinee.1.fixed ... ok
+tests/ui/block_scrutinee.2.fixed ... ok
+tests/ui/bind_instead_of_map_multipart.fixed ... ok
+Building aux file tests/ui/auxiliary/proc_macro_derive.rs ... ok
+Building aux file tests/ui/auxiliary/proc_macros.rs ... ok
+tests/ui/blocks_in_conditions_2021.rs ... ok
+tests/ui/bool_comparison.rs ... ok
+tests/ui/blocks_in_conditions_2021.fixed ... ok
+tests/ui/bool_assert_comparison.rs ... ok
+tests/ui/bool_comparison.fixed ... ok
+tests/ui/bool_to_int_with_if.rs ... ok
+tests/ui/borrow_and_ref_as_ptr.rs ... ok
+tests/ui/borrow_and_ref_as_ptr.fixed ... ok
+tests/ui/bool_to_int_with_if.fixed ... ok
+tests/ui/bool_assert_comparison.fixed ... ok
+tests/ui/borrow_as_ptr_no_std.rs ... ok
+tests/ui/borrow_as_ptr_raw_ref.rs ... ok
+tests/ui/borrow_as_ptr_no_std.fixed ... ok
+tests/ui/borrow_as_ptr_raw_ref.fixed ... ok
+tests/ui/borrow_deref_ref_unfixable.rs ... ok
+Building aux file tests/ui/auxiliary/proc_macro_attr.rs ... ok
+Building aux file tests/ui/auxiliary/interior_mutable_const.rs ... ok
+tests/ui/allow_attributes_without_reason.rs ... ok
+tests/ui/allow_attributes.rs ... ok
+tests/ui/almost_complete_range.rs ... ok
+tests/ui/borrow_as_ptr.rs ... ok
+tests/ui/arc_with_non_send_sync.rs ... ok
+tests/ui/borrow_interior_mutable_const.rs ... ok
+tests/ui/as_conversions.rs ... ok
+tests/ui/bad_bit_masks.rs ... ok
+tests/ui/big_endian_bytes.rs ... ok
+tests/ui/borrow_deref_ref.rs ... ok
+tests/ui/arithmetic_side_effects.rs ... ok
+tests/ui/almost_complete_range.fixed ... ok
+tests/ui/allow_attributes.fixed ... ok
+tests/ui/box_default_no_std.rs ... ok
+tests/ui/box_collection.rs ... ok
+tests/ui/borrow_as_ptr.fixed ... ok
+tests/ui/borrowed_box.rs ... ok
+tests/ui/boxed_local.rs ... ok
+tests/ui/big_endian_bytes.1.fixed ... ok
+tests/ui/box_default.rs ... ok
+tests/ui/big_endian_bytes.2.fixed ... ok
+tests/ui/by_ref_peekable_peek.rs ... ok
+tests/ui/byte_char_slices.rs ... ok
+tests/ui/borrow_deref_ref.fixed ... ok
+tests/ui/bytes_count_to_len.rs ... ok
+tests/ui/bytes_nth.rs ... ok
+tests/ui/bytecount.rs ... ok
+tests/ui/borrowed_box.fixed ... ok
+tests/ui/case_sensitive_file_extension_comparisons.rs ... ok
+tests/ui/builtin_type_shadow.rs ... ok
+tests/ui/box_default.fixed ... ok
+tests/ui/by_ref_peekable_peek.1.fixed ... ok
+tests/ui/by_ref_peekable_peek.2.fixed ... ok
+tests/ui/bytes_count_to_len.fixed ... ok
+tests/ui/by_ref_peekable_peek.3.fixed ... ok
+tests/ui/byte_char_slices.fixed ... ok
+tests/ui/bytes_nth.fixed ... ok
+tests/ui/cast_abs_to_unsigned.rs ... ok
+tests/ui/cast.rs ... ok
+tests/ui/case_sensitive_file_extension_comparisons.fixed ... ok
+tests/ui/cast_alignment.rs ... ok
+tests/ui/cast_enum_constructor.rs ... ok
+tests/ui/cast_lossless_bool.rs ... ok
+tests/ui/cast_nan_to_int.rs ... ok
+tests/ui/cast_raw_slice_pointer_cast.rs ... ok
+tests/ui/cast_abs_to_unsigned.fixed ... ok
+tests/ui/cast_lossless_float.rs ... ok
+tests/ui/cast_lossless_integer_unfixable.rs ... ok
+tests/ui/cast_lossless_integer.rs ... ok
+tests/ui/cast_raw_slice_pointer_cast_no_std.rs ... ok
+tests/ui/cast_size.rs ... ok
+tests/ui/cast_size.rs (revision `r32bit`) ... ignored (in-test comment)
+tests/ui/cast_size.rs (revision `r64bit`) ... ok
+tests/ui/cfg_attr_cargo_clippy.rs ... ok
+tests/ui/cast_slice_different_sizes.rs ... ok
+tests/ui/cast_raw_slice_pointer_cast.fixed ... ok
+tests/ui/cfg_attr_rustfmt.rs ... ok
+tests/ui/cfg_not_test.rs ... ok
+tests/ui/cast_lossless_float.fixed ... ok
+tests/ui/blocks_in_conditions.rs ... ok
+tests/ui/cast_raw_slice_pointer_cast_no_std.fixed ... ok
+tests/ui/cast_lossless_bool.fixed ... ok
+tests/ui/char_indices_as_byte_indices.rs ... ok
+tests/ui/cast_lossless_integer.fixed ... ok
+tests/ui/char_lit_as_u8.rs ... ok
+tests/ui/char_lit_as_u8_unfixable.rs ... ok
+tests/ui/cfg_attr_cargo_clippy.fixed ... ok
+tests/ui/chunks_exact_to_as_chunks.rs ... ok
+tests/ui/cfg_attr_rustfmt.fixed ... ok
+tests/ui/checked_conversions.rs ... ok
+tests/ui/chunks_exact_to_as_chunks_fixable.rs ... ok
+tests/ui/char_lit_as_u8.fixed ... ok
+tests/ui/clone_on_copy_impl.rs ... ok
+tests/ui/blocks_in_conditions.fixed ... ok
+tests/ui/cloned_instead_of_copied.rs ... ok
+tests/ui/char_indices_as_byte_indices.fixed ... ok
+tests/ui/clone_on_ref_ptr.rs ... ok
+tests/ui/checked_conversions.fixed ... ok
+tests/ui/clone_on_copy.rs ... ok
+tests/ui/clear_with_drain.rs ... ok
+tests/ui/cmp_null.rs ... ok
+tests/ui/cloned_ref_to_slice_refs.rs ... ok
+tests/ui/chunks_exact_to_as_chunks_fixable.fixed ... ok
+tests/ui/cognitive_complexity_attr_used.rs ... ok
+tests/ui/coerce_container_to_any.rs ... ok
+tests/ui/cloned_instead_of_copied.fixed ... ok
+tests/ui/collapsible_else_if_unfixable.rs ... ok
+tests/ui/clone_on_ref_ptr.fixed ... ok
+tests/ui/cmp_null.fixed ... ok
+tests/ui/collapsible_else_if.rs ... ok
+tests/ui/cognitive_complexity.rs ... ok
+tests/ui/cloned_ref_to_slice_refs.fixed ... ok
+tests/ui/clone_on_copy.fixed ... ok
+tests/ui/collapsible_if.rs ... ok
+tests/ui/coerce_container_to_any.fixed ... ok
+tests/ui/clear_with_drain.fixed ... ok
+tests/ui/collapsible_if_unfixable.rs ... ok
+tests/ui/collapsible_else_if.fixed ... ok
+tests/ui/collapsible_match_fixable.rs ... ok
+tests/ui/collapsible_match2.rs ... ok
+tests/ui/collapsible_if.fixed ... ok
+tests/ui/collapsible_match.rs ... ok
+tests/ui/collapsible_if_let_chains.rs ... ok
+tests/ui/collapsible_if_let_chains.rs (revision `edition2021`) ... ok
+tests/ui/collapsible_if_let_chains.rs (revision `edition2024`) ... ok
+tests/ui/comparison_chain.rs ... ok
+tests/ui/collapsible_str_replace.rs ... ok
+tests/ui/comparison_to_empty.rs ... ok
+tests/ui/confusing_method_to_numeric_cast.rs ... ok
+tests/ui/collection_is_never_read.rs ... ok
+tests/ui/const_is_empty.rs ... ok
+tests/ui/collapsible_match_fixable.fixed ... ok
+tests/ui/copy_iterator.rs ... ok
+tests/ui/const_comparisons.rs ... ok
+tests/ui/collapsible_if_let_chains.edition2024.fixed ... ok
+tests/ui/crate_in_macro_def.rs ... ok
+tests/ui/create_dir.rs ... ok
+tests/ui/collapsible_str_replace.fixed ... ok
+tests/ui/decimal_literal_representation.rs ... ok
+tests/ui/comparison_to_empty.fixed ... ok
+tests/ui/confusing_method_to_numeric_cast.fixed ... ok
+tests/ui/def_id_nocore.rs ... ok
+tests/ui/decimal_bitwise_operands.rs ... ok
+tests/ui/debug_assert_with_mut_call.rs ... ok
+tests/ui/default_constructed_unit_structs.rs ... ok
+tests/ui/decimal_literal_representation.fixed ... ok
+tests/ui/crate_in_macro_def.fixed ... ok
+tests/ui/default_instead_of_iter_empty_no_std.rs ... ok
+tests/ui/declare_interior_mutable_const.rs ... ok
+tests/ui/default_instead_of_iter_empty.rs ... ok
+tests/ui/create_dir.fixed ... ok
+tests/ui/default_union_representation.rs ... ok
+tests/ui/default_numeric_fallback_f64.rs ... ok
+tests/ui/default_numeric_fallback_i32.rs ... ok
+tests/ui/deprecated.rs ... ok
+tests/ui/default_trait_access.rs ... ok
+tests/ui/deref_addrof_macro.rs ... ok
+tests/ui/deref_addrof_double_trigger.rs ... ok
+tests/ui/default_instead_of_iter_empty_no_std.fixed ... ok
+tests/ui/default_instead_of_iter_empty.fixed ... ok
+tests/ui/default_constructed_unit_structs.fixed ... ok
+tests/ui/deref_addrof.rs ... ok
+tests/ui/default_numeric_fallback_f64.fixed ... ok
+tests/ui/deref_by_slicing.rs ... ok
+tests/ui/default_numeric_fallback_i32.fixed ... ok
+tests/ui/derivable_impls.rs ... ok
+tests/ui/derivable_impls_derive_const.rs ... ok
+tests/ui/derive.rs ... ok
+tests/ui/derived_hash_with_manual_eq.rs ... ok
+tests/ui/derive_ord_xor_partial_ord.rs ... ok
+tests/ui/default_trait_access.fixed ... ok
+tests/ui/disallowed_script_idents.rs ... ok
+tests/ui/deref_addrof.fixed ... ok
+tests/ui/disallowed_names.rs ... ok
+tests/ui/deref_by_slicing.fixed ... ok
+tests/ui/derive_partial_eq_without_eq.rs ... ok
+tests/ui/derivable_impls_derive_const.fixed ... ok
+tests/ui/diverging_sub_expression.rs ... ok
+tests/ui/doc_link_with_quotes.rs ... ok
+tests/ui/doc_broken_link.rs ... ok
+tests/ui/doc_errors.rs ... ok
+tests/ui/doc_suspicious_footnotes_include.rs ... ok
+tests/ui/doc_suspicious_footnotes.rs ... ok
+tests/ui/derivable_impls.fixed ... ok
+tests/ui/doc_unsafe.rs ... ok
+tests/ui/double_comparison.rs ... ok
+tests/ui/double_ended_iterator_last.rs ... ok
+tests/ui/double_must_use_unfixable.rs ... ok
+tests/ui/double_must_use.rs ... ok
+tests/ui/duplicate_underscore_argument.rs ... ok
+tests/ui/drop_non_drop.rs ... ok
+tests/ui/duplicated_attributes.rs ... ok
+tests/ui/drain_collect_nostd.rs ... ok
+tests/ui/double_comparison.fixed ... ok
+tests/ui/drain_collect.rs ... ok
+tests/ui/derive_partial_eq_without_eq.fixed ... ok
+tests/ui/doc_suspicious_footnotes.fixed ... ok
+Building aux file tests/ui/auxiliary/macro_rules.rs ... ok
+tests/ui/double_ended_iterator_last.fixed ... ok
+tests/ui/duration_suboptimal_units_days_weeks.rs ... ok
+tests/ui/duration_subsec.rs ... ok
+tests/ui/double_must_use.fixed ... ok
+tests/ui/duration_suboptimal_units.rs ... ok
+tests/ui/drain_collect_nostd.fixed ... ok
+tests/ui/else_if_without_else.rs ... ok
+tests/ui/empty_docs.rs ... ok
+tests/ui/elidable_lifetime_names.rs ... ok
+tests/ui/eager_transmute.rs ... ok
+tests/ui/drain_collect.fixed ... ok
+tests/ui/double_parens.rs ... ok
+tests/ui/empty_drop.rs ... ok
+tests/ui/empty_enums_without_never_type.rs ... ok
+tests/ui/duration_suboptimal_units_days_weeks.fixed ... ok
+tests/ui/empty_enums.rs ... ok
+tests/ui/duration_suboptimal_units.fixed ... ok
+tests/ui/duration_subsec.fixed ... ok
+tests/ui/empty_loop.rs ... ok
+tests/ui/empty_loop_intrinsic.rs ... ok
+tests/ui/empty_enum_variants_with_brackets.rs ... ok
+tests/ui/elidable_lifetime_names.fixed ... ok
+tests/ui/empty_drop.fixed ... ok
+tests/ui/empty_loop_no_std.rs ... ok
+tests/ui/eager_transmute.fixed ... ok
+tests/ui/empty_structs_with_brackets.rs ... ok
+tests/ui/entry_btree.rs ... ok
+tests/ui/double_parens.fixed ... ok
+tests/ui/entry_with_else.rs ... ok
+tests/ui/empty_enum_variants_with_brackets.fixed ... ok
+tests/ui/entry_unfixable.rs ... ok
+tests/ui/entry.rs ... ok
+tests/ui/enum_clike_unportable_variant.rs ... ok
+tests/ui/enum_glob_use.rs ... ok
+tests/ui/enum_variants.rs ... ok
+tests/ui/entry_btree.fixed ... ok
+tests/ui/empty_structs_with_brackets.fixed ... ok
+tests/ui/eprint_with_newline.rs ... ok
+tests/ui/entry_with_else.fixed ... ok
+tests/ui/equatable_if_let_const_cmp.rs ... ok
+tests/ui/eq_op.rs ... ok
+tests/ui/eq_op_macros.rs ... ok
+tests/ui/erasing_op.rs ... ok
+tests/ui/enum_glob_use.fixed ... ok
+tests/ui/err_expect.rs ... ok
+tests/ui/equatable_if_let.rs ... ok
+tests/ui/error_impl_error.rs ... ok
+tests/ui/eprint_with_newline.fixed ... ok
+tests/ui/eta_nostd.rs ... ok
+tests/ui/entry.fixed ... ok
+tests/ui/equatable_if_let_const_cmp.fixed ... ok
+tests/ui/exit1.rs ... ok
+tests/ui/exhaustive_items.rs ... ok
+tests/ui/exit1_compile_flag_test.rs ... ok
+tests/ui/exit2.rs ... ok
+tests/ui/exit2_compile_flag_test.rs ... ok
+tests/ui/excessive_precision.rs ... ok
+tests/ui/exit3.rs ... ok
+tests/ui/err_expect.fixed ... ok
+tests/ui/equatable_if_let.fixed ... ok
+tests/ui/eta_nostd.fixed ... ok
+tests/ui/exhaustive_items.fixed ... ok
+tests/ui/exit3_compile_flag_test.rs ... ok
+tests/ui/expect.rs ... ok
+tests/ui/exit4.rs ... ok
+tests/ui/expect_tool_lint_rfc_2383.rs ... ok
+tests/ui/eta.rs ... ok
+tests/ui/excessive_precision.fixed ... ok
+tests/ui/expect_fun_call.rs ... ok
+tests/ui/explicit_into_iter_loop.rs ... ok
+tests/ui/explicit_deref_methods.rs ... ok
+tests/ui/explicit_write_in_test.rs ... ok
+tests/ui/extend_with_drain.rs ... ok
+tests/ui/explicit_write.rs ... ok
+tests/ui/explicit_counter_loop.rs ... ok
+tests/ui/explicit_iter_loop.rs ... ok
+tests/ui/extra_unused_lifetimes.rs ... ok
+tests/ui/explicit_auto_deref.rs ... ok
+tests/ui/extra_unused_type_parameters.rs ... ok
+tests/ui/expect_fun_call.fixed ... ok
+tests/ui/extra_unused_type_parameters_unfixable.rs ... ok
+tests/ui/explicit_into_iter_loop.fixed ... ok
+tests/ui/explicit_deref_methods.fixed ... ok
+tests/ui/extend_with_drain.fixed ... ok
+tests/ui/fallible_impl_from.rs ... ok
+tests/ui/explicit_write.fixed ... ok
+tests/ui/extra_unused_type_parameters.fixed ... ok
+tests/ui/eta.fixed ... ok
+tests/ui/field_scoped_visibility_modifiers.rs ... ok
+tests/ui/filetype_is_file.rs ... ok
+tests/ui/explicit_iter_loop.fixed ... ok
+tests/ui/field_reassign_with_default.rs ... ok
+tests/ui/explicit_auto_deref.fixed ... ok
+tests/ui/filter_map_bool_then.rs ... ok
+tests/ui/filter_map_bool_then_unfixable.rs ... ok
+tests/ui/filter_map_next.rs ... ok
+tests/ui/filter_map_identity.rs ... ok
+tests/ui/filter_next_unfixable.rs ... ok
+tests/ui/flat_map_option.rs ... ok
+tests/ui/float_arithmetic.rs ... ok
+tests/ui/float_cmp_const.rs ... ok
+Building aux file tests/ui/auxiliary/option_helpers.rs ... ok
+tests/ui/float_cmp.rs ... ok
+tests/ui/flat_map_identity.rs ... ok
+tests/ui/float_equality_without_abs.rs ... ok
+tests/ui/floating_point_abs.rs ... ok
+tests/ui/floating_point_arithmetic_nostd.rs ... ok
+tests/ui/flat_map_option.fixed ... ok
+tests/ui/filter_map_next.fixed ... ok
+tests/ui/filter_map_identity.fixed ... ok
+tests/ui/floating_point_exp.rs ... ok
+tests/ui/flat_map_identity.fixed ... ok
+tests/ui/filter_map_bool_then.fixed ... ok
+tests/ui/floating_point_log.rs ... ok
+tests/ui/floating_point_hypot.rs ... ok
+tests/ui/filter_next.rs ... ok
+tests/ui/floating_point_logbase.rs ... ok
+tests/ui/floating_point_rad.rs ... ok
+tests/ui/floating_point_powf.rs ... ok
+tests/ui/floating_point_abs.fixed ... ok
+tests/ui/floating_point_powi.rs ... ok
+tests/ui/floating_point_mul_add.rs ... ok
+tests/ui/floating_point_hypot.fixed ... ok
+tests/ui/floating_point_log.fixed ... ok
+tests/ui/floating_point_logbase.fixed ... ok
+tests/ui/floating_point_exp.fixed ... ok
+tests/ui/fn_params_excessive_bools.rs ... ok
+tests/ui/fn_to_numeric_cast.rs ... ok
+tests/ui/fn_to_numeric_cast.rs (revision `r32bit`) ... ignored (in-test comment)
+tests/ui/fn_to_numeric_cast.rs (revision `r64bit`) ... ok
+tests/ui/filter_next.fixed ... ok
+tests/ui/floating_point_powi.fixed ... ok
+tests/ui/fn_to_numeric_cast_any.rs ... ok
+tests/ui/floating_point_powf.fixed ... ok
+tests/ui/floating_point_rad.fixed ... ok
+tests/ui/for_unbounded_range.rs ... ok
+tests/ui/floating_point_mul_add.fixed ... ok
+tests/ui/forget_non_drop.rs ... ok
+tests/ui/format_collect.rs ... ok
+tests/ui/format_push_string_no_core.rs ... ok
+tests/ui/format.rs ... ok
+tests/ui/format_push_string_no_std.rs ... ok
+tests/ui/format_push_string_no_std_unfixable.rs ... ok
+tests/ui/format_args.rs ... ok
+tests/ui/for_kv_map.rs ... ok
+tests/ui/for_unbounded_range.fixed ... ok
+tests/ui/format_push_string.rs ... ok
+tests/ui/formatting.rs ... ok
+tests/ui/format_in_format_args_unfixable.rs ... ok
+tests/ui/four_forward_slashes_bare_cr.rs ... ok
+tests/ui/format_push_string_no_std.fixed ... ok
+tests/ui/format_push_string_unfixable.rs ... ok
+tests/ui/four_forward_slashes.rs ... ok
+tests/ui/four_forward_slashes_first_line.rs ... ok
+tests/ui/from_raw_with_void_ptr.rs ... ok
+tests/ui/format.fixed ... ok
+tests/ui/format_args.fixed ... ok
+tests/ui/format_push_string.fixed ... ok
+tests/ui/from_over_into_unfixable.rs ... ok
+tests/ui/from_over_into.rs ... ok
+tests/ui/four_forward_slashes.fixed ... ok
+tests/ui/four_forward_slashes_first_line.fixed ... ok
+tests/ui/for_kv_map.fixed ... ok
+tests/ui/functions.rs ... ok
+tests/ui/from_str_radix_10.rs ... ok
+tests/ui/functions_maxlines.rs ... ok
+tests/ui/get_first.rs ... ok
+tests/ui/from_over_into.fixed ... ok
+tests/ui/get_last_with_len.rs ... ok
+tests/ui/get_unwrap.rs ... ok
+tests/ui/host_endian_bytes.rs ... ok
+tests/ui/if_not_else_bittest.rs ... ok
+tests/ui/from_str_radix_10.fixed ... ok
+tests/ui/if_not_else.rs ... ok
+tests/ui/identity_op.rs ... ok
+tests/ui/if_let_mutex.rs ... ok
+tests/ui/if_let_mutex.rs (revision `edition2021`) ... ok
+tests/ui/if_let_mutex.rs (revision `edition2024`) ... ok
+tests/ui/get_first.fixed ... ok
+tests/ui/if_same_then_else.rs ... ok
+tests/ui/if_same_then_else2.rs ... ok
+tests/ui/get_last_with_len.fixed ... ok
+tests/ui/host_endian_bytes.1.fixed ... ok
+tests/ui/if_not_else.fixed ... ok
+tests/ui/get_unwrap.fixed ... ok
+tests/ui/host_endian_bytes.2.fixed ... ok
+tests/ui/if_then_some_else_none_unfixable.rs ... ok
+tests/ui/identity_op.fixed ... ok
+tests/ui/ifs_same_cond.rs ... ok
+tests/ui/ignore_without_reason.rs ... ok
+tests/ui/impl_hash_with_borrow_str_and_bytes.rs ... ok
+tests/ui/if_then_some_else_none.rs ... ok
+tests/ui/impl_trait_in_params.rs ... ok
+tests/ui/future_not_send.rs ... ok
+tests/ui/future_not_send.rs (revision `current`) ... ok
+tests/ui/future_not_send.rs (revision `next`) ... ok
+tests/ui/ignored_unit_patterns.rs ... ok
+tests/ui/impl.rs ... ok
+tests/ui/implicit_clone.rs ... ok
+tests/ui/implicit_hasher.rs ... ok
+tests/ui/implicit_return.rs ... ok
+tests/ui/implicit_saturating_add.rs ... ok
+tests/ui/inconsistent_digit_grouping.rs ... ok
+tests/ui/inconsistent_struct_constructor.rs ... ok
+tests/ui/implied_bounds_in_impls.rs ... ok
+tests/ui/implicit_saturating_sub.rs ... ok
+tests/ui/if_then_some_else_none.fixed ... ok
+tests/ui/ignored_unit_patterns.fixed ... ok
+tests/ui/incompatible_msrv.rs ... ok
+tests/ui/indexing_slicing_index.rs ... ok
+tests/ui/implicit_hasher.fixed ... ok
+tests/ui/implicit_saturating_add.fixed ... ok
+tests/ui/inconsistent_digit_grouping.fixed ... ok
+tests/ui/implicit_clone.fixed ... ok
+tests/ui/implicit_return.fixed ... ok
+tests/ui/implied_bounds_in_impls.fixed ... ok
+tests/ui/inconsistent_struct_constructor.fixed ... ok
+tests/ui/implicit_saturating_sub.fixed ... ok
+tests/ui/infallible_destructuring_match.rs ... ok
+tests/ui/ineffective_open_options.rs ... ok
+tests/ui/indexing_slicing_slice.rs ... ok
+tests/ui/inefficient_to_string.rs ... ok
+tests/ui/ineffective_bit_masks.rs ... ok
+tests/ui/infallible_try_from.rs ... ok
+tests/ui/infinite_iter.rs ... ok
+tests/ui/inherent_to_string.rs ... ok
+tests/ui/inline_modules_cfg_test.rs ... ok
+tests/ui/init_numbered_fields.rs ... ok
+tests/ui/inline_fn_without_body.rs ... ok
+tests/ui/infinite_loops.rs ... ok
+tests/ui/ineffective_open_options.fixed ... ok
+tests/ui/infallible_destructuring_match.fixed ... ok
+tests/ui/inefficient_to_string.fixed ... ok
+tests/ui/inline_trait_bounds.rs ... ok
+tests/ui/int_plus_one.rs ... ok
+tests/ui/inline_fn_without_body.fixed ... ok
+tests/ui/inspect_for_each.rs ... ok
+tests/ui/init_numbered_fields.fixed ... ok
+tests/ui/integer_division.rs ... ok
+tests/ui/integer_division_remainder_used.rs ... ok
+tests/ui/invisible_characters_unfixable.rs ... ok
+tests/ui/io_other_error.rs ... ok
+tests/ui/invalid_upcast_comparisons.rs ... ok
+tests/ui/into_iter_without_iter.rs ... ok
+tests/ui/into_iter_on_ref.rs ... ok
+tests/ui/int_plus_one.fixed ... ok
+tests/ui/issue-3145.rs ... ok
+tests/ui/inline_trait_bounds.fixed ... ok
+tests/ui/ip_constant_from_external.rs ... ok
+tests/ui/issue-111399.rs ... ok
+tests/ui/ip_constant.rs ... ok
+tests/ui/is_digit_ascii_radix.rs ... ok
+tests/ui/io_other_error.fixed ... ok
+tests/ui/issue_2356.rs ... ok
+tests/ui/issue-7447.rs ... ok
+tests/ui/issue_4266.rs ... ok
+tests/ui/items_after_statement.rs ... ok
+tests/ui/into_iter_on_ref.fixed ... ok
+tests/ui/iter_count.rs ... ok
+tests/ui/ip_constant.fixed ... ok
+tests/ui/iter_cloned_collect.rs ... ok
+tests/ui/issue_2356.fixed ... ok
+tests/ui/is_digit_ascii_radix.fixed ... ok
+tests/ui/iter_next_loop.rs ... ok
+tests/ui/iter_next_slice.rs ... ok
+tests/ui/iter_filter_is_ok.rs ... ok
+tests/ui/iter_filter_is_some.rs ... ok
+tests/ui/iter_not_returning_iterator.rs ... ok
+tests/ui/iter_nth.rs ... ok
+tests/ui/iter_nth_zero.rs ... ok
+tests/ui/iter_count.fixed ... ok
+tests/ui/iter_kv_map.rs ... ok
+tests/ui/iter_on_empty_collections.rs ... ok
+tests/ui/iter_out_of_bounds.rs ... ok
+tests/ui/iter_next_slice.fixed ... ok
+tests/ui/iter_on_single_items.rs ... ok
+tests/ui/iter_cloned_collect.fixed ... ok
+tests/ui/iter_filter_is_ok.fixed ... ok
+tests/ui/iter_over_hash_type.rs ... ok
+tests/ui/iter_nth.fixed ... ok
+tests/ui/iter_filter_is_some.fixed ... ok
+tests/ui/iter_nth_zero.fixed ... ok
+tests/ui/iter_skip_next_unfixable.rs ... ok
+tests/ui/iter_skip_zero.rs ... ok
+tests/ui/iter_skip_next.rs ... ok
+tests/ui/iter_on_single_items.fixed ... ok
+tests/ui/iter_on_empty_collections.fixed ... ok
+tests/ui/iter_kv_map.fixed ... ok
+tests/ui/iter_without_into_iter.rs ... ok
+tests/ui/join_absolute_paths.rs ... ok
+tests/ui/iter_overeager_cloned.rs ... ok
+tests/ui/iterator_step_by_zero.rs ... ok
+tests/ui/iter_with_drain.rs ... ok
+tests/ui/large_digit_groups.rs ... ok
+tests/ui/large_enum_variant_no_std.rs ... ok
+tests/ui/iter_skip_zero.fixed ... ok
+tests/ui/iter_skip_next.fixed ... ok
+tests/ui/large_enum_variant.rs ... ok
+tests/ui/large_enum_variant.rs (revision `r32bit`) ... ignored (in-test comment)
+tests/ui/large_enum_variant.rs (revision `r64bit`) ... ok
+tests/ui/large_digit_groups.fixed ... ok
+tests/ui/join_absolute_paths.2.fixed ... ok
+tests/ui/large_stack_arrays.rs ... ok
+tests/ui/join_absolute_paths.1.fixed ... ok
+tests/ui/iter_with_drain.fixed ... ok
+tests/ui/large_futures.rs ... ok
+tests/ui/iter_overeager_cloned.fixed ... ok
+tests/ui/large_stack_frames.rs ... ok
+tests/ui/large_types_passed_by_value.rs ... ok
+tests/ui/len_without_is_empty_expect.rs ... ok
+tests/ui/legacy_numeric_constants_unfixable.rs ... ok
+tests/ui/len_zero_ranges.rs ... ok
+tests/ui/legacy_numeric_constants.rs ... ok
+tests/ui/len_zero.rs ... ok
+tests/ui/let_underscore_future.rs ... ok
+tests/ui/let_underscore_lock.rs ... ok
+tests/ui/len_without_is_empty.rs ... ok
+tests/ui/let_underscore_must_use.rs ... ok
+tests/ui/let_if_seq.rs ... ok
+tests/ui/len_zero_ranges.fixed ... ok
+tests/ui/let_underscore_untyped.rs ... ok
+tests/ui/large_futures.fixed ... ok
+tests/ui/legacy_numeric_constants.fixed ... ok
+tests/ui/len_zero.fixed ... ok
+tests/ui/let_with_type_underscore.rs ... ok
+tests/ui/literals.rs ... ok
+tests/ui/lossy_float_literal.rs ... ok
+tests/ui/lines_filter_map_ok.rs ... ok
+tests/ui/literal_string_with_formatting_arg.rs ... ok
+tests/ui/linkedlist.rs ... ok
+tests/ui/let_unit.rs ... ok
+tests/ui/let_and_return.edition2021.fixed ... ok
+tests/ui/let_with_type_underscore.fixed ... ok
+tests/ui/little_endian_bytes.rs ... ok
+tests/ui/lossy_float_literal.fixed ... ok
+tests/ui/let_and_return.rs ... ok
+tests/ui/let_and_return.rs (revision `edition2021`) ... ok
+tests/ui/let_and_return.rs (revision `edition2024`) ... ok
+Building aux file tests/ui/auxiliary/macro_use_helper.rs ... ok
+tests/ui/manual_arithmetic_check-2.rs ... ok
+tests/ui/lines_filter_map_ok.fixed ... ok
+tests/ui/manual_abs_diff.rs ... ok
+tests/ui/manual_arithmetic_check.rs ... ok
+tests/ui/little_endian_bytes.2.fixed ... ok
+tests/ui/little_endian_bytes.1.fixed ... ok
+tests/ui/let_unit.fixed ... ok
+tests/ui/manual_assert_eq.rs ... ok
+tests/ui/manual_async_fn.rs ... ok
+tests/ui/macro_use_imports.rs ... ok
+tests/ui/manual_arithmetic_check.fixed ... ok
+tests/ui/manual_abs_diff.fixed ... ok
+tests/ui/let_and_return.edition2024.fixed ... ok
+tests/ui/manual_bit_width.rs ... ok
+tests/ui/macro_use_imports_expect.rs ... ok
+tests/ui/manual_assert.rs ... ok
+tests/ui/manual_bits.rs ... ok
+tests/ui/manual_assert.rs (revision `edition2018`) ... ok
+tests/ui/manual_assert.rs (revision `edition2021`) ... ok
+tests/ui/manual_assert.edition2018.fixed ... ok
+tests/ui/macro_use_imports.fixed ... ok
+tests/ui/manual_checked_ops.rs ... ok
+tests/ui/manual_async_fn.fixed ... ok
+tests/ui/manual_assert_eq.fixed ... ok
+tests/ui/manual_bit_width.fixed ... ok
+tests/ui/manual_clear.rs ... ok
+tests/ui/manual_clamp.rs ... ok
+tests/ui/manual_assert.edition2021.fixed ... ok
+tests/ui/manual_bits.fixed ... ok
+tests/ui/manual_c_str_literals.rs ... ok
+tests/ui/manual_c_str_literals.rs (revision `edition2018`) ... ok
+tests/ui/manual_c_str_literals.rs (revision `edition2021`) ... ok
+tests/ui/manual_contains.rs ... ok
+tests/ui/manual_dangling_ptr.rs ... ok
+tests/ui/manual_div_ceil_with_feature.rs ... ok
+tests/ui/manual_clear.fixed ... ok
+tests/ui/manual_div_ceil.rs ... ok
+tests/ui/manual_filter.rs ... ok
+tests/ui/manual_filter_unfixable.rs ... ok
+tests/ui/manual_find.rs ... ok
+tests/ui/manual_clamp.fixed ... ok
+tests/ui/manual_c_str_literals.edition2021.fixed ... ok
+tests/ui/manual_dangling_ptr.fixed ... ok
+tests/ui/manual_contains.fixed ... ok
+tests/ui/manual_div_ceil.fixed ... ok
+tests/ui/manual_filter_map.rs ... ok
+tests/ui/manual_div_ceil_with_feature.fixed ... ok
+tests/ui/manual_find_fixable.rs ... ok
+tests/ui/manual_hash_one.rs ... ok
+tests/ui/manual_filter.fixed ... ok
+tests/ui/manual_instant_elapsed.rs ... ok
+tests/ui/manual_float_methods.rs ... ok
+tests/ui/manual_ilog2.rs ... ok
+tests/ui/manual_flatten.rs ... ok
+tests/ui/manual_find_map.rs ... ok
+tests/ui/manual_inspect.rs ... ok
+tests/ui/manual_ignore_case_cmp.rs ... ok
+tests/ui/manual_filter_map.fixed ... ok
+tests/ui/manual_float_methods.2.fixed ... ok
+tests/ui/manual_instant_elapsed.fixed ... ok
+tests/ui/manual_float_methods.1.fixed ... ok
+tests/ui/manual_hash_one.fixed ... ok
+tests/ui/manual_is_ascii_check.rs ... ok
+tests/ui/manual_find_fixable.fixed ... ok
+tests/ui/manual_float_methods.3.fixed ... ok
+tests/ui/manual_ilog2.fixed ... ok
+tests/ui/manual_is_power_of_two.rs ... ok
+tests/ui/manual_inspect.fixed ... ok
+tests/ui/manual_flatten.fixed ... ok
+tests/ui/manual_find_map.fixed ... ok
+tests/ui/large_const_arrays.rs ... ok
+tests/ui/manual_ignore_case_cmp.fixed ... ok
+tests/ui/manual_is_ascii_check.fixed ... ok
+tests/ui/manual_is_multiple_of.rs ... ok
+tests/ui/manual_isolate_lowest_one.rs ... ok
+tests/ui/manual_is_power_of_two.fixed ... ok
+tests/ui/manual_main_separator_str.rs ... ok
+tests/ui/manual_let_else_question_mark.rs ... ok
+tests/ui/manual_let_else_match.rs ... ok
+tests/ui/manual_let_else.rs ... ok
+tests/ui/manual_let_else_unfixable.rs ... ok
+tests/ui/manual_is_variant_and.rs ... ok
+tests/ui/manual_isolate_lowest_one.fixed ... ok
+tests/ui/manual_is_multiple_of.fixed ... ok
+tests/ui/manual_map_option.rs ... ok
+tests/ui/manual_map_option_2.rs ... ok
+tests/ui/manual_main_separator_str.fixed ... ok
+tests/ui/manual_midpoint.rs ... ok
+tests/ui/manual_next_back.rs ... ok
+tests/ui/manual_let_else_match.fixed ... ok
+tests/ui/manual_non_exhaustive_enum.rs ... ok
+tests/ui/manual_non_exhaustive_struct.rs ... ok
+tests/ui/manual_let_else_question_mark.fixed ... ok
+tests/ui/manual_map_option.fixed ... ok
+tests/ui/manual_let_else.fixed ... ok
+tests/ui/manual_map_option_2.fixed ... ok
+tests/ui/manual_is_variant_and.fixed ... ok
+tests/ui/manual_next_back.fixed ... ok
+tests/ui/manual_midpoint.fixed ... ok
+tests/ui/manual_noop_waker.rs ... ok
+tests/ui/manual_ok_or.rs ... ok
+tests/ui/manual_ok_err.rs ... ok
+tests/ui/manual_option_as_slice.rs ... ok
+tests/ui/manual_pattern_char_comparison.rs ... ok
+tests/ui/manual_option_zip.rs ... ok
+tests/ui/manual_range_patterns.rs ... ok
+tests/ui/manual_repeat_n.rs ... ok
+tests/ui/manual_pop_if_unfixable.rs ... ok
+tests/ui/manual_rem_euclid.rs ... ok
+tests/ui/manual_pop_if.rs ... ok
+tests/ui/manual_ok_or.fixed ... ok
+tests/ui/manual_pattern_char_comparison.fixed ... ok
+tests/ui/manual_ok_err.fixed ... ok
+tests/ui/manual_option_as_slice.fixed ... ok
+tests/ui/manual_range_patterns.fixed ... ok
+tests/ui/manual_option_zip.fixed ... ok
+tests/ui/manual_rem_euclid.fixed ... ok
+tests/ui/manual_repeat_n.fixed ... ok
+tests/ui/manual_rotate.rs ... ok
+tests/ui/manual_pop_if.fixed ... ok
+tests/ui/manual_saturating_arithmetic.rs ... ok
+tests/ui/manual_slice_size_calculation.rs ... ok
+tests/ui/manual_str_repeat.rs ... ok
+tests/ui/manual_split_once.rs ... ok
+tests/ui/manual_slice_fill.rs ... ok
+tests/ui/manual_rotate.fixed ... ok
+tests/ui/manual_string_new.rs ... ok
+tests/ui/manual_strip.rs ... ok
+tests/ui/manual_swap_auto_fix.rs ... ok
+tests/ui/manual_strip_fixable.rs ... ok
+tests/ui/manual_saturating_arithmetic.fixed ... ok
+tests/ui/manual_retain.rs ... ok
+tests/ui/manual_slice_size_calculation.fixed ... ok
+tests/ui/manual_str_repeat.fixed ... ok
+tests/ui/manual_take_nocore.rs ... ok
+tests/ui/manual_take.rs ... ok
+tests/ui/manual_split_once.fixed ... ok
+tests/ui/manual_string_new.fixed ... ok
+tests/ui/manual_swap_auto_fix.fixed ... ok
+tests/ui/manual_strip_fixable.fixed ... ok
+tests/ui/manual_slice_fill.fixed ... ok
+tests/ui/manual_take_nostd.rs ... ok
+tests/ui/manual_try_fold.rs ... ok
+tests/ui/manual_take.fixed ... ok
+tests/ui/manual_unwrap_or_default_unfixable.rs ... ok
+tests/ui/manual_unwrap_or_default.rs ... ok
+tests/ui/many_single_char_names.rs ... ok
+tests/ui/manual_take_nostd.fixed ... ok
+tests/ui/manual_unwrap_or.rs ... ok
+tests/ui/manual_while_let_some.rs ... ok
+tests/ui/map_all_any_identity.rs ... ok
+tests/ui/map_clone.rs ... ok
+tests/ui/map_flatten.rs ... ok
+tests/ui/map_collect_result_unit.rs ... ok
+tests/ui/manual_unwrap_or_default.fixed ... ok
+tests/ui/map_err.rs ... ok
+tests/ui/map_flatten_fixable.rs ... ok
+tests/ui/manual_while_let_some.fixed ... ok
+tests/ui/manual_unwrap_or.fixed ... ok
+tests/ui/map_all_any_identity.fixed ... ok
+tests/ui/manual_retain.fixed ... ok
+tests/ui/map_identity.rs ... ok
+tests/ui/map_or_identity.rs ... ok
+tests/ui/map_collect_result_unit.fixed ... ok
+tests/ui/map_unit_fn.rs ... ok
+tests/ui/map_clone.fixed ... ok
+tests/ui/map_flatten_fixable.fixed ... ok
+tests/ui/map_flatten.fixed ... ok
+tests/ui/map_unwrap_or_fixable.rs ... ok
+tests/ui/map_with_unused_argument_over_ranges.rs ... ok
+tests/ui/map_with_unused_argument_over_ranges_nostd.rs ... ok
+tests/ui/map_unwrap_or.rs ... ok
+tests/ui/map_or_identity.fixed ... ok
+tests/ui/match_like_matches_macro_if_let_guard.rs ... ok
+tests/ui/match_bool.rs ... ok
+tests/ui/map_identity.fixed ... ok
+tests/ui/match_like_matches_macro.rs ... ok
+tests/ui/match_overlapping_arm.rs ... ok
+tests/ui/match_as_ref.rs ... ok
+tests/ui/map_with_unused_argument_over_ranges_nostd.fixed ... ok
+tests/ui/map_unwrap_or_fixable.fixed ... ok
+tests/ui/map_with_unused_argument_over_ranges.fixed ... ok
+tests/ui/match_ref_pats.rs ... ok
+tests/ui/match_result_ok.rs ... ok
+tests/ui/match_bool.fixed ... ok
+tests/ui/match_same_arms_expect.rs ... ok
+tests/ui/match_as_ref.fixed ... ok
+tests/ui/match_same_arms_non_exhaustive.rs ... ok
+tests/ui/match_same_arms.rs ... ok
+tests/ui/match_like_matches_macro.fixed ... ok
+tests/ui/match_same_arms2.rs ... ok
+tests/ui/match_ref_pats.fixed ... ok
+tests/ui/match_single_binding2.rs ... ok
+tests/ui/match_result_ok.fixed ... ok
+tests/ui/match_wild_err_arm.rs ... ok
+tests/ui/match_str_case_mismatch.rs ... ok
+tests/ui/match_wildcard_for_single_variants.rs ... ok
+tests/ui/match_same_arms_non_exhaustive.fixed ... ok
+tests/ui/mem_replace_option_with_none.rs ... ok
+tests/ui/mem_replace_option_with_none_no_std.rs ... ok
+tests/ui/match_single_binding.rs ... ok
+tests/ui/match_same_arms.fixed ... ok
+tests/ui/mem_replace_option_with_some.rs ... ok
+tests/ui/mem_forget.rs ... ok
+tests/ui/match_same_arms2.fixed ... ok
+tests/ui/match_single_binding2.fixed ... ok
+tests/ui/match_wildcard_for_single_variants.fixed ... ok
+tests/ui/match_str_case_mismatch.fixed ... ok
+tests/ui/mem_replace_option_with_some_no_std.rs ... ok
+tests/ui/mem_replace_option_with_none_no_std.fixed ... ok
+tests/ui/large_const_arrays.fixed ... ok
+tests/ui/mem_replace_option_with_none.fixed ... ok
+tests/ui/mem_replace_with_default_no_std.rs ... ok
+tests/ui/mem_replace_option_with_some.fixed ... ok
+tests/ui/mem_replace_with_uninit_unfixable.rs ... ok
+tests/ui/mem_replace_with_uninit.rs ... ok
+tests/ui/min_rust_version_attr.rs ... ok
+tests/ui/min_rust_version_invalid_attr.rs ... ok
+tests/ui/mem_replace_option_with_some_no_std.fixed ... ok
+tests/ui/methods.rs ... ok
+tests/ui/mem_replace_with_default.rs ... ok
+tests/ui/min_ident_chars.rs ... ok
+tests/ui/min_max.rs ... ok
+tests/ui/mem_replace_with_default_no_std.fixed ... ok
+tests/ui/match_single_binding.fixed ... ok
+tests/ui/mismatching_type_param_order.rs ... ok
+tests/ui/mem_replace_with_uninit.fixed ... ok
+tests/ui/misnamed_getters_2021.rs ... ok
+tests/ui/misrefactored_assign_op.rs ... ok
+tests/ui/mismatched_bit_width_type.rs ... ok
+tests/ui/missing_fields_in_debug.rs ... ok
+tests/ui/misnamed_getters.rs ... ok
+tests/ui/missing_asserts_for_indexing_unfixable.rs ... ok
+tests/ui/missing_inline_executable.rs ... ok
+tests/ui/misnamed_getters_2021.fixed ... ok
+tests/ui/missing_asserts_for_indexing.rs ... ok
+tests/ui/mem_replace_with_default.fixed ... ok
+tests/ui/missing_inline.rs ... ok
+tests/ui/misrefactored_assign_op.1.fixed ... ok
+tests/ui/misrefactored_assign_op.2.fixed ... ok
+tests/ui/missing_const_for_thread_local.rs ... ok
+tests/ui/missing_inline_proc_macro.rs ... ok
+tests/ui/mismatched_bit_width_type.fixed ... ok
+tests/ui/misnamed_getters.fixed ... ok
+tests/ui/missing_inline_test_crate.rs ... ok
+tests/ui/missing_spin_loop_no_std.rs ... ok
+tests/ui/missing_assert_message.rs ... ok
+tests/ui/missing_assert_message.rs (revision `edition2015`) ... ok
+tests/ui/missing_assert_message.rs (revision `edition2021`) ... ok
+tests/ui/missing_spin_loop.rs ... ok
+tests/ui/missing_trait_methods.rs ... ok
+tests/ui/missing_asserts_for_indexing.fixed ... ok
+tests/ui/missing_transmute_annotations.rs ... ok
+tests/ui/missing_panics_doc.rs ... ok
+tests/ui/missing_transmute_annotations_unfixable.rs ... ok
+tests/ui/mistyped_literal_suffix.rs ... ok
+tests/ui/mixed_attributes_style.rs ... ok
+tests/ui/missing_spin_loop_no_std.fixed ... ok
+tests/ui/module_inception.rs ... ok
+tests/ui/mixed_read_write_in_expression.rs ... ok
+tests/ui/missing_spin_loop.fixed ... ok
+tests/ui/module_name_repetitions.rs ... ok
+tests/ui/missing_transmute_annotations.fixed ... ok
+tests/ui/modulo_arithmetic_float.rs ... ok
+tests/ui/mistyped_literal_suffix.fixed ... ok
+tests/ui/missing_const_for_thread_local.fixed ... ok
+tests/ui/modulo_arithmetic_integral_const.rs ... ok
+tests/ui/modulo_arithmetic_integral.rs ... ok
+tests/ui/msrv_attributes_without_early_lints.rs ... ok
+tests/ui/modulo_one.rs ... ok
+tests/ui/multi_assignments.rs ... ok
+tests/ui/multiple_inherent_impl_cfg.rs ... ok
+tests/ui/multiple_bound_locations.rs ... ok
+tests/ui/must_use_unit_unfixable.rs ... ok
+tests/ui/must_use_unit.rs ... ok
+tests/ui/mut_mut_unfixable.rs ... ok
+tests/ui/must_use_candidates.rs ... ok
+tests/ui/mut_range_bound.rs ... ok
+tests/ui/mut_mutex_lock.rs ... ok
+tests/ui/mut_from_ref.rs ... ok
+tests/ui/mutex_atomic.rs ... ok
+tests/ui/mut_key.rs ... ok
+tests/ui/mut_mut.rs ... ok
+tests/ui/mutex_atomic_unfixable.rs ... ok
+tests/ui/must_use_unit.fixed ... ok
+tests/ui/needless_arbitrary_self_type.rs ... ok
+tests/ui/multiple_unsafe_ops_per_block.rs ... ok
+tests/ui/needless_bitwise_bool.rs ... ok
+tests/ui/must_use_candidates.fixed ... ok
+tests/ui/needless_as_bytes.rs ... ok
+tests/ui/mutex_atomic.fixed ... ok
+tests/ui/mut_mutex_lock.fixed ... ok
+tests/ui/needless_bool_assign.rs ... ok
+tests/ui/needless_arbitrary_self_type_unfixable.rs ... ok
+tests/ui/mut_mut.fixed ... ok
+tests/ui/needless_borrow_false_positive_16200.rs ... ok
+tests/ui/needless_arbitrary_self_type.fixed ... ok
+tests/ui/needless_borrow.rs ... ok
+tests/ui/needless_borrow_pat.rs ... ok
+tests/ui/needless_bitwise_bool.fixed ... ok
+tests/ui/needless_arbitrary_self_type_unfixable.fixed ... ok
+tests/ui/needless_bool_assign.fixed ... ok
+tests/ui/needless_borrowed_ref.rs ... ok
+tests/ui/needless_as_bytes.fixed ... ok
+tests/ui/needless_character_iteration.rs ... ok
+tests/ui/needless_borrow_false_positive_16200.fixed ... ok
+tests/ui/needless_borrows_for_generic_args.rs ... ok
+tests/ui/needless_else.rs ... ok
+tests/ui/needless_borrow.fixed ... ok
+tests/ui/needless_doc_main.rs ... ok
+tests/ui/needless_borrow_pat.fixed ... ok
+tests/ui/needless_character_iteration.fixed ... ok
+tests/ui/needless_borrowed_ref.fixed ... ok
+tests/ui/needless_continue.rs ... ok
+tests/ui/needless_for_each_unfixable.rs ... ok
+tests/ui/needless_for_each_fixable.rs ... ok
+tests/ui/needless_else.fixed ... ok
+tests/ui/needless_collect_indirect.rs ... ok
+tests/ui/needless_ifs.rs ... ok
+tests/ui/needless_collect.rs ... ok
+tests/ui/needless_borrows_for_generic_args.fixed ... ok
+tests/ui/needless_option_take.rs ... ok
+tests/ui/needless_match.rs ... ok
+tests/ui/needless_late_init.rs ... ok
+tests/ui/needless_parens_on_range_literals.rs ... ok
+tests/ui/needless_option_as_deref.rs ... ok
+tests/ui/needless_maybe_sized.rs ... ok
+tests/ui/needless_for_each_fixable.fixed ... ok
+tests/ui/needless_ifs.fixed ... ok
+tests/ui/needless_option_take.fixed ... ok
+tests/ui/needless_lifetimes.rs ... ok
+tests/ui/needless_parens_on_range_literals.fixed ... ok
+tests/ui/needless_match.fixed ... ok
+tests/ui/needless_option_as_deref.fixed ... ok
+tests/ui/needless_maybe_sized.fixed ... ok
+tests/ui/needless_late_init.fixed ... ok
+tests/ui/needless_pass_by_ref_mut_2021.rs ... ok
+tests/ui/needless_collect_indirect.fixed ... ok
+tests/ui/needless_pass_by_ref_mut2.rs ... ok
+tests/ui/needless_collect.fixed ... ok
+tests/ui/needless_pass_by_value_proc_macro.rs ... ok
+tests/ui/needless_pub_self.rs ... ok
+tests/ui/needless_raw_string.rs ... ok
+tests/ui/needless_pass_by_ref_mut.rs ... ok
+tests/ui/needless_raw_string_hashes.rs ... ok
+tests/ui/needless_pass_by_ref_mut2.fixed ... ok
+tests/ui/needless_lifetimes.fixed ... ok
+tests/ui/needless_question_mark.rs ... ok
+tests/ui/needless_range_loop2.rs ... ok
+tests/ui/needless_pass_by_value.rs ... ok
+tests/ui/needless_range_loop.rs ... ok
+tests/ui/needless_pub_self.fixed ... ok
+tests/ui/needless_raw_string_hashes.fixed ... ok
+tests/ui/needless_raw_string.fixed ... ok
+tests/ui/needless_splitn.rs ... ok
+tests/ui/needless_return_with_question_mark.rs ... ok
+tests/ui/needless_type_cast.rs ... ok
+tests/ui/needless_return.rs ... ok
+tests/ui/needless_update.rs ... ok
+tests/ui/neg_cmp_op_on_partial_ord.rs ... ok
+tests/ui/needless_type_cast_unfixable.rs ... ok
+tests/ui/needless_question_mark.fixed ... ok
+tests/ui/never_loop_iterator_reduction.rs ... ok
+tests/ui/never_loop_fixable.rs ... ok
+tests/ui/neg_multiply.rs ... ok
+tests/ui/needless_splitn.fixed ... ok
+tests/ui/needless_return_with_question_mark.fixed ... ok
+tests/ui/needless_type_cast.fixed ... ok
+tests/ui/never_loop.rs ... ok
+tests/ui/new_ret_no_self_overflow.rs ... ok
+tests/ui/new_ret_no_self.rs ... ok
+tests/ui/neg_multiply.fixed ... ok
+tests/ui/never_loop_fixable.fixed ... ok
+tests/ui/no_effect_async_fn.rs ... ok
+tests/ui/new_without_default.rs ... ok
+tests/ui/no_effect.rs ... ok
+tests/ui/needless_return.fixed ... ok
+tests/ui/no_mangle_with_rust_abi_2021.rs ... ok
+tests/ui/no_effect_return.rs ... ok
+tests/ui/no_mangle_with_rust_abi.rs ... ok
+tests/ui/no_effect_replace.rs ... ok
+tests/ui/non_ascii_literal_unfixable.rs ... ok
+tests/ui/non_expressive_names_error_recovery.rs ... ok
+tests/ui/non_minimal_cfg.rs ... ok
+tests/ui/non_expressive_names.rs ... ok
+tests/ui/non_canonical_partial_ord_impl_fully_qual.rs ... ok
+tests/ui/non_minimal_cfg2.rs ... ok
+tests/ui/non_canonical_clone_impl.rs ... ok
+tests/ui/non_octal_unix_permissions.rs ... ok
+tests/ui/new_without_default.fixed ... ok
+tests/ui/non_send_fields_in_send_ty.rs ... ok
+tests/ui/non_canonical_partial_ord_impl.rs ... ok
+tests/ui/non_zero_suggestions.rs ... ok
+tests/ui/non_expressive_names_error_recovery.fixed ... ok
+tests/ui/non_minimal_cfg.fixed ... ok
+tests/ui/non_zero_suggestions_unfixable.rs ... ok
+tests/ui/nonminimal_bool_methods_unfixable.rs ... ok
+tests/ui/non_octal_unix_permissions.fixed ... ok
+tests/ui/non_canonical_clone_impl.fixed ... ok
+tests/ui/nonminimal_bool.rs ... ok
+tests/ui/non_zero_suggestions.fixed ... ok
+tests/ui/obfuscated_if_else.rs ... ok
+tests/ui/nonminimal_bool_methods.rs ... ok
+tests/ui/octal_escapes.rs ... ok
+tests/ui/nonnull_unchecked_on_box_ptr.rs ... ok
+tests/ui/non_canonical_partial_ord_impl.fixed ... ok
+tests/ui/ok_expect.rs ... ok
+tests/ui/only_used_in_recursion2.rs ... ok
+tests/ui/only_used_in_recursion.rs ... ok
+tests/ui/op_ref.rs ... ok
+tests/ui/open_options_fixable.rs ... ok
+tests/ui/open_options.rs ... ok
+tests/ui/option_as_ref_cloned.rs ... ok
+tests/ui/option_env_unwrap.rs ... ok
+tests/ui/obfuscated_if_else.fixed ... ok
+tests/ui/nonminimal_bool_methods.fixed ... ok
+tests/ui/option_as_ref_deref.rs ... ok
+tests/ui/nonnull_unchecked_on_box_ptr.fixed ... ok
+tests/ui/ok_expect.fixed ... ok
+tests/ui/option_filter_map.rs ... ok
+tests/ui/open_options_fixable.fixed ... ok
+tests/ui/op_ref.fixed ... ok
+tests/ui/option_map_or_none.rs ... ok
+tests/ui/option_map_unit_fn_unfixable.rs ... ok
+tests/ui/option_as_ref_cloned.fixed ... ok
+tests/ui/option_as_ref_deref.fixed ... ok
+tests/ui/option_map_unit_fn_fixable.rs ... ok
+tests/ui/option_if_let_else.rs ... ok
+tests/ui/option_filter_map.fixed ... ok
+tests/ui/or_then_unwrap.rs ... ok
+tests/ui/overly_complex_bool_expr.rs ... ok
+tests/ui/owned_cow.rs ... ok
+tests/ui/option_map_or_none.fixed ... ok
+tests/ui/option_option.rs ... ok
+tests/ui/overly_complex_bool_expr.fixed ... ok
+tests/ui/panic_in_result_fn.rs ... ok
+tests/ui/option_map_unit_fn_fixable.fixed ... ok
+tests/ui/panic_in_result_fn_debug_assertions.rs ... ok
+tests/ui/owned_cow.fixed ... ok
+tests/ui/or_then_unwrap.fixed ... ok
+tests/ui/panic_in_result_fn_assertions.rs ... ok
+tests/ui/panicking_macros.rs ... ok
+tests/ui/partial_pub_fields.rs ... ok
+tests/ui/panicking_overflow_checks.rs ... ok
+tests/ui/or_fun_call.rs ... ok
+tests/ui/partialeq_ne_impl.rs ... ok
+tests/ui/path_ends_with_ext.rs ... ok
+tests/ui/path_buf_push_overwrite.rs ... ok
+tests/ui/partialeq_to_none.rs ... ok
+tests/ui/option_if_let_else.fixed ... ok
+tests/ui/permissions_set_readonly_false.rs ... ok
+tests/ui/patterns.rs ... ok
+tests/ui/pathbuf_init_then_push.rs ... ok
+tests/ui/pointers_in_nomem_asm_block.rs ... ok
+tests/ui/precedence.rs ... ok
+tests/ui/precedence_bits.rs ... ok
+tests/ui/path_buf_push_overwrite.fixed ... ok
+tests/ui/partialeq_to_none.fixed ... ok
+tests/ui/print_in_format_impl.rs ... ok
+tests/ui/path_ends_with_ext.fixed ... ok
+tests/ui/pathbuf_init_then_push.fixed ... ok
+tests/ui/patterns.fixed ... ok
+tests/ui/print_stderr.rs ... ok
+tests/ui/pointer_format.rs ... ok
+tests/ui/precedence.fixed ... ok
+tests/ui/precedence_bits.fixed ... ok
+tests/ui/print_literal.rs ... ok
+tests/ui/print_stdout_build_script.rs ... ok
+tests/ui/or_fun_call.fixed ... ok
+tests/ui/println_empty_string_unfixable.rs ... ok
+tests/ui/print_stdout.rs ... ok
+tests/ui/println_empty_string.rs ... ok
+tests/ui/proc_macro.rs ... ok
+tests/ui/print_with_newline.rs ... ok
+tests/ui/ptr_eq.rs ... ok
+tests/ui/ptr_cast_constness.rs ... ok
+tests/ui/ptr_eq_no_std.rs ... ok
+tests/ui/ptr_as_ptr.rs ... ok
+tests/ui/print_literal.fixed ... ok
+tests/ui/ptr_offset_by_literal.rs ... ok
+tests/ui/pub_use.rs ... ok
+tests/ui/ptr_arg.rs ... ok
+tests/ui/println_empty_string.fixed ... ok
+tests/ui/pub_with_shorthand.rs ... ok
+tests/ui/print_with_newline.fixed ... ok
+tests/ui/ptr_offset_with_cast.rs ... ok
+tests/ui/ptr_eq_no_std.fixed ... ok
+tests/ui/ptr_eq.fixed ... ok
+tests/ui/ptr_offset_by_literal.fixed ... ok
+tests/ui/pub_without_shorthand.rs ... ok
+tests/ui/ptr_cast_constness.fixed ... ok
+tests/ui/question_mark_used.rs ... ok
+tests/ui/range.rs ... ok
+tests/ui/ptr_offset_with_cast.fixed ... ok
+tests/ui/pub_with_shorthand.fixed ... ok
+tests/ui/ptr_as_ptr.fixed ... ok
+tests/ui/range_contains.rs ... ok
+tests/ui/rc_buffer.rs ... ok
+tests/ui/range_unfixable.rs ... ok
+tests/ui/question_mark.rs ... ok
+tests/ui/rc_buffer_arc.rs ... ok
+tests/ui/pub_without_shorthand.fixed ... ok
+tests/ui/range.fixed ... ok
+tests/ui/rc_buffer_redefined_string.rs ... ok
+tests/ui/range_plus_minus_one.rs ... ok
+tests/ui/read_line_without_trim.rs ... ok
+tests/ui/rc_mutex.rs ... ok
+tests/ui/rc_buffer.fixed ... ok
+tests/ui/range_contains.fixed ... ok
+tests/ui/readonly_write_lock.rs ... ok
+tests/ui/rc_buffer_arc.fixed ... ok
+tests/ui/redundant_as_str.rs ... ok
+tests/ui/redundant_allocation.rs ... ok
+tests/ui/read_line_without_trim.fixed ... ok
+tests/ui/redundant_allocation_fixable.rs ... ok
+tests/ui/read_zero_byte_vec.rs ... ok
+tests/ui/redundant_at_rest_pattern.rs ... ok
+tests/ui/recursive_format_impl.rs ... ok
+tests/ui/readonly_write_lock.fixed ... ok
+tests/ui/range_plus_minus_one.fixed ... ok
+tests/ui/question_mark.fixed ... ok
+tests/ui/redundant_allocation_fixable.fixed ... ok
+tests/ui/redundant_closure_call_early.rs ... ok
+tests/ui/redundant_as_str.fixed ... ok
+tests/ui/redundant_closure_call_late.rs ... ok
+tests/ui/redundant_async_block.rs ... ok
+tests/ui/redundant_at_rest_pattern.fixed ... ok
+tests/ui/redundant_clone.rs ... ok
+tests/ui/redundant_field_names.rs ... ok
+tests/ui/redundant_pattern_matching_if_let_true.rs ... ok
+tests/ui/redundant_closure_call_fixable.rs ... ok
+tests/ui/redundant_else.rs ... ok
+tests/ui/redundant_guards.rs ... ok
+tests/ui/redundant_pattern_matching_drop_order.rs ... ok
+tests/ui/redundant_locals.rs ... ok
+tests/ui/redundant_pattern_matching_ipaddr.rs ... ok
+tests/ui/redundant_pattern_matching_poll.rs ... ok
+tests/ui/redundant_field_names.fixed ... ok
+tests/ui/redundant_pattern_matching_option.rs ... ok
+tests/ui/redundant_pattern_matching_if_let_true.fixed ... ok
+tests/ui/redundant_async_block.fixed ... ok
+tests/ui/redundant_clone.fixed ... ok
+tests/ui/redundant_pattern_matching_drop_order.fixed ... ok
+tests/ui/redundant_pattern_matching_ipaddr.fixed ... ok
+tests/ui/redundant_guards.fixed ... ok
+tests/ui/redundant_pattern_matching_poll.fixed ... ok
+tests/ui/redundant_else.fixed ... ok
+tests/ui/redundant_pub_crate.rs ... ok
+tests/ui/redundant_closure_call_fixable.fixed ... ok
+tests/ui/redundant_pattern_matching_result.rs ... ok
+tests/ui/redundant_pattern_matching_option.fixed ... ok
+tests/ui/redundant_slicing.rs ... ok
+tests/ui/redundant_static_lifetimes.rs ... ok
+tests/ui/redundant_static_lifetimes_multiple.rs ... ok
+tests/ui/ref_binding_to_reference.rs ... ok
+tests/ui/redundant_pub_crate.fixed ... ok
+tests/ui/redundant_type_annotations.rs ... ok
+tests/ui/redundant_slicing.fixed ... ok
+tests/ui/ref_patterns.rs ... ok
+tests/ui/redundant_pattern_matching_result.fixed ... ok
+tests/ui/ref_option_ref.rs ... ok
+tests/ui/redundant_test_prefix.rs ... ok
+tests/ui/redundant_static_lifetimes.fixed ... ok
+tests/ui/ref_as_ptr.rs ... ok
+tests/ui/redundant_test_prefix_unfixable.rs ... ok
+tests/ui/renamed_builtin_attr.rs ... ok
+tests/ui/ref_binding_to_reference.fixed ... ok
+tests/ui/regex.rs ... ok
+tests/ui/rename.rs ... ok
+tests/ui/repeat_once.rs ... ok
+tests/ui/repeat_vec_with_capacity_nostd.rs ... ok
+tests/ui/repeat_vec_with_capacity.rs ... ok
+tests/ui/repr_packed_without_abi.rs ... ok
+tests/ui/redundant_test_prefix.fixed ... ok
+tests/ui/replace_box.rs ... ok
+tests/ui/renamed_builtin_attr.fixed ... ok
+tests/ui/reserve_after_initialization.rs ... ok
+tests/ui/ref_as_ptr.fixed ... ok
+tests/ui/rest_pat_in_fully_bound_structs.rs ... ok
+tests/ui/rename.fixed ... ok
+tests/ui/repeat_once.fixed ... ok
+tests/ui/repeat_vec_with_capacity_nostd.fixed ... ok
+tests/ui/repeat_vec_with_capacity.fixed ... ok
+tests/ui/result_filter_map.rs ... ok
+tests/ui/result_large_err.rs ... ok
+Building aux file tests/ui/auxiliary/non-exhaustive-struct.rs ... ok
+tests/ui/result_unit_error_no_std.rs ... ok
+tests/ui/rest_pat_in_fully_bound_structs.fixed ... ok
+tests/ui/replace_box.fixed ... ok
+tests/ui/result_map_unit_fn_unfixable.rs ... ok
+tests/ui/result_unit_error.rs ... ok
+tests/ui/reserve_after_initialization.fixed ... ok
+tests/ui/result_map_or_into_option.rs ... ok
+tests/ui/result_map_unit_fn_fixable.rs ... ok
+tests/ui/result_filter_map.fixed ... ok
+tests/ui/return_self_not_must_use.rs ... ok
+tests/ui/rest_pattern_accessible_field.rs ... ok
+tests/ui/reversed_empty_ranges_loops_unfixable.rs ... ok
+tests/ui/reversed_empty_ranges_unfixable.rs ... ok
+tests/ui/reversed_empty_ranges_fixable.rs ... ok
+tests/ui/reversed_empty_ranges_loops_fixable.rs ... ok
+tests/ui/return_and_then.rs ... ok
+tests/ui/result_map_unit_fn_fixable.fixed ... ok
+tests/ui/result_map_or_into_option.fixed ... ok
+tests/ui/same_functions_in_if_condition.rs ... ok
+tests/ui/same_item_push.rs ... ok
+tests/ui/same_length_and_capacity.rs ... ok
+tests/ui/same_name_method.rs ... ok
+tests/ui/rest_pattern_accessible_field.fixed ... ok
+tests/ui/reversed_empty_ranges_loops_fixable.fixed ... ok
+tests/ui/reversed_empty_ranges_fixable.fixed ... ok
+tests/ui/search_is_some_fixable_none_2021.rs ... ok
+tests/ui/search_is_some.rs ... ok
+tests/ui/search_is_some_fixable_some_2021.rs ... ok
+tests/ui/seek_from_current.rs ... ok
+tests/ui/return_and_then.fixed ... ok
+tests/ui/self_named_constructors.rs ... ok
+tests/ui/seek_to_start_instead_of_rewind.rs ... ok
+tests/ui/self_assignment.rs ... ok
+tests/ui/search_is_some_fixable_none.rs ... ok
+tests/ui/semicolon_inside_block.rs ... ok
+tests/ui/semicolon_inside_block_stmt_expr_attrs.rs ... ok
+tests/ui/search_is_some_fixable_none_2021.fixed ... ok
+tests/ui/seek_from_current.fixed ... ok
+tests/ui/semicolon_if_nothing_returned.rs ... ok
+tests/ui/search_is_some_fixable_some_2021.fixed ... ok
+tests/ui/serde.rs ... ok
+tests/ui/semicolon_outside_block.rs ... ok
+tests/ui/search_is_some_fixable_some.rs ... ok
+tests/ui/seek_to_start_instead_of_rewind.fixed ... ok
+tests/ui/semicolon_inside_block_stmt_expr_attrs.fixed ... ok
+tests/ui/semicolon_inside_block.fixed ... ok
+tests/ui/set_contains_or_insert.rs ... ok
+tests/ui/short_circuit_statement.rs ... ok
+tests/ui/semicolon_outside_block.fixed ... ok
+tests/ui/should_panic_without_expect.rs ... ok
+tests/ui/semicolon_if_nothing_returned.fixed ... ok
+tests/ui/shadow.rs ... ok
+tests/ui/search_is_some_fixable_none.fixed ... ok
+tests/ui/short_circuit_statement.fixed ... ok
+tests/ui/similar_names.rs ... ok
+tests/ui/single_char_add_str.rs ... ok
+tests/ui/significant_drop_tightening.rs ... ok
+tests/ui/single_call_fn.rs ... ok
+tests/ui/single_char_lifetime_names.rs ... ok
+tests/ui/single_component_path_imports.rs ... ok
+tests/ui/search_is_some_fixable_some.fixed ... ok
+tests/ui/single_component_path_imports_macro.rs ... ok
+tests/ui/single_char_pattern.rs ... ok
+tests/ui/single_component_path_imports_self_after.rs ... ok
+tests/ui/single_component_path_imports_nested_first.rs ... ok
+tests/ui/single_char_add_str.fixed ... ok
+tests/ui/single_component_path_imports_self_before.rs ... ok
+tests/ui/single_element_loop_nofix.rs ... ok
+tests/ui/single_element_loop.rs ... ok
+tests/ui/significant_drop_tightening.fixed ... ok
+tests/ui/single_component_path_imports.fixed ... ok
+tests/ui/single_match_else.rs ... ok
+tests/ui/single_match_else_deref_patterns.rs ... ok
+tests/ui/single_char_pattern.fixed ... ok
+tests/ui/single_option_map.rs ... ok
+tests/ui/single_range_in_vec_init_unfixable.rs ... ok
+tests/ui/single_match.rs ... ok
+tests/ui/significant_drop_in_scrutinee.rs ... ok
+tests/ui/size_of_ref.rs ... ok
+tests/ui/single_match_else_deref_patterns.fixed ... ok
+tests/ui/skip_while_next.rs ... ok
+tests/ui/sliced_string_as_bytes.rs ... ok
+tests/ui/single_element_loop.fixed ... ok
+tests/ui/single_match_else.fixed ... ok
+tests/ui/slow_vector_initialization.rs ... ok
+tests/ui/stable_sort_primitive.rs ... ok
+tests/ui/some_filter.rs ... ok
+tests/ui/single_range_in_vec_init.old_range.1.fixed ... ok
+tests/ui/single_range_in_vec_init.old_range.2.fixed ... ok
+tests/ui/single_match.fixed ... ok
+tests/ui/single_range_in_vec_init.rs ... ok
+tests/ui/single_range_in_vec_init.rs (revision `old_range`) ... ok
+tests/ui/single_range_in_vec_init.rs (revision `new_range`) ... ok
+tests/ui/std_instead_of_core_unfixable.rs ... ok
+tests/ui/sliced_string_as_bytes.fixed ... ok
+tests/ui/starts_ends_with.rs ... ok
+tests/ui/std_instead_of_core.rs ... ok
+tests/ui/some_filter.fixed ... ok
+tests/ui/slow_vector_initialization.fixed ... ok
+tests/ui/str_split.rs ... ok
+tests/ui/stable_sort_primitive.fixed ... ok
+tests/ui/string_add.rs ... ok
+tests/ui/starts_ends_with.fixed ... ok
+tests/ui/single_range_in_vec_init.new_range.1.fixed ... ok
+tests/ui/string_add_assign.rs ... ok
+tests/ui/str_to_string.rs ... ok
+tests/ui/single_range_in_vec_init.new_range.2.fixed ... ok
+tests/ui/string_extend.rs ... ok
+tests/ui/string_from_utf8_as_bytes.rs ... ok
+tests/ui/std_instead_of_core.fixed ... ok
+tests/ui/string_lit_as_bytes.rs ... ok
+tests/ui/str_split.fixed ... ok
+tests/ui/string_lit_chars_any.rs ... ok
+tests/ui/struct_excessive_bools.rs ... ok
+tests/ui/string_slice.rs ... ok
+tests/ui/string_add_assign.fixed ... ok
+tests/ui/string_extend.fixed ... ok
+tests/ui/string_from_utf8_as_bytes.fixed ... ok
+tests/ui/struct_fields.rs ... ok
+tests/ui/strlen_on_c_strings.rs ... ok
+tests/ui/str_to_string.fixed ... ok
+tests/ui/suspicious_command_arg_space.rs ... ok
+tests/ui/string_lit_as_bytes.fixed ... ok
+tests/ui/suspicious_doc_comments_unfixable.rs ... ok
+tests/ui/suspicious_arithmetic_impl.rs ... ok
+tests/ui/string_lit_chars_any.fixed ... ok
+tests/ui/suspicious_doc_comments.rs ... ok
+tests/ui/suspicious_map.rs ... ok
+tests/ui/suspicious_command_arg_space.fixed ... ok
+tests/ui/suspicious_splitn.rs ... ok
+tests/ui/strlen_on_c_strings.fixed ... ok
+tests/ui/suspicious_xor_used_as_pow.rs ... ok
+tests/ui/suspicious_unary_op_formatting.rs ... ok
+tests/ui/swap_ptr_to_ref.rs ... ok
+tests/ui/suspicious_doc_comments.fixed ... ok
+tests/ui/suspicious_to_owned.rs ... ok
+tests/ui/suspicious_operation_groupings.rs ... ok
+tests/ui/swap_ptr_to_ref_unfixable.rs ... ok
+tests/ui/swap.rs ... ok
+tests/ui/tabs_in_doc_comments.rs ... ok
+tests/ui/test_attr_in_doctest.rs ... ok
+tests/ui/temporary_assignment.rs ... ok
+tests/ui/swap_with_temporary_unfixable.rs ... ok
+tests/ui/suspicious_to_owned.1.fixed ... ok
+tests/ui/swap_ptr_to_ref.fixed ... ok
+tests/ui/tests_outside_test_module.rs ... ok
+tests/ui/swap_with_temporary.rs ... ok
+tests/ui/suspicious_to_owned.2.fixed ... ok
+tests/ui/tabs_in_doc_comments.fixed ... ok
+tests/ui/suspicious_operation_groupings.fixed ... ok
+tests/ui/swap.fixed ... ok
+tests/ui/to_string_trait_impl.rs ... ok
+tests/ui/to_digit_is_some.rs ... ok
+tests/ui/toplevel_ref_arg_non_rustfix.rs ... ok
+tests/ui/too_long_first_doc_paragraph-fix.rs ... ok
+tests/ui/track-diagnostics-clippy.rs ... ok
+tests/ui/too_long_first_doc_paragraph.rs ... ok
+tests/ui/trailing_zeros.rs ... ok
+tests/ui/toplevel_ref_arg.rs ... ok
+tests/ui/swap_with_temporary.fixed ... ok
+tests/ui/track-diagnostics.rs ... ok
+tests/ui/transmute_32bit.rs ... ignored (in-test comment)
+tests/ui/trailing_empty_array.rs ... ok
+tests/ui/track-diagnostics-clippy.fixed ... ok
+tests/ui/to_digit_is_some.fixed ... ok
+tests/ui/too_long_first_doc_paragraph-fix.fixed ... ok
+tests/ui/trait_duplication_in_bounds_assoc_const_eq.rs ... ok
+tests/ui/trailing_zeros.fixed ... ok
+tests/ui/trait_duplication_in_bounds.rs ... ok
+tests/ui/toplevel_ref_arg.fixed ... ok
+tests/ui/transmute.rs ... ok
+tests/ui/trait_duplication_in_bounds_unfixable.rs ... ok
+tests/ui/transmute_64bit.rs ... ok
+tests/ui/trait_duplication_in_bounds_assoc_const_eq.fixed ... ok
+tests/ui/transmute_null_to_fn.rs ... ok
+tests/ui/transmute_collection.rs ... ok
+tests/ui/transmute_int_to_non_zero.rs ... ok
+Building aux file tests/ui/auxiliary/proc_macro_suspicious_else_formatting.rs ... ok
+tests/ui/transmute_ptr_to_ptr.rs ... ok
+tests/ui/transmute_ptr_to_ref.rs ... ok
+tests/ui/transmute_ref_to_ref.rs ... ok
+tests/ui/transmute_ref_to_ref_no_std.rs ... ok
+tests/ui/trait_duplication_in_bounds.fixed ... ok
+tests/ui/transmutes_expressible_as_ptr_casts.rs ... ok
+tests/ui/transmuting_null.rs ... ok
+tests/ui/transmute_int_to_non_zero.fixed ... ok
+tests/ui/trim_split_whitespace.rs ... ok
+tests/ui/transmute_undefined_repr.rs ... ok
+tests/ui/transmute_ref_to_ref_no_std.fixed ... ok
+tests/ui/transmute_ref_to_ref.fixed ... ok
+tests/ui/trivially_copy_pass_by_ref.rs ... ok
+tests/ui/transmute_ptr_to_ptr.fixed ... ok
+tests/ui/transmute_ptr_to_ref.fixed ... ok
+tests/ui/transmutes_expressible_as_ptr_casts.fixed ... ok
+tests/ui/ty_fn_sig.rs ... ok
+tests/ui/trim_split_whitespace.fixed ... ok
+tests/ui/try_err.rs ... ok
+tests/ui/type_complexity.rs ... ok
+tests/ui/tuple_array_conversions.rs ... ok
+tests/ui/type_id_on_box.rs ... ok
+tests/ui/unbuffered_bytes.rs ... ok
+tests/ui/type_id_on_box_unfixable.rs ... ok
+tests/ui/trivially_copy_pass_by_ref.fixed ... ok
+tests/ui/unchecked_time_subtraction_unfixable.rs ... ok
+tests/ui/unchecked_time_subtraction.rs ... ok
+tests/ui/uninit_assumed_init.rs ... ok
+tests/ui/type_repetition_in_bounds.rs ... ok
+tests/ui/unicode.rs ... ok
+tests/ui/type_id_on_box.fixed ... ok
+tests/ui/uninhabited_references.rs ... ok
+tests/ui/unchecked_time_subtraction.fixed ... ok
+tests/ui/try_err.fixed ... ok
+tests/ui/unconditional_recursion.rs ... ok
+tests/ui/uninit_vec.rs ... ok
+tests/ui/unknown_attribute.rs ... ok
+tests/ui/unit_hash.rs ... ok
+tests/ui/unit_arg_fixable.rs ... ok
+tests/ui/unicode.fixed ... ok
+tests/ui/unit_return_expecting_ord.rs ... ok
+tests/ui/unit_cmp.rs ... ok
+tests/ui/uninlined_format_args_panic.edition2018.fixed ... ok
+tests/ui/unit_arg.rs ... ok
+tests/ui/uninlined_format_args.rs ... ok
+tests/ui/unit_hash.fixed ... ok
+tests/ui/unnecessary_clippy_cfg.rs ... ok
+tests/ui/unnecessary_box_returns.rs ... ok
+tests/ui/unnecessary_cast_unfixable.rs ... ok
+tests/ui/unknown_clippy_lints.rs ... ok
+tests/ui/uninlined_format_args_panic.rs ... ok
+tests/ui/uninlined_format_args_panic.rs (revision `edition2018`) ... ok
+tests/ui/uninlined_format_args_panic.rs (revision `edition2021`) ... ok
+tests/ui/uninlined_format_args_panic.rs (revision `edition2024`) ... ok
+tests/ui/unnecessary_fallible_conversions.rs ... ok
+tests/ui/uninlined_format_args_panic.edition2021.fixed ... ok
+tests/ui/unit_arg_fixable.fixed ... ok
+Building aux file tests/ui/auxiliary/extern_fake_libc.rs ... ok
+tests/ui/unnecessary_fallible_conversions.fixed ... ok
+tests/ui/unnecessary_find_map.rs ... ok
+tests/ui/unnecessary_first_then_check.rs ... ok
+tests/ui/unnecessary_fallible_conversions_unfixable.rs ... ok
+tests/ui/unknown_clippy_lints.fixed ... ok
+tests/ui/uninlined_format_args.fixed ... ok
+tests/ui/uninlined_format_args_panic.edition2024.fixed ... ok
+tests/ui/unnecessary_filter_map.rs ... ok
+tests/ui/suspicious_else_formatting.rs ... ok
+tests/ui/unnecessary_get_then_check.rs ... ok
+tests/ui/unnecessary_first_then_check.fixed ... ok
+tests/ui/unnecessary_lazy_eval_unfixable.rs ... ok
+tests/ui/unnecessary_literal_bound.rs ... ok
+tests/ui/unnecessary_fold.rs ... ok
+tests/ui/unnecessary_map_on_constructor.rs ... ok
+tests/ui/unnecessary_iter_cloned.rs ... ok
+tests/ui/unnecessary_literal_unwrap_unfixable.rs ... ok
+tests/ui/unnecessary_join.rs ... ok
+tests/ui/unnecessary_get_then_check.fixed ... ok
+tests/ui/unnecessary_literal_unwrap.rs ... ok
+tests/ui/unnecessary_literal_bound.fixed ... ok
+tests/ui/unnecessary_lazy_eval.rs ... ok
+tests/ui/unnecessary_map_on_constructor.fixed ... ok
+tests/ui/unnecessary_cast.rs ... ok
+Building aux file tests/ui/auxiliary/external_consts.rs ... ok
+tests/ui/unnecessary_join.fixed ... ok
+tests/ui/unnecessary_mut_passed.rs ... ok
+tests/ui/unnecessary_map_or.rs ... ok
+tests/ui/unnecessary_fold.fixed ... ok
+tests/ui/unnecessary_literal_unwrap.fixed ... ok
+tests/ui/unnecessary_operation.rs ... ok
+tests/ui/unnecessary_iter_cloned.fixed ... ok
+tests/ui/unnecessary_option_map_or_else.rs ... ok
+tests/ui/unnecessary_os_str_debug_formatting.rs ... ok
+tests/ui/unnecessary_owned_empty_strings.rs ... ok
+tests/ui/unnecessary_mut_passed.fixed ... ok
+tests/ui/unnecessary_min_or_max.rs ... ok
+tests/ui/unnecessary_lazy_eval.fixed ... ok
+tests/ui/unnecessary_rest_pattern.rs ... ok
+tests/ui/unnecessary_path_debug_formatting.rs ... ok
+tests/ui/unnecessary_cast.fixed ... ok
+tests/ui/unnecessary_map_or.fixed ... ok
+tests/ui/unnecessary_result_map_or_else.rs ... ok
+tests/ui/unnecessary_option_map_or_else.fixed ... ok
+tests/ui/unnecessary_owned_empty_strings.fixed ... ok
+tests/ui/unnecessary_safety_comment.rs ... ok
+tests/ui/unnecessary_self_imports.rs ... ok
+tests/ui/unnecessary_operation.fixed ... ok
+tests/ui/unnecessary_min_or_max.fixed ... ok
+tests/ui/unnecessary_semicolon_feature_stmt_expr_attributes.rs ... ok
+tests/ui/unnecessary_sort_by_no_std.rs ... ok
+tests/ui/unnecessary_rest_pattern.fixed ... ok
+tests/ui/unnecessary_result_map_or_else.fixed ... ok
+tests/ui/unnecessary_sort_by_no_core.rs ... ok
+tests/ui/unnecessary_self_imports.fixed ... ok
+tests/ui/unnecessary_semicolon_feature_stmt_expr_attributes.fixed ... ok
+tests/ui/unnecessary_to_owned_on_split.rs ... ok
+tests/ui/unnecessary_trailing_comma.rs ... ok
+tests/ui/unnecessary_sort_by.rs ... ok
+tests/ui/unnecessary_sort_by_no_std.fixed ... ok
+tests/ui/unnecessary_unsafety_doc.rs ... ok
+tests/ui/unnecessary_struct_initialization.rs ... ok
+tests/ui/unnecessary_semicolon.edition2021.fixed ... ok
+tests/ui/unnecessary_semicolon.rs ... ok
+tests/ui/unnecessary_semicolon.rs (revision `edition2021`) ... ok
+tests/ui/unnecessary_semicolon.rs (revision `edition2024`) ... ok
+tests/ui/unneeded_field_pattern.rs ... ok
+tests/ui/unnecessary_wraps.rs ... ok
+Building aux file tests/ui/auxiliary/unnecessary_unwrap_unchecked_helper.rs ... ok
+tests/ui/unnecessary_to_owned_on_split.fixed ... ok
+tests/ui/unneeded_wildcard_pattern.rs ... ok
+tests/ui/unnecessary_trailing_comma.fixed ... ok
+tests/ui/unnecessary_struct_initialization.fixed ... ok
+tests/ui/unnested_or_patterns2.rs ... ok
+tests/ui/unnested_or_patterns.rs ... ok
+tests/ui/unnecessary_to_owned.rs ... ok
+tests/ui/unreadable_literal.rs ... ok
+tests/ui/unnecessary_semicolon.edition2024.fixed ... ok
+Building aux file tests/ui/auxiliary/non-exhaustive-enum.rs ... ok
+tests/ui/unnecessary_sort_by.fixed ... ok
+tests/ui/unnecessary_unwrap_unchecked.rs ... ok
+tests/ui/unneeded_wildcard_pattern.fixed ... ok
+tests/ui/unnested_or_patterns.fixed ... ok
+tests/ui/unseparated_prefix_literals.rs ... ok
+tests/ui/unnested_or_patterns2.fixed ... ok
+tests/ui/unsafe_removed_from_name.rs ... ok
+tests/ui/unreadable_literal.fixed ... ok
+tests/ui/unneeded_struct_pattern.rs ... ok
+tests/ui/unused_async_trait_impl_no_std.rs ... ok
+tests/ui/unsafe_derive_deserialize.rs ... ok
+tests/ui/unused_async.rs ... ok
+tests/ui/unused_async_trait_impl.rs ... ok
+tests/ui/unseparated_prefix_literals.fixed ... ok
+tests/ui/unnecessary_unwrap_unchecked.fixed ... ok
+tests/ui/unused_enumerate_index.rs ... ok
+tests/ui/unused_format_specs.rs ... ok
+tests/ui/unused_format_specs_width.rs ... ok
+tests/ui/unused_async_trait_impl_no_std.fixed ... ok
+tests/ui/unneeded_struct_pattern.fixed ... ok
+tests/ui/unnecessary_to_owned.fixed ... ok
+tests/ui/unused_rounding.rs ... ok
+tests/ui/unused_io_amount.rs ... ok
+tests/ui/unused_async_trait_impl.fixed ... ok
+tests/ui/unused_result_ok.rs ... ok
+tests/ui/unused_self.rs ... ok
+tests/ui/unused_format_specs.1.fixed ... ok
+tests/ui/unused_peekable.rs ... ok
+tests/ui/unused_format_specs.2.fixed ... ok
+tests/ui/unused_enumerate_index.fixed ... ok
+tests/ui/unused_trait_names.rs ... ok
+tests/ui/unused_rounding.fixed ... ok
+tests/ui/unwrap_or.rs ... ok
+tests/ui/unused_result_ok.fixed ... ok
+tests/ui/unwrap_expect_used.rs ... ok
+tests/ui/upper_case_acronyms.rs ... ok
+tests/ui/use_debug.rs ... ok
+tests/ui/unwrap_in_result.rs ... ok
+tests/ui/unwrap_or_else_default.rs ... ok
+tests/ui/unused_unit.edition2021.fixed ... ok
+tests/ui/use_self_structs.rs ... ok
+tests/ui/unused_unit.rs ... ok
+tests/ui/unused_unit.rs (revision `edition2021`) ... ok
+tests/ui/unused_unit.rs (revision `edition2024`) ... ok
+tests/ui/unwrap_or.fixed ... ok
+tests/ui/upper_case_acronyms.fixed ... ok
+tests/ui/used_underscore_binding.rs ... ok
+tests/ui/use_self_trait.rs ... ok
+tests/ui/useful_asref.rs ... ok
+tests/ui/unused_trait_names.fixed ... ok
+tests/ui/unwrap_or_else_default.fixed ... ok
+tests/ui/use_self_structs.fixed ... ok
+Building aux file tests/ui/auxiliary/external_item.rs ... ok
+tests/ui/useless_attribute.rs ... ok
+tests/ui/useless_concat.rs ... ok
+tests/ui/unused_unit.edition2024.fixed ... ok
+tests/ui/use_self_trait.fixed ... ok
+tests/ui/use_self.rs ... ok
+tests/ui/useless_asref.rs ... ok
+tests/ui/useless_conversion_try.rs ... ok
+tests/ui/useless_borrows_in_formatting.rs ... ok
+tests/ui/used_underscore_items.rs ... ok
+tests/ui/useless_concat.fixed ... ok
+tests/ui/useless_nonzero_new_unchecked.rs ... ok
+tests/ui/useless_vec_unfixable.rs ... ok
+tests/ui/useless_attribute.fixed ... ok
+tests/ui/vec_box_sized.rs ... ok
+tests/ui/useless_nonzero_new_unchecked.fixed ... ok
+tests/ui/useless_vec.rs ... ok
+tests/ui/vec_init_then_push.rs ... ok
+tests/ui/vec_resize_to_zero.rs ... ok
+tests/ui/waker_clone_wake.rs ... ok
+tests/ui/verbose_file_reads.rs ... ok
+tests/ui/useless_borrows_in_formatting.fixed ... ok
+tests/ui/useless_asref.fixed ... ok
+tests/ui/while_float.rs ... ok
+tests/ui/useless_conversion.rs ... ok
+tests/ui/use_self.fixed ... ok
+tests/ui/volatile_composites.rs ... ok
+tests/ui/vec_resize_to_zero.fixed ... ok
+tests/ui/waker_clone_wake.fixed ... ok
+tests/ui/while_immutable_condition.rs ... ok
+tests/ui/wild_in_or_pats.rs ... ok
+tests/ui/useless_vec.fixed ... ok
+tests/ui/while_let_loop.rs ... ok
+tests/ui/wildcard_enum_match_arm.rs ... ok
+tests/ui/wildcard_imports_cfgtest.rs ... ok
+Building aux file tests/ui/auxiliary/wildcard_imports_helper.rs ... ok
+tests/ui/with_capacity_zero.rs ... ok
+tests/ui/write_literal_unfixable.rs ... ok
+tests/ui/writeln_empty_string_unfixable.rs ... ok
+tests/ui/writeln_empty_string.rs ... ok
+tests/ui/while_let_on_iterator.rs ... ok
+tests/ui/write_with_newline.rs ... ok
+tests/ui/wildcard_enum_match_arm.fixed ... ok
+tests/ui/useless_conversion.fixed ... ok
+tests/ui/write_literal.rs ... ok
+tests/ui/wildcard_imports.rs ... ok
+tests/ui/with_capacity_zero.fixed ... ok
+tests/ui/wrong_self_convention.rs ... ok
+tests/ui/wrong_self_conventions_mut.rs ... ok
+tests/ui/wrong_self_convention2.rs ... ok
+tests/ui/writeln_empty_string.fixed ... ok
+tests/ui/write_with_newline.fixed ... ok
+tests/ui/wildcard_imports.fixed ... ok
+tests/ui/zero_div_zero.rs ... ok
+tests/ui/zero_offset.rs ... ok
+tests/ui/wildcard_imports_2021.rs ... ok
+tests/ui/wildcard_imports_2021.rs (revision `edition2018`) ... ok
+tests/ui/wildcard_imports_2021.rs (revision `edition2021`) ... ok
+tests/ui/write_literal.fixed ... ok
+tests/ui/wildcard_imports_2021.edition2018.fixed ... ok
+tests/ui/zero_ptr.rs ... ok
+tests/ui/zero_repeat_side_effects_never_pattern.rs ... ok
+tests/ui/zero_ptr_no_std.rs ... ok
+tests/ui/zero_repeat_side_effects_unfixable.rs ... ok
+tests/ui/zero_repeat_side_effects.rs ... ok
+tests/ui/zero_sized_btreemap_values.rs ... ok
+tests/ui/zero_sized_hashmap_values.rs ... ok
+tests/ui/{literal_string_with_formatting_args}.rs ... ok
+tests/ui/wildcard_imports_2021.edition2021.fixed ... ok
+tests/ui/zero_ptr.fixed ... ok
+tests/ui/zero_repeat_side_effects_never_pattern.fixed ... ok
+tests/ui/zombie_processes.rs ... ok
+tests/ui/zero_ptr_no_std.fixed ... ok
+tests/ui/while_let_on_iterator.fixed ... ok
+tests/ui/zombie_processes_fixable.rs ... ok
+tests/ui/author/blocks.rs ... ok
+tests/ui/author/macro_in_closure.rs ... ok
+tests/ui/author/call.rs ... ok
+tests/ui/zero_repeat_side_effects.fixed ... ok
+tests/ui/author/issue_17240.rs ... ok
+tests/ui/author/macro_in_loop.rs ... ok
+tests/ui/author/matches.rs ... ok
+tests/ui/author/if.rs ... ok
+tests/ui/author/repeat.rs ... ok
+tests/ui/author/issue_3849.rs ... ok
+tests/ui/author/loop.rs ... ok
+tests/ui/zombie_processes_fixable.fixed ... ok
+tests/ui/author/struct.rs ... ok
+tests/ui/branches_sharing_code/false_positives.rs ... ok
+tests/ui/checked_unwrap/if_let_chains.rs ... ok
+tests/ui/checked_unwrap/complex_conditionals_nested.rs ... ok
+tests/ui/branches_sharing_code/shared_match_tail.rs ... ok
+tests/ui/checked_unwrap/complex_conditionals.rs ... ok
+tests/ui/branches_sharing_code/shared_at_top.rs ... ok
+tests/ui/branches_sharing_code/shared_at_bottom.rs ... ok
+tests/ui/branches_sharing_code/shared_at_top_and_bottom.rs ... ok
+tests/ui/cmp_owned/asymmetric_partial_eq.rs ... ok
+tests/ui/branches_sharing_code/valid_if_blocks.rs ... ok
+tests/ui/cmp_owned/comparison_flip.rs ... ok
+tests/ui/checked_unwrap/simple_conditionals.rs ... ok
+tests/ui/crashes/enum-glob-import-crate.rs ... ok
+tests/ui/crashes/associated-constant-ice.rs ... ok
+tests/ui/crashes/elidable_lifetime_names_impl_trait.rs ... ok
+tests/ui/branches_sharing_code/shared_match_tail.fixed ... ok
+tests/ui/crashes/cc_seme.rs ... ok
+tests/ui/cmp_owned/without_suggestion.rs ... ok
+tests/ui/cmp_owned/with_suggestion.rs ... ok
+tests/ui/cmp_owned/asymmetric_partial_eq.fixed ... ok
+tests/ui/crashes/ice-10148.rs ... ok
+tests/ui/cmp_owned/comparison_flip.fixed ... ok
+tests/ui/crashes/ice-10508a.rs ... ok
+tests/ui/crashes/ice-10508c.rs ... ok
+tests/ui/crashes/ice-10912.rs ... ok
+tests/ui/crashes/elidable_lifetime_names_impl_trait.fixed ... ok
+tests/ui/crashes/ice-10508b.rs ... ok
+tests/ui/crashes/ice-11065.rs ... ok
+tests/ui/crashes/ice-11230.rs ... ok
+tests/ui/crashes/ice-11337.rs ... ok
+tests/ui/crashes/ice-11755.rs ... ok
+tests/ui/crashes/ice-11422.rs ... ok
+tests/ui/cmp_owned/with_suggestion.fixed ... ok
+tests/ui/crashes/ice-12253.rs ... ok
+tests/ui/crashes/ice-12491.rs ... ok
+tests/ui/crashes/ice-11803.rs ... ok
+tests/ui/crashes/ice-12616.rs ... ok
+tests/ui/crashes/ice-12585.rs ... ok
+tests/ui/crashes/ice-12979.rs ... ok
+tests/ui/crashes/ice-11939.rs ... ok
+tests/ui/crashes/ice-11422.fixed ... ok
+tests/ui/crashes/ice-13862.rs ... ok
+tests/ui/crashes/ice-13544-original.rs ... ok
+tests/ui/crashes/ice-12491.fixed ... ok
+tests/ui/crashes/ice-14303.rs ... ok
+tests/ui/crashes/ice-13544-reduced.rs ... ok
+tests/ui/crashes/ice-12979.1.fixed ... ok
+tests/ui/crashes/ice-11230.fixed ... ok
+tests/ui/crashes/ice-14935.rs ... ok
+tests/ui/crashes/ice-12979.2.fixed ... ok
+tests/ui/crashes/ice-14325.rs ... ok
+tests/ui/crashes/ice-12616.fixed ... ok
+tests/ui/crashes/ice-1588.rs ... ok
+tests/ui/crashes/ice-15684.rs ... ok
+tests/ui/crashes/ice-15657.rs ... ok
+tests/ui/crashes/ice-16950.rs ... ok
+tests/ui/crashes/ice-15666.rs ... ok
+tests/ui/crashes/ice-2499.rs ... ok
+tests/ui/crashes/ice-2594.rs ... ok
+tests/ui/crashes/ice-1782.rs ... ok
+tests/ui/crashes/ice-2727.rs ... ok
+tests/ui/crashes/ice-1969.rs ... ok
+tests/ui/crashes/ice-2760.rs ... ok
+tests/ui/crashes/ice-17352.rs ... ok
+tests/ui/crashes/ice-2865.rs ... ok
+tests/ui/crashes/ice-2862.rs ... ok
+tests/ui/crashes/ice-3151.rs ... ok
+tests/ui/crashes/ice-15666.fixed ... ok
+tests/ui/crashes/ice-2774.rs ... ok
+tests/ui/crashes/ice-360.rs ... ok
+tests/ui/crashes/ice-3717.rs ... ok
+tests/ui/crashes/ice-3891.rs ... ok
+tests/ui/crashes/ice-3747.rs ... ok
+tests/ui/crashes/ice-3462.rs ... ok
+tests/ui/crashes/ice-4545.rs ... ok
+tests/ui/crashes/ice-4121.rs ... ok
+tests/ui/crashes/ice-3969.rs ... ok
+tests/ui/crashes/ice-4579.rs ... ok
+tests/ui/crashes/ice-4671.rs ... ok
+tests/ui/crashes/ice-3717.fixed ... ok
+tests/ui/crashes/ice-4775.rs ... ok
+tests/ui/crashes/ice-2774.fixed ... ok
+tests/ui/crashes/ice-4760.rs ... ok
+tests/ui/crashes/ice-5238.rs ... ok
+tests/ui/crashes/ice-5207.rs ... ok
+tests/ui/crashes/ice-4968.rs ... ok
+tests/ui/crashes/ice-4727.rs ... ok
+tests/ui/crashes/ice-5389.rs ... ok
+tests/ui/crashes/ice-5497.rs ... ok
+tests/ui/crashes/ice-5223.rs ... ok
+tests/ui/crashes/ice-5579.rs ... ok
+tests/ui/crashes/ice-5835.rs ... ok
+tests/ui/crashes/ice-5872.rs ... ok
+tests/ui/crashes/ice-6179.rs ... ok
+tests/ui/crashes/ice-6250.rs ... ok
+tests/ui/crashes/ice-5944.rs ... ok
+tests/ui/crashes/ice-6153.rs ... ok
+tests/ui/crashes/ice-6139.rs ... ok
+tests/ui/crashes/ice-6251.rs ... ok
+tests/ui/crashes/ice-6254.rs ... ok
+tests/ui/crashes/ice-5835.fixed ... ok
+tests/ui/crashes/ice-6255.rs ... ok
+tests/ui/crashes/ice-5872.fixed ... ok
+tests/ui/crashes/ice-6250.fixed ... ok
+tests/ui/crashes/ice-6792.rs ... ok
+tests/ui/crashes/ice-6256.rs ... ok
+tests/ui/crashes/ice-6539.rs ... ok
+tests/ui/crashes/ice-6252.rs ... ok
+tests/ui/crashes/ice-6793.rs ... ok
+tests/ui/crashes/ice-6332.rs ... ok
+tests/ui/crashes/ice-6840.rs ... ok
+tests/ui/crashes/ice-7012.rs ... ok
+tests/ui/crashes/ice-700.rs ... ok
+tests/ui/crashes/ice-7340.rs ... ok
+tests/ui/crashes/ice-7126.rs ... ok
+tests/ui/crashes/ice-7423.rs ... ok
+tests/ui/crashes/ice-7231.rs ... ok
+tests/ui/crashes/ice-7868.rs ... ok
+tests/ui/crashes/ice-7169.rs ... ok
+tests/ui/crashes/ice-7410.rs ... ok
+tests/ui/crashes/ice-7869.rs ... ok
+Building aux file tests/ui/crashes/auxiliary/ice-7272-aux.rs ... ok
+Building aux file tests/ui/crashes/auxiliary/proc_macro_crash.rs ... ok
+tests/ui/crashes/ice-7934.rs ... ok
+tests/ui/crashes/ice-8250.rs ... ok
+tests/ui/crashes/ice-8386.rs ... ok
+tests/ui/crashes/ice-8821.rs ... ok
+tests/ui/crashes/ice-9238.rs ... ok
+tests/ui/crashes/ice-7169.fixed ... ok
+tests/ui/crashes/ice-8850.rs ... ok
+tests/ui/crashes/ice-9041.rs ... ok
+tests/ui/crashes/ice-7272.rs ... ok
+tests/ui/crashes/ice-9405.rs ... ok
+tests/ui/crashes/ice-9242.rs ... ok
+Building aux file tests/ui/crashes/auxiliary/ice-8681-aux.rs ... ok
+tests/ui/crashes/ice-9414.rs ... ok
+tests/ui/crashes/ice-8250.fixed ... ok
+tests/ui/crashes/ice-9459.rs ... ok
+tests/ui/crashes/ice-9463.rs ... ok
+tests/ui/crashes/ice-8850.fixed ... ok
+tests/ui/crashes/ice-9625.rs ... ok
+tests/ui/crashes/ice-96721.rs ... ok
+tests/ui/crashes/ice-9746.rs ... ok
+tests/ui/crashes/ice-9041.fixed ... ok
+tests/ui/crashes/ice-8681.rs ... ok
+tests/ui/crashes/ice_exact_size.rs ... ok
+tests/ui/crashes/ice-rust-107877.rs ... ok
+tests/ui/crashes/if_same_then_else.rs ... ok
+tests/ui/crashes/implements-trait.rs ... ok
+tests/ui/crashes/inherent_impl.rs ... ok
+tests/ui/crashes/issues_loop_mut_cond.rs ... ok
+tests/ui/crashes/issue-825.rs ... ok
+tests/ui/crashes/ice-96721.fixed ... ok
+tests/ui/crashes/mgca-16691.rs ... ok
+tests/ui/crashes/match_same_arms_const.rs ... ok
+tests/ui/crate_level_checks/entrypoint_recursion.rs ... ignored (in-test comment)
+tests/ui/crashes/needless_pass_by_value-w-late-bound.rs ... ok
+tests/ui/crashes/missing_const_for_fn_14774.rs ... ok
+tests/ui/crashes/needless_borrow_fp.rs ... ok
+tests/ui/crashes/shadow.rs ... ok
+tests/ui/crashes/returns.rs ... ok
+tests/ui/crashes/regressions.rs ... ok
+tests/ui/crashes/single-match-else.rs ... ok
+tests/ui/crashes/trivial_bounds.rs ... ok
+tests/ui/crashes/unreachable-array-or-slice.rs ... ok
+tests/ui/crate_level_checks/no_std_main_recursion.rs ... ok
+tests/ui/crashes/needless_pass_by_value-w-late-bound.fixed ... ok
+tests/ui/crashes/missing_const_for_fn_14774.fixed ... ok
+tests/ui/crate_level_checks/no_std_swap.rs ... ok
+tests/ui/crashes/used_underscore_binding_macro.rs ... ok
+tests/ui/crate_level_checks/std_main_recursion.rs ... ok
+tests/ui/doc/doc_include_without_cfg.rs ... ok
+tests/ui/doc/doc_comment_double_space_linebreaks.rs ... ok
+tests/ui/dbg_macro/dbg_macro_unfixable.rs ... ok
+tests/ui/crate_level_checks/no_std_swap.fixed ... ok
+tests/ui/doc/doc_nested_refdef_blockquote.rs ... ok
+tests/ui/doc/doc_markdown-issue_13097.rs ... ok
+tests/ui/doc/doc_lazy_blockquote.rs ... ok
+tests/ui/doc/doc-fixable.rs ... ok
+tests/ui/doc/doc_lazy_list.rs ... ok
+tests/ui/dbg_macro/dbg_macro.rs ... ok
+tests/ui/doc/doc_nested_refdef_list_item.rs ... ok
+tests/ui/doc/doc_comment_double_space_linebreaks.fixed ... ok
+tests/ui/doc/doc_overindented_list_items.rs ... ok
+tests/ui/doc/doc_paragraph_missing_punctuation_split_16169.rs ... ok
+tests/ui/doc/doc_nested_refdef_blockquote.fixed ... ok
+tests/ui/doc/doc_include_without_cfg.fixed ... ok
+tests/ui/doc/doc_lazy_blockquote.fixed ... ok
+tests/ui/doc/doc_markdown-issue_13097.fixed ... ok
+tests/ui/doc/doc_lazy_list.fixed ... ok
+tests/ui/doc/doc-fixable.fixed ... ok
+tests/ui/doc/doc_paragraphs_missing_punctuation_emoji.rs ... ok
+tests/ui/doc/doc_nested_refdef_list_item.fixed ... ok
+tests/ui/doc/doc_paragraphs_missing_punctuation.rs ... ok
+tests/ui/doc/doc_overindented_list_items.fixed ... ok
+tests/ui/doc/footnote_issue_13183.rs ... ok
+tests/ui/doc/doc_paragraphs_missing_punctuation_unfixable.rs ... ok
+tests/ui/doc/issue_10262.rs ... ok
+tests/ui/doc/issue_12795.rs ... ok
+tests/ui/crashes/ice-3741.rs ... ok
+tests/ui/doc/issue_902.rs ... ok
+tests/ui/dbg_macro/dbg_macro.fixed ... ok
+tests/ui/doc/issue_1832.rs ... ok
+tests/ui/doc/issue_12795.fixed ... ok
+tests/ui/doc/link_adjacent.rs ... ok
+tests/ui/doc/issue_9473.rs ... ok
+tests/ui/doc/issue_10262.fixed ... ok
+tests/ui/doc/doc_paragraphs_missing_punctuation.fixed ... ok
+tests/ui/doc/needless_doctest_main.rs ... ok
+tests/ui/doc/unbalanced_ticks.rs ... ok
+tests/ui/empty_line_after/doc_comments.rs ... ok
+tests/ui/empty_line_after/outer_attribute.rs ... ok
+tests/ui/items_after_test_module/after_proc_macros.rs ... ok
+tests/ui/doc/link_adjacent.fixed ... ok
+tests/ui/index_refutable_slice/slice_indexing_in_macro.rs ... ok
+tests/ui/doc/issue_9473.fixed ... ok
+tests/ui/items_after_test_module/imported_module.rs ... ok
+tests/ui/index_refutable_slice/if_let_slice_binding.rs ... ok
+tests/ui/empty_line_after/doc_comments.1.fixed ... ok
+tests/ui/items_after_test_module/multiple_modules.rs ... ok
+tests/ui/items_after_test_module/root_module.rs ... ok
+tests/ui/items_after_test_module/in_submodule.rs ... ok
+tests/ui/empty_line_after/doc_comments.2.fixed ... ok
+tests/ui/manual_memcpy/with_loop_counters.rs ... ok
+tests/ui/index_refutable_slice/slice_indexing_in_macro.fixed ... ok
+tests/ui/empty_line_after/outer_attribute.1.fixed ... ok
+tests/ui/empty_line_after/outer_attribute.2.fixed ... ok
+tests/ui/mixed_attributes_style/mod_declaration.rs ... ok
+tests/ui/mixed_attributes_style/global_allow.rs ... ok
+tests/ui/items_after_test_module/root_module.fixed ... ok
+tests/ui/missing_const_for_fn/const_trait.rs ... ok
+tests/ui/index_refutable_slice/if_let_slice_binding.fixed ... ok
+tests/ui/manual_memcpy/without_loop_counters.rs ... ok
+tests/ui/missing_const_for_fn/could_be_const.rs ... ok
+Building aux file tests/ui/missing_const_for_fn/auxiliary/helper.rs ... ok
+tests/ui/needless_bool/simple.rs ... ok
+tests/ui/manual_memcpy/with_loop_counters.fixed ... ok
+tests/ui/needless_bool/fixable.rs ... ok
+tests/ui/missing_const_for_fn/const_trait.fixed ... ok
+tests/ui/out_of_bounds_indexing/issue-3102.rs ... ok
+Building aux file tests/ui/non_std_lazy_static/auxiliary/once_cell.rs ... ok
+tests/ui/pattern_type_mismatch/mutability.rs ... ok
+tests/ui/out_of_bounds_indexing/simple.rs ... ok
+tests/ui/missing_const_for_fn/could_be_const.fixed ... ok
+tests/ui/needless_bool/fixable.fixed ... ok
+tests/ui/manual_memcpy/without_loop_counters.fixed ... ok
+tests/ui/pattern_type_mismatch/pattern_alternatives.rs ... ok
+tests/ui/missing_const_for_fn/cant_be_const.rs ... ok
+tests/ui/pattern_type_mismatch/pattern_structs.rs ... ok
+tests/ui/non_std_lazy_static/non_std_lazy_static_other_once_cell.rs ... ok
+tests/ui/pattern_type_mismatch/pattern_tuples.rs ... ok
+tests/ui/rc_clone_in_vec_init/arc.rs ... ok
+Building aux file tests/ui/non_std_lazy_static/auxiliary/lazy_static.rs ... ok
+tests/ui/size_of_in_element_count/expressions.rs ... ok
+tests/ui/should_impl_trait/corner_cases.rs ... ok
+Building aux file tests/ui/pattern_type_mismatch/auxiliary/external.rs ... ok
+tests/ui/rc_clone_in_vec_init/weak.rs ... ok
+tests/ui/rc_clone_in_vec_init/rc.rs ... ok
+tests/ui/size_of_in_element_count/functions.rs ... ok
+tests/ui/crashes/third-party/conf_allowlisted.rs ... ok
+tests/ui/non_std_lazy_static/non_std_lazy_static_no_std.rs ... ok
+tests/ui/non_std_lazy_static/non_std_lazy_static_unfixable.rs ... ok
+tests/ui/should_impl_trait/method_list_1.rs ... ok
+tests/ui/should_impl_trait/method_list_1.rs (revision `edition2015`) ... ok
+tests/ui/should_impl_trait/method_list_1.rs (revision `edition2021`) ... ok
+tests/ui/should_impl_trait/method_list_2.rs ... ok
+tests/ui/should_impl_trait/method_list_2.rs (revision `edition2015`) ... ok
+tests/ui/should_impl_trait/method_list_2.rs (revision `edition2021`) ... ok
+tests/ui/non_std_lazy_static/non_std_lazy_static_fixable.rs ... ok
+tests/ui/pattern_type_mismatch/syntax.rs ... ok
+tests/ui/non_std_lazy_static/non_std_lazy_static_fixable.fixed ... ok
+
+test result: ok. 1839 passed; 6 ignored
+
+Building dependencies ... ok
+tests/ui-toml/allow_mixed_uninlined_format_args/uninlined_format_args.rs ... ok
+tests/ui-toml/arithmetic_side_effects_allowed/arithmetic_side_effects_allowed.rs ... ok
+tests/ui-toml/absolute_paths/absolute_paths_2015.rs ... ok
+tests/ui-toml/absolute_paths/absolute_paths_2015.rs (revision `default`) ... ok
+tests/ui-toml/absolute_paths/absolute_paths_2015.rs (revision `allow_crates`) ... ok
+tests/ui-toml/array_size_threshold/array_size_threshold.rs ... ok
+tests/ui-toml/allow_mixed_uninlined_format_args/uninlined_format_args.fixed ... ok
+tests/ui-toml/await_holding_invalid_type_with_replacement/await_holding_invalid_type.rs ... ok
+tests/ui-toml/bad_toml/conf_bad_toml.rs ... ok
+tests/ui-toml/await_holding_invalid_type/await_holding_invalid_type.rs ... ok
+tests/ui-toml/bad_toml_type/conf_bad_type.rs ... ok
+tests/ui-toml/borrow_interior_mutable_const/ignore.rs ... ok
+tests/ui-toml/collapsible_if/collapsible_else_if.rs ... ok
+tests/ui-toml/collapsible_if/collapsible_if.rs ... ok
+tests/ui-toml/check_incompatible_msrv_in_tests/check_incompatible_msrv_in_tests.rs ... ok
+tests/ui-toml/check_incompatible_msrv_in_tests/check_incompatible_msrv_in_tests.rs (revision `default`) ... ok
+tests/ui-toml/check_incompatible_msrv_in_tests/check_incompatible_msrv_in_tests.rs (revision `enabled`) ... ok
+tests/ui-toml/collapsible_if/collapsible_if.fixed ... ok
+tests/ui-toml/collapsible_if/collapsible_else_if.fixed ... ok
+tests/ui-toml/collapsible_if/collapsible_if_let_chains.rs ... ok
+tests/ui-toml/collapsible_if/collapsible_if_let_chains.fixed ... ok
+tests/ui-toml/conf_deprecated_key/conf_deprecated_key.rs ... ok
+tests/ui-toml/dbg_macro/dbg_macro.rs ... ok
+Building aux file tests/ui/auxiliary/proc_macros.rs ... ok
+tests/ui-toml/decimal_literal_representation/decimal_literal_representation.rs ... ok
+tests/ui-toml/declare_interior_mutable_const/ignore.rs ... ok
+tests/ui-toml/arbitrary_source_item_ordering/ordering_only_impl.rs ... ok
+tests/ui-toml/arbitrary_source_item_ordering/ordering_only_impl.rs (revision `only_impl`) ... ok
+tests/ui-toml/arbitrary_source_item_ordering/ordering_only_trait.rs ... ok
+tests/ui-toml/arbitrary_source_item_ordering/ordering_only_trait.rs (revision `only_trait`) ... ok
+tests/ui-toml/arbitrary_source_item_ordering/ordering_only_enum.rs ... ok
+tests/ui-toml/arbitrary_source_item_ordering/ordering_only_enum.rs (revision `only_enum`) ... ok
+tests/ui-toml/arbitrary_source_item_ordering/ordering_good_var_1.rs ... ok
+tests/ui-toml/arbitrary_source_item_ordering/ordering_good_var_1.rs (revision `var_1`) ... ok
+tests/ui-toml/decimal_literal_representation/decimal_literal_representation.fixed ... ok
+tests/ui-toml/arbitrary_source_item_ordering/ordering_mixed_var_1.rs ... ok
+tests/ui-toml/arbitrary_source_item_ordering/ordering_mixed_var_1.rs (revision `var_1`) ... ok
+tests/ui-toml/dbg_macro/dbg_macro.fixed ... ok
+Building aux file tests/ui-toml/disallowed_macros/auxiliary/macros.rs ... ok
+tests/ui-toml/disallowed_names_append/disallowed_names.rs ... ok
+tests/ui-toml/disallowed_names_replace/disallowed_names.rs ... ok
+tests/ui-toml/duplicated_keys_deprecated/duplicated_keys.rs ... ok
+tests/ui-toml/duplicated_keys/duplicated_keys.rs ... ok
+tests/ui-toml/doc_valid_idents_append/doc_markdown.rs ... ok
+tests/ui-toml/disallowed_script_idents/disallowed_script_idents.rs ... ok
+tests/ui-toml/doc_valid_idents_replace/doc_markdown.rs ... ok
+tests/ui-toml/duplicated_keys_deprecated_2/duplicated_keys.rs ... ok
+tests/ui-toml/doc_valid_idents_replace/doc_markdown.fixed ... ok
+tests/ui-toml/doc_valid_idents_append/doc_markdown.fixed ... ok
+tests/ui-toml/enum_variant_size/enum_variant_size.rs ... ok
+tests/ui-toml/excessive_precision/excessive_precision.rs ... ok
+tests/ui-toml/expect_used/expect_used.rs ... ok
+tests/ui-toml/arbitrary_source_item_ordering/ordering_mixed.rs ... ok
+tests/ui-toml/arbitrary_source_item_ordering/ordering_mixed.rs (revision `default`) ... ok
+tests/ui-toml/arbitrary_source_item_ordering/ordering_mixed.rs (revision `default_exp`) ... ok
+tests/ui-toml/arbitrary_source_item_ordering/ordering_mixed.rs (revision `ord_within`) ... ok
+tests/ui-toml/enum_variant_size/enum_variant_size.fixed ... ok
+tests/ui-toml/extra_unused_type_parameters/extra_unused_type_parameters.rs ... ok
+tests/ui-toml/fn_params_excessive_bools/test.rs ... ok
+tests/ui-toml/excessive_precision/excessive_precision.fixed ... ok
+tests/ui-toml/arbitrary_source_item_ordering/selective_ordering.rs ... ok
+tests/ui-toml/arbitrary_source_item_ordering/selective_ordering.rs (revision `default`) ... ok
+tests/ui-toml/arbitrary_source_item_ordering/selective_ordering.rs (revision `ord_within`) ... ok
+tests/ui-toml/arbitrary_source_item_ordering/selective_ordering.rs (revision `ord_in_2`) ... ok
+tests/ui-toml/arbitrary_source_item_ordering/selective_ordering.rs (revision `ord_in_3`) ... ok
+tests/ui-toml/explicit_iter_loop/explicit_iter_loop.rs ... ok
+tests/ui-toml/good_toml_no_false_negatives/conf_no_false_negatives.rs ... ok
+tests/ui-toml/functions_maxlines/test.rs ... ok
+tests/ui-toml/impl_trait_in_params/impl_trait_in_params.rs ... ok
+tests/ui-toml/ifs_same_cond/ifs_same_cond.rs ... ok
+tests/ui-toml/invalid_min_rust_version/invalid_min_rust_version.rs ... ok
+tests/ui-toml/indexing_slicing/indexing_slicing.rs ... ok
+tests/ui-toml/large_include_file/large_include_file.rs ... ok
+tests/ui-toml/explicit_iter_loop/explicit_iter_loop.fixed ... ok
+tests/ui-toml/large_stack_frames/large_stack_frames.rs ... ok
+tests/ui-toml/large_futures/large_futures.rs ... ok
+tests/ui-toml/large_stack_frames_for_special_targets/large_stack_frames.rs ... ok
+tests/ui-toml/large_types_passed_by_value/large_types_passed_by_value.rs ... ok
+tests/ui-toml/manual_let_else/manual_let_else.rs ... ok
+tests/ui-toml/lint_decimal_readability/test.rs ... ok
+tests/ui-toml/large_stack_frames_for_macros/large_stack_frames.rs ... ok
+tests/ui-toml/max_suggested_slice_pattern_length/index_refutable_slice.rs ... ok
+tests/ui-toml/large_futures/large_futures.fixed ... ok
+tests/ui-toml/min_ident_chars_trait_impl/min_ident_chars.rs ... ok
+tests/ui-toml/large_types_passed_by_value/large_types_passed_by_value.fixed ... ok
+tests/ui-toml/manual_let_else/manual_let_else.fixed ... ok
+tests/ui-toml/lint_decimal_readability/test.fixed ... ok
+Building aux file tests/ui-toml/min_ident_chars/auxiliary/extern_types.rs ... ok
+Building aux file tests/ui-toml/disallowed_macros/auxiliary/proc_macros.rs ... ok
+tests/ui-toml/max_suggested_slice_pattern_length/index_refutable_slice.fixed ... ok
+tests/ui-toml/min_rust_version/min_rust_version.rs ... ok
+tests/ui-toml/missing_enforced_import_rename/conf_missing_enforced_import_rename.rs ... ok
+tests/ui-toml/modulo_arithmetic/modulo_arithmetic.rs ... ok
+tests/ui-toml/module_inception/module_inception.rs ... ok
+tests/ui-toml/min_ident_chars/min_ident_chars.rs ... ok
+tests/ui-toml/mut_key/mut_key.rs ... ok
+tests/ui-toml/excessive_nesting/excessive_nesting.rs ... ok
+tests/ui-toml/needless_late_init/needless_late_init.rs ... ok
+tests/ui-toml/min_rust_version/min_rust_version.fixed ... ok
+tests/ui-toml/missing_enforced_import_rename/conf_missing_enforced_import_rename.fixed ... ok
+tests/ui-toml/arbitrary_source_item_ordering/ordering_good.rs ... ok
+tests/ui-toml/arbitrary_source_item_ordering/ordering_good.rs (revision `default`) ... ok
+tests/ui-toml/arbitrary_source_item_ordering/ordering_good.rs (revision `default_exp`) ... ok
+tests/ui-toml/arbitrary_source_item_ordering/ordering_good.rs (revision `bad_conf_1`) ... ok
+tests/ui-toml/arbitrary_source_item_ordering/ordering_good.rs (revision `bad_conf_2`) ... ok
+tests/ui-toml/arbitrary_source_item_ordering/ordering_good.rs (revision `bad_conf_3`) ... ok
+tests/ui-toml/arbitrary_source_item_ordering/ordering_good.rs (revision `bad_conf_4`) ... ok
+tests/ui-toml/arbitrary_source_item_ordering/ordering_good.rs (revision `bad_conf_5`) ... ok
+tests/ui-toml/arbitrary_source_item_ordering/ordering_good.rs (revision `bad_conf_6`) ... ok
+tests/ui-toml/needless_pass_by_ref_mut/needless_pass_by_ref_mut.rs ... ok
+tests/ui-toml/needless_raw_string_hashes_one_allowed/needless_raw_string_hashes.rs ... ok
+tests/ui-toml/path_ends_with_ext/path_ends_with_ext.rs ... ok
+tests/ui-toml/panic/panic.rs ... ok
+tests/ui-toml/private-doc-errors/doc_lints.rs ... ok
+tests/ui-toml/print_macro/print_macro.rs ... ok
+tests/ui-toml/needless_raw_string_hashes_one_allowed/needless_raw_string_hashes.fixed ... ok
+tests/ui-toml/needless_pass_by_ref_mut/needless_pass_by_ref_mut.fixed ... ok
+tests/ui-toml/replaceable_disallowed_types/replaceable_disallowed_types.rs ... ok
+tests/ui-toml/result_large_err/result_large_err.rs ... ok
+tests/ui-toml/pub_underscore_fields/pub_underscore_fields.rs ... ok
+tests/ui-toml/pub_underscore_fields/pub_underscore_fields.rs (revision `exported`) ... ok
+tests/ui-toml/pub_underscore_fields/pub_underscore_fields.rs (revision `all_pub_fields`) ... ok
+tests/ui-toml/semicolon_block/both.rs ... ok
+tests/ui-toml/semicolon_block/semicolon_inside_block.rs ... ok
+tests/ui-toml/ref_option/ref_option_traits.rs ... ok
+tests/ui-toml/ref_option/ref_option_traits.rs (revision `private`) ... ok
+tests/ui-toml/ref_option/ref_option_traits.rs (revision `all`) ... ok
+tests/ui-toml/absolute_paths/absolute_paths.rs ... ok
+tests/ui-toml/absolute_paths/absolute_paths.rs (revision `default`) ... ok
+tests/ui-toml/absolute_paths/absolute_paths.rs (revision `allow_crates`) ... ok
+tests/ui-toml/absolute_paths/absolute_paths.rs (revision `allow_long`) ... ok
+tests/ui-toml/absolute_paths/absolute_paths.rs (revision `no_short`) ... ok
+tests/ui-toml/ref_option/ref_option.rs ... ok
+tests/ui-toml/ref_option/ref_option.rs (revision `private`) ... ok
+tests/ui-toml/ref_option/ref_option.rs (revision `all`) ... ok
+tests/ui-toml/ref_option/ref_option.private.fixed ... ok
+tests/ui-toml/semicolon_block/both.fixed ... ok
+tests/ui-toml/replaceable_disallowed_types/replaceable_disallowed_types.fixed ... ok
+tests/ui-toml/semicolon_block/semicolon_inside_block.fixed ... ok
+tests/ui-toml/semicolon_block/semicolon_outside_block.rs ... ok
+tests/ui-toml/renamed_function_params/renamed_function_params.rs ... ok
+tests/ui-toml/struct_excessive_bools/test.rs ... ok
+tests/ui-toml/renamed_function_params/renamed_function_params.rs (revision `default`) ... ok
+tests/ui-toml/renamed_function_params/renamed_function_params.rs (revision `extend`) ... ok
+tests/ui-toml/strict_non_send_fields_in_send_ty/test.rs ... ok
+tests/ui-toml/missing_docs_in_private_items/missing_docs_in_private_items.rs ... ok
+tests/ui-toml/missing_docs_in_private_items/missing_docs_in_private_items.rs (revision `default`) ... ok
+tests/ui-toml/missing_docs_in_private_items/missing_docs_in_private_items.rs (revision `crate_root`) ... ok
+tests/ui-toml/missing_docs_in_private_items/missing_docs_in_private_items.rs (revision `allow_unused`) ... ok
+tests/ui-toml/toml_disallow/conf_french_disallowed_name.rs ... ok
+tests/ui-toml/toml_disallowed_fields/conf_disallowed_fields.rs ... ok
+tests/ui-toml/ref_option/ref_option.all.fixed ... ok
+tests/ui-toml/suppress_lint_in_const/test.rs ... ok
+tests/ui-toml/semicolon_block/semicolon_outside_block.fixed ... ok
+tests/ui-toml/toml_invalid_path/conf_invalid_path.rs ... ok
+tests/ui-toml/toml_disallowed_types/conf_disallowed_types.rs ... ok
+tests/ui-toml/toml_inconsistent_struct_constructor/conf_inconsistent_struct_constructor.rs ... ok
+tests/ui-toml/toml_disallowed_methods/conf_disallowed_methods.rs ... ok
+tests/ui-toml/toml_unknown_key/conf_unknown_key.rs ... ok
+tests/ui-toml/toml_unknown_config_struct_field/toml_unknown_config_struct_field.rs ... ok
+tests/ui-toml/toml_replaceable_disallowed_methods/replaceable_disallowed_methods.rs ... ok
+tests/ui-toml/toml_unloaded_crate/conf_unloaded_crate.rs ... ok
+tests/ui-toml/toml_trivially_copy/test.rs ... ok
+tests/ui-toml/too_large_for_stack/boxed_local.rs ... ok
+Building aux file tests/ui-toml/nonstandard_macro_braces/auxiliary/proc_macro_derive.rs ... ok
+tests/ui-toml/too_large_for_stack/useless_vec.rs ... ok
+tests/ui-toml/too_many_arguments/too_many_arguments.rs ... ok
+tests/ui-toml/type_repetition_in_bounds/main.rs ... ok
+tests/ui-toml/type_complexity/type_complexity.rs ... ok
+tests/ui-toml/disallowed_macros/disallowed_macros.rs ... ok
+tests/ui-toml/toml_replaceable_disallowed_methods/replaceable_disallowed_methods.fixed ... ok
+tests/ui-toml/toml_inconsistent_struct_constructor/conf_inconsistent_struct_constructor.fixed ... ok
+tests/ui-toml/unnecessary_box_returns/unnecessary_box_returns.rs ... ok
+tests/ui-toml/unwrap_used/unwrap_used_const.rs ... ok
+tests/ui-toml/too_large_for_stack/useless_vec.fixed ... ok
+tests/ui-toml/unwrap_used_allowed/unwrap_used_allowed.rs ... ok
+tests/ui-toml/unwrap_used/unwrap_used.rs ... ok
+tests/ui-toml/upper_case_acronyms_aggressive/upper_case_acronyms.rs ... ok
+tests/ui-toml/vec_box_sized/test.rs ... ok
+tests/ui-toml/unnecessary_box_returns/unnecessary_box_returns.fixed ... ok
+tests/ui-toml/useless_vec/useless_vec.rs ... ok
+tests/ui-toml/wildcard_imports/wildcard_imports.rs ... ok
+tests/ui-toml/use_self/use_self.default.fixed ... ok
+tests/ui-toml/verbose_bit_mask/verbose_bit_mask.rs ... ok
+tests/ui-toml/use_self/use_self.rs ... ok
+tests/ui-toml/use_self/use_self.rs (revision `default`) ... ok
+tests/ui-toml/use_self/use_self.rs (revision `disabled`) ... ok
+tests/ui-toml/upper_case_acronyms_aggressive/upper_case_acronyms.fixed ... ok
+tests/ui-toml/vec_box_sized/test.fixed ... ok
+tests/ui-toml/wildcard_imports_whitelist/wildcard_imports.rs ... ok
+tests/ui-toml/useless_vec/useless_vec.fixed ... ok
+tests/ui-toml/zero_single_char_names/zero_single_char_names.rs ... ok
+tests/ui-toml/wildcard_imports/wildcard_imports.fixed ... ok
+tests/ui-toml/unwrap_used/unwrap_used.fixed ... ok
+tests/ui-toml/use_self/use_self.disabled.fixed ... ok
+tests/ui-toml/verbose_bit_mask/verbose_bit_mask.fixed ... ok
+tests/ui-toml/arbitrary_source_item_ordering/alphabetical_or_trait_item_order/alphabetical_or_trait_item_order.rs ... ok
+tests/ui-toml/wildcard_imports_whitelist/wildcard_imports.fixed ... ok
+tests/ui-toml/arbitrary_source_item_ordering/alphabetical_or_trait_item_order/alphabetical_or_trait_item_order_failed.rs ... ok
+tests/ui-toml/item_name_repetitions/allow_exact_repetitions/item_name_repetitions.rs ... ok
+tests/ui-toml/item_name_repetitions/threshold0/item_name_repetitions.rs ... ok
+tests/ui-toml/arbitrary_source_item_ordering/trait_definition_order/trait_definition_order.rs ... ok
+tests/ui-toml/item_name_repetitions/allowed_prefixes/item_name_repetitions.rs ... ok
+tests/ui-toml/arbitrary_source_item_ordering/trait_definition_order/trait_definition_order_failed.rs ... ok
+tests/ui-toml/arbitrary_source_item_ordering/trait_definition_order/trait_definition_order_failed.rs (revision `trait_def`) ... ok
+tests/ui-toml/item_name_repetitions/allowed_prefixes_extend/item_name_repetitions.rs ... ok
+tests/ui-toml/item_name_repetitions/threshold5/item_name_repetitions.rs ... ok
+tests/ui-toml/macro_metavars_in_unsafe/private/test.rs ... ok
+tests/ui-toml/macro_metavars_in_unsafe/default/test.rs ... ok
+Building aux file tests/ui/auxiliary/proc_macro_unsafe.rs ... ok
+tests/ui-toml/undocumented_unsafe_blocks/undocumented_unsafe_blocks_fixable.default.fixed ... ok
+tests/ui-toml/undocumented_unsafe_blocks/undocumented_unsafe_blocks_fixable.rs ... ok
+tests/ui-toml/undocumented_unsafe_blocks/undocumented_unsafe_blocks_fixable.rs (revision `default`) ... ok
+tests/ui-toml/undocumented_unsafe_blocks/undocumented_unsafe_blocks_fixable.rs (revision `disabled`) ... ok
+tests/ui-toml/undocumented_unsafe_blocks/undocumented_unsafe_blocks_fixable.disabled.fixed ... ok
+tests/ui-toml/nonstandard_macro_braces/conf_nonstandard_macro_braces.rs ... ok
+tests/ui-toml/nonstandard_macro_braces/conf_nonstandard_macro_braces.fixed ... ok
+tests/ui-toml/undocumented_unsafe_blocks/undocumented_unsafe_blocks.rs ... ok
+tests/ui-toml/undocumented_unsafe_blocks/undocumented_unsafe_blocks.rs (revision `default`) ... ok
+tests/ui-toml/undocumented_unsafe_blocks/undocumented_unsafe_blocks.rs (revision `disabled`) ... ok
+
+test result: ok. 194 passed
+
+tests/ui-cargo/cargo_rust_version/fail_both_same/Cargo.toml ... ok
+tests/ui-cargo/cargo_rust_version/fail_clippy/Cargo.toml ... ok
+tests/ui-cargo/cargo_rust_version/pass_both_same/Cargo.toml ... ok
+tests/ui-cargo/cargo_rust_version/fail_cargo/Cargo.toml ... ok
+tests/ui-cargo/cargo_rust_version/fail_file_attr/Cargo.toml ... ok
+tests/ui-cargo/cargo_rust_version/fail_both_diff/Cargo.toml ... ok
+tests/ui-cargo/cargo_common_metadata/pass_publish_empty/Cargo.toml ... ok
+tests/ui-cargo/cargo_common_metadata/pass/Cargo.toml ... ok
+tests/ui-cargo/cargo_common_metadata/pass_publish_false/Cargo.toml ... ok
+tests/ui-cargo/cargo_common_metadata/fail/Cargo.toml ... ok
+tests/ui-cargo/cargo_common_metadata/fail_publish/Cargo.toml ... ok
+tests/ui-cargo/cargo_common_metadata/fail_publish_true/Cargo.toml ... ok
+tests/ui-cargo/cargo_rust_version/pass_cargo/Cargo.toml ... ok
+tests/ui-cargo/cargo_rust_version/warn_both_diff/Cargo.toml ... ok
+tests/ui-cargo/definition_in_module_root/fail_mod/Cargo.toml ... ok
+tests/ui-cargo/definition_in_module_root/fail_edge_cases/Cargo.toml ... ok
+tests/ui-cargo/cargo_rust_version/pass_clippy/Cargo.toml ... ok
+tests/ui-cargo/cargo_rust_version/pass_file_attr/Cargo.toml ... ok
+tests/ui-cargo/definition_in_module_root/pass_path_attr/Cargo.toml ... ok
+tests/ui-cargo/definition_in_module_root/pass_lib_with_definitions/Cargo.toml ... ok
+tests/ui-cargo/definition_in_module_root/pass_bin/Cargo.toml ... ok
+tests/ui-cargo/duplicate_mod/fail/Cargo.toml ... ok
+tests/ui-cargo/definition_in_module_root/fail_path_attr/Cargo.toml ... ok
+tests/ui-cargo/feature_name/fail/Cargo.toml ... ok
+tests/ui-cargo/lint_groups_priority/pass/Cargo.toml ... ok
+tests/ui-cargo/lint_groups_priority/fail/Cargo.toml ... ok
+tests/ui-cargo/feature_name/pass/Cargo.toml ... ok
+tests/ui-cargo/module_style/duplicated_mod_names_14697/Cargo.toml ... ok
+tests/ui-cargo/module_style/fail_no_mod/Cargo.toml ... ok
+tests/ui-cargo/module_style/fail_mod_remap/Cargo.toml ... ok
+tests/ui-cargo/module_style/fail_mod/Cargo.toml ... ok
+tests/ui-cargo/module_style/pass_mod/Cargo.toml ... ok
+tests/ui-cargo/module_style/pass_no_mod/Cargo.toml ... ok
+tests/ui-cargo/module_style/inline_mod/Cargo.toml ... ok
+tests/ui-cargo/module_style/with_path_attr_mod/Cargo.toml ... ok
+tests/ui-cargo/module_style/segment_with_mod_name_10271_11916/Cargo.toml ... ok
+tests/ui-cargo/module_style/with_path_attr_no_mod/Cargo.toml ... ok
+tests/ui-cargo/multiple_config_files/no_warn/Cargo.toml ... ok
+tests/ui-cargo/multiple_config_files/warn/Cargo.toml ... ok
+tests/ui-cargo/module_style/segment_with_mod_name_10271_11916/foo/bar/Cargo.toml ... ok
+tests/ui-cargo/multiple_inherent_impl/config_fail/Cargo.toml ... ok
+tests/ui-cargo/multiple_inherent_impl/file_fail/Cargo.toml ... ok
+tests/ui-cargo/multiple_inherent_impl/module_fail/Cargo.toml ... ok
+tests/ui-cargo/multiple_inherent_impl/crate_fail/Cargo.toml ... ok
+tests/ui-cargo/undocumented_unsafe_blocks/fail/Cargo.toml ... ok
+tests/ui-cargo/multiple_crate_versions/fail/Cargo.toml ... ok
+tests/ui-cargo/multiple_crate_versions/12145_with_dashes/Cargo.toml ... ok
+tests/ui-cargo/multiple_crate_versions/12176_allow_duplicate_crates/Cargo.toml ... ok
+tests/ui-cargo/wildcard_dependencies/fail/Cargo.toml ... ok
+tests/ui-cargo/wildcard_dependencies/pass/Cargo.toml ... ok
+tests/ui-cargo/multiple_crate_versions/pass/Cargo.toml ... ok
+
+test result: ok. 51 passed; 1 filtered out
+
+     Running tests/config-consistency.rs (/Volumes/Storage/rr-build-2026-10-08/rr-target/debug/build/clippy/b2fa5dbf6cbf5c55/out/config_consistency-b2fa5dbf6cbf5c55)
+
+running 1 test
+test config_consistency ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/config-metadata.rs (/Volumes/Storage/rr-build-2026-10-08/rr-target/debug/build/clippy/e8149e2bb9d3173c/out/config_metadata-e8149e2bb9d3173c)
+
+running 2 tests
+test book ... ok
+test changelog ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/dogfood.rs (/Volumes/Storage/rr-build-2026-10-08/rr-target/debug/build/clippy/745c7e5d6f9a15e8/out/dogfood-745c7e5d6f9a15e8)
+linting ./
+linting clippy_dev
+linting clippy_lints_internal
+linting clippy_lints
+linting clippy_utils
+linting clippy_config
+linting declare_clippy_lint
+linting lintcheck
+linting rustc_tools_util
+     Running tests/integration.rs (/Volumes/Storage/rr-build-2026-10-08/rr-target/debug/build/clippy/ce62eff2b4c6a455/out/integration-ce62eff2b4c6a455)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/lint-attributes-organization.rs (/Volumes/Storage/rr-build-2026-10-08/rr-target/debug/build/clippy/7e9ff2927ae61515/out/lint_attributes_organization-7e9ff2927ae61515)
+
+running 2 tests
+test internal_sanity_check ... ok
+test lint_attribute_organization ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/lint-page.rs (/Volumes/Storage/rr-build-2026-10-08/rr-target/debug/build/clippy/239a9f0d2be150eb/out/lint_page-239a9f0d2be150eb)
+
+running 1 test
+test lint_page_accessibility ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/lint_message_convention.rs (/Volumes/Storage/rr-build-2026-10-08/rr-target/debug/build/clippy/fe311760a68f7c2e/out/lint_message_convention-fe311760a68f7c2e)
+
+running 1 test
+test lint_message_convention ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests/missing-test-files.rs (/Volumes/Storage/rr-build-2026-10-08/rr-target/debug/build/clippy/0529f47430e2838a/out/missing_test_files-0529f47430e2838a)
+
+running 1 test
+test test_missing_tests ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/no-profile-in-cargo-toml.rs (/Volumes/Storage/rr-build-2026-10-08/rr-target/debug/build/clippy/51a90ea821b5e5d0/out/no_profile_in_cargo_toml-51a90ea821b5e5d0)
+
+running 1 test
+test no_profile_in_cargo_toml ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/rr.rs (/Volumes/Storage/rr-build-2026-10-08/rr-target/debug/build/clippy/29e8e1a97e69559e/out/rr-29e8e1a97e69559e)
+
+running 18 tests
+test ordinary_traits_lifetimes_and_core_assertions_work ... ok
+test explicit_std_from_extern_flags_is_rejected ... ok
+test nested_macros_and_conditional_derives_are_rejected ... ok
+test nested_release_assertions_and_escape_calls_are_checked ... ok
+test rejects_generic_definitions_and_impl_trait ... ok
+test cloning_copy_values_and_ufcs_still_need_reasons ... ok
+test leaks_forgetting_and_unsafe_need_reasons ... ok
+test requires_no_std_and_rejects_std_aliases ... ok
+test rejects_complex_traits_and_dyn ... ok
+test unrelated_method_names_do_not_trigger ... ok
+test rejects_macro_definitions_calls_and_derives ... ok
+test accepts_trailing_block_and_multiline_statement_comments ... ok
+test rejects_async_functions_blocks_closures_and_await ... ok
+test collects_and_shared_ownership_need_reasons ... ok
+test rules_cannot_be_lowered_to_allow ... ok
+test comment_must_be_real_nonempty_and_adjacent ... ok
+test strings_vectors_and_owning_conversions_need_reasons ... ok
+test unsafe_contracts_and_runtime_borrowing_need_reasons ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.10s
+
+     Running tests/rr_cli.rs (/Volumes/Storage/rr-build-2026-10-08/rr-target/debug/build/clippy/f297aff0676f4163/out/rr_cli-f297aff0676f4163)
+
+running 4 tests
+test cargo_environment_cannot_disable_rr ... ok
+test rustc_argument_files_work_and_cannot_disable_rules ... ok
+test explicit_prebuilt_dependencies_and_local_modules_work ... ok
+test init_check_lint_and_build_native_binary_without_manifest ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+
+     Running tests/symbols-used.rs (/Volumes/Storage/rr-build-2026-10-08/rr-target/debug/build/clippy/83fc54241f57070e/out/symbols_used-83fc54241f57070e)
+
+running 1 test
+test all_symbols_are_used ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/versioncheck.rs (/Volumes/Storage/rr-build-2026-10-08/rr-target/debug/build/clippy/36541946567ef58a/out/versioncheck-36541946567ef58a)
+
+running 3 tests
+test check_host_compiler ... ok
+test consistent_clippy_crate_versions ... ok
+test check_that_clippy_has_the_same_major_version_as_rustc ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/workspace.rs (/Volumes/Storage/rr-build-2026-10-08/rr-target/debug/build/clippy/76c25217a72ef575/out/workspace-76c25217a72ef575)
+
+running 2 tests
+test test_module_style_with_dep_in_subdir ... ok
+test test_no_deps_ignores_path_deps_in_workspaces ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.35s
+

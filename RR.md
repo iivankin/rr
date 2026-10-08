@@ -131,17 +131,30 @@ Temporary build/Cargo caches and generated fixture lockfiles were removed.
 
 ## Distribution size
 
-The macOS arm64 bundle is stripped by default: approximately 296 MiB instead of
-329 MiB. This removes local/debug symbols from rr, rustc_driver and LLVM, so
-compiler-crash stacks can have fewer function names. Source diagnostics,
-metadata and generated programs are unaffected. LLVM target support is retained.
-The stripped package passed the relocated distribution smoke checks.
+The new macOS ARM64 bundle is approximately 217.37 MiB unpacked, compared with
+296.33 MiB for the previous stripped stock-toolchain bundle (329 MiB unstripped).
+The reduction is 78.95 MiB, or 26.64%. The executable embeds rustc_driver and
+AArch64-only LLVM with ThinLTO; it depends dynamically only on system macOS
+libraries. It is stripped and ad-hoc signed. Compiler-crash stacks can therefore
+have fewer function names; source diagnostics and compiler inputs are retained.
 
-Only macOS arm64 core/alloc/compiler_builtins are bundled. Cross compilation
-requires a matching target sysroot and linker/SDK supplied separately. Building
-LLVM with only AArch64 would remove code generation for other architectures;
-ARM64 targets on other operating systems would still require their own target
-libraries and linking tools. No such LLVM rebuild has been applied.
+| Part | Size |
+| --- | ---: |
+| rr, including compiler driver and LLVM | 125.21 MiB |
+| Complete core/alloc/compiler_builtins objects and metadata | 76.86 MiB |
+| License notices | 15.29 MiB |
+| Version, configuration and documentation | about 0.01 MiB |
+
+The bundle passed relocated init/check/lint/build, native execution, explicit
+dependency, local module, alloc and restriction checks without Rust/Cargo tools
+in PATH or loader/sysroot overrides. Compiler libraries were built from the
+pinned source; core and alloc source code was not modified. The compiler keeps
+its language machinery and auxiliary interfaces.
+
+Only the macOS ARM64 target sysroot and AArch64 backend are bundled. Other ARM64
+targets need their own libraries and linker/SDK. This executable cannot generate
+code for x86_64 or other LLVM architectures. Detailed build/check logs are in
+verification/static-compiler-2026-10-08/.
 
 
 ## GitHub Actions: reduced LLVM and static compiler driver
@@ -161,10 +174,39 @@ The workflow runs formatting, check, all-target/all-feature Clippy, tests and
 relocated standalone smoke checks before uploading a tar.gz artifact. It checks
 that rr has only system dynamic dependencies and records the AArch64-only backend
 list from the built llvm-config. The exact bootstrap configuration accompanies the artifact.
-The compiler/LLVM build script refuses to run outside GitHub Actions.
+The same `scripts/build-toolchain.sh` can build locally with explicit source,
+scratch and installation directories. Put these directories, CARGO_HOME,
+CARGO_TARGET_DIR and TMPDIR on the build volume; RR_BUILD_JOBS sets parallelism.
+Set SYSROOT to the installed compiler directory when checking or testing the
+unpackaged static development drivers. The packaged rr selects its adjacent
+sysroot automatically.
+The upstream formatting test also needs the existing rustup executable in PATH.
 Sticky disks and persistent Actions build caches are not used; compiler build directories are
 on the ephemeral runner. Artifacts are kept for 14 days.
 
 Run the **Build rr with static driver and ARM64 LLVM** workflow manually under
 Actions in github.com/loomatech/rr. The source repository uses Cargo to bootstrap
 rr; projects compiled by the distributed rr still use only its direct CLI.
+
+## Planned native distributions
+
+The intended release set is one independent bundle per OS and architecture:
+
+| OS | Architecture | LLVM backend |
+| --- | --- | --- |
+| macOS | ARM64 | AArch64 |
+| macOS | x86_64 | X86 |
+| Linux | ARM64 | AArch64 |
+| Linux | x86_64 | X86 |
+| Windows | ARM64 | AArch64 |
+| Windows | x86_64 | X86 |
+
+Each bundle contains its own native executable and matching target sysroot,
+with only its native LLVM backend. These are planned distributions, not six
+verified releases: the current packaging and release workflow support macOS
+ARM64 only. Each additional platform needs native build and execution checks.
+Cross compilation between architectures is outside the bundled release set.
+
+Keep core and alloc intact. Do not remove compiler language machinery or
+auxiliary rustc interfaces in this pass; the current compiler changes only
+enable static driver linking and retain the necessary object archives.

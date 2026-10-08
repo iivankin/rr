@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
-"""Apply the two required, checked changes to the pinned Rust source in CI."""
+"""Apply the two required, checked changes to the pinned Rust source."""
 from pathlib import Path
 import sys
+
+
+def patch(path, old, new):
+    source = path.read_text()
+    # A local build may resume after a failed compile or download. Accept only
+    # the exact original text or our exact already-applied replacement.
+    if source.count(new) == 1 and old not in source:
+        return
+    if source.count(old) != 1 or new in source:
+        raise SystemExit(f"Pinned source changed: {path}; refusing an unverified patch")
+    path.write_text(source.replace(old, new))
+
 
 root = Path(sys.argv[1])
 manifest = root / "compiler/rustc_driver/Cargo.toml"
 old = 'crate-type = ["dylib"]'
 new = '''# rr embeds the compiler driver; do not export a separate compiler dylib.
 crate-type = ["rlib"]'''
-source = manifest.read_text()
-if source.count(old) != 1:
-    raise SystemExit("Pinned rustc_driver crate-type changed; refusing an unverified patch")
-manifest.write_text(source.replace(old, new))
+patch(manifest, old, new)
 
 bootstrap = root / "src/bootstrap/src/core/build_steps/compile.rs"
 old = '''                    // Distribute the rest of the rustc crates as rmeta files only to reduce
@@ -21,7 +30,4 @@ old = '''                    // Distribute the rest of the rustc crates as rmeta
 new = '''                    // rr statically links rustc_driver, so private compiler crates
                     // need their object archives as well as separate type metadata.
                     filename.ends_with(".rmeta") || filename.ends_with(".rlib")'''
-source = bootstrap.read_text()
-if source.count(old) != 1:
-    raise SystemExit("Pinned bootstrap artifact filter changed; refusing an unverified patch")
-bootstrap.write_text(source.replace(old, new))
+patch(bootstrap, old, new)

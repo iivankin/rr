@@ -1,0 +1,42 @@
+PASS: local static compiler/LLVM build on external Storage (2026-10-08)
+
+Artifacts:
+  /Volumes/Storage/rr-macos-arm64-2026-10-08
+  /Volumes/Storage/rr-macos-arm64-2026-10-08.tar.gz
+Size: 217.37 MiB unpacked; 71.56 MiB tar.gz.
+Previous stripped stock bundle: 296.33 MiB.
+Reduction: 78.95 MiB (26.64%).
+
+Compiler: Rust 1.99.0-nightly, source 84b36a78a28a63f134171c670be1932ffa2485f8.
+LLVM: 23.1.0, source 21cf28432798952d942bacc6bcee3a328faa3638, AArch64 only.
+Native LLVM, stage2 compiler and release rr use ThinLTO.
+rustc_driver and LLVM are static in rr; dynamic dependencies are system macOS libraries.
+core and alloc sources are unchanged. No compiler components were removed.
+Only driver crate type and bootstrap object-archive retention were patched.
+All tracked Rust sources in the main rr repo matched the tested checkout.
+
+Checks:
+  cargo fmt --all --check: PASS
+  cargo check --locked: PASS
+  cargo-clippy clippy --all-targets --all-features -- -D warnings: PASS
+  cargo test --locked -- --skip 5041_allow_dev_build: PASS
+  rr restrictions: 18 passed; rr CLI: 4 passed.
+  Clippy UI: 1839 passed, 6 ignored; TOML: 194 passed.
+  Cargo UI: 51 passed, 1 excluded; dogfood: 9 packages passed.
+  Relocated standalone init/check/lint/build/native/extern/modules/alloc/restrictions: PASS
+  Same relocated smoke after removal of compiler/build source and caches: PASS
+  Unavailable explicit TMPDIR is rejected without system-disk fallback: PASS
+
+The unchanged excluded nix 0.9 fixture relies on libc APIs removed on macOS;
+its original failure is documented in verification/summary.txt.
+Initial setup failures and successful reruns are retained in logs:
+  static development drivers needed SYSROOT pointing to the custom toolchain;
+  the upstream formatting test needed the existing rustup executable in PATH.
+The distribution smoke removes Rust/Cargo PATH entries and DYLD/SYSROOT overrides.
+
+Cleanup: task-owned build tree, Rust/LLVM source checkouts, downloaded bootstrap
+compiler, installed development toolchain, targets, Ninja virtualenv, Cargo home,
+vendor directories, clang/cache directories and temporary smoke copies removed.
+Existing user Rust/Cargo installations and the previous release bundle retained.
+Future native Linux/Windows/macOS x86_64 and ARM64 distributions remain planned;
+this verified artifact is macOS ARM64 only. No sticky disks or Actions runs used.
