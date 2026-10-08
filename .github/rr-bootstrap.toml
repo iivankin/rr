@@ -6,13 +6,15 @@ change-id = "ignore"
 build = "aarch64-apple-darwin"
 host = ["aarch64-apple-darwin"]
 target = ["aarch64-apple-darwin"]
-jobs = 2
+# Leave memory and CPU capacity for ThinLTO while compiling dependencies.
+jobs = 6
 docs = false
 compiler-docs = false
 extended = false
 
 [llvm]
 download-ci-llvm = false
+thin-lto = true
 targets = "AArch64"
 experimental-targets = ""
 link-shared = false
@@ -29,8 +31,8 @@ optimize = true
 debuginfo-level = 0
 debug-assertions = false
 incremental = false
-# Avoid a large whole-compiler LTO link on the standard 7 GiB Actions runner.
-lto = "off"
+# Retain bitcode in compiler rlibs for the final statically linked rr ThinLTO.
+lto = "thin"
 codegen-backends = ["llvm"]
 omit-git-hash = false
 rpath = true

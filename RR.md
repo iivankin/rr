@@ -146,10 +146,12 @@ libraries and linking tools. No such LLVM rebuild has been applied.
 
 ## GitHub Actions: reduced LLVM and static compiler driver
 
-The manual workflow `.github/workflows/rr-arm64.yml` runs on macOS 15 arm64.
+The manual workflow `.github/workflows/rr-arm64.yml` runs on Blacksmith macOS 15
+arm64 (12 vCPU / 48 GB RAM), with six compilation workers and one LLVM link job.
 It fetches Rust commit 84b36a78a28a63f134171c670be1932ffa2485f8 and its exact LLVM
 submodule, builds stage2 Rust with LLVM.targets=AArch64, and compiles rr against
 that matching compiler. No prebuilt full LLVM or compiler driver is substituted.
+LLVM, stage2 compiler libraries and the release rr executable use ThinLTO.
 LLVM and rustc_driver are statically linked into rr. System macOS libraries
 remain dynamic; core/alloc objects and metadata stay external as compiler inputs.
 The bootstrap artifact filter also retains private compiler rlibs, because
@@ -160,9 +162,9 @@ relocated standalone smoke checks before uploading a tar.gz artifact. It checks
 that rr has only system dynamic dependencies and records the AArch64-only backend
 list from the built llvm-config. The exact bootstrap configuration accompanies the artifact.
 The compiler/LLVM build script refuses to run outside GitHub Actions.
-No persistent Actions build cache is configured; compiler build directories are
+Sticky disks and persistent Actions build caches are not used; compiler build directories are
 on the ephemeral runner. Artifacts are kept for 14 days.
 
 Run the **Build rr with static driver and ARM64 LLVM** workflow manually under
-Actions in github.com/iivankin/rr. The source repository uses Cargo to bootstrap
+Actions in github.com/loomatech/rr. The source repository uses Cargo to bootstrap
 rr; projects compiled by the distributed rr still use only its direct CLI.
