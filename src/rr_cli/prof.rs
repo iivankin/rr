@@ -90,6 +90,12 @@ pub fn flags(
             "--extern".into(),
             format!("force:rr_prof_rt={}", runtime.display()),
         ]);
+        // The runtime's memcpy and memmove stand for compiler_builtins',
+        // which on ELF are weak; on COFF they are not, and the first
+        // definition, the runtime's, is to win.
+        if super::target::is_rr(target) && super::target::is_windows(target) {
+            compiler.push("-Clink-arg=--allow-multiple-definition".into());
+        }
     }
     Ok(())
 }
