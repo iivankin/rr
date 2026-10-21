@@ -24,7 +24,12 @@ def install(runtime, bundle):
     fuzz = bundle / 'fuzz'
     fuzz.mkdir(exist_ok=True)
     shutil.copy2(templates / 'fuzz.rs.in', fuzz / 'fuzz.rs')
-    shutil.copy2(templates / f'fuzz-{system}.flags', fuzz / 'fuzz.flags')
+    flags = (templates / f'fuzz-{system}.flags').read_text().splitlines()
+    if host == 'aarch64-pc-windows-msvc':
+        # There each function's counters are padded to an alignment, so a
+        # table of one PC per counter cannot match them: counters only.
+        flags.remove('-Cllvm-args=-sanitizer-coverage-pc-table')
+    (fuzz / 'fuzz.flags').write_text('\n'.join(flags) + '\n')
     shutil.copy2(templates / 'asan.flags', fuzz / 'asan.flags')
     shutil.copy2(templates / 'USAGE.txt', fuzz / 'USAGE.txt')
 
