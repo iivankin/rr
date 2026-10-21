@@ -41,7 +41,7 @@ with tempfile.TemporaryDirectory(prefix="rr-relocated-", dir=os.environ.get("TMP
 
     run("--version")
     sysroot = run("--print", "sysroot").stdout.strip()
-    assert Path(sysroot) == bundle, sysroot
+    assert Path(sysroot).resolve() == bundle.resolve(), sysroot
     run("init", "native")
     run("native/src/main.rs", "--crate-name", "native", "-O", "-o", f"native/app{exe}")
     run("lint", "native/src/main.rs", "--crate-name", "native", "-Dwarnings")
