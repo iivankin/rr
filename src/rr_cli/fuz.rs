@@ -110,8 +110,7 @@ pub fn run(args: &[String]) -> io::Result<ExitCode> {
     let runtime_args = args.get(split + 1..).unwrap_or_default();
     let root = match &target {
         Some(path) => std::env::current_dir()?.join("fuzz").join(path.replace("::", "_")),
-        None => Path::new(source)
-            .canonicalize()?
+        None => super::canonical(Path::new(source))?
             .parent()
             .ok_or_else(|| io::Error::other("missing source directory"))?
             .to_owned(),

@@ -196,7 +196,18 @@ fn has_key(arg: &str, key: &str) -> bool {
 
 fn executable() -> io::Result<PathBuf> {
     // Resolve launch symlinks so runtime libraries remain relative to the bundle.
-    env::current_exe()?.canonicalize()
+    canonical(&env::current_exe()?)
+}
+
+/// path with its links resolved. On Windows that is a `\\?\` path, which
+/// many programs do not read: a drive path drops the prefix.
+fn canonical(path: &Path) -> io::Result<PathBuf> {
+    let resolved = path.canonicalize()?;
+    let text = resolved.to_string_lossy();
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => Ok(PathBuf::from(rest)),
+        _ => Ok(resolved),
+    }
 }
 
 fn help() {

@@ -141,7 +141,7 @@ pub fn run(args: &[String]) -> io::Result<ExitCode> {
     let scratch;
     let dir = if let Some(dir) = &o.keep {
         fs::create_dir_all(dir)?;
-        dir.canonicalize()?
+        super::canonical(dir)?
     } else {
         scratch = workspace::Scratch::new()?;
         scratch.path.clone()
