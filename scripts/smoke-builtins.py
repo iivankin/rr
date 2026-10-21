@@ -108,7 +108,7 @@ with tempfile.TemporaryDirectory(prefix='rr-builtins-', dir=env.get('TMPDIR')) a
 
     def run(*args, good=True, rule=None):
         result = subprocess.run([str(rr), *map(str, args)], cwd=work, env=env,
-                                text=True, capture_output=True)
+                                text=True, encoding="utf-8", errors="replace", capture_output=True)
         assert (result.returncode == 0) == good, result.stderr
         if rule:
             assert rule in result.stderr, result.stderr

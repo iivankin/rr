@@ -34,7 +34,7 @@ with tempfile.TemporaryDirectory(prefix="rr-relocated-", dir=os.environ.get("TMP
 
     def run(*args, good=True):
         result = subprocess.run([str(rr), *args], cwd=root, env=env,
-                                text=True, capture_output=True)
+                                text=True, encoding="utf-8", errors="replace", capture_output=True)
         if (result.returncode == 0) != good:
             raise AssertionError(f"{args}: {result.stdout}\n{result.stderr}")
         return result
@@ -61,7 +61,7 @@ with tempfile.TemporaryDirectory(prefix="rr-relocated-", dir=os.environ.get("TMP
     fuzzing = (bundle / "fuzz/fuzz.flags").is_file()
     def make(*targets):
         done = subprocess.run(["make", f"RR={link}", *targets], cwd=root / "project",
-                              env=env, text=True, capture_output=True)
+                              env=env, text=True, encoding="utf-8", errors="replace", capture_output=True)
         if done.returncode != 0:
             raise AssertionError(f"make {' '.join(targets)}\n{done.stdout}\n{done.stderr}")
         return done
@@ -76,12 +76,12 @@ with tempfile.TemporaryDirectory(prefix="rr-relocated-", dir=os.environ.get("TMP
     profiled = make("prof").stdout
     assert "greet  src/greet.rs:" in profiled and "<- run  src/main.rs:" in profiled, profiled
     over = subprocess.run(["make", f"RR={link}", "prof", "PROFMAX=1"], cwd=root / "project", env=env,
-                          text=True, capture_output=True)
+                          text=True, encoding="utf-8", errors="replace", capture_output=True)
     assert over.returncode != 0 and "above the budget" in over.stdout, over.stdout
     copies = profiled.split("copies through memcpy and memmove", 1)
     assert len(copies) == 2 and "greet  src/greet.rs:" in copies[1], profiled
     over = subprocess.run(["make", f"RR={link}", "prof", "PROFCOPIED=1"], cwd=root / "project", env=env,
-                          text=True, capture_output=True)
+                          text=True, encoding="utf-8", errors="replace", capture_output=True)
     assert over.returncode != 0 and "bytes copied, above the budget" in over.stdout, over.stdout
     # The programs in examples/corpus: every check their Makefiles offer,
     # and a short run of each fuzz target, on this bundle.
@@ -94,7 +94,7 @@ with tempfile.TemporaryDirectory(prefix="rr-relocated-", dir=os.environ.get("TMP
             steps.append(("fuzz", "FUZZTIME=5"))
         for targets in steps:
             done = subprocess.run(["make", f"RR={link}", *targets], cwd=copy, env=env,
-                                  text=True, capture_output=True)
+                                  text=True, encoding="utf-8", errors="replace", capture_output=True)
             if done.returncode != 0:
                 raise AssertionError(f"{program.name}: make {' '.join(targets)}\n{done.stdout}\n{done.stderr}")
     run("init", "library", "--lib")

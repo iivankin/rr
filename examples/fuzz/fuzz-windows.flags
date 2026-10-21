@@ -15,3 +15,5 @@
 -ldylib=kernel32
 -ldylib=advapi32
 -ldylib=dbghelp
+-Clink-arg=/SUBSYSTEM:CONSOLE
+-Clink-arg=/INCLUDE:main
