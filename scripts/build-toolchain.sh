@@ -74,13 +74,3 @@ case "$rr_host" in
 esac
 # Fail before building rr if the bootstrap change did not retain static objects.
 test -n "$(find "$rr_prefix/lib/rustlib/$rr_host/lib" -name 'librustc_driver-*.rlib' -print -quit)"
-if [ -n "${GITHUB_ENV:-}" ]; then
-    # A static development driver has no compiler dylib path to locate its sysroot.
-    cat >> "$GITHUB_ENV" <<ENV
-RR_TOOLCHAIN=$rr_prefix
-RR_HOST=$rr_host
-RUSTC=$rr_prefix/bin/rustc
-RUSTDOC=$rr_prefix/bin/rustdoc
-SYSROOT=$rr_prefix
-ENV
-fi

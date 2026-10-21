@@ -115,8 +115,36 @@ jobs:
         run: mv ci-rust "$RR_TEMP/rust"
       - name: Cargo, rustfmt and the library source for developing rr
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt,rust-src
+      # The compiler takes hours to build and changes only with these files:
+      # it is kept between runs, saved as soon as it is built, so that a
+      # later step's failure does not lose it.
+      - name: Restore the compiler built before
+        id: toolchain
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.RR_TEMP }}/rr-toolchain
+          key: rr-toolchain-${{ matrix.name }}-${{ env.RUST_COMMIT }}-${{ hashFiles('.github/rr-bootstrap.toml', 'scripts/build-toolchain.sh', 'scripts/prepare-static-driver.py') }}
       - name: Build LLVM and the matching static compiler
+        if: steps.toolchain.outputs.cache-hit != 'true'
         run: scripts/build-toolchain.sh "$RR_TEMP/rust" "$RR_TEMP/rr-scratch" "$RR_TEMP/rr-toolchain"
+      - name: Keep the compiler for later runs
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.RR_TEMP }}/rr-toolchain
+          key: ${{ steps.toolchain.outputs.cache-primary-key }}
+      - name: LLVM's source, for libFuzzer, when the compiler came from the cache
+        if: steps.toolchain.outputs.cache-hit == 'true'
+        run: git -C "$RR_TEMP/rust" submodule update --init --depth 1 src/llvm-project
+      - name: The compiler on the environment, for rr's checks
+        run: |
+          rr_rustc="$RR_TEMP/rr-toolchain/bin/rustc"
+          {
+            echo "RR_TOOLCHAIN=$RR_TEMP/rr-toolchain"
+            echo "RUSTC=$rr_rustc"
+            echo "RUSTDOC=$RR_TEMP/rr-toolchain/bin/rustdoc"
+            echo "SYSROOT=$RR_TEMP/rr-toolchain"
+          } >> "$GITHUB_ENV"
       - name: rr's own checks
         if: runner.os != 'Windows'
         env:
