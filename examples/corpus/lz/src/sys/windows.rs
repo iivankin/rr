@@ -1,0 +1,204 @@
+//! What the program needs of Windows: the heap, input, output, arguments
+//! and an end on a bug, through kernel32.dll; there is no C runtime. The rest of
+//! the crate calls only this; unsafe stays here.
+
+use alloc::vec::Vec;
+use core::alloc::{GlobalAlloc, Layout};
+use core::ffi::{c_char, c_void};
+use core::ptr::null_mut;
+
+#[link(name = "kernel32", kind = "raw-dylib")]
+// rr: escape(unsafe): each signature is kernel32's, from its documentation.
+unsafe extern "system" {
+    fn GetProcessHeap() -> *mut c_void;
+    fn HeapAlloc(heap: *mut c_void, flags: u32, size: usize) -> *mut c_void;
+    fn HeapReAlloc(heap: *mut c_void, flags: u32, p: *mut c_void, size: usize) -> *mut c_void;
+    fn HeapFree(heap: *mut c_void, flags: u32, p: *mut c_void) -> i32;
+    fn GetStdHandle(which: u32) -> *mut c_void;
+    fn WriteFile(
+        file: *mut c_void,
+        p: *const u8,
+        n: u32,
+        written: *mut u32,
+        overlapped: *mut c_void,
+    ) -> i32;
+    fn ReadFile(
+        file: *mut c_void,
+        p: *mut u8,
+        n: u32,
+        read: *mut u32,
+        overlapped: *mut c_void,
+    ) -> i32;
+}
+
+/// The alignment HeapAlloc gives every block.
+const HEAP_ALIGN: usize = 16;
+const HEAP_ZERO_MEMORY: u32 = 8;
+const STD_INPUT_HANDLE: u32 = (-10i32).cast_unsigned();
+const STD_OUTPUT_HANDLE: u32 = (-11i32).cast_unsigned();
+const STD_ERROR_HANDLE: u32 = (-12i32).cast_unsigned();
+
+/// The global allocator: the process heap, as std's System is on
+/// Windows. A block aligned beyond the heap's is taken larger and
+/// aligned inside, with the heap's own pointer kept just before it.
+pub struct Heap;
+
+/// The process's heap.
+fn heap() -> *mut c_void {
+    // rr: escape(unsafe): the process heap is always there.
+    unsafe { GetProcessHeap() }
+}
+
+/// A block for l, zeroed or not.
+fn block(l: Layout, flags: u32) -> *mut u8 {
+    let heap = heap();
+    if l.align() <= HEAP_ALIGN {
+        // rr: escape(unsafe): HeapAlloc takes a plain size.
+        return unsafe { HeapAlloc(heap, flags, l.size()) }.cast();
+    }
+    let Some(total) = l.size().checked_add(l.align()) else {
+        return null_mut();
+    };
+    // rr: escape(unsafe): HeapAlloc takes a plain size.
+    let p = unsafe { HeapAlloc(heap, flags, total) }.cast::<u8>();
+    if p.is_null() {
+        return p;
+    }
+    // p is aligned to 16, l to more: the aligned block starts 16 bytes or
+    // more into p's, which leaves room for the pointer before it.
+    let offset = match p.align_offset(l.align()) {
+        0 => l.align(),
+        o => o,
+    };
+    let aligned = p.wrapping_add(offset);
+    // rr: escape(unsafe, cast): the word before aligned lies within the block, past p.
+    unsafe { aligned.cast::<*mut u8>().wrapping_sub(1).write_unaligned(p) };
+    aligned
+}
+
+/// The heap's own pointer of a block of l.
+fn origin(p: *mut u8, l: Layout) -> *mut c_void {
+    if l.align() <= HEAP_ALIGN {
+        return p.cast();
+    }
+    // rr: escape(unsafe, cast): block kept the heap's pointer just before p.
+    unsafe { p.cast::<*mut u8>().wrapping_sub(1).read_unaligned() }.cast()
+}
+
+// Blocks come from the process heap and go back to it by the pointer
+// it gave; an aligned block keeps that pointer before it: GlobalAlloc's
+// contract holds.
+// rr: escape(unsafe): GlobalAlloc is unsafe to implement.
+unsafe impl GlobalAlloc for Heap {
+    // rr: escape(unsafe): the signature GlobalAlloc requires.
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        block(l, 0)
+    }
+
+    // rr: escape(unsafe): the signature GlobalAlloc requires.
+    unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+        block(l, HEAP_ZERO_MEMORY)
+    }
+
+    // rr: escape(unsafe): the signature GlobalAlloc requires.
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        // rr: escape(unsafe): the block came from the process heap.
+        unsafe { HeapFree(heap(), 0, origin(p, l)) };
+    }
+
+    // rr: escape(unsafe): the signature GlobalAlloc requires.
+    unsafe fn realloc(&self, p: *mut u8, l: Layout, size: usize) -> *mut u8 {
+        if l.align() <= HEAP_ALIGN {
+            // rr: escape(unsafe): p is a live block of the process heap.
+            return unsafe { HeapReAlloc(heap(), 0, p.cast(), size) }.cast();
+        }
+        let q = block(Layout::from_size_align(size, l.align()).unwrap_or(l), 0);
+        if !q.is_null() {
+            // rr: escape(unsafe): both blocks are live and hold at least this much.
+            unsafe { core::ptr::copy_nonoverlapping(p, q, l.size().min(size)) };
+            // rr: escape(unsafe): p came from this heap and is not used after.
+            unsafe { HeapFree(heap(), 0, origin(p, l)) };
+        }
+        q
+    }
+}
+
+fn write_all(which: u32, mut p: &[u8]) {
+    // rr: escape(unsafe): the standard handles are the process's own.
+    let handle = unsafe { GetStdHandle(which) };
+    while !p.is_empty() {
+        let n = u32::try_from(p.len()).unwrap_or(u32::MAX);
+        let mut written = 0;
+        // rr: escape(unsafe): p is readable memory of at least n bytes.
+        let ok = unsafe { WriteFile(handle, p.as_ptr(), n, &raw mut written, null_mut()) };
+        // An error, or nothing written: give up.
+        if ok == 0 || written == 0 {
+            return;
+        }
+        p = &p[written as usize..];
+    }
+}
+
+/// Standard input, all of it up to max bytes, onto out; false when it
+/// holds more or cannot be read. A pipe whose writer is gone has ended.
+pub fn stdin(out: &mut Vec<u8>, max: usize) -> bool {
+    // rr: escape(unsafe): the standard handles are the process's own.
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    let mut buf = [0u8; 16384];
+    loop {
+        let mut n = 0;
+        let room = u32::try_from(buf.len()).unwrap_or(u32::MAX);
+        // rr: escape(unsafe): buf is writable memory of at least room bytes.
+        let r = unsafe { ReadFile(handle, buf.as_mut_ptr(), room, &raw mut n, null_mut()) };
+        let n = n as usize;
+        if n == 0 {
+            return true;
+        }
+        if r == 0 || out.len() + n > max {
+            return false;
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+}
+
+pub fn stdout(p: &[u8]) {
+    write_all(STD_OUTPUT_HANDLE, p);
+}
+
+pub fn stderr(p: &[u8]) {
+    write_all(STD_ERROR_HANDLE, p);
+}
+
+/// main's arguments as byte strings, in UTF-8.
+///
+/// # Safety
+/// argv must hold argc NUL-terminated strings that live as long as the
+/// process, as main's own do.
+// rr: escape(unsafe): the caller vouches for argv, which only main can.
+pub unsafe fn args(argc: i32, argv: *const *const c_char) -> Vec<&'static [u8]> {
+    let argc = usize::try_from(argc).unwrap_or(0);
+    let mut out = Vec::with_capacity(argc);
+    // rr: escape(unsafe): argv holds argc of main's strings, per the contract.
+    let argv = unsafe { core::slice::from_raw_parts(argv, argc) };
+    for &s in argv {
+        // rr: escape(unsafe): s is NUL-terminated and lives as long as the process.
+        out.push(unsafe { core::ffi::CStr::from_ptr(s) }.to_bytes());
+    }
+    out
+}
+
+/// End the process at once, as abort does: a bug was found. Windows's
+/// fast fail ends it without running anything more.
+pub fn die() -> ! {
+    // FAST_FAIL_FATAL_APP_EXIT.
+    #[cfg(target_arch = "x86_64")]
+    // rr: escape(unsafe): __fastfail does not return.
+    unsafe {
+        core::arch::asm!("int 0x29", in("ecx") 7, options(noreturn, nostack));
+    }
+    #[cfg(target_arch = "aarch64")]
+    // rr: escape(unsafe): __fastfail does not return.
+    unsafe {
+        core::arch::asm!("brk #0xf003", in("x0") 7, options(noreturn, nostack));
+    }
+}

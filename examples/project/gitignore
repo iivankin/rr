@@ -1,0 +1,4 @@
+build/
+%NAME%
+%NAME%.exe
+fuzz/

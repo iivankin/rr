@@ -16,6 +16,36 @@ use rustc_lint::{LateContext, Lint, LintContext};
 use rustc_span::Span;
 use std::env;
 
+/// rr: what answers an emission of a Clippy lint rr enforces.
+pub enum Escaped {
+    /// An adjacent `// rr: escape(kind): reason` names the lint's kind.
+    Yes,
+    /// Nothing does.
+    No,
+    /// An adjacent reason there names other kinds, not this one.
+    Unnamed(Span, &'static str),
+}
+
+/// rr's check of an emission. Unset outside rr.
+pub static ESCAPE: std::sync::OnceLock<fn(&rustc_session::Session, &'static Lint, Span) -> Escaped> =
+    std::sync::OnceLock::new();
+
+fn escaped(sess: &rustc_session::Session, lint: &'static Lint, sp: &MultiSpan) -> Escaped {
+    match (ESCAPE.get(), sp.primary_span()) {
+        (Some(check), Some(span)) => check(sess, lint, span),
+        _ => Escaped::No,
+    }
+}
+
+fn unnamed_note(diag: &mut Diag<'_, ()>, hint: Option<(Span, &'static str)>) {
+    if let Some((comment, kind)) = hint {
+        diag.span_note(
+            comment,
+            format!("this reason does not name `{kind}`; write `// rr: escape({kind}): ...`"),
+        );
+    }
+}
+
 fn docs_link(diag: &mut Diag<'_, ()>, lint: &'static Lint) {
     if env::var("CLIPPY_DISABLE_DOCS_LINKS").is_err()
         && let Some(lint) = lint.name_lower().strip_prefix("clippy::")
@@ -251,6 +281,11 @@ where
     }
 
     let sp = sp.into();
+    let hint = match escaped(cx.sess(), lint, &sp) {
+        Escaped::Yes => return,
+        Escaped::No => None,
+        Escaped::Unnamed(comment, kind) => Some((comment, kind)),
+    };
     #[expect(clippy::disallowed_methods)]
     cx.emit_span_lint(
         lint,
@@ -259,6 +294,7 @@ where
             diag.primary_message(msg);
             diag.span(sp);
             f(diag);
+            unnamed_note(diag, hint);
             docs_link(diag, lint);
 
             #[cfg(debug_assertions)]
@@ -329,6 +365,12 @@ pub fn span_lint_hir_and_then(
     msg: impl Into<DiagMessage>,
     f: impl FnOnce(&mut Diag<'_, ()>),
 ) {
+    let sp = sp.into();
+    let hint = match escaped(cx.tcx.sess, lint, &sp) {
+        Escaped::Yes => return,
+        Escaped::No => None,
+        Escaped::Unnamed(comment, kind) => Some((comment, kind)),
+    };
     #[expect(clippy::disallowed_methods)]
     cx.tcx.emit_node_span_lint(
         lint,
@@ -337,6 +379,7 @@ pub fn span_lint_hir_and_then(
         rustc_errors::DiagDecorator(|diag| {
             diag.primary_message(msg);
             f(diag);
+            unnamed_note(diag, hint);
             docs_link(diag, lint);
 
             #[cfg(debug_assertions)]

@@ -274,10 +274,10 @@ fn run_rustfmt(update_mode: UpdateMode) {
     let args: Vec<_> = walk_dir_no_dot_or_target(".")
         .filter_map(|e| {
             let e = expect_action(e, ErrAction::Read, ".");
-            e.path()
-                .as_os_str()
-                .as_encoded_bytes()
-                .ends_with(b".rs")
+            // Programs written in restricted Rust keep rr fmt's style, not
+            // this repository's.
+            let rr_program = e.path().starts_with("./examples/corpus");
+            (!rr_program && e.path().as_os_str().as_encoded_bytes().ends_with(b".rs"))
                 .then(|| e.into_path().into_os_string())
         })
         .collect();

@@ -41,21 +41,80 @@ pub fn init(args: &[String]) -> io::Result<ExitCode> {
                 kind_set = true;
             },
             path if !path.starts_with('-') && directory.is_none() => directory = Some(PathBuf::from(path)),
-            _ => return Err(io::Error::other("usage: rr init [DIR] [--lib|--bin]")),
+            _ => return Err(io::Error::other("usage: rr init [DIR] [--lib]")),
         }
     }
     let root = directory.unwrap_or_else(|| PathBuf::from("."));
     fs::create_dir_all(&root)?;
-    let file = root.join(if library { "lib.rs" } else { "main.rs" });
-    // create_new prevents init from overwriting existing source code.
-    let mut output = fs::OpenOptions::new().write(true).create_new(true).open(&file)?;
-    output.write_all(if library { LIB.as_bytes() } else { BIN.as_bytes() })?;
-    println!("Created {}", file.display());
+    let name = crate_name(&root.canonicalize()?);
+    let files: &[(&str, &str)] = if library { &[("src/lib.rs", LIB)] } else { PROJECT };
+    // Refuse before writing anything, so that init never overwrites code
+    // or leaves half a project.
+    for (path, _) in files {
+        if root.join(path).exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} exists", root.join(path).display()),
+            ));
+        }
+    }
+    for (path, text) in files {
+        let file = root.join(path);
+        if let Some(dir) = file.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        let mut output = fs::OpenOptions::new().write(true).create_new(true).open(&file)?;
+        output.write_all(text.replace("%NAME%", &name).as_bytes())?;
+        println!("Created {}", file.display());
+    }
+    if !library {
+        println!("Next: make fmt && make format check lint && make && make test (see AGENTS.md)");
+    }
     Ok(ExitCode::SUCCESS)
 }
 
-const LIB: &str = "#![no_std]\n\npub fn answer() -> u32 {\n    42\n}\n";
+/// The directory's name as a crate name: [a-z0-9_], not starting with a
+/// digit.
+fn crate_name(dir: &std::path::Path) -> String {
+    let base = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let mut name: String = base
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
+        name.insert_str(0, "app_");
+    }
+    name
+}
 
-// This minimal native executable uses the platform C runtime for process entry
-// and abort, while requiring neither std nor a Rust allocator.
-const BIN: &str = "#![no_std]\n#![no_main]\n\n#[link(name = \"c\")]\nunsafe extern \"C\" {\n    fn abort() -> !;\n}\n\n#[unsafe(no_mangle)]\npub extern \"C\" fn main() -> i32 {\n    0\n}\n\n#[panic_handler]\nfn panic(_: &core::panic::PanicInfo<'_>) -> ! {\n    // rr: escape: abort terminates the process on panic; the C runtime provides this symbol.\n    unsafe { abort() }\n}\n";
+/// A program as rr projects are laid out: one crate, src/main.rs with
+/// its allocator, panic handler and entry, the system in src/sys/, one
+/// file for each of macOS, Linux and Windows, a
+/// module with its tests, bench and fuzz target beside its code, a
+/// Makefile for every check, and the instructions for whoever changes
+/// it.
+const PROJECT: &[(&str, &str)] = &[
+    ("AGENTS.md", include_str!("../../examples/project/AGENTS.md")),
+    ("Makefile", include_str!("../../examples/project/Makefile")),
+    (".gitignore", include_str!("../../examples/project/gitignore")),
+    ("src/main.rs", include_str!("../../examples/project/src/main.rs.in")),
+    (
+        "src/sys/macos.rs",
+        include_str!("../../examples/project/src/sys/macos.rs.in"),
+    ),
+    (
+        "src/sys/linux.rs",
+        include_str!("../../examples/project/src/sys/linux.rs.in"),
+    ),
+    (
+        "src/sys/windows.rs",
+        include_str!("../../examples/project/src/sys/windows.rs.in"),
+    ),
+    ("src/greet.rs", include_str!("../../examples/project/src/greet.rs.in")),
+];
+
+/// A library crate on its own, for a program to depend on.
+const LIB: &str = "#![no_std]\n\npub fn answer() -> u32 {\n    42\n}\n";

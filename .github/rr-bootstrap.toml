@@ -3,19 +3,21 @@
 change-id = "ignore"
 
 [build]
-build = "aarch64-apple-darwin"
-host = ["aarch64-apple-darwin"]
-target = ["aarch64-apple-darwin"]
+# The build, host and target are the machine's own: bootstrap finds it.
 # Leave memory and CPU capacity for ThinLTO while compiling dependencies.
 jobs = 6
 docs = false
 compiler-docs = false
 extended = false
+# ASan is an optional runtime for instrumented fuzz targets, not the compiler.
+sanitizers = true
 
 [llvm]
 download-ci-llvm = false
 thin-lto = true
-targets = "AArch64"
+# The host's own backend only: build-toolchain.sh sets llvm.targets.
+# On Linux, rr carries its C++ library, as official rustc does.
+static-libstdcpp = true
 experimental-targets = ""
 link-shared = false
 optimize = true
@@ -34,6 +36,8 @@ incremental = false
 # Retain bitcode in compiler rlibs for the final statically linked rr ThinLTO.
 lto = "thin"
 codegen-backends = ["llvm"]
+# rust-lld links rr's Linux and Windows targets with no system linker.
+lld = true
 omit-git-hash = false
 rpath = true
 

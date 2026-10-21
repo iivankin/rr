@@ -22,9 +22,13 @@ fn main() -> Result<(), Errors> {
     println!("{:?}", x.map_err(|_| Errors::Ignored));
     //~^ map_err_ignore
 
-    // Should not warn you because you explicitly ignore the parameter
-    // using a named wildcard value
+    // A name the closure never reads drops the error as well.
     println!("{:?}", x.map_err(|_foo| Errors::Ignored));
+    //~^ map_err_ignore
+
+    // So does a move closure.
+    println!("{:?}", x.map_err(move |_| Errors::Ignored));
+    //~^ map_err_ignore
 
     Ok(())
 }

@@ -1,0 +1,38 @@
+#![no_std]
+#![no_main]
+
+/// # Safety
+/// A nonempty input must reference `size` initialized, readable bytes in one
+/// allocation, valid throughout this call, with `size <= isize::MAX`.
+#[unsafe(no_mangle)]
+// rr: escape(unsafe): libFuzzer supplies size readable bytes for the duration of each call.
+pub unsafe extern "C" fn LLVMFuzzerTestOneInput(pointer: *const u8, size: usize) -> i32 {
+    // A zero-length input may have a null pointer; from_raw_parts still needs nonnull.
+    if size == 0 {
+        test_input(&[]);
+        return 0;
+    }
+    // rr: escape(unsafe): libFuzzer guarantees a valid allocation for this nonempty input.
+    let input = unsafe { core::slice::from_raw_parts(pointer, size) };
+    test_input(input);
+    0
+}
+
+fn test_input(input: &[u8]) {
+    // Replace this with the parser or API under test and the invariants its
+    // result must keep. Invalid input is normal.
+    if let Ok(text) = core::str::from_utf8(input) {
+        assert!(text.len() == input.len());
+    }
+}
+
+// rr: escape(unsafe): abort is the C library's, taking nothing.
+unsafe extern "C" {
+    fn abort() -> !;
+}
+
+#[panic_handler]
+fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
+    // rr: escape(unsafe): abort lets libFuzzer capture and persist the input causing a panic.
+    unsafe { abort() }
+}

@@ -1,12 +1,16 @@
 #[path = "restricted/mod.rs"]
 mod restricted;
 
+#[path = "harness.rs"]
+mod harness;
+
 // Override the C allocator in the same way that the `rustc` binary would do.
 rustc_driver::override_c_allocator_in_binary!();
 
 use clippy_utils::sym;
 use declare_clippy_lint::LintListBuilder;
 use rustc_interface::interface;
+use rustc_middle::ty::{Instance, SymbolName, TyCtxt};
 use rustc_session::config::ErrorOutputType;
 use rustc_session::{EarlyDiagCtxt, Session};
 use rustc_span::symbol::Symbol;
@@ -123,6 +127,57 @@ impl rustc_driver::Callbacks for RustcCallbacks {
 struct ClippyCallbacks {
     clippy_args_var: Option<String>,
     restricted: bool,
+    /// `rr build --prof`: see `profiled_symbol_name`.
+    prof: bool,
+}
+
+type SymbolNameQuery = for<'tcx> fn(TyCtxt<'tcx>, Instance<'tcx>) -> SymbolName<'tcx>;
+
+static SYMBOL_NAME: std::sync::OnceLock<SymbolNameQuery> = std::sync::OnceLock::new();
+
+/// rr prof's renaming. The allocator functions `#[global_allocator]`
+/// defines in the program become `__rg_*`; rr prof's runtime defines its
+/// `rr_prof_rust_*` as the `__rust_*` the program calls, which count each
+/// call and hand it on. (A function named `__rust_alloc` would make the
+/// runtime a second global allocator to the compiler.)
+fn profiled_symbol_name<'tcx>(tcx: TyCtxt<'tcx>, instance: Instance<'tcx>) -> SymbolName<'tcx> {
+    let name = SYMBOL_NAME
+        .get()
+        .map_or(SymbolName::new(tcx, ""), |query| query(tcx, instance));
+    let def = instance.def_id();
+    let item = tcx.opt_item_name(def);
+    for method in ["alloc", "dealloc", "realloc", "alloc_zeroed"] {
+        let rust = rustc_symbol_mangling::mangle_internal_symbol(tcx, &format!("__rust_{method}"));
+        // The runtime's functions keep their new names wherever they are
+        // named, as a Windows link names upstream exports; the program's
+        // allocator is renamed only where it is defined.
+        if name.name == rust && def.is_local() {
+            return SymbolName::new(
+                tcx,
+                &rustc_symbol_mangling::mangle_internal_symbol(tcx, &format!("__rg_{method}")),
+            );
+        }
+        if item.is_some_and(|n| n.as_str() == format!("rr_prof_rust_{method}"))
+            && tcx.crate_name(def.krate).as_str() == "rr_prof_rt"
+        {
+            return SymbolName::new(tcx, &rust);
+        }
+    }
+    name
+}
+
+/// Plain rustc with rr prof's renaming: how rr builds the runtime.
+struct ProfCallbacks;
+
+impl rustc_driver::Callbacks for ProfCallbacks {
+    fn config(&mut self, config: &mut interface::Config) {
+        config.override_queries = Some(override_symbol_name);
+    }
+}
+
+fn override_symbol_name(_: &Session, providers: &mut rustc_middle::util::Providers) {
+    let _ = SYMBOL_NAME.set(providers.queries.symbol_name);
+    providers.queries.symbol_name = profiled_symbol_name;
 }
 
 impl rustc_driver::Callbacks for ClippyCallbacks {
@@ -130,11 +185,15 @@ impl rustc_driver::Callbacks for ClippyCallbacks {
     fn config(&mut self, config: &mut interface::Config) {
         let previous = config.register_lints.take();
         let restricted = self.restricted;
+        if self.prof {
+            config.override_queries = Some(override_symbol_name);
+        }
         if restricted {
             // rr rules are requirements, even with --cap-lints=allow or -A warnings.
             config.opts.lint_cap = None;
             // ForceWarn has priority over Forbid in rustc. Remove that override
             // only for required rr rules; other compiler/Clippy lints retain it.
+            self::restricted::force_clippy(&mut config.opts);
             config.opts.lint_opts.retain(|(name, level)| {
                 *level != rustc_lint::Level::ForceWarn
                     || !(name == "rr" || name == "warnings" || name.starts_with("rr_"))
@@ -165,7 +224,11 @@ impl rustc_driver::Callbacks for ClippyCallbacks {
             list_builder.insert(clippy_lints::declared_lints::LINTS);
             list_builder.register(lint_store);
 
-            let conf = clippy_config::Conf::load(sess);
+            let conf = if restricted {
+                clippy_config::Conf::load_adjusted(sess, self::restricted::adjust_conf)
+            } else {
+                clippy_config::Conf::load(sess)
+            };
             clippy_lints::register_lint_passes(lint_store, conf, !restricted);
             if restricted {
                 self::restricted::register(lint_store);
@@ -187,6 +250,23 @@ impl rustc_driver::Callbacks for ClippyCallbacks {
         // Disable flattening and inlining of format_args!(), so the HIR matches with the AST.
         config.opts.unstable_opts.flatten_format_args = false;
     }
+
+    fn after_crate_root_parsing(
+        &mut self,
+        compiler: &interface::Compiler,
+        krate: &mut rustc_ast::Crate,
+    ) -> rustc_driver::Compilation {
+        self::harness::apply(&compiler.sess, krate);
+        rustc_driver::Compilation::Continue
+    }
+
+    fn after_analysis(&mut self, _: &interface::Compiler, tcx: TyCtxt<'_>) -> rustc_driver::Compilation {
+        // Every rule has heard its reasons by now: what is left answers nothing.
+        if self.restricted {
+            self::restricted::unused_reasons(tcx);
+        }
+        rustc_driver::Compilation::Continue
+    }
 }
 
 fn display_help() -> ExitCode {
@@ -199,7 +279,7 @@ fn display_help() -> ExitCode {
 
 const BUG_REPORT_URL: &str = "https://github.com/rust-lang/rust-clippy/issues/new?template=ice.yml";
 
-pub fn run(mut orig_args: Vec<String>, restricted: bool) -> ExitCode {
+pub fn run(mut orig_args: Vec<String>, restricted: bool, prof: bool) -> ExitCode {
     let early_dcx = EarlyDiagCtxt::new(ErrorOutputType::default());
 
     rustc_driver::init_rustc_env_logger(&early_dcx);
@@ -228,6 +308,10 @@ pub fn run(mut orig_args: Vec<String>, restricted: bool) -> ExitCode {
             })
         }
 
+        if let Err(error) = harness::take(&mut orig_args) {
+            early_dcx.early_fatal(error);
+        }
+
         let sys_root_env = std::env::var("SYSROOT").ok();
         let pass_sysroot_env_if_given = |args: &mut Vec<String>, sys_root_env| {
             if let Some(sys_root) = sys_root_env
@@ -247,7 +331,11 @@ pub fn run(mut orig_args: Vec<String>, restricted: bool) -> ExitCode {
             let mut args: Vec<String> = orig_args.clone();
             pass_sysroot_env_if_given(&mut args, sys_root_env);
 
-            rustc_driver::run_compiler(&args, &mut DefaultCallbacks);
+            if prof {
+                rustc_driver::run_compiler(&args, &mut ProfCallbacks);
+            } else {
+                rustc_driver::run_compiler(&args, &mut DefaultCallbacks);
+            }
             return ExitCode::SUCCESS;
         }
 
@@ -317,6 +405,7 @@ pub fn run(mut orig_args: Vec<String>, restricted: bool) -> ExitCode {
                 &mut ClippyCallbacks {
                     clippy_args_var,
                     restricted,
+                    prof,
                 },
             );
         } else {

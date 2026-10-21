@@ -1,20 +1,20 @@
-use clippy_utils::diagnostics::span_lint_and_help;
-use rustc_hir::{BlockCheckMode, Expr, ExprKind, Node, UnsafeSource};
-use rustc_lint::{LateContext, LateLintPass};
+use clippy_utils::diagnostics::{span_lint_and_help, span_lint_and_then};
+use rustc_hir::{BlockCheckMode, Expr, ExprKind, Item, ItemKind, LetStmt, Mutability, Node, UnsafeSource};
+use rustc_lint::{LateContext, LateLintPass, LintContext as _};
 use rustc_middle::ty::{self, Ty};
 use rustc_session::impl_lint_pass;
 use rustc_span::Span;
 use rustc_span::def_id::DefId;
 
-use super::comments::has_escape_reason;
-use super::{RR_NO_STD, RR_UNEXPLAINED_ESCAPE};
+use super::comments::{has_escape_reason, note};
+use super::{RR_NO_STD, RR_UNEXPLAINED_ESCAPE, copies};
 
 pub struct EscapeHatches;
 impl_lint_pass!(EscapeHatches => [RR_NO_STD, RR_UNEXPLAINED_ESCAPE]);
 
 impl<'tcx> LateLintPass<'tcx> for EscapeHatches {
     fn check_path(&mut self, cx: &LateContext<'tcx>, path: &rustc_hir::Path<'tcx>, _: rustc_hir::HirId) {
-        if path.span.from_expansion() {
+        if !super::builtins::is_user_code(path.span) {
             return;
         }
         let std_path = path
@@ -38,28 +38,95 @@ impl<'tcx> LateLintPass<'tcx> for EscapeHatches {
     }
 
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) {
-        if expr.span.from_expansion() {
+        if !super::builtins::is_user_code(expr.span) {
             return;
         }
-        let Some(operation) = escape_operation(cx, expr) else {
+        let Some((kind, operation)) = escape_operation(cx, expr) else {
             return;
         };
-        if has_escape_reason(cx, statement_span(cx, expr), expr.span) {
+        let statement = statement_span(cx, expr.hir_id, expr.span);
+        if has_escape_reason(cx, statement, expr.span, kind) {
             return;
         }
-        span_lint_and_help(
+        span_lint_and_then(
             cx,
             RR_UNEXPLAINED_ESCAPE,
             expr.span,
             format!("{operation} needs an ownership justification"),
-            None,
-            "add an adjacent `// rr: escape: <reason>` explaining the cost or risk and why ordinary borrowing/ownership is insufficient",
+            |diag| {
+                diag.help(match kind {
+                    "copy" => "borrow it where it is, or move it if its owner is done with it; a copy is for two owners that must both live on",
+                    "shared" => "own it in one place and lend it with & or &mut",
+                    "leak" => "let it drop; leak only what must live as long as the process",
+                    _ => "say in the reason what makes it sound",
+                });
+                note(diag, cx.sess(), statement, expr.span, kind);
+            },
+        );
+    }
+
+    fn check_local(&mut self, cx: &LateContext<'tcx>, local: &'tcx LetStmt<'tcx>) {
+        if !super::builtins::is_user_code(local.span) {
+            return;
+        }
+        for (copy, operation) in copies::filled_once(cx, local) {
+            let let_statement = statement_span(cx, local.pat.hir_id, local.span);
+            let copy_statement = statement_span(cx, copy.hir_id, copy.span);
+            if has_escape_reason(cx, let_statement, local.span, "copy")
+                || has_escape_reason(cx, copy_statement, copy.span, "copy")
+            {
+                continue;
+            }
+            span_lint_and_then(
+                cx,
+                RR_UNEXPLAINED_ESCAPE,
+                copy.span,
+                format!("{operation} needs an ownership justification"),
+                |diag| {
+                    diag.span_note(local.span, "the buffer is made here; borrow or move the data instead");
+                    note(diag, cx.sess(), let_statement, local.span, "copy");
+                },
+            );
+        }
+    }
+
+    fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx Item<'tcx>) {
+        if !super::builtins::is_user_code(item.span) {
+            return;
+        }
+        if let ItemKind::Impl(implementation) = &item.kind {
+            large_copy(cx, item, implementation);
+            return;
+        }
+        let ItemKind::Static(mutability, ..) = item.kind else {
+            return;
+        };
+        let ty = cx.tcx.type_of(item.owner_id).instantiate_identity().skip_norm_wip();
+        let operation = if mutability == Mutability::Mut {
+            "static mut (global mutable state)"
+        } else if !ty.is_freeze(cx.tcx, cx.typing_env()) {
+            "a static with interior mutability, such as an atomic (global mutable state)"
+        } else {
+            return;
+        };
+        if has_escape_reason(cx, item.span, item.span, "shared") {
+            return;
+        }
+        span_lint_and_then(
+            cx,
+            RR_UNEXPLAINED_ESCAPE,
+            item.span,
+            format!("{operation} needs an ownership justification"),
+            |diag| {
+                diag.help("pass the state by reference instead, unless something outside the call tree must reach it, such as a signal handler");
+                note(diag, cx.sess(), item.span, item.span, "shared");
+            },
         );
     }
 }
 
-fn statement_span(cx: &LateContext<'_>, expr: &Expr<'_>) -> Span {
-    for (_, node) in cx.tcx.hir_parent_iter(expr.hir_id) {
+fn statement_span(cx: &LateContext<'_>, id: rustc_hir::HirId, span: Span) -> Span {
+    for (_, node) in cx.tcx.hir_parent_iter(id) {
         match node {
             Node::Stmt(stmt) => return stmt.span,
             Node::LetStmt(local) => return local.span,
@@ -67,14 +134,44 @@ fn statement_span(cx: &LateContext<'_>, expr: &Expr<'_>) -> Span {
             _ => {},
         }
     }
-    expr.span
+    span
 }
 
-fn escape_operation<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'tcx>) -> Option<&'static str> {
+/// Larger than this, a Copy type is copied whole, silently, at every use.
+const COPY_MAX: u64 = 64;
+
+/// `impl Copy` for a type larger than `COPY_MAX` bytes: each move of it
+/// becomes a copy that no `clone()` shows.
+fn large_copy<'tcx>(cx: &LateContext<'tcx>, item: &'tcx Item<'tcx>, implementation: &'tcx rustc_hir::Impl<'tcx>) {
+    let Some(header) = implementation.of_trait else { return };
+    if header.trait_ref.trait_def_id() != cx.tcx.lang_items().copy_trait() {
+        return;
+    }
+    let ty = cx.tcx.type_of(item.owner_id).instantiate_identity().skip_norm_wip();
+    let Ok(layout) = cx.tcx.layout_of(cx.typing_env().as_query_input(ty)) else {
+        return;
+    };
+    let size = layout.size.bytes();
+    if size <= COPY_MAX || has_escape_reason(cx, item.span, item.span, "copy") {
+        return;
+    }
+    span_lint_and_then(
+        cx,
+        RR_UNEXPLAINED_ESCAPE,
+        item.span,
+        format!("Copy on a type of {size} bytes copies it whole at every use; this needs an ownership justification"),
+        |diag| {
+            diag.help(format!("keep it a moved value, or Copy only up to {COPY_MAX} bytes"));
+            note(diag, cx.sess(), item.span, item.span, "copy");
+        },
+    );
+}
+
+fn escape_operation<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'tcx>) -> Option<(&'static str, &'static str)> {
     if let ExprKind::Block(block, _) = expr.kind
         && matches!(block.rules, BlockCheckMode::UnsafeBlock(UnsafeSource::UserProvided))
     {
-        return Some("an unsafe block");
+        return Some(("unsafe", "an unsafe block"));
     }
     let def_id = match expr.kind {
         ExprKind::MethodCall(_, _, _, _) => cx.typeck_results().type_dependent_def_id(expr.hir_id),
@@ -83,37 +180,53 @@ fn escape_operation<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'tcx>) -> Option<&
         },
         _ => None,
     }?;
+    if copies::copy_helper(cx, def_id) {
+        return Some(("copy", "a call to a function that only returns a copy of its argument"));
+    }
     let name = cx.tcx.item_name(def_id);
     let trait_id = cx.tcx.trait_of_assoc(def_id);
     if matches!(name.as_str(), "clone" | "clone_from")
         && trait_id.is_some()
         && trait_id == cx.tcx.lang_items().clone_trait()
     {
-        return Some("Clone copying (which may allocate or increment a reference count)");
+        return Some((
+            "copy",
+            "Clone copying (which may allocate or increment a reference count)",
+        ));
     }
     if !is_standard_definition(cx, def_id) {
         return None;
     }
+    if let Some(operation) = copies::conversion(cx, expr, def_id) {
+        return Some(("copy", operation));
+    }
     match name.as_str() {
-        "to_owned" | "clone_into" => Some("conversion to owned data"),
-        "to_vec" => Some("copying a slice into a Vec"),
+        "to_owned" | "clone_into" => Some(("copy", "conversion to owned data")),
+        "to_vec" => Some(("copy", "copying a slice into a Vec")),
         "borrow" | "borrow_mut" | "try_borrow" | "try_borrow_mut"
             if cx.tcx.def_path_str(def_id).contains("RefCell") =>
         {
-            Some("runtime-checked borrowing through RefCell")
+            Some(("shared", "runtime-checked borrowing through RefCell"))
         },
-        "cloned" => Some("cloning iterator elements"),
+        "cloned" => Some(("copy", "cloning iterator elements")),
         "collect" if owned_collection(cx, cx.typeck_results().expr_ty(expr)) => {
-            Some("materializing an owned collection")
+            Some(("copy", "materializing an owned collection"))
         },
-        "leak" if cx.tcx.def_path_str(def_id).contains("boxed") => {
-            Some("Box::leak (extending a lifetime by leaking storage)")
+        "leak" => Some(("leak", "leak (extending a lifetime by leaking storage)")),
+        "into_raw" | "into_raw_parts" | "into_non_null" => Some((
+            "leak",
+            "into_raw (ownership handed to a raw pointer, which nothing frees)",
+        )),
+        "forget" => Some(("leak", "mem::forget (skipping destruction)")),
+        "transmute" | "transmute_copy" | "transmute_unchecked" => {
+            Some(("unsafe", "transmute (bypassing type/lifetime checks)"))
         },
-        "forget" => Some("mem::forget (skipping destruction)"),
-        "transmute" | "transmute_copy" | "transmute_unchecked" => Some("transmute (bypassing type/lifetime checks)"),
         _ => match owner_kind(cx, cx.typeck_results().expr_ty(expr)) {
-            Some("Rc" | "Arc") => Some("creating or acquiring shared ownership (Rc/Arc)"),
-            Some("RefCell") => Some("creating interior mutability (RefCell)"),
+            Some("Rc" | "Arc") => Some(("shared", "creating or acquiring shared ownership (Rc/Arc)")),
+            Some("RefCell") => Some(("shared", "creating interior mutability (RefCell)")),
+            Some("Cell") => Some(("shared", "creating interior mutability (Cell, UnsafeCell or OnceCell)")),
+            Some("Atomic") => Some(("shared", "creating interior mutability (an atomic)")),
+            Some("ManuallyDrop") => Some(("leak", "ManuallyDrop (skipping destruction)")),
             _ => None,
         },
     }
@@ -131,6 +244,9 @@ fn owner_kind<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>) -> Option<&'static str
         "alloc::rc::Rc" => Some("Rc"),
         "alloc::sync::Arc" => Some("Arc"),
         "core::cell::RefCell" => Some("RefCell"),
+        "core::cell::Cell" | "core::cell::UnsafeCell" | "core::cell::OnceCell" | "core::cell::LazyCell" => Some("Cell"),
+        "core::mem::ManuallyDrop" => Some("ManuallyDrop"),
+        path if path.starts_with("core::sync::atomic::Atomic") => Some("Atomic"),
         _ => None,
     }
 }

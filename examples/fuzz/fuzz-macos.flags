@@ -1,0 +1,13 @@
+--cfg=fuzzing
+-O
+-Ccodegen-units=1
+-Cdebuginfo=1
+-Cdebug-assertions=yes
+-Cpasses=sancov-module
+-Cllvm-args=-sanitizer-coverage-level=4
+-Cllvm-args=-sanitizer-coverage-inline-8bit-counters
+-Cllvm-args=-sanitizer-coverage-pc-table
+-Cllvm-args=-sanitizer-coverage-trace-compares
+-lstatic=Fuzzer
+-ldylib=c++
+-ldylib=System

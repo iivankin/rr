@@ -71,7 +71,7 @@ pub fn check_arguments(cx: &EarlyContext<'_>, tokens: &TokenStream) {
                 span.with_hi(delimiters.close.hi()),
                 "nested macro calls are forbidden by rr",
                 None,
-                "only core panic/assert macros are allowed, including inside other macros",
+                "only no_std compiler builtins and core panic/assert macros are allowed, including inside other macros",
             );
         }
     }

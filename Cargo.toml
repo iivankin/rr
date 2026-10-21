@@ -30,6 +30,12 @@ clippy_lints_internal = { path = "clippy_lints_internal", optional = true }
 tempfile = { version = "3.20", optional = true }
 color-print = "0.3.4"
 anstream = "0.6.18"
+ctrlc = "=3.5.1"
+# rr prof: stack addresses to functions and lines, from DWARF or a dSYM.
+addr2line = { version = "0.25.1", default-features = false, features = ["loader", "rustc-demangle"] }
+object = { version = "0.37.3", default-features = false, features = ["read", "std"] }
+# rr fmt: rustfmt's library at the compiler's own commit (rustfmt/).
+rustfmt-nightly = { path = "rustfmt" }
 
 [dev-dependencies]
 cargo_metadata = "0.23"

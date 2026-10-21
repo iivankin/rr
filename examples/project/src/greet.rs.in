@@ -1,0 +1,62 @@
+//! Greetings, written into the caller's buffer.
+
+use alloc::vec::Vec;
+
+/// "hello, <name>" and a newline, appended to out: a caller that greets
+/// many reuses one buffer.
+#[cfg_attr(rr, rr::hot)]
+pub fn greet(out: &mut Vec<u8>, name: &[u8]) {
+    out.extend_from_slice(b"hello, ");
+    // rr: escape(copy): the greeting carries the name, and out is what
+    // the program writes.
+    out.extend_from_slice(if name.is_empty() { b"world" } else { name });
+    out.push(b'\n');
+}
+
+/// Any bytes as a name: one greeting, one line.
+#[cfg(fuzzing)]
+pub fn fuzz_greet(input: &[u8]) {
+    let mut out = Vec::new();
+    greet(&mut out, input);
+    assert!(out.starts_with(b"hello, "));
+    assert!(out.ends_with(b"\n"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::greet;
+    use alloc::vec::Vec;
+    use test::Bencher;
+
+    #[test]
+    fn names_the_name() {
+        let mut out = Vec::new();
+        greet(&mut out, b"rr");
+        assert_eq!(out, b"hello, rr\n");
+    }
+
+    #[test]
+    fn greets_the_world_without_one() {
+        let mut out = Vec::new();
+        greet(&mut out, b"");
+        assert_eq!(out, b"hello, world\n");
+    }
+
+    #[test]
+    fn appends_to_what_is_there() {
+        let mut out = Vec::new();
+        greet(&mut out, b"a");
+        greet(&mut out, b"b");
+        assert_eq!(out, b"hello, a\nhello, b\n");
+    }
+
+    /// One greeting into a buffer that is reused: no allocation.
+    #[bench]
+    fn into_one_buffer(b: &mut Bencher) {
+        let mut out = Vec::new();
+        b.iter(|| {
+            out.clear();
+            greet(&mut out, b"rr");
+        });
+    }
+}

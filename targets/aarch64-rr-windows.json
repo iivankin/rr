@@ -1,0 +1,44 @@
+{
+  "abi": "llvm",
+  "abi-return-struct-as-int": true,
+  "arch": "aarch64",
+  "binary-format": "coff",
+  "crt-static-respected": true,
+  "data-layout": "e-m:w-p270:32:32-p271:32:32-p272:64:64-p:64:64-i32:32-i64:64-i128:128-n32:64-S128-Fn32",
+  "dll-prefix": "",
+  "dll-suffix": ".dll",
+  "dynamic-linking": true,
+  "eh-frame-header": false,
+  "emit-debug-gdb-scripts": false,
+  "env": "gnu",
+  "exe-suffix": ".exe",
+  "features": "+v8a,+neon",
+  "frame-pointer": "non-leaf",
+  "has-thread-local": false,
+  "is-like-windows": true,
+  "linker": "rust-lld",
+  "linker-flavor": "gnu-lld",
+  "llvm-target": "aarch64-pc-windows-gnu",
+  "max-atomic-width": 128,
+  "metadata": {
+    "description": "aarch64 Windows without a C runtime: rr programs call kernel32.dll",
+    "std": false
+  },
+  "no-default-libraries": true,
+  "os": "windows",
+  "panic-strategy": "abort",
+  "pre-link-args": {
+    "gnu-lld": [
+      "-m",
+      "arm64pe",
+      "--subsystem",
+      "console"
+    ]
+  },
+  "requires-uwtable": true,
+  "target-family": [
+    "windows"
+  ],
+  "target-pointer-width": 64,
+  "vendor": "rr"
+}

@@ -1,6 +1,7 @@
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::res::MaybeDef as _;
-use rustc_hir::{CaptureBy, Closure, Expr, ExprKind, PatKind};
+use clippy_utils::visitors::is_local_used;
+use rustc_hir::{Closure, Expr, ExprKind, PatKind};
 use rustc_lint::LateContext;
 use rustc_span::sym;
 
@@ -16,14 +17,17 @@ pub(super) fn check(cx: &LateContext<'_>, e: &Expr<'_>, arg: &Expr<'_>) {
             .skip_norm_wip()
             .is_diag_item(cx, sym::Result)
         && let ExprKind::Closure(&Closure {
-            capture_clause: CaptureBy::Ref,
-            body,
-            fn_decl_span,
-            ..
+            body, fn_decl_span, ..
         }) = arg.kind
         && let closure_body = cx.tcx.hir_body(body)
         && let [param] = closure_body.params
-        && let PatKind::Wild = param.pat.kind
+        // `_`, or a name the closure never reads, which drops the error as
+        // well; so does a `move` closure.
+        && match param.pat.kind {
+            PatKind::Wild => true,
+            PatKind::Binding(_, id, ..) => !is_local_used(cx, closure_body.value, id),
+            _ => false,
+        }
     {
         // span the area of the closure capture and warn that the
         // original error will be thrown away
@@ -32,11 +36,9 @@ pub(super) fn check(cx: &LateContext<'_>, e: &Expr<'_>, arg: &Expr<'_>) {
             cx,
             MAP_ERR_IGNORE,
             fn_decl_span,
-            "`map_err(|_|...` wildcard pattern discards the original error",
+            "this `map_err` closure discards the original error",
             |diag| {
-                diag.help(
-                    "consider storing the original error as a source in the new error, or silence this warning using an ignored identifier (`.map_err(|_foo| ...`)",
-                );
+                diag.help("keep the original error in the new one, or convert it with a From impl and `?`");
             },
         );
     }

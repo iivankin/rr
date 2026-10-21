@@ -1,0 +1,4 @@
+build/
+kv
+kv.exe
+fuzz/

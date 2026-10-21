@@ -22,7 +22,7 @@ use walkdir::{DirEntry, WalkDir};
 
 mod test_utils;
 
-const SKIPPED_FILES: [&str; 7] = [
+const SKIPPED_FILES: [&str; 9] = [
     "./tests/lint-attributes-organization.rs", // this file, for the sanity checks
     "./tests/ui/blanket_clippy_restriction_lints.rs", // separate lines are better
     "./tests/ui/deprecated.rs",                // generated
@@ -30,6 +30,8 @@ const SKIPPED_FILES: [&str; 7] = [
     "./tests/ui/rename.rs",                    // generated
     "./tests/ui/unknown_clippy_lints.rs",      // separate lines are better
     "./target/",                               // generated files
+    "./rustfmt/",                              // rustfmt's own source, as upstream has it
+    "./examples/corpus/",                      // programs in restricted Rust, in rr fmt's style
 ];
 
 #[test]

@@ -930,8 +930,17 @@ fn load_conf_file(sess: &Session) -> Option<Arc<SourceFile>> {
 
 impl Conf {
     pub fn load(sess: &Session) -> &'static Conf {
+        Conf::load_adjusted(sess, |_| {})
+    }
+
+    /// The configuration, with `adjust` applied to it the first time it is loaded.
+    pub fn load_adjusted(sess: &Session, adjust: fn(&mut Conf)) -> &'static Conf {
         static CONF: OnceLock<Conf> = OnceLock::new();
-        CONF.get_or_init(|| Conf::load_inner(sess))
+        CONF.get_or_init(|| {
+            let mut conf = Conf::load_inner(sess);
+            adjust(&mut conf);
+            conf
+        })
     }
 
     fn load_inner(sess: &Session) -> Conf {

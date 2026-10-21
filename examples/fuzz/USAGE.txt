@@ -1,0 +1,28 @@
+Hosts: macOS, Linux (with cc and libstdc++) and Windows (with Visual Studio's
+build tools). No Cargo or Rust std is needed.
+
+Create a harness in your project:
+  rr fuz init
+
+Edit test_input in fuz.rs to call your parser/API. Expected invalid inputs should
+return an error, not panic. Add assertions for invariants that must always hold.
+
+Build and run with coverage-guided libFuzzer:
+  rr fuz fuz.rs -- -runs=100000
+
+Enable AddressSanitizer for memory bugs in instrumented unsafe code:
+  rr fuz fuz.rs --asan -- -max_total_time=60
+
+Reproduce a discovered input:
+  rr fuz fuz.rs -- artifacts/crash-HASH -runs=1
+
+Compiler flags go before --; libFuzzer arguments go after it. rr locates its
+bundled libraries and configures coverage and the optional ASan runtime itself.
+Default corpus/ and artifacts/ directories live beside the source file. Custom
+libFuzzer paths are relative to the current directory. Found crashes and corpus
+inputs persist. The temporary executable is removed after exit or terminal Ctrl-C.
+
+Fuzzing is separate from production builds. Harnesses have the normal rr rules,
+including explanation comments for unsafe/clone/other escape hatches. ASan does
+not instrument precompiled core/alloc or arbitrary external libraries. The engine
+itself is a precompiled C++ runtime and uses system libc/libc++.

@@ -1,0 +1,312 @@
+//! What the program needs of Linux: the heap, input, output, arguments
+//! and an end on a bug, by system calls; there is no C library. The rest of the
+//! crate calls only this; unsafe stays here.
+
+use alloc::vec::Vec;
+use core::alloc::{GlobalAlloc, Layout};
+use core::ffi::c_char;
+use core::ptr::null_mut;
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+
+/// The system call numbers this file uses, which differ by architecture.
+#[cfg(target_arch = "x86_64")]
+mod nr {
+    pub const WRITE: usize = 1;
+    pub const MMAP: usize = 9;
+    pub const MUNMAP: usize = 11;
+    pub const GETPID: usize = 39;
+    pub const KILL: usize = 62;
+    pub const EXIT_GROUP: usize = 231;
+    pub const READ: usize = 0;
+}
+
+#[cfg(target_arch = "aarch64")]
+mod nr {
+    pub const WRITE: usize = 64;
+    pub const MMAP: usize = 222;
+    pub const MUNMAP: usize = 215;
+    pub const GETPID: usize = 172;
+    pub const KILL: usize = 129;
+    pub const EXIT_GROUP: usize = 94;
+    pub const READ: usize = 63;
+}
+
+/// System call n; its result, or a negative error number.
+///
+/// # Safety
+/// The arguments are those system call n takes, and memory it reads or
+/// writes is valid for it.
+// rr: escape(unsafe): the caller vouches for the arguments, which only it knows.
+unsafe fn syscall(n: usize, args: [usize; 6]) -> isize {
+    let r: isize;
+    #[cfg(target_arch = "x86_64")]
+    // rr: escape(unsafe): the Linux system call convention for x86_64.
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") n => r,
+            in("rdi") args[0],
+            in("rsi") args[1],
+            in("rdx") args[2],
+            in("r10") args[3],
+            in("r8") args[4],
+            in("r9") args[5],
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack),
+        );
+    }
+    #[cfg(target_arch = "aarch64")]
+    // rr: escape(unsafe): the Linux system call convention for aarch64.
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") n,
+            inlateout("x0") args[0] => r,
+            in("x1") args[1],
+            in("x2") args[2],
+            in("x3") args[3],
+            in("x4") args[4],
+            in("x5") args[5],
+            options(nostack),
+        );
+    }
+    r
+}
+
+const PAGE: usize = 4096;
+const PROT_READ_WRITE: usize = 3;
+const MAP_PRIVATE_ANONYMOUS: usize = 0x22;
+const SIGABRT: usize = 6;
+
+/// Fresh zeroed pages, size bytes of them, or null.
+fn map(size: usize) -> *mut u8 {
+    let none = usize::MAX;
+    // rr: escape(unsafe): an anonymous private mapping touches no memory of ours.
+    let r = unsafe {
+        syscall(
+            nr::MMAP,
+            [0, size, PROT_READ_WRITE, MAP_PRIVATE_ANONYMOUS, none, 0],
+        )
+    };
+    match usize::try_from(r) {
+        Ok(at) => core::ptr::with_exposed_provenance_mut(at),
+        Err(_) => null_mut(),
+    }
+}
+
+/// Give back the pages at p, size bytes, from map.
+fn unmap(p: *mut u8, size: usize) {
+    // rr: escape(unsafe): p and size are a mapping of ours, unused from here.
+    unsafe { syscall(nr::MUNMAP, [p.expose_provenance(), size, 0, 0, 0, 0]) };
+}
+
+/// The block sizes the heap keeps lists of: 16 bytes to a page.
+const CLASSES: usize = 9;
+/// The pages taken at once for small blocks.
+const CHUNK: usize = 64 * PAGE;
+
+/// The global allocator. Blocks up to a page come in sizes of powers of
+/// two, each size aligned to itself, carved from chunks of pages and kept
+/// on a list when freed; a larger block is pages of its own. One lock
+/// keeps the lists whole when threads share the heap.
+pub struct Heap;
+
+// The heap's state is the process's: GlobalAlloc gives Heap's methods
+// only &self, of a static every allocation reaches.
+// rr: escape(shared): the global allocator's lock.
+static LOCK: AtomicBool = AtomicBool::new(false);
+/// The free blocks of each size, each holding a pointer to the next.
+// rr: escape(shared): the global allocator's free lists, under LOCK.
+static FREE: [AtomicPtr<u8>; CLASSES] = [const { AtomicPtr::new(null_mut()) }; CLASSES];
+/// What is left of the chunk being carved.
+// rr: escape(shared): the global allocator's chunk, under LOCK.
+static NEXT: AtomicPtr<u8> = AtomicPtr::new(null_mut());
+// rr: escape(shared): the global allocator's chunk, under LOCK.
+static LEFT: AtomicUsize = AtomicUsize::new(0);
+
+/// The size class of l, or None when it takes pages of its own.
+fn class(l: Layout) -> Option<usize> {
+    let size = l
+        .size()
+        .max(l.align())
+        .max(16)
+        .checked_next_power_of_two()?;
+    if size > PAGE {
+        return None;
+    }
+    Some(size.trailing_zeros() as usize - 4)
+}
+
+fn lock() {
+    while LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+}
+
+fn unlock() {
+    LOCK.store(false, Ordering::Release);
+}
+
+/// A block of class c: a freed one, or the next from the chunk.
+fn small(c: usize) -> *mut u8 {
+    let size = 16 << c;
+    let head = FREE[c].load(Ordering::Relaxed);
+    if !head.is_null() {
+        // rr: escape(unsafe, cast): a free block, aligned to 16 at least, holds the next one's address.
+        let next = unsafe { head.cast::<*mut u8>().read() };
+        FREE[c].store(next, Ordering::Relaxed);
+        return head;
+    }
+    let mut at = NEXT.load(Ordering::Relaxed);
+    let mut left = LEFT.load(Ordering::Relaxed);
+    let pad = at.align_offset(size);
+    if at.is_null() || pad.saturating_add(size) > left {
+        // The rest of the chunk is too small for this size: a new chunk.
+        at = map(CHUNK);
+        if at.is_null() {
+            return null_mut();
+        }
+        left = CHUNK;
+    } else {
+        at = at.wrapping_add(pad);
+        left -= pad;
+    }
+    NEXT.store(at.wrapping_add(size), Ordering::Relaxed);
+    LEFT.store(left - size, Ordering::Relaxed);
+    at
+}
+
+/// Pages for a block of l's size, at l's alignment.
+fn large(l: Layout) -> *mut u8 {
+    let size = l.size().next_multiple_of(PAGE);
+    if l.align() <= PAGE {
+        return map(size);
+    }
+    // Map more, then give back what is before and after the aligned part.
+    let total = size + l.align();
+    let p = map(total);
+    if p.is_null() {
+        return p;
+    }
+    let head = p.align_offset(l.align());
+    if head > 0 {
+        unmap(p, head);
+    }
+    let tail = total - head - size;
+    if tail > 0 {
+        unmap(p.wrapping_add(head + size), tail);
+    }
+    p.wrapping_add(head)
+}
+
+// Every block is its class's size or whole pages, at l's alignment, and
+// dealloc finds the same class from the same layout: GlobalAlloc's
+// contract holds.
+// rr: escape(unsafe): GlobalAlloc is unsafe to implement.
+unsafe impl GlobalAlloc for Heap {
+    // rr: escape(unsafe): the signature GlobalAlloc requires.
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        let Some(c) = class(l) else {
+            return large(l);
+        };
+        lock();
+        let p = small(c);
+        unlock();
+        p
+    }
+
+    // rr: escape(unsafe): the signature GlobalAlloc requires.
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        let Some(c) = class(l) else {
+            let size = l.size().next_multiple_of(PAGE);
+            unmap(p, size);
+            return;
+        };
+        lock();
+        // rr: escape(unsafe, cast): p is a block of class c, aligned to 16 at least, no longer used.
+        unsafe { p.cast::<*mut u8>().write(FREE[c].load(Ordering::Relaxed)) };
+        FREE[c].store(p, Ordering::Relaxed);
+        unlock();
+    }
+}
+
+fn write_all(fd: usize, mut p: &[u8]) {
+    while !p.is_empty() {
+        // rr: escape(unsafe): p is readable memory of its length.
+        let n = unsafe {
+            syscall(
+                nr::WRITE,
+                [fd, p.as_ptr().expose_provenance(), p.len(), 0, 0, 0],
+            )
+        };
+        // An error, or nothing written: give up.
+        let Some(n) = usize::try_from(n).ok().filter(|n| *n > 0) else {
+            return;
+        };
+        p = &p[n..];
+    }
+}
+
+/// Standard input, all of it up to max bytes, onto out; false when it
+/// holds more or cannot be read.
+pub fn stdin(out: &mut Vec<u8>, max: usize) -> bool {
+    let mut buf = [0u8; 16384];
+    loop {
+        let at = buf.as_mut_ptr().expose_provenance();
+        // rr: escape(unsafe): buf is writable memory of its length.
+        let n = unsafe { syscall(nr::READ, [0, at, buf.len(), 0, 0, 0]) };
+        let Ok(n) = usize::try_from(n) else {
+            return false;
+        };
+        if n == 0 {
+            return true;
+        }
+        if out.len() + n > max {
+            return false;
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+}
+
+pub fn stdout(p: &[u8]) {
+    write_all(1, p);
+}
+
+pub fn stderr(p: &[u8]) {
+    write_all(2, p);
+}
+
+/// main's arguments as byte strings.
+///
+/// # Safety
+/// argv must hold argc NUL-terminated strings that live as long as the
+/// process, as main's own do.
+// rr: escape(unsafe): the caller vouches for argv, which only main can.
+pub unsafe fn args(argc: i32, argv: *const *const c_char) -> Vec<&'static [u8]> {
+    let argc = usize::try_from(argc).unwrap_or(0);
+    let mut out = Vec::with_capacity(argc);
+    // rr: escape(unsafe): argv holds argc of main's strings, per the contract.
+    let argv = unsafe { core::slice::from_raw_parts(argv, argc) };
+    for &s in argv {
+        // rr: escape(unsafe): s is NUL-terminated and lives as long as the process.
+        out.push(unsafe { core::ffi::CStr::from_ptr(s) }.to_bytes());
+    }
+    out
+}
+
+/// End the process at once, as abort does: a bug was found.
+pub fn die() -> ! {
+    // rr: escape(unsafe): getpid takes nothing.
+    let pid = unsafe { syscall(nr::GETPID, [0; 6]) };
+    // rr: escape(unsafe): kill takes no memory of ours.
+    unsafe { syscall(nr::KILL, [pid.cast_unsigned(), SIGABRT, 0, 0, 0, 0]) };
+    // rr: escape(unsafe): exit_group takes no memory of ours.
+    unsafe { syscall(nr::EXIT_GROUP, [134, 0, 0, 0, 0, 0]) };
+    loop {
+        core::hint::spin_loop();
+    }
+}
