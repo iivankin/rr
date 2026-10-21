@@ -96,6 +96,15 @@ jobs:
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
         with:
           arch: ${{ matrix.name == 'rr-windows-aarch64' && 'arm64' || 'x64' }}
+      - name: Clang for LLVM on Windows on ARM, which Visual Studio's compiler miscompiles
+        if: matrix.name == 'rr-windows-aarch64'
+        run: |
+          # Visual Studio's own clang-cl, for ARM64 hosts; a short path, so
+          # that no space splits it.
+          clang="$(ls -d "/c/Program Files/Microsoft Visual Studio"/*/*/VC/Tools/Llvm/ARM64/bin/clang-cl.exe | head -1)"
+          clang="$(cygpath -m -s "$clang")"
+          "$clang" --version
+          { echo "CC=$clang"; echo "CXX=$clang"; } >> "$GITHUB_ENV"
       - name: Paths that bash and Windows programs both read
         run: |
           echo "RR_TEMP=$( (command -v cygpath >/dev/null && cygpath -m "$RUNNER_TEMP") || echo "$RUNNER_TEMP")" >> "$GITHUB_ENV"
@@ -123,7 +132,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.RR_TEMP }}/rr-toolchain
-          key: rr-toolchain-${{ matrix.name }}-${{ env.RUST_COMMIT }}-${{ hashFiles('.github/rr-bootstrap.toml', 'scripts/build-toolchain.sh', 'scripts/prepare-static-driver.py') }}
+          key: rr-toolchain-${{ matrix.name }}-${{ env.RUST_COMMIT }}-${{ matrix.name == 'rr-windows-aarch64' && 'clang-' || '' }}${{ hashFiles('.github/rr-bootstrap.toml', 'scripts/build-toolchain.sh', 'scripts/prepare-static-driver.py') }}
       - name: Build LLVM and the matching static compiler
         if: steps.toolchain.outputs.cache-hit != 'true'
         run: scripts/build-toolchain.sh "$RR_TEMP/rust" "$RR_TEMP/rr-scratch" "$RR_TEMP/rr-toolchain"
