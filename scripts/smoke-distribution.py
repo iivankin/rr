@@ -57,8 +57,12 @@ with tempfile.TemporaryDirectory(prefix="rr-relocated-", dir=os.environ.get("TMP
         (root / "rr-link").symlink_to(rr)
         link = root / "rr-link"
     fuzzing = (bundle / "fuzz/fuzz.flags").is_file()
-    make = lambda *targets: subprocess.run(["make", f"RR={link}", *targets], cwd=root / "project",
-                                           env=env, check=True, text=True, capture_output=True)
+    def make(*targets):
+        done = subprocess.run(["make", f"RR={link}", *targets], cwd=root / "project",
+                              env=env, text=True, capture_output=True)
+        if done.returncode != 0:
+            raise AssertionError(f"make {' '.join(targets)}\n{done.stdout}\n{done.stderr}")
+        return done
     make()
     tested = make("test").stdout
     assert "4 passed, 0 failed" in tested, tested
