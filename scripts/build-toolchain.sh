@@ -25,11 +25,12 @@ mkdir -p "$rr_scratch"
 # Windows has python, not always python3.
 rr_python="$(command -v python3 || command -v python)"
 # LLVM's ThinLTO objects are bitcode: on Linux the compiler links with
-# lld, which reads them; on Windows, where it would take clang-cl, LLVM is
-# built without ThinLTO.
+# lld, which reads them. On Windows, where LLVM's would take clang-cl and
+# the compiler's crashed the stage 1 compiler on ARM64, neither uses it,
+# as official Windows builds of rustc do not.
 case "$(uname -s)" in
 Linux) rr_set=(--set rust.bootstrap-override-lld=external) ;;
-MINGW* | MSYS* | CYGWIN*) rr_set=(--set llvm.thin-lto=false) ;;
+MINGW* | MSYS* | CYGWIN*) rr_set=(--set llvm.thin-lto=false --set rust.lto=off) ;;
 *) rr_set=() ;;
 esac
 # rr builds for its host only. The installed toolchain names the host: on
