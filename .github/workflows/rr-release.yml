@@ -10,6 +10,10 @@ on:
         description: 'Tag to publish as a release (empty: build only)'
         required: false
         default: ''
+      hosts:
+        description: 'Distributions to build, by name, comma-separated (empty: all)'
+        required: false
+        default: ''
   push:
     tags: ['v*']
 
@@ -28,23 +32,35 @@ env:
   RUST_COMMIT: 84b36a78a28a63f134171c670be1932ffa2485f8
 
 jobs:
+  hosts:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+    steps:
+      - name: The distributions this run builds
+        id: pick
+        env:
+          HOSTS: ${{ inputs.hosts }}
+        run: |
+          python3 - >> "$GITHUB_OUTPUT" <<'PY'
+          import json, os
+          all = [
+              {'name': 'rr-macos-arm64', 'runner': 'macos-15'},
+              {'name': 'rr-linux-x86_64', 'runner': 'ubuntu-24.04', 'container': 'ubuntu:20.04'},
+              {'name': 'rr-linux-aarch64', 'runner': 'ubuntu-24.04-arm', 'container': 'ubuntu:20.04'},
+              {'name': 'rr-windows-x86_64', 'runner': 'windows-2025'},
+              {'name': 'rr-windows-aarch64', 'runner': 'windows-11-arm'},
+          ]
+          wanted = [h.strip() for h in os.environ.get('HOSTS', '').split(',') if h.strip()]
+          chosen = [h for h in all if not wanted or h['name'] in wanted]
+          print('matrix=' + json.dumps({'include': chosen}))
+          PY
+
   build:
+    needs: hosts
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - name: rr-macos-arm64
-            runner: macos-15
-          - name: rr-linux-x86_64
-            runner: ubuntu-24.04
-            container: ubuntu:20.04
-          - name: rr-linux-aarch64
-            runner: ubuntu-24.04-arm
-            container: ubuntu:20.04
-          - name: rr-windows-x86_64
-            runner: windows-2025
-          - name: rr-windows-aarch64
-            runner: windows-11-arm
+      matrix: ${{ fromJSON(needs.hosts.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
     container: ${{ matrix.container }}
     timeout-minutes: 360
@@ -63,9 +79,12 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           echo CC=clang >> "$GITHUB_ENV"
           echo CXX=clang++ >> "$GITHUB_ENV"
-      - name: macOS and Windows build tools
-        if: ${{ !matrix.container }}
-        run: python3 -m pip install -q ninja==1.13.0
+      - name: macOS build tools
+        if: runner.os == 'macOS'
+        run: brew install ninja
+      - name: Windows build tools
+        if: runner.os == 'Windows'
+        run: python -m pip install -q ninja==1.13.0
       - name: Visual Studio's compilers on PATH
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
