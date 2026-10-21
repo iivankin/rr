@@ -20,7 +20,8 @@ def compile_command(host, file, output):
                 '-fno-omit-frame-pointer', '-arch', 'arm64', '-mmacosx-version-min=11.0',
                 '-c', file, '-o', output]
     if host.endswith('-windows-msvc'):
-        return ['cl', '/nologo', '/std:c++17', '/O2', '/MD', '/EHsc', '/c', file, f'/Fo{output}']
+        include = Path(file).parent.parent  # compiler-rt/lib, for sanitizer_common's headers
+        return ['cl', '/nologo', '/std:c++17', '/O2', '/MD', '/EHsc', f'/I{include}', '/c', file, f'/Fo{output}']
     return ['c++', '-std=c++17', '-O2', '-g1', '-fPIC', '-fno-omit-frame-pointer', '-c', file,
             '-o', output]
 
@@ -37,6 +38,10 @@ def build(source, toolchain, destination):
     sources = sorted(p for p in source.glob('*.cpp') if p.name != 'FuzzerInterceptors.cpp')
     if len(sources) != 25:
         raise SystemExit('Expected the 25 sources in the pinned LLVM fuzzer runtime')
+    if host.endswith('-windows-msvc'):
+        # On COFF, coverage's section bounds are defined by compiler-rt, not
+        # by the linker: libFuzzer's archive carries them.
+        sources.append(source.parent / 'sanitizer_common/sanitizer_coverage_win_sections.cpp')
     toolchain_lib = toolchain / 'lib/rustlib' / host / 'lib'
     asan_sources = sorted(toolchain_lib.glob('librustc-nightly_rt.asan.*'))
     if not asan_sources and not host.endswith('-windows-msvc'):
