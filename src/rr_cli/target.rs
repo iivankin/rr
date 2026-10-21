@@ -31,7 +31,9 @@ pub fn named(args: &[String]) -> Option<String> {
     }
 }
 
-/// The rr target of this host, when it is not macOS.
+/// The rr target of this host, when it is not macOS and the sysroot in
+/// use has it: a distribution's does, while a development build of rr
+/// against its compiler's own sysroot builds for the host's native target.
 pub fn host() -> Option<&'static str> {
     let os = if cfg!(target_os = "linux") {
         "linux"
@@ -40,7 +42,11 @@ pub fn host() -> Option<&'static str> {
     } else {
         return None;
     };
-    RR.iter().copied().find(|t| t.starts_with(ARCH) && t.ends_with(os))
+    let target = RR.iter().copied().find(|t| t.starts_with(ARCH) && t.ends_with(os))?;
+    let sysroot = super::prof::bundle().or_else(|| std::env::var_os("SYSROOT").map(Into::into));
+    sysroot
+        .is_none_or(|s| s.join("lib/rustlib").join(target).is_dir())
+        .then_some(target)
 }
 
 /// Whether target is one of rr's own.

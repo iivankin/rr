@@ -162,7 +162,7 @@ jobs:
           RUSTFLAGS: ${{ matrix.container && '-Clink-arg=-fuse-ld=lld' || '' }}
         run: |
           cargo fmt --all --check
-          cargo test --locked -- --skip 5041_allow_dev_build
+          cargo test --locked --no-fail-fast -- --skip 5041_allow_dev_build
       - name: Build, package and verify the distribution
         run: scripts/release.sh "$RR_TEMP/rust" "$RR_TEMP/rr-toolchain" "$RR_TEMP/rr-release" "${{ matrix.name }}"
       - name: Upload the distribution
