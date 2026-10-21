@@ -189,8 +189,8 @@ impl Frame {
             || ["alloc::", "core::", "<alloc::", "<core::"]
                 .iter()
                 .any(|p| f.starts_with(p))
-            || self.file.contains("/library/alloc/")
-            || self.file.contains("/library/core/")
+            || self.file.replace('\\', "/").contains("/library/alloc/")
+            || self.file.replace('\\', "/").contains("/library/core/")
     }
 
     fn place(&self) -> String {
@@ -201,7 +201,9 @@ impl Frame {
         let file = Path::new(&self.file)
             .strip_prefix(&cwd)
             .map_or(Path::new(&self.file), |p| p);
-        format!("{}  {}:{}", self.function, file.display(), self.line)
+        // One separator on every system, as Windows' line tables have theirs.
+        let file = file.to_string_lossy().replace('\\', "/");
+        format!("{}  {}:{}", self.function, file, self.line)
     }
 }
 
