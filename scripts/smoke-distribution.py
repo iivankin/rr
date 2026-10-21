@@ -52,7 +52,9 @@ with tempfile.TemporaryDirectory(prefix="rr-relocated-", dir=os.environ.get("TMP
     # or on Windows, where a link takes privileges, a copy.
     if windows:
         shutil.copytree(bundle, root / "rr-copy")
-        link = root / "rr-copy" / f"rr{exe}"
+        # Forward slashes: a recipe that make runs through sh would take
+        # backslashes for escapes.
+        link = (root / "rr-copy" / f"rr{exe}").as_posix()
     else:
         (root / "rr-link").symlink_to(rr)
         link = root / "rr-link"
