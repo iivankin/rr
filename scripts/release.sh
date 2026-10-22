@@ -30,12 +30,12 @@ export SYSROOT="$rr_toolchain" CARGO_TARGET_DIR="$rr_scratch/target"
 # only to rr. The driver embeds rustc and LLVM: one executable at a time.
 # On Linux LLVM's ThinLTO objects are bitcode, which lld reads and the
 # GNU linker does not.
-# On Windows the compiler's libraries carry no bitcode, as the compiler is
-# built without LTO there: rr is too.
+# On Windows Visual Studio's lld-link, beside the clang-cl in CC that
+# compiled LLVM, reads them; its own linker does not.
 rr_link= rr_lto=thin
 case "$rr_host" in
 *-linux-*) rr_link=-Clink-arg=-fuse-ld=lld ;;
-*-windows-*) rr_lto=off ;;
+*-windows-*) rr_link="-Clinker=$(dirname "${CC:?CC must name clang-cl}")/lld-link.exe" ;;
 esac
 RUSTFLAGS="$rr_link" CARGO_PROFILE_RELEASE_LTO=$rr_lto CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
     cargo build --locked --release --bin rr

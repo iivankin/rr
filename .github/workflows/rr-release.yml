@@ -107,12 +107,12 @@ jobs:
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
         with:
           arch: ${{ matrix.name == 'rr-windows-aarch64' && 'arm64' || 'x64' }}
-      - name: Clang for LLVM on Windows on ARM, which Visual Studio's compiler miscompiles
-        if: matrix.name == 'rr-windows-aarch64'
+      - name: Clang for LLVM on Windows, for ThinLTO, and as Visual Studio's compiler miscompiles it on ARM
+        if: runner.os == 'Windows'
         run: |
-          # Visual Studio's own clang-cl, for ARM64 hosts; a short path, so
-          # that no space splits it.
-          clang="$(ls -d "/c/Program Files/Microsoft Visual Studio"/*/*/VC/Tools/Llvm/ARM64/bin/clang-cl.exe | head -1)"
+          # Visual Studio's own clang-cl, for the host; a short path, so
+          # that no space splits it. lld-link and llvm-lib are beside it.
+          clang="$(ls -d "/c/Program Files/Microsoft Visual Studio"/*/*/VC/Tools/Llvm/${{ matrix.name == 'rr-windows-aarch64' && 'ARM64' || 'x64' }}/bin/clang-cl.exe | head -1)"
           clang="$(cygpath -m -s "$clang")"
           "$clang" --version
           { echo "CC=$clang"; echo "CXX=$clang"; } >> "$GITHUB_ENV"
@@ -143,7 +143,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.RR_TEMP }}/rr-toolchain
-          key: rr-toolchain-${{ matrix.name }}-${{ env.RUST_COMMIT }}-${{ matrix.name == 'rr-windows-aarch64' && 'clang-' || '' }}${{ matrix.container && 'clang18-' || '' }}${{ hashFiles('.github/rr-bootstrap.toml', 'scripts/build-toolchain.sh', 'scripts/prepare-static-driver.py') }}
+          key: rr-toolchain-${{ matrix.name }}-${{ env.RUST_COMMIT }}-${{ runner.os == 'Windows' && 'clang-lto-' || '' }}${{ matrix.container && 'clang18-' || '' }}${{ hashFiles('.github/rr-bootstrap.toml', 'scripts/build-toolchain.sh', 'scripts/prepare-static-driver.py') }}
       - name: Build LLVM and the matching static compiler
         if: steps.toolchain.outputs.cache-hit != 'true'
         run: scripts/build-toolchain.sh "$RR_TEMP/rust" "$RR_TEMP/rr-scratch" "$RR_TEMP/rr-toolchain"
@@ -208,5 +208,5 @@ jobs:
           cd dist
           sha256sum rr-*.tar.gz rr-*.zip > SHA256SUMS
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "rr $TAG" \
-            --notes "rr, Restricted Rust: the compiler and linter for macOS arm64, Linux x86_64 and aarch64, Windows x86_64 and aarch64. Each archive holds rr, its sysroots for the host and for rr's Linux and Windows targets, rust-lld and libFuzzer; see README.md inside." \
+            --notes "rr, Restricted Rust: the compiler and linter for macOS arm64, Linux x86_64 and aarch64, Windows x86_64 and aarch64. Each archive holds rr, its sysroots for the host and for the host's rr target where there is one, rust-lld and libFuzzer; see README.md inside." \
             rr-*.tar.gz rr-*.zip SHA256SUMS ./*-verification.txt

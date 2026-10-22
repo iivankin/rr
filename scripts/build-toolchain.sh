@@ -24,21 +24,27 @@ cd "$rr_source"
 mkdir -p "$rr_scratch"
 # Windows has python, not always python3.
 rr_python="$(command -v python3 || command -v python)"
-# LLVM's ThinLTO objects are bitcode: on Linux the compiler links with
-# lld, which reads them. On Windows, where LLVM's would take clang-cl and
-# the compiler's crashed the stage 1 compiler on ARM64, neither uses it,
-# as official Windows builds of rustc do not.
-case "$(uname -s)" in
-Linux) rr_set=(--set rust.bootstrap-override-lld=external) ;;
-MINGW* | MSYS* | CYGWIN*) rr_set=(--set llvm.thin-lto=false --set rust.lto=off) ;;
-*) rr_set=() ;;
-esac
 # rr builds for its host only. The installed toolchain names the host: on
 # Windows on ARM, bash itself may be an emulated x86_64 program.
-case "$(rustc -vV | sed -n 's/^host: //p')" in
+rr_build="$(rustc -vV | sed -n 's/^host: //p' | tr -d '\r')"
+case "$rr_build" in
 x86_64-*) rr_backend=X86 ;;
 aarch64-*) rr_backend=AArch64 ;;
 *) echo "Unsupported host: $(rustc -vV)" >&2; exit 1 ;;
+esac
+# LLVM's ThinLTO objects are bitcode: the compiler links with lld, which
+# reads them. On Windows LLVM is compiled with Visual Studio's clang-cl, in
+# CC, and archived and linked with the llvm-lib and lld-link beside it.
+case "$(uname -s)" in
+Linux) rr_set=(--set rust.bootstrap-override-lld=external) ;;
+MINGW* | MSYS* | CYGWIN*)
+    rr_llvm_bin="$(dirname "${CC:?CC must name clang-cl}")"
+    test -x "$rr_llvm_bin/lld-link.exe"
+    test -x "$rr_llvm_bin/llvm-lib.exe"
+    rr_set=(--set "target.$rr_build.linker=$rr_llvm_bin/lld-link.exe"
+        --set "target.$rr_build.ar=$rr_llvm_bin/llvm-lib.exe")
+    ;;
+*) rr_set=() ;;
 esac
 rr_set+=(--set "llvm.targets=$rr_backend")
 "$rr_python" x.py dist --stage 2 -j "${RR_BUILD_JOBS:-6}" ${rr_set[@]+"${rr_set[@]}"} rustc rust-std rustc-dev rust-src

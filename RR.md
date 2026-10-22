@@ -535,6 +535,8 @@ The release workflow builds stage2 Rust at commit
 backend for the host and rust-lld, and compiles rr against that matching
 compiler on each host. No prebuilt LLVM or compiler driver is substituted.
 LLVM, stage2 compiler libraries and the release rr executable use ThinLTO.
+On Windows LLVM is compiled with Visual Studio's clang-cl, named in CC, and
+the compiler and rr link with the lld-link beside it, which reads LLVM's bitcode.
 LLVM and rustc_driver are statically linked into rr; system libraries remain
 dynamic; core/alloc objects and metadata stay external as compiler inputs. The
 bootstrap artifact filter also retains private compiler rlibs, because
