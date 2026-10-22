@@ -53,8 +53,12 @@ case "$rr_host" in
     done
     ;;
 *-linux-*)
-    # rust-lld links the host's rr target.
+    # rust-lld links the host's rr target; through gcc-ld/ld.lld it is
+    # also the linker cc runs for x86_64-unknown-linux-gnu, as rustc
+    # links that by default, for fuzz targets.
     cp "$rr_toolchain/lib/rustlib/$rr_host/bin/rust-lld" "$rr_tools/"
+    mkdir -p "$rr_tools/gcc-ld"
+    cp "$rr_toolchain/lib/rustlib/$rr_host/bin/gcc-ld/ld.lld" "$rr_tools/gcc-ld/"
     # LLVM and the compiler driver are embedded in rr; keep the symbols
     # its panics name, drop the debug information.
     chmod u+w "$rr_destination/rr" "$rr_tools/rust-lld"
