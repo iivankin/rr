@@ -60,9 +60,12 @@ case "$rr_host" in
     mkdir -p "$rr_tools/gcc-ld"
     cp "$rr_toolchain/lib/rustlib/$rr_host/bin/gcc-ld/ld.lld" "$rr_tools/gcc-ld/"
     # LLVM and the compiler driver are embedded in rr; keep the symbols
-    # its panics name, drop the debug information.
+    # its panics name, drop the debug information. BOLT, which lays out
+    # rr on x86_64, needs the source file symbols too: they tell apart
+    # the local functions that GCC split into hot and cold parts in the
+    # static C++ library.
     chmod u+w "$rr_destination/rr" "$rr_tools/rust-lld"
-    strip -S "$rr_destination/rr" "$rr_tools/rust-lld"
+    strip -S --keep-file-symbols "$rr_destination/rr" "$rr_tools/rust-lld"
     ;;
 *-windows-*)
     # rust-lld links the host's rr target.
