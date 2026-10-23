@@ -536,13 +536,17 @@ The release workflow builds stage2 Rust at commit
 backend for the host and rust-lld, and compiles rr against that matching
 compiler on each host. No prebuilt LLVM or compiler driver is substituted.
 LLVM, stage2 compiler libraries and the release rr executable use ThinLTO.
-As in official Rust builds, the compiler is optimized by profile: it is built
-once with its Rust crates and once with LLVM instrumented, each run over
-scripts/pgo-train.py's work (checking and building rr's crates, building
-ordinary crates, core and alloc, and compiling the example programs), and
-the release compiler is built with both profiles and one codegen unit per
-crate. Off Windows it allocates with jemalloc, and on Linux x86_64 BOLT lays
-out the rr executable by a profile of the smoke checks.
+As in official Rust builds, the compiler on Linux and Windows is optimized by
+profile: it is built once with its Rust crates and once with LLVM
+instrumented, each run over scripts/pgo-train.py's work (checking and
+building rr's crates and their dependencies, core and alloc, and compiling
+the example programs), and the release compiler is built with both profiles.
+Linux compiles LLVM with clang 23, the version of the compiler's own LLVM,
+since the compiler's profile flags reach the C and C++ code that clang
+compiles; macOS, whose Apple clang is older, has no PGO, as in official
+builds. Every compiler has one codegen unit per crate; off Windows it
+allocates with jemalloc, and on Linux x86_64 BOLT lays out the rr executable
+by a profile of the smoke checks.
 On Windows LLVM is compiled with LLVM 20.1.3's clang-cl, named in CC, and
 the compiler and rr link with the lld-link beside it, which reads LLVM's bitcode.
 LLVM and rustc_driver are statically linked into rr; system libraries remain

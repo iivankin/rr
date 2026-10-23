@@ -7,7 +7,10 @@
 # builds (see scripts/pgo-profile.sh): RR_PGO=generate-rustc and
 # RR_PGO=generate-llvm build a compiler, without LTO, whose Rust or C++ half
 # writes raw profiles into RR_PGO_DIR; RR_PGO=use builds the release compiler
-# with RR_PGO_DIR/rustc.profdata and llvm.profdata.
+# with RR_PGO_DIR/rustc.profdata and llvm.profdata. Cargo's cc passes the
+# Rust half's profile flags to C and C++ code that clang compiles, such as
+# the compiler's LLVM wrapper and jemalloc, so clang must be the same LLVM
+# version as the compiler's, as on Linux (clang 23); clang-cl takes none.
 set -euo pipefail
 if [ "$#" -ne 3 ]; then
     echo 'Usage: scripts/build-toolchain.sh RUST_SOURCE SCRATCH_DIRECTORY INSTALL_PREFIX' >&2
@@ -43,9 +46,15 @@ esac
 # archived and linked with the llvm-lib and lld-link beside it; clang's
 # runtime directory, with its profiling runtime, must be on LIB. Elsewhere
 # the compiler allocates with jemalloc, as official builds do.
+# The instrumented compilers below allocate with the system's malloc:
+# jemalloc, instrumented, profiles its own start and recurses into itself.
 rr_windows=
+rr_allocator=jemalloc
+case "${RR_PGO:-}" in
+generate-*) rr_allocator=system ;;
+esac
 case "$(uname -s)" in
-Linux) rr_set=(--set rust.bootstrap-override-lld=external --set build.allocator=jemalloc) ;;
+Linux) rr_set=(--set rust.bootstrap-override-lld=external --set "build.allocator=$rr_allocator") ;;
 MINGW* | MSYS* | CYGWIN*)
     rr_windows=1
     rr_llvm_bin="$(dirname "${CC:?CC must name clang-cl}")"
@@ -54,7 +63,7 @@ MINGW* | MSYS* | CYGWIN*)
     rr_set=(--set "target.$rr_build.linker=$rr_llvm_bin/lld-link.exe"
         --set "target.$rr_build.ar=$rr_llvm_bin/llvm-lib.exe")
     ;;
-*) rr_set=(--set build.allocator=jemalloc) ;;
+*) rr_set=(--set "build.allocator=$rr_allocator") ;;
 esac
 rr_set+=(--set "llvm.targets=$rr_backend")
 rr_pgo_dir="${RR_PGO_DIR:-}"

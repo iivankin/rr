@@ -5,13 +5,14 @@ name: Build and release rr
 # compiler builds run on request or on a tag, not on every push.
 #
 # The compiler is built as official Rust builds are, with profile-guided
-# optimization: `profile` builds it twice, with its Rust half and with its
-# C++ half (LLVM) instrumented, and gathers a profile from each at rr's
-# kind of work; `toolchain` builds the release compiler with both
-# profiles, ThinLTO and one codegen unit per crate; `build` builds rr,
-# which BOLT lays out on Linux x86_64, and packages it. Compilers and
-# profiles are kept in the cache, so a job whose result is there does
-# nothing.
+# optimization on Linux and Windows: `profile` builds it twice, with its Rust
+# half and with its C++ half (LLVM) instrumented, and gathers a profile from
+# each at rr's kind of work; `toolchain` builds the release compiler with
+# both profiles, ThinLTO and one codegen unit per crate; `build` builds rr,
+# which BOLT lays out on Linux x86_64, and packages it. On macOS, as in
+# official builds, there is no PGO: Apple's clang cannot read the profiles
+# of the compiler's newer LLVM. Compilers and profiles are kept in the cache,
+# so a job whose result is there does nothing.
 on:
   workflow_dispatch:
     inputs:
@@ -42,6 +43,7 @@ jobs:
     outputs:
       matrix: ${{ steps.pick.outputs.matrix }}
       profiles: ${{ steps.pick.outputs.profiles }}
+      pgo: ${{ steps.pick.outputs.pgo }}
     steps:
       - name: The distributions this run builds
         id: pick
@@ -51,20 +53,23 @@ jobs:
           python3 - >> "$GITHUB_OUTPUT" <<'PY'
           import json, os
           all = [
-              {'name': 'rr-macos-arm64', 'runner': 'macos-15'},
-              {'name': 'rr-linux-x86_64', 'runner': 'ubuntu-24.04', 'container': 'ubuntu:20.04'},
-              {'name': 'rr-linux-aarch64', 'runner': 'ubuntu-24.04-arm', 'container': 'ubuntu:20.04'},
-              {'name': 'rr-windows-x86_64', 'runner': 'windows-2025'},
-              {'name': 'rr-windows-aarch64', 'runner': 'windows-11-arm'},
+              {'name': 'rr-macos-arm64', 'runner': 'macos-15', 'pgo': False},
+              {'name': 'rr-linux-x86_64', 'runner': 'ubuntu-24.04', 'container': 'ubuntu:20.04', 'pgo': True},
+              {'name': 'rr-linux-aarch64', 'runner': 'ubuntu-24.04-arm', 'container': 'ubuntu:20.04', 'pgo': True},
+              {'name': 'rr-windows-x86_64', 'runner': 'windows-2025', 'pgo': True},
+              {'name': 'rr-windows-aarch64', 'runner': 'windows-11-arm', 'pgo': True},
           ]
           wanted = [h.strip() for h in os.environ.get('HOSTS', '').split(',') if h.strip()]
           chosen = [h for h in all if not wanted or h['name'] in wanted]
           print('matrix=' + json.dumps({'include': chosen}))
-          print('profiles=' + json.dumps({'include': [dict(h, kind=k) for h in chosen for k in ('rustc', 'llvm')]}))
+          profiles = [dict(h, kind=k) for h in chosen if h['pgo'] for k in ('rustc', 'llvm')]
+          print('profiles=' + json.dumps({'include': profiles}))
+          print('pgo=' + json.dumps(bool(profiles)))
           PY
 
   profile:
     needs: hosts
+    if: needs.hosts.outputs.pgo == 'true'
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.hosts.outputs.profiles) }}
@@ -120,6 +125,7 @@ jobs:
 
   toolchain:
     needs: [hosts, profile]
+    if: ${{ !cancelled() && needs.hosts.result == 'success' && (needs.profile.result == 'success' || needs.profile.result == 'skipped') }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.hosts.outputs.matrix) }}
@@ -155,23 +161,23 @@ jobs:
         with:
           name: ${{ matrix.name }}
       - name: The Rust half's profile
-        if: steps.toolchain.outputs.cache-hit != 'true'
+        if: steps.toolchain.outputs.cache-hit != 'true' && matrix.pgo
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.RR_TEMP }}/rr-pgo/rustc.profdata
           key: rr-pgo-rustc-${{ steps.key.outputs.key }}
           fail-on-cache-miss: true
       - name: LLVM's profile
-        if: steps.toolchain.outputs.cache-hit != 'true'
+        if: steps.toolchain.outputs.cache-hit != 'true' && matrix.pgo
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.RR_TEMP }}/rr-pgo/llvm.profdata
           key: rr-pgo-llvm-${{ steps.key.outputs.key }}
           fail-on-cache-miss: true
-      - name: Build LLVM and the matching static compiler with both profiles
+      - name: Build LLVM and the matching static compiler, with both profiles where there are
         if: steps.toolchain.outputs.cache-hit != 'true'
         env:
-          RR_PGO: use
+          RR_PGO: ${{ matrix.pgo && 'use' || '' }}
         run: RR_PGO_DIR="$RR_TEMP/rr-pgo" scripts/build-toolchain.sh "$RR_TEMP/rust" "$RR_TEMP/rr-scratch" "$RR_TEMP/rr-toolchain"
       - name: Keep the compiler
         if: steps.toolchain.outputs.cache-hit != 'true'
@@ -182,6 +188,7 @@ jobs:
 
   build:
     needs: [hosts, toolchain]
+    if: ${{ !cancelled() && needs.toolchain.result == 'success' }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.hosts.outputs.matrix) }}

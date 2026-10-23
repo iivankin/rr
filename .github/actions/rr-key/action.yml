@@ -19,4 +19,4 @@ runs:
       shell: bash
       run: |
         echo "RR_TEMP=$( (command -v cygpath >/dev/null && cygpath -m "$RUNNER_TEMP") || echo "$RUNNER_TEMP")" >> "$GITHUB_ENV"
-        echo "key=rr-toolchain-${{ inputs.name }}-$RUST_COMMIT-clang18-llvm20.1.3-${{ hashFiles('.github/rr-bootstrap.toml', 'scripts/build-toolchain.sh', 'scripts/prepare-static-driver.py', 'scripts/pgo-profile.sh', 'scripts/pgo-train.py') }}" >> "$GITHUB_OUTPUT"
+        echo "key=rr-toolchain-${{ inputs.name }}-$RUST_COMMIT-clang23-llvm20.1.3-${{ hashFiles('.github/rr-bootstrap.toml', 'scripts/build-toolchain.sh', 'scripts/prepare-static-driver.py', 'scripts/pgo-profile.sh', 'scripts/pgo-train.py') }}" >> "$GITHUB_OUTPUT"

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Run an instrumented compiler (scripts/build-toolchain.sh with RR_PGO set)
 over the work rr's compiler does, so that it writes its raw profiles into
-PROFILE_DIR: checking and building rr's own crates, which use the
-compiler's private crates, building ordinary crates for debugging and for
-release, building core and alloc, and compiling rr's example programs as
-rr does. Cargo is RUSTUP_TOOLCHAIN's, which must be a nightly."""
+PROFILE_DIR: checking rr's own crates and building them and their
+dependencies for debugging and for release, building core and alloc, and
+compiling rr's example programs as rr does. Cargo is RUSTUP_TOOLCHAIN's,
+which must be a nightly."""
 import os
 from pathlib import Path
 import shutil
@@ -41,10 +41,7 @@ def main():
         # rr's libraries, not its executables, which would link the
         # instrumented compiler without its profiling runtime.
         run('cargo', 'build', '--locked', '-p', 'clippy_lints', '-p', 'rustfmt-nightly')
-        run('cargo', 'build', '--locked', '--release', '-p', 'clippy_utils')
-        dev = REPO / 'clippy_dev/Cargo.toml'
-        run('cargo', 'build', '--locked', '--manifest-path', dev)
-        run('cargo', 'build', '--locked', '--release', '--manifest-path', dev)
+        run('cargo', 'build', '--locked', '--release', '-p', 'clippy_utils', '-p', 'rustfmt-nightly')
         run(sys.executable, REPO / 'scripts/build-target-sysroot.py', rustc, scratch / 'sysroot', host)
         programs = [REPO / 'examples/corpus/kv/src/main.rs', REPO / 'examples/corpus/lz/src/main.rs']
         for program in programs:
