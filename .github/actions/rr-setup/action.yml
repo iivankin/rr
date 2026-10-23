@@ -81,7 +81,11 @@ runs:
         7z x -o"$RUNNER_TEMP/llvm" "$RUNNER_TEMP/$installer" > /dev/null
         clang="$(cygpath -m "$RUNNER_TEMP/llvm/bin/clang-cl.exe")"
         "$clang" --version
-        { echo "CC=$clang"; echo "CXX=$clang"; } >> "$GITHUB_ENV"
+        # Code clang-cl instruments names clang's profiling runtime, which
+        # the linker finds on LIB.
+        runtime="$(dirname "$("$clang" /clang:-print-libgcc-file-name /clang:--rtlib=compiler-rt | tr -d '\r')")"
+        ls "$runtime"/clang_rt.profile-*.lib
+        { echo "CC=$clang"; echo "CXX=$clang"; echo "LIB=$LIB;$(cygpath -w "$runtime")"; } >> "$GITHUB_ENV"
     - name: Long paths for the compiler's source
       shell: bash
       run: git config --global core.longpaths true

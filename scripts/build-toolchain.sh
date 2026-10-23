@@ -40,8 +40,9 @@ aarch64-*) rr_backend=AArch64 ;;
 esac
 # LLVM's ThinLTO objects are bitcode: the compiler links with lld, which
 # reads them. On Windows LLVM is compiled with LLVM's clang-cl, in CC, and
-# archived and linked with the llvm-lib and lld-link beside it. Elsewhere the
-# compiler allocates with jemalloc, as official builds do.
+# archived and linked with the llvm-lib and lld-link beside it; clang's
+# runtime directory, with its profiling runtime, must be on LIB. Elsewhere
+# the compiler allocates with jemalloc, as official builds do.
 rr_windows=
 case "$(uname -s)" in
 Linux) rr_set=(--set rust.bootstrap-override-lld=external --set build.allocator=jemalloc) ;;
@@ -50,8 +51,7 @@ MINGW* | MSYS* | CYGWIN*)
     rr_llvm_bin="$(dirname "${CC:?CC must name clang-cl}")"
     test -x "$rr_llvm_bin/lld-link.exe"
     test -x "$rr_llvm_bin/llvm-lib.exe"
-    rr_set=(--set "llvm.clang-cl=$CC"
-        --set "target.$rr_build.linker=$rr_llvm_bin/lld-link.exe"
+    rr_set=(--set "target.$rr_build.linker=$rr_llvm_bin/lld-link.exe"
         --set "target.$rr_build.ar=$rr_llvm_bin/llvm-lib.exe")
     ;;
 *) rr_set=(--set build.allocator=jemalloc) ;;
