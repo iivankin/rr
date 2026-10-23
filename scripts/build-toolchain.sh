@@ -85,6 +85,14 @@ generate-rustc | generate-llvm)
         rr_set+=(--set build.profiler=true --set "pgo.rustc.generate=\"$rr_pgo_dir\"")
     else
         rr_set+=(--set "pgo.llvm.generate=\"$rr_pgo_dir\"")
+        # The profiling runtime's value profiles are lists that the
+        # compiler's codegen threads extend without ordering their
+        # memory: on AArch64 a thread can loop in one forever. Branch
+        # counts, the bulk of the profile, need no such lists.
+        if [ "$rr_backend" = AArch64 ]; then
+            rr_set+=(--set 'llvm.cflags="-mllvm -disable-vp=true"'
+                --set 'llvm.cxxflags="-mllvm -disable-vp=true"')
+        fi
     fi
     ;;
 use)

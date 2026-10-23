@@ -544,7 +544,9 @@ the example programs), and the release compiler is built with both profiles.
 Linux compiles LLVM with clang 23, the version of the compiler's own LLVM,
 since the compiler's profile flags reach the C and C++ code that clang
 compiles; macOS, whose Apple clang is older, has no PGO, as in official
-builds. Every compiler has one codegen unit per crate; off Windows it
+builds. On AArch64 LLVM's profile has branch counts but no value profiles,
+whose runtime lists hang the instrumented compiler's codegen threads there.
+Every compiler has one codegen unit per crate; off Windows it
 allocates with jemalloc, and on Linux x86_64 BOLT lays out the rr executable
 by a profile of the smoke checks.
 On Windows LLVM is compiled with LLVM 20.1.3's clang-cl, named in CC, and

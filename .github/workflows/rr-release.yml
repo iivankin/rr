@@ -115,6 +115,8 @@ jobs:
           name: ${{ matrix.name }}
       - name: Build the instrumented compiler and gather its profile
         if: steps.toolchain.outputs.cache-hit != 'true' && steps.profile.outputs.cache-hit != 'true'
+        # About an hour and a half at most; longer is a hang.
+        timeout-minutes: 180
         run: scripts/pgo-profile.sh "${{ matrix.kind }}" "$RR_TEMP/rust" "$RR_TEMP/rr-scratch" "$RR_TEMP/rr-pgo"
       - name: Keep the profile
         if: steps.toolchain.outputs.cache-hit != 'true' && steps.profile.outputs.cache-hit != 'true'
