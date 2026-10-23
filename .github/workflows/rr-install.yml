@@ -1,0 +1,74 @@
+name: Install rr
+
+# Runs install.sh and install.ps1 from this commit against a published
+# release on each host, both ways: the default install, which puts rr on
+# PATH, and one into the directory RR_INSTALL names. The release workflow
+# calls it after it publishes.
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Release tag to install (empty: the latest)'
+        required: false
+        default: ''
+  workflow_call:
+    inputs:
+      release:
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, ubuntu-24.04, ubuntu-24.04-arm, windows-2025, windows-11-arm]
+    runs-on: ${{ matrix.runner }}
+    env:
+      RR_VERSION: ${{ inputs.release }}
+    steps:
+      - name: Checkout rr
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: install.sh, by default and into RR_INSTALL
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          sh install.sh < /dev/null
+          "$HOME/.local/bin/rr" --version
+          RR_INSTALL="$RUNNER_TEMP/rr" sh install.sh < /dev/null
+          # Again, over the installed one.
+          RR_INSTALL="$RUNNER_TEMP/rr" sh install.sh < /dev/null
+          cd "$RUNNER_TEMP"
+          PATH="$RUNNER_TEMP/rr:$PATH" rr init demo
+          cd demo
+          PATH="$RUNNER_TEMP/rr:$PATH" make test
+          PATH="$HOME/.local/bin:$PATH" make
+          ./demo
+      - name: install.ps1 by default, in Windows PowerShell, as from irm
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          Get-Content -Raw install.ps1 | Invoke-Expression
+          rr --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if (-not ([Environment]::GetEnvironmentVariable('Path', 'User') -split ';' -contains "$env:LOCALAPPDATA\Programs\rr")) { exit 1 }
+      - name: install.ps1 into RR_INSTALL, twice, in PowerShell
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:RR_INSTALL = "$env:RUNNER_TEMP\rr"
+          ./install.ps1
+          ./install.ps1
+          Set-Location $env:RUNNER_TEMP
+          & "$env:RUNNER_TEMP\rr\rr.exe" init demo
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Set-Location demo
+          & "$env:RUNNER_TEMP\rr\rr.exe" src/main.rs -o demo.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          ./demo.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }

@@ -210,3 +210,9 @@ jobs:
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "rr $TAG" \
             --notes "rr, Restricted Rust: the compiler and linter for macOS arm64, Linux x86_64 and aarch64, Windows x86_64 and aarch64. Each archive holds rr, its sysroots for the host and for the host's rr target where there is one, rust-lld and libFuzzer; see README.md inside." \
             rr-*.tar.gz rr-*.zip SHA256SUMS ./*-verification.txt
+
+  installers:
+    needs: release
+    uses: ./.github/workflows/rr-install.yml
+    with:
+      release: ${{ inputs.release || github.ref_name }}
