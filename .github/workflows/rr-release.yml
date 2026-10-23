@@ -3,6 +3,15 @@ name: Build and release rr
 # Builds the static compiler and rr for each host, verifies each
 # distribution, and on a tag publishes them as a GitHub release. Full
 # compiler builds run on request or on a tag, not on every push.
+#
+# The compiler is built as official Rust builds are, with profile-guided
+# optimization: `profile` builds it twice, with its Rust half and with its
+# C++ half (LLVM) instrumented, and gathers a profile from each at rr's
+# kind of work; `toolchain` builds the release compiler with both
+# profiles, ThinLTO and one codegen unit per crate; `build` builds rr,
+# which BOLT lays out on Linux x86_64, and packages it. Compilers and
+# profiles are kept in the cache, so a job whose result is there does
+# nothing.
 on:
   workflow_dispatch:
     inputs:
@@ -32,6 +41,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.pick.outputs.matrix }}
+      profiles: ${{ steps.pick.outputs.profiles }}
     steps:
       - name: The distributions this run builds
         id: pick
@@ -50,10 +60,66 @@ jobs:
           wanted = [h.strip() for h in os.environ.get('HOSTS', '').split(',') if h.strip()]
           chosen = [h for h in all if not wanted or h['name'] in wanted]
           print('matrix=' + json.dumps({'include': chosen}))
+          print('profiles=' + json.dumps({'include': [dict(h, kind=k) for h in chosen for k in ('rustc', 'llvm')]}))
           PY
 
-  build:
+  profile:
     needs: hosts
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.hosts.outputs.profiles) }}
+    name: profile (${{ matrix.name }}, ${{ matrix.kind }})
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Git, in the Linux container
+        if: matrix.container
+        run: apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -qy git ca-certificates
+      - name: Checkout rr
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The compiler's cache key
+        id: key
+        uses: ./.github/actions/rr-key
+        with:
+          name: ${{ matrix.name }}
+      - name: Whether the release compiler is built
+        id: toolchain
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.RR_TEMP }}/rr-toolchain
+          key: ${{ steps.key.outputs.key }}
+          lookup-only: true
+      - name: Whether the profile is gathered
+        id: profile
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.RR_TEMP }}/rr-pgo/${{ matrix.kind }}.profdata
+          key: rr-pgo-${{ matrix.kind }}-${{ steps.key.outputs.key }}
+          lookup-only: true
+      - name: Build tools and the compiler's source
+        if: steps.toolchain.outputs.cache-hit != 'true' && steps.profile.outputs.cache-hit != 'true'
+        uses: ./.github/actions/rr-setup
+        with:
+          name: ${{ matrix.name }}
+      - name: Build the instrumented compiler and gather its profile
+        if: steps.toolchain.outputs.cache-hit != 'true' && steps.profile.outputs.cache-hit != 'true'
+        run: scripts/pgo-profile.sh "${{ matrix.kind }}" "$RR_TEMP/rust" "$RR_TEMP/rr-scratch" "$RR_TEMP/rr-pgo"
+      - name: Keep the profile
+        if: steps.toolchain.outputs.cache-hit != 'true' && steps.profile.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.RR_TEMP }}/rr-pgo/${{ matrix.kind }}.profdata
+          key: rr-pgo-${{ matrix.kind }}-${{ steps.key.outputs.key }}
+
+  toolchain:
+    needs: [hosts, profile]
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.hosts.outputs.matrix) }}
@@ -64,104 +130,97 @@ jobs:
       run:
         shell: bash
     steps:
-      - name: Linux build tools, in a glibc 2.31 container for old systems
+      - name: Git, in the Linux container
         if: matrix.container
-        run: |
-          apt-get update -q
-          DEBIAN_FRONTEND=noninteractive apt-get install -qy build-essential git python3 python3-pip \
-            curl pkg-config file xz-utils ca-certificates zlib1g-dev make gnupg
-          # Ubuntu 20.04's clang 10 miscompiles this LLVM for x86_64: LLVM's
-          # own packages of clang 18, for the same old glibc.
-          curl -sSf https://apt.llvm.org/llvm-snapshot.gpg.key | gpg --dearmor -o /usr/share/keyrings/llvm.gpg
-          echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/focal/ llvm-toolchain-focal-18 main" \
-            > /etc/apt/sources.list.d/llvm.list
-          apt-get update -q
-          DEBIAN_FRONTEND=noninteractive apt-get install -qy clang-18 lld-18 llvm-18
-          for tool in clang clang++ ld.lld llvm-ar llvm-ranlib; do
-            ln -sf "/usr/bin/$tool-18" "/usr/bin/$tool"
-          done
-          clang --version
-          pip3 install -q cmake==3.31.6 ninja==1.13.0
-          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          # LLVM's ThinLTO objects are bitcode: LLVM's own archiver indexes
-          # their symbols, which binutils' does not.
-          {
-            echo CC=clang
-            echo CXX=clang++
-            echo AR=llvm-ar
-            echo RANLIB=llvm-ranlib
-          } >> "$GITHUB_ENV"
-      - name: macOS build tools
-        if: runner.os == 'macOS'
-        run: brew install ninja
-      - name: Windows build tools
-        if: runner.os == 'Windows'
-        run: |
-          python -m pip install -q ninja==1.13.0
-          # Git's GNU link (hard links) would stand before Visual Studio's
-          # linker on PATH in bash.
-          mv /usr/bin/link.exe /usr/bin/gnu-link.exe
-      - name: Visual Studio's compilers on PATH
-        if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
-        with:
-          arch: ${{ matrix.name == 'rr-windows-aarch64' && 'arm64' || 'x64' }}
-      - name: Clang for LLVM on Windows, for ThinLTO, and as Visual Studio's compiler miscompiles it on ARM
-        if: runner.os == 'Windows'
-        run: |
-          # Visual Studio's own clang-cl, for the host; a short path, so
-          # that no space splits it. lld-link and llvm-lib are beside it.
-          clang="$(ls -d "/c/Program Files/Microsoft Visual Studio"/*/*/VC/Tools/Llvm/${{ matrix.name == 'rr-windows-aarch64' && 'ARM64' || 'x64' }}/bin/clang-cl.exe | head -1)"
-          clang="$(cygpath -m -s "$clang")"
-          "$clang" --version
-          { echo "CC=$clang"; echo "CXX=$clang"; } >> "$GITHUB_ENV"
-      - name: Paths that bash and Windows programs both read
-        run: |
-          echo "RR_TEMP=$( (command -v cygpath >/dev/null && cygpath -m "$RUNNER_TEMP") || echo "$RUNNER_TEMP")" >> "$GITHUB_ENV"
-          git config --global core.longpaths true
+        run: apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -qy git ca-certificates
       - name: Checkout rr
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Checkout pinned Rust compiler
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: The compiler's cache key
+        id: key
+        uses: ./.github/actions/rr-key
         with:
-          repository: rust-lang/rust
-          ref: ${{ env.RUST_COMMIT }}
-          path: ci-rust
-          persist-credentials: false
-      - name: The compiler's source outside rr's, whose checks walk rr's tree
-        run: mv ci-rust "$RR_TEMP/rust"
-      - name: Cargo, rustfmt and the library source for developing rr
-        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt,rust-src
-      # The compiler takes hours to build and changes only with these files:
-      # it is kept between runs, saved as soon as it is built, so that a
-      # later step's failure does not lose it.
-      - name: Restore the compiler built before
+          name: ${{ matrix.name }}
+      - name: Whether the release compiler is built
         id: toolchain
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.RR_TEMP }}/rr-toolchain
-          key: rr-toolchain-${{ matrix.name }}-${{ env.RUST_COMMIT }}-${{ runner.os == 'Windows' && 'clang-lto-' || '' }}${{ matrix.container && 'clang18-' || '' }}${{ hashFiles('.github/rr-bootstrap.toml', 'scripts/build-toolchain.sh', 'scripts/prepare-static-driver.py') }}
-      - name: Build LLVM and the matching static compiler
+          key: ${{ steps.key.outputs.key }}
+          lookup-only: true
+      - name: Build tools and the compiler's source
         if: steps.toolchain.outputs.cache-hit != 'true'
-        run: scripts/build-toolchain.sh "$RR_TEMP/rust" "$RR_TEMP/rr-scratch" "$RR_TEMP/rr-toolchain"
-      - name: Keep the compiler for later runs
+        uses: ./.github/actions/rr-setup
+        with:
+          name: ${{ matrix.name }}
+      - name: The Rust half's profile
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.RR_TEMP }}/rr-pgo/rustc.profdata
+          key: rr-pgo-rustc-${{ steps.key.outputs.key }}
+          fail-on-cache-miss: true
+      - name: LLVM's profile
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.RR_TEMP }}/rr-pgo/llvm.profdata
+          key: rr-pgo-llvm-${{ steps.key.outputs.key }}
+          fail-on-cache-miss: true
+      - name: Build LLVM and the matching static compiler with both profiles
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        env:
+          RR_PGO: use
+        run: RR_PGO_DIR="$RR_TEMP/rr-pgo" scripts/build-toolchain.sh "$RR_TEMP/rust" "$RR_TEMP/rr-scratch" "$RR_TEMP/rr-toolchain"
+      - name: Keep the compiler
         if: steps.toolchain.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ env.RR_TEMP }}/rr-toolchain
-          key: ${{ steps.toolchain.outputs.cache-primary-key }}
-      - name: LLVM's source, for libFuzzer, when the compiler came from the cache
-        if: steps.toolchain.outputs.cache-hit == 'true'
+          key: ${{ steps.key.outputs.key }}
+
+  build:
+    needs: [hosts, toolchain]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.hosts.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Git, in the Linux container
+        if: matrix.container
+        run: apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -qy git ca-certificates
+      - name: Checkout rr
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The compiler's cache key
+        id: key
+        uses: ./.github/actions/rr-key
+        with:
+          name: ${{ matrix.name }}
+      - name: Build tools and the compiler's source
+        uses: ./.github/actions/rr-setup
+        with:
+          name: ${{ matrix.name }}
+      - name: The release compiler
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.RR_TEMP }}/rr-toolchain
+          key: ${{ steps.key.outputs.key }}
+          fail-on-cache-miss: true
+      - name: LLVM's source, for libFuzzer
         run: git -C "$RR_TEMP/rust" submodule update --init --depth 1 src/llvm-project
       - name: The compiler on the environment, for rr's checks
         run: |
-          rr_rustc="$RR_TEMP/rr-toolchain/bin/rustc"
           {
             echo "RR_TOOLCHAIN=$RR_TEMP/rr-toolchain"
-            echo "RUSTC=$rr_rustc"
+            echo "RUSTC=$RR_TEMP/rr-toolchain/bin/rustc"
             echo "RUSTDOC=$RR_TEMP/rr-toolchain/bin/rustdoc"
             echo "SYSROOT=$RR_TEMP/rr-toolchain"
           } >> "$GITHUB_ENV"

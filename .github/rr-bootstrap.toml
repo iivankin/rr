@@ -32,6 +32,8 @@ channel = "nightly"
 optimize = true
 debuginfo-level = 0
 debug-assertions = false
+# One codegen unit per compiler crate, as official builds have.
+codegen-units = 1
 incremental = false
 # Retain bitcode in compiler rlibs for the final statically linked rr ThinLTO.
 lto = "thin"

@@ -1,0 +1,22 @@
+name: rr compiler key
+description: >-
+  RR_TEMP, a directory that bash and Windows programs both read, and the
+  cache key of the compiler for a host, which changes with what the compiler
+  is built from and how: the pinned source, the C++ compilers, and the
+  scripts that build and profile it.
+inputs:
+  name:
+    description: The distribution's name, such as rr-linux-x86_64
+    required: true
+outputs:
+  key:
+    description: The compiler's cache key
+    value: ${{ steps.key.outputs.key }}
+runs:
+  using: composite
+  steps:
+    - id: key
+      shell: bash
+      run: |
+        echo "RR_TEMP=$( (command -v cygpath >/dev/null && cygpath -m "$RUNNER_TEMP") || echo "$RUNNER_TEMP")" >> "$GITHUB_ENV"
+        echo "key=rr-toolchain-${{ inputs.name }}-$RUST_COMMIT-clang18-llvm20.1.3-${{ hashFiles('.github/rr-bootstrap.toml', 'scripts/build-toolchain.sh', 'scripts/prepare-static-driver.py', 'scripts/pgo-profile.sh', 'scripts/pgo-train.py') }}" >> "$GITHUB_OUTPUT"

@@ -2,6 +2,12 @@
 # Build the pinned compiler for this machine with rr's changes: the driver
 # as a static library, LLVM with the host's own backend only, rust-lld, and
 # the library source. Linux, macOS and Windows (Git Bash) hosts.
+#
+# Profile-guided optimization, as official Rust builds have it, takes three
+# builds (see scripts/pgo-profile.sh): RR_PGO=generate-rustc and
+# RR_PGO=generate-llvm build a compiler, without LTO, whose Rust or C++ half
+# writes raw profiles into RR_PGO_DIR; RR_PGO=use builds the release compiler
+# with RR_PGO_DIR/rustc.profdata and llvm.profdata.
 set -euo pipefail
 if [ "$#" -ne 3 ]; then
     echo 'Usage: scripts/build-toolchain.sh RUST_SOURCE SCRATCH_DIRECTORY INSTALL_PREFIX' >&2
@@ -33,20 +39,53 @@ aarch64-*) rr_backend=AArch64 ;;
 *) echo "Unsupported host: $(rustc -vV)" >&2; exit 1 ;;
 esac
 # LLVM's ThinLTO objects are bitcode: the compiler links with lld, which
-# reads them. On Windows LLVM is compiled with Visual Studio's clang-cl, in
-# CC, and archived and linked with the llvm-lib and lld-link beside it.
+# reads them. On Windows LLVM is compiled with LLVM's clang-cl, in CC, and
+# archived and linked with the llvm-lib and lld-link beside it. Elsewhere the
+# compiler allocates with jemalloc, as official builds do.
+rr_windows=
 case "$(uname -s)" in
-Linux) rr_set=(--set rust.bootstrap-override-lld=external) ;;
+Linux) rr_set=(--set rust.bootstrap-override-lld=external --set build.allocator=jemalloc) ;;
 MINGW* | MSYS* | CYGWIN*)
+    rr_windows=1
     rr_llvm_bin="$(dirname "${CC:?CC must name clang-cl}")"
     test -x "$rr_llvm_bin/lld-link.exe"
     test -x "$rr_llvm_bin/llvm-lib.exe"
-    rr_set=(--set "target.$rr_build.linker=$rr_llvm_bin/lld-link.exe"
+    rr_set=(--set "llvm.clang-cl=$CC"
+        --set "target.$rr_build.linker=$rr_llvm_bin/lld-link.exe"
         --set "target.$rr_build.ar=$rr_llvm_bin/llvm-lib.exe")
     ;;
-*) rr_set=() ;;
+*) rr_set=(--set build.allocator=jemalloc) ;;
 esac
 rr_set+=(--set "llvm.targets=$rr_backend")
+rr_pgo_dir="${RR_PGO_DIR:-}"
+if [ -n "$rr_windows" ] && [ -n "$rr_pgo_dir" ]; then
+    rr_pgo_dir="$(cygpath -m "$rr_pgo_dir")"
+fi
+case "${RR_PGO:-}" in
+'') ;;
+generate-rustc | generate-llvm)
+    test -n "$rr_pgo_dir"
+    # The instrumented compiler only gathers profiles: no LTO, and as many
+    # codegen units as usual. A dynamic LLVM carries the profiling runtime
+    # of the C++ compiler that instrumented it; Windows links it statically.
+    rr_set+=(--set llvm.thin-lto=false --set rust.lto=off --set rust.codegen-units=16)
+    if [ -z "$rr_windows" ]; then
+        rr_set+=(--set llvm.link-shared=true)
+    fi
+    if [ "$RR_PGO" = generate-rustc ]; then
+        rr_set+=(--set build.profiler=true --set "pgo.rustc.generate=\"$rr_pgo_dir\"")
+    else
+        rr_set+=(--set "pgo.llvm.generate=\"$rr_pgo_dir\"")
+    fi
+    ;;
+use)
+    test -f "$rr_pgo_dir/rustc.profdata"
+    test -f "$rr_pgo_dir/llvm.profdata"
+    rr_set+=(--set "pgo.rustc.use=\"$rr_pgo_dir/rustc.profdata\""
+        --set "pgo.llvm.use=\"$rr_pgo_dir/llvm.profdata\"")
+    ;;
+*) echo "Unknown RR_PGO: $RR_PGO" >&2; exit 1 ;;
+esac
 "$rr_python" x.py dist --stage 2 -j "${RR_BUILD_JOBS:-6}" ${rr_set[@]+"${rr_set[@]}"} rustc rust-std rustc-dev rust-src
 # The host is in the name of the compiler archive bootstrap made.
 rr_host="$(ls build/dist/rustc-nightly-*.tar.gz | sed 's|.*/rustc-nightly-||; s|\.tar\.gz$||')"
@@ -70,13 +109,18 @@ rr_tools="$rr_prefix/lib/rustlib/$rr_host/bin"
 mkdir -p "$rr_tools"
 # rust-lld, in the compiler's component, links rr's Linux and Windows targets.
 ls "$rr_tools"/rust-lld*
+rr_llvm_build="$(dirname "$(dirname "$rr_llvm_config")")"
 case "$rr_host" in
 *-apple-darwin)
     # -Cstrip on Darwin needs this real LLVM helper even in the minimal distribution.
-    rr_llvm_build="$(dirname "$(dirname "$rr_llvm_config")")"
     cmake --build "$rr_llvm_build" --target llvm-objcopy -j "${RR_BUILD_JOBS:-6}"
     cp "$rr_llvm_build/bin/llvm-objcopy" "$rr_tools/rust-objcopy"
     ;;
 esac
+if [ "${RR_PGO:-}" = generate-rustc ]; then
+    # The compiler's own LLVM reads the raw profiles of its profiling
+    # runtime; scripts/pgo-profile.sh runs it where it is built.
+    cmake --build "$rr_llvm_build" --target llvm-profdata -j "${RR_BUILD_JOBS:-6}"
+fi
 # Fail before building rr if the bootstrap change did not retain static objects.
 test -n "$(find "$rr_prefix/lib/rustlib/$rr_host/lib" -name 'librustc_driver-*.rlib' -print -quit)"

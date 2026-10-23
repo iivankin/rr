@@ -34,7 +34,7 @@ def build(rustc, destination, target):
         (crate / 'src').mkdir(parents=True)
         (crate / 'Cargo.toml').write_text(
             '[package]\nname = "rr_sysroot"\nversion = "0.0.0"\nedition = "2024"\n\n'
-            '[profile.release]\npanic = "abort"\nopt-level = 2\ncodegen-units = 16\n')
+            '[profile.release]\npanic = "abort"\nopt-level = 2\ncodegen-units = 1\n')
         (crate / 'src/lib.rs').write_text('#![no_std]\n')
         flags = '-Cembed-bitcode=yes'
         if rr_target:

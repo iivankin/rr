@@ -2,7 +2,8 @@
 """Verify a distribution: rr embeds rustc_driver and LLVM with the host's
 backend only, depends on nothing but the system's own libraries, and on
 Linux and Windows carries the sysroot of the host's rr target and the
-rust-lld that links it."""
+rust-lld that links it; it allocates with jemalloc except on Windows, and
+on Linux x86_64 BOLT has laid it out."""
 from pathlib import Path
 import platform
 import subprocess
@@ -63,6 +64,13 @@ for target in expected:
         raise SystemExit(f'No sysroot for {target}')
     if not any(bundle.glob(f'lib/rustlib/{host}/bin/rust-lld*')):
         raise SystemExit(f'No rust-lld to link {target}')
+# Off Windows the compiler allocates with jemalloc, whose messages name it;
+# on Linux x86_64 BOLT has laid rr out and left its note.
+if system != 'Windows' and b'<jemalloc>' not in rr.read_bytes():
+    raise SystemExit('rr does not allocate with jemalloc')
+if host == 'x86_64-unknown-linux-gnu' and \
+        '.note.bolt_info' not in subprocess.check_output(['readelf', '-S', '-W', str(rr)], text=True):
+    raise SystemExit('rr was not laid out by BOLT')
 size = sum(file.stat().st_size for file in bundle.rglob('*') if file.is_file())
 print(f'PASS static rustc_driver and LLVM; {backend} only; sysroots for {host} {" ".join(expected)}; '
       f'unpacked size {size / 1024**2:.2f} MiB')

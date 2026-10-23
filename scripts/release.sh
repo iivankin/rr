@@ -30,10 +30,12 @@ export SYSROOT="$rr_toolchain" CARGO_TARGET_DIR="$rr_scratch/target"
 # only to rr. The driver embeds rustc and LLVM: one executable at a time.
 # On Linux LLVM's ThinLTO objects are bitcode, which lld reads and the
 # GNU linker does not.
-# On Windows Visual Studio's lld-link, beside the clang-cl in CC that
-# compiled LLVM, reads them; its own linker does not.
+# On Windows LLVM's lld-link, beside the clang-cl in CC that compiled
+# LLVM, reads them; Visual Studio's linker does not. On Linux x86_64 rr
+# keeps its relocations for BOLT, below.
 rr_link= rr_lto=thin
 case "$rr_host" in
+x86_64-*-linux-*) rr_link='-Clink-arg=-fuse-ld=lld -Clink-arg=-Wl,--emit-relocs' ;;
 *-linux-*) rr_link=-Clink-arg=-fuse-ld=lld ;;
 *-windows-*) rr_link="-Clinker=$(dirname "${CC:?CC must name clang-cl}")/lld-link.exe" ;;
 esac
@@ -46,6 +48,22 @@ rr_bundle="dist/$rr_name"
 scripts/package-rr.sh "$CARGO_TARGET_DIR/release/rr$rr_exe" "$rr_toolchain" "$rr_scratch/client" "$rr_bundle"
 python3 scripts/add-fuzz-runtime.py "$rr_scratch/fuzz-runtime" "$rr_bundle"
 cp .github/rr-bootstrap.toml "$rr_bundle/bootstrap.toml"
+# On Linux x86_64 BOLT lays out rr's code by a profile of rr at its smoke
+# work, as official builds lay out rustc's and LLVM's; BOLT on AArch64 is
+# not reliable yet.
+if [ "$rr_host" = x86_64-unknown-linux-gnu ]; then
+    rr_bolt="$rr_scratch/bolt"
+    rm -rf "$rr_bolt"
+    mkdir -p "$rr_bolt/profiles"
+    cp "$rr_bundle/rr" "$rr_bolt/rr"
+    llvm-bolt "$rr_bolt/rr" -instrument --instrumentation-file="$rr_bolt/profiles/rr.fdata" \
+        --instrumentation-file-append-pid -o "$rr_bundle/rr"
+    (unset RUSTC RUSTDOC SYSROOT; python3 scripts/smoke-distribution.py "$rr_bundle" > "$rr_bolt/train.log")
+    merge-fdata "$rr_bolt"/profiles/*.fdata > "$rr_bolt/rr.fdata"
+    llvm-bolt "$rr_bolt/rr" -data "$rr_bolt/rr.fdata" -o "$rr_bundle/rr" \
+        -reorder-blocks=ext-tsp -reorder-functions=cdsort -split-functions \
+        -split-strategy=cdsplit -split-all-cold -jump-tables=move -icf=all -dyno-stats
+fi
 python3 scripts/verify-bundle.py "$rr_bundle" | tee "dist/$rr_name-verification.txt"
 unset RUSTC RUSTDOC SYSROOT
 python3 scripts/smoke-distribution.py "$rr_bundle" | tee -a "dist/$rr_name-verification.txt"
