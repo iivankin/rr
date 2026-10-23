@@ -1,9 +1,10 @@
 # rr — Restricted Rust
 
-A compiler and linter forked from Clippy's `rust-1.99.0` tag, commit
-`49e2f89a2605a9a340e04955fdbefa9803e6027a`. Its matching private compiler API is
-**rustc 1.99.0-nightly (84b36a78a, 2026-08-06)**, toolchain `nightly-2026-08-07`.
-It is not the stable 1.99.0 compiler binary.
+A compiler and linter forked from Clippy, at the Clippy of Rust 1.99.1 (Clippy's
+`rust-1.99.0` tag with that release's own changes). Its matching private
+compiler API is **rustc 1.99.1 (58cf8f9c3, 2026-10-13)**: rr's compiler is built
+from that source with nightly features enabled. Development builds use
+`nightly-2026-08-15`, the nightly before 1.99 branched from master.
 
 ## Use
 
@@ -531,7 +532,7 @@ Logs and the current report are in verification/builtins-2026-10-08/.
 ## GitHub Actions: static compiler driver
 
 The release workflow builds stage2 Rust at commit
-84b36a78a28a63f134171c670be1932ffa2485f8 with its exact LLVM submodule, LLVM's
+58cf8f9c35b355199727627d07ae34a4e2846d67 with its exact LLVM submodule, LLVM's
 backend for the host and rust-lld, and compiles rr against that matching
 compiler on each host. No prebuilt LLVM or compiler driver is substituted.
 LLVM, stage2 compiler libraries and the release rr executable use ThinLTO.

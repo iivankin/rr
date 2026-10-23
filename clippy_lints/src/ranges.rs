@@ -12,7 +12,8 @@ use clippy_utils::{
 use rustc_ast::Mutability;
 use rustc_ast::ast::RangeLimits;
 use rustc_errors::Applicability;
-use rustc_hir::{BinOpKind, Expr, ExprKind, HirId, LangItem, Node};
+use rustc_hir::attrs::lang_items::LangItem;
+use rustc_hir::{BinOpKind, Expr, ExprKind, HirId, Node};
 use rustc_lint::{LateContext, LateLintPass, Lint};
 use rustc_middle::ty::{self, ClauseKind, GenericArgKind, PredicatePolarity, Ty};
 use rustc_session::impl_lint_pass;
@@ -433,8 +434,8 @@ fn can_switch_ranges<'tcx>(
                 .param_env(id)
                 .caller_bounds()
                 .into_iter()
-                .any(|p| {
-                    if let ClauseKind::Trait(t) = p.kind().skip_binder()
+                .any(|c| {
+                    if let ClauseKind::Trait(t) = c.kind().skip_binder()
                         && t.polarity == PredicatePolarity::Positive
                         && matches!(
                             cx.tcx.get_diagnostic_name(t.trait_ref.def_id),

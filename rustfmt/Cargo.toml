@@ -1,4 +1,4 @@
-# rustfmt's library at the rustc commit rr is built from (84b36a78a,
+# rustfmt's library at the rustc commit rr is built from (1.99.1, 58cf8f9c3,
 # src/tools/rustfmt), without its binaries and tests: rr fmt formats with it.
 [package]
 name = "rustfmt-nightly"

@@ -11,7 +11,7 @@ use rustc_span::hygiene::{ExpnId, ExpnKind, MacroKind};
 
 use super::RR_NO_MACROS;
 
-// Pinned to register_builtin_macros in Rust 84b36a78a. std_panic and the
+// Pinned to register_builtin_macros in Rust 1.99.1. std_panic and the
 // proc_macro quote expander are deliberately excluded; derive stays forbidden.
 pub(super) fn is_builtin(name: &str) -> bool {
     matches!(

@@ -1,6 +1,6 @@
 # rr — Restricted Rust
 
-A standalone Rust compiler and linter based on Clippy rust-1.99.0.
+A standalone Rust compiler and linter based on the Clippy of Rust 1.99.1.
 
 ```sh
 rr init demo
@@ -42,5 +42,5 @@ host's backend only and statically links it and the matching Rust compiler
 driver into rr on each host, then tests, packages and publishes the
 distributions. Each builds for its own host only.
 
-The pinned private compiler API is Rust 1.99.0-nightly, commit 84b36a78a (2026-08-06).
+The pinned private compiler API is Rust 1.99.1, commit 58cf8f9c3 (2026-10-13).
 The original Clippy documentation is retained in [UPSTREAM.md](UPSTREAM.md).

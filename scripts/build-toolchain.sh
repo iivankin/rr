@@ -10,7 +10,7 @@ fi
 rr_source="$1"
 rr_scratch="$2"
 rr_prefix="$3"
-rr_revision='84b36a78a28a63f134171c670be1932ffa2485f8'
+rr_revision='58cf8f9c35b355199727627d07ae34a4e2846d67'
 [ "$(git -C "$rr_source" rev-parse HEAD)" = "$rr_revision" ]
 cmake --version
 ninja --version

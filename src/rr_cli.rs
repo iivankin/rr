@@ -40,7 +40,7 @@ fn subcommand(raw0: &str, args: &[String]) -> Option<io::Result<ExitCode>> {
             Ok(ExitCode::SUCCESS)
         },
         "--version" | "-V" => {
-            println!("rr 0.1.0 (Restricted Rust; Clippy rust-1.99.0; rustc 1.99.0-nightly 84b36a78a)");
+            println!("rr 0.2.0 (Restricted Rust; Clippy and rustc 1.99.1, 58cf8f9c3)");
             Ok(ExitCode::SUCCESS)
         },
         "init" => workspace::init(rest),

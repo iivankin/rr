@@ -10,8 +10,8 @@ import subprocess
 import sys
 import tempfile
 
-RUST = '84b36a78a28a63f134171c670be1932ffa2485f8'
-LLVM = '21cf28432798952d942bacc6bcee3a328faa3638'
+RUST = '58cf8f9c35b355199727627d07ae34a4e2846d67'
+LLVM = '1b9c0d5ff9bbe7634aead059efe6b11a7eeba145'
 
 
 def compile_command(host, file, output):
