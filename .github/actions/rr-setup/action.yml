@@ -31,7 +31,12 @@ runs:
           tools+=(llvm-bolt merge-fdata)
           packages+=(bolt-23)
         fi
-        DEBIAN_FRONTEND=noninteractive apt-get install -qy "${packages[@]}"
+        # apt.llvm.org replaces its builds in place: an index read just
+        # before a new build is published can name files already gone.
+        for attempt in 1 2 3; do
+          DEBIAN_FRONTEND=noninteractive apt-get install -qy "${packages[@]}" && break
+          [ "$attempt" -lt 3 ] && sleep 60 && apt-get update -q || exit 1
+        done
         for tool in "${tools[@]}"; do
           ln -sf "/usr/lib/llvm-23/bin/$tool" "/usr/bin/$tool"
         done
