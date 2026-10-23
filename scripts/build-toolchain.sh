@@ -98,8 +98,20 @@ generate-rustc | generate-llvm)
 use)
     test -f "$rr_pgo_dir/rustc.profdata"
     test -f "$rr_pgo_dir/llvm.profdata"
-    rr_set+=(--set "pgo.rustc.use=\"$rr_pgo_dir/rustc.profdata\""
-        --set "pgo.llvm.use=\"$rr_pgo_dir/llvm.profdata\"")
+    rr_rustc_profile="$rr_pgo_dir/rustc.profdata"
+    rr_llvm_profile="$rr_pgo_dir/llvm.profdata"
+    # On Linux clang compiles the LLVM wrapper with the Rust half's profile
+    # and LLVM with its own, and the static driver's ThinLTO link, which
+    # takes both, needs one profile summary: both halves use the union of
+    # the two profiles, whose functions are disjoint.
+    if [ "$(uname -s)" = Linux ]; then
+        rr_rustc_profile="$rr_pgo_dir/compiler.profdata"
+        rr_llvm_profile="$rr_rustc_profile"
+        llvm-profdata merge -o "$rr_rustc_profile" \
+            "$rr_pgo_dir/rustc.profdata" "$rr_pgo_dir/llvm.profdata"
+    fi
+    rr_set+=(--set "pgo.rustc.use=\"$rr_rustc_profile\""
+        --set "pgo.llvm.use=\"$rr_llvm_profile\"")
     ;;
 *) echo "Unknown RR_PGO: $RR_PGO" >&2; exit 1 ;;
 esac
