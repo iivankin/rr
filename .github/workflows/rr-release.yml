@@ -54,7 +54,11 @@ jobs:
           import json, os
           all = [
               {'name': 'rr-macos-arm64', 'runner': 'macos-15', 'pgo': False},
-              {'name': 'rr-linux-x86_64', 'runner': 'ubuntu-24.04', 'container': 'ubuntu:20.04', 'pgo': True},
+              # BOLT, which lays out rr on Linux x86_64, needs more memory
+              # than the runner has: its build adds swap, which takes a
+              # privileged container and the runner's spare disk at /mnt.
+              {'name': 'rr-linux-x86_64', 'runner': 'ubuntu-24.04', 'container': 'ubuntu:20.04', 'pgo': True,
+               'build_container': {'image': 'ubuntu:20.04', 'options': '--privileged -v /mnt:/mnt'}},
               {'name': 'rr-linux-aarch64', 'runner': 'ubuntu-24.04-arm', 'container': 'ubuntu:20.04', 'pgo': True},
               {'name': 'rr-windows-x86_64', 'runner': 'windows-2025', 'pgo': True},
               {'name': 'rr-windows-aarch64', 'runner': 'windows-11-arm', 'pgo': True},
@@ -195,7 +199,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.hosts.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
-    container: ${{ matrix.container }}
+    container: ${{ matrix.build_container || matrix.container }}
     timeout-minutes: 360
     defaults:
       run:
@@ -204,6 +208,15 @@ jobs:
       - name: Git, in the Linux container
         if: matrix.container
         run: apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -qy git ca-certificates
+      - name: Swap for BOLT
+        if: matrix.build_container
+        run: |
+          df -h /mnt
+          fallocate -l 24G /mnt/rr-bolt.swap
+          chmod 600 /mnt/rr-bolt.swap
+          mkswap /mnt/rr-bolt.swap
+          swapon /mnt/rr-bolt.swap
+          free -g
       - name: Checkout rr
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
