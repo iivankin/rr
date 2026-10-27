@@ -477,7 +477,11 @@ pub(super) fn copy<'tcx>(
             .then_some("a copy between pointers")
         },
         ExprKind::Assign(place, value, _)
-            if in_memory(place) && held(typeck, place) && repeated(cx, e) && loaded(cx, typeck, value) =>
+            if in_memory(place)
+                && held(typeck, place)
+                && repeated(cx, e)
+                && loaded(cx, typeck, value)
+                && !small_move_within(cx, typeck, place, value) =>
         {
             Some("a copy one element at a time")
         },
@@ -572,10 +576,44 @@ fn in_memory(mut place: &Expr<'_>) -> bool {
     }
 }
 
+/// The most bytes of a Copy element moved within one buffer that are not
+/// a copy: a permutation, as `swap` makes one, moves words, not data.
+const MOVE_WITHIN_MAX: u64 = 8;
+
+/// Whether an element of a buffer is stored into another place of the same
+/// buffer, and is a small Copy value: `ids[hole] = ids[next]` in a sort.
+fn small_move_within<'tcx>(
+    cx: &LateContext<'tcx>,
+    typeck: &TypeckResults<'tcx>,
+    place: &Expr<'_>,
+    value: &Expr<'_>,
+) -> bool {
+    let (ExprKind::Index(into, ..), ExprKind::Index(from, ..)) = (place.kind, value.kind) else {
+        return false;
+    };
+    if !clippy_utils::SpanlessEq::new(cx).eq_expr(place.span.ctxt(), into, from) {
+        return false;
+    }
+    let ty = typeck.expr_ty(value);
+    let env = TypingEnv::post_analysis(cx.tcx, typeck.hir_owner.def_id);
+    cx.tcx.type_is_copy_modulo_regions(env, ty)
+        && cx
+            .tcx
+            .layout_of(env.as_query_input(ty))
+            .is_ok_and(|layout| layout.size.bytes() <= MOVE_WITHIN_MAX)
+}
+
 /// Whether e is a value read as it is from memory the program holds: an
 /// element, what a reference points to, a field of either, or a binding
-/// of one.
+/// of one; or a value built from such reads, field by field (`Item {
+/// position: it.position, weight: it.weight }`, `Id(source.0)`), which
+/// copies it as reading it whole does.
 fn loaded(cx: &LateContext<'_>, typeck: &TypeckResults<'_>, mut e: &Expr<'_>) -> bool {
+    if let Some(parts) = rebuilt(typeck, e) {
+        let read = parts.iter().filter(|part| loaded(cx, typeck, part)).count();
+        let built = parts.iter().filter(|part| fixed(typeck, part)).count();
+        return read > 0 && read + built == parts.len() && read * 2 >= parts.len();
+    }
     loop {
         e = match e.kind {
             ExprKind::Field(base, _) => base,
@@ -586,6 +624,24 @@ fn loaded(cx: &LateContext<'_>, typeck: &TypeckResults<'_>, mut e: &Expr<'_>) ->
             ExprKind::Path(_) => return e.res_local_id().is_some_and(|id| element(cx, typeck, id)),
             _ => return false,
         };
+    }
+}
+
+/// The parts of a struct or tuple struct built here from its fields:
+/// `S { a: x, b: y }`, `S(x, y)`.
+fn rebuilt<'a>(typeck: &TypeckResults<'_>, e: &'a Expr<'a>) -> Option<Vec<&'a Expr<'a>>> {
+    match e.kind {
+        ExprKind::Struct(_, fields, rustc_hir::StructTailExpr::None) if !fields.is_empty() => {
+            Some(fields.iter().map(|field| field.expr).collect())
+        },
+        ExprKind::Call(f, args)
+            if !args.is_empty()
+                && let ExprKind::Path(ref path) = f.kind
+                && matches!(typeck.qpath_res(path, f.hir_id), Res::Def(DefKind::Ctor(..), _)) =>
+        {
+            Some(args.iter().collect())
+        },
+        _ => None,
     }
 }
 

@@ -14,7 +14,7 @@ unsafe extern "C" {
     fn calloc(n: usize, size: usize) -> *mut c_void;
     fn realloc(p: *mut c_void, size: usize) -> *mut c_void;
     fn free(p: *mut c_void);
-    fn posix_memalign(p: &mut *mut c_void, align: usize, size: usize) -> c_int;
+    fn posix_memalign(p: *mut *mut c_void, align: usize, size: usize) -> c_int;
     fn write(fd: c_int, p: *const c_void, n: usize) -> isize;
     fn open(path: *const c_char, flags: c_int, ...) -> c_int;
     fn close(fd: c_int) -> c_int;
@@ -40,7 +40,7 @@ fn aligned(l: Layout) -> *mut u8 {
     let mut p = null_mut();
     let align = l.align().max(size_of::<usize>());
     // rr: escape(unsafe): p is a local out-parameter; align is a power of two.
-    let r = unsafe { posix_memalign(&mut p, align, l.size()) };
+    let r = unsafe { posix_memalign(&raw mut p, align, l.size()) };
     if r != 0 { null_mut() } else { p.cast() }
 }
 
@@ -102,7 +102,9 @@ fn write_all(fd: c_int, mut p: &[u8]) {
         let Some(n) = usize::try_from(n).ok().filter(|n| *n > 0) else {
             return;
         };
-        p = &p[n..];
+        // More than was asked: the system broke its contract; give up.
+        let Some(rest) = p.get(n..) else { return };
+        p = rest;
     }
 }
 
@@ -164,8 +166,10 @@ fn c_path(path: &[u8], buf: &mut [u8; PATH_MAX + 1]) -> Result<(), Error> {
     if path.len() > PATH_MAX || path.contains(&0) {
         return Err(Error);
     }
-    buf[..path.len()].copy_from_slice(path);
-    buf[path.len()] = 0;
+    buf.get_mut(..path.len())
+        .ok_or(Error)?
+        .copy_from_slice(path);
+    *buf.get_mut(path.len()).ok_or(Error)? = 0;
     Ok(())
 }
 
@@ -212,7 +216,8 @@ impl File {
             // rr: escape(unsafe): p is readable memory of its length.
             let n = unsafe { pwrite(self.fd, p.as_ptr().cast(), p.len(), at) };
             let n = usize::try_from(n).ok().filter(|n| *n > 0).ok_or(Error)?;
-            p = &p[n..];
+            // More than was asked: the system broke its contract.
+            p = p.get(n..).ok_or(Error)?;
             off += n as u64;
         }
         Ok(())

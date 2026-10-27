@@ -64,6 +64,7 @@ const fn table() -> [u32; 256] {
             };
             k += 1;
         }
+        // rr: escape(panic): i < 256, the table's length; this runs when the program compiles.
         t[i as usize] = c;
         i += 1;
     }
@@ -75,6 +76,8 @@ pub fn crc32(p: &[&[u8]]) -> u32 {
     let mut c = !0u32;
     for piece in p {
         for b in *piece {
+            // rr: escape(panic, cast): CRC-32 takes the low byte of c, and a
+            // byte indexes the table of 256 entries.
             c = TABLE[usize::from(c.to_le_bytes()[0] ^ b)] ^ (c >> 8);
         }
     }
@@ -124,8 +127,12 @@ pub fn read(p: &[u8]) -> Read<'_> {
     if p.len() < end {
         return Read::Short;
     }
-    let key = &p[HEADER..HEADER + key_len];
-    let value = &p[HEADER + key_len..end];
+    let (Some(key), Some(value)) = (
+        p.get(HEADER..HEADER + key_len),
+        p.get(HEADER + key_len..end),
+    ) else {
+        return Read::Short;
+    };
     if crc32(&[&h[4..], key, value]) != crc {
         return Read::Bad;
     }

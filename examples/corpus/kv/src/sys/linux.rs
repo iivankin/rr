@@ -155,6 +155,8 @@ fn class(l: Layout) -> Option<usize> {
 }
 
 fn lock() {
+    // rr: escape(loop): another thread holds the lock for one allocation,
+    // a few instructions; a program of one thread never waits here.
     while LOCK
         .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
@@ -170,11 +172,13 @@ fn unlock() {
 /// A block of class c: a freed one, or the next from the chunk.
 fn small(c: usize) -> *mut u8 {
     let size = 16 << c;
-    let head = FREE[c].load(Ordering::Relaxed);
+    // rr: escape(panic): class gives an index below CLASSES, for sizes up to a page.
+    let list = &FREE[c];
+    let head = list.load(Ordering::Relaxed);
     if !head.is_null() {
         // rr: escape(unsafe, cast): a free block, aligned to 16 at least, holds the next one's address.
         let next = unsafe { head.cast::<*mut u8>().read() };
-        FREE[c].store(next, Ordering::Relaxed);
+        list.store(next, Ordering::Relaxed);
         return head;
     }
     let mut at = NEXT.load(Ordering::Relaxed);
@@ -242,10 +246,12 @@ unsafe impl GlobalAlloc for Heap {
             unmap(p, size);
             return;
         };
+        // rr: escape(panic): class gives an index below CLASSES, for sizes up to a page.
+        let list = &FREE[c];
         lock();
         // rr: escape(unsafe, cast): p is a block of class c, aligned to 16 at least, no longer used.
-        unsafe { p.cast::<*mut u8>().write(FREE[c].load(Ordering::Relaxed)) };
-        FREE[c].store(p, Ordering::Relaxed);
+        unsafe { p.cast::<*mut u8>().write(list.load(Ordering::Relaxed)) };
+        list.store(p, Ordering::Relaxed);
         unlock();
     }
 }
@@ -263,7 +269,9 @@ fn write_all(fd: usize, mut p: &[u8]) {
         let Some(n) = usize::try_from(n).ok().filter(|n| *n > 0) else {
             return;
         };
-        p = &p[n..];
+        // More than was asked: the system broke its contract; give up.
+        let Some(rest) = p.get(n..) else { return };
+        p = rest;
     }
 }
 
@@ -336,8 +344,10 @@ fn c_path(path: &[u8], buf: &mut [u8; PATH_MAX + 1]) -> Result<(), Error> {
     if path.len() > PATH_MAX || path.contains(&0) {
         return Err(Error);
     }
-    buf[..path.len()].copy_from_slice(path);
-    buf[path.len()] = 0;
+    buf.get_mut(..path.len())
+        .ok_or(Error)?
+        .copy_from_slice(path);
+    *buf.get_mut(path.len()).ok_or(Error)? = 0;
     Ok(())
 }
 
@@ -385,7 +395,8 @@ impl File {
             if n == 0 {
                 return Err(Error);
             }
-            p = &p[n..];
+            // More than was asked: the system broke its contract.
+            p = p.get(n..).ok_or(Error)?;
             off += n as u64;
         }
         Ok(())

@@ -43,16 +43,19 @@ format:
 check:
 	$(RR) check src/main.rs --crate-name $(NAME)
 	$(RR) test src/main.rs --check --crate-name $(NAME)
+	$(RR) check src/main.rs --cfg fuzzing --crate-name $(NAME)
 
 lint:
 	$(RR) lint src/main.rs --crate-name $(NAME)
 	$(RR) test src/main.rs --lint --crate-name $(NAME)
+	$(RR) lint src/main.rs --cfg fuzzing --crate-name $(NAME)
 
-# Each target runs FUZZTIME seconds; what it found is kept in
-# fuzz/TARGET/: corpus/, and a crash in artifacts/.
+# The targets build once and share FUZZTIME seconds: half evenly, the rest
+# by the coverage each finds; rr then says which found nothing new. What
+# each found is kept in fuzz/TARGET/: corpus/, and a crash in artifacts/.
 fuzz:
-	@for t in $(FUZZ); do echo "$$t" && $(RR) fuz src/main.rs --target $$t \
-		--crate-name $(NAME) -- -max_total_time=$(FUZZTIME) || exit 1; done
+	$(RR) fuz src/main.rs $(foreach t,$(FUZZ),--target $(t)) --budget $(FUZZTIME) \
+		--crate-name $(NAME)
 
 # Where the program allocates and copies: built with --prof, then run
 # under rr prof. PROFRUN is what to run; PROFMAX fails above a budget

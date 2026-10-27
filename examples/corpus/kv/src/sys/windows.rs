@@ -163,7 +163,14 @@ fn write_all(which: u32, mut p: &[u8]) {
         if ok == 0 || written == 0 {
             return;
         }
-        p = &p[written as usize..];
+        // More than was asked: the system broke its contract; give up.
+        let Some(rest) = usize::try_from(written)
+            .ok()
+            .and_then(|count| p.get(count..))
+        else {
+            return;
+        };
+        p = rest;
     }
 }
 
@@ -270,7 +277,7 @@ fn wide_path(path: &[u8], buf: &mut [u16; PATH_MAX + 1]) -> Result<(), Error> {
     if wide == 0 && !path.is_empty() {
         return Err(Error);
     }
-    buf[wide] = 0;
+    *buf.get_mut(wide).ok_or(Error)? = 0;
     Ok(())
 }
 
@@ -303,6 +310,8 @@ impl File {
                 null_mut(),
             )
         };
+        // rr: escape(sentinel): CreateFileW says it failed with
+        // INVALID_HANDLE_VALUE, all ones.
         if handle.addr() == usize::MAX {
             return Err(Error);
         }
@@ -344,7 +353,11 @@ impl File {
             if written == 0 {
                 return Err(Error);
             }
-            p = &p[written as usize..];
+            // More than was asked: the system broke its contract.
+            p = usize::try_from(written)
+                .ok()
+                .and_then(|count| p.get(count..))
+                .ok_or(Error)?;
             off += u64::from(written);
         }
         Ok(())

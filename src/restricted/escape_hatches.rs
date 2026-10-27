@@ -5,6 +5,7 @@ use rustc_middle::ty::{self, Ty};
 use rustc_session::impl_lint_pass;
 use rustc_span::Span;
 use rustc_span::def_id::DefId;
+use rustc_span::hygiene::{ExpnKind, MacroKind};
 
 use super::comments::{has_escape_reason, note};
 use super::{RR_NO_STD, RR_UNEXPLAINED_ESCAPE, copies};
@@ -91,11 +92,13 @@ impl<'tcx> LateLintPass<'tcx> for EscapeHatches {
     }
 
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx Item<'tcx>) {
-        if !super::builtins::is_user_code(item.span) {
+        if let ItemKind::Impl(implementation) = &item.kind
+            && let Some(span) = written(item.span)
+        {
+            large_copy(cx, item, implementation, span);
             return;
         }
-        if let ItemKind::Impl(implementation) = &item.kind {
-            large_copy(cx, item, implementation);
+        if !super::builtins::is_user_code(item.span) {
             return;
         }
         let ItemKind::Static(mutability, ..) = item.kind else {
@@ -140,9 +143,25 @@ fn statement_span(cx: &LateContext<'_>, id: rustc_hir::HirId, span: Span) -> Spa
 /// Larger than this, a Copy type is copied whole, silently, at every use.
 const COPY_MAX: u64 = 64;
 
-/// `impl Copy` for a type larger than `COPY_MAX` bytes: each move of it
-/// becomes a copy that no `clone()` shows.
-fn large_copy<'tcx>(cx: &LateContext<'tcx>, item: &'tcx Item<'tcx>, implementation: &'tcx rustc_hir::Impl<'tcx>) {
+/// Where an impl was written: its own span, or for a derived one the
+/// `#[derive(..)]` that made it.
+fn written(span: Span) -> Option<Span> {
+    if super::builtins::is_user_code(span) {
+        return Some(span);
+    }
+    let data = span.ctxt().outer_expn_data();
+    (matches!(data.kind, ExpnKind::Macro(MacroKind::Derive, _)) && super::builtins::is_user_code(data.call_site))
+        .then_some(data.call_site)
+}
+
+/// `impl Copy` for a type larger than `COPY_MAX` bytes, written or derived
+/// at span: each move of it becomes a copy that no `clone()` shows.
+fn large_copy<'tcx>(
+    cx: &LateContext<'tcx>,
+    item: &'tcx Item<'tcx>,
+    implementation: &'tcx rustc_hir::Impl<'tcx>,
+    span: Span,
+) {
     let Some(header) = implementation.of_trait else { return };
     if header.trait_ref.trait_def_id() != cx.tcx.lang_items().copy_trait() {
         return;
@@ -152,17 +171,17 @@ fn large_copy<'tcx>(cx: &LateContext<'tcx>, item: &'tcx Item<'tcx>, implementati
         return;
     };
     let size = layout.size.bytes();
-    if size <= COPY_MAX || has_escape_reason(cx, item.span, item.span, "copy") {
+    if size <= COPY_MAX || has_escape_reason(cx, span, span, "copy") {
         return;
     }
     span_lint_and_then(
         cx,
         RR_UNEXPLAINED_ESCAPE,
-        item.span,
+        span,
         format!("Copy on a type of {size} bytes copies it whole at every use; this needs an ownership justification"),
         |diag| {
             diag.help(format!("keep it a moved value, or Copy only up to {COPY_MAX} bytes"));
-            note(diag, cx.sess(), item.span, item.span, "copy");
+            note(diag, cx.sess(), span, span, "copy");
         },
     );
 }
@@ -199,6 +218,14 @@ fn escape_operation<'tcx>(cx: &LateContext<'tcx>, expr: &Expr<'tcx>) -> Option<(
     }
     if let Some(operation) = copies::conversion(cx, expr, def_id) {
         return Some(("copy", operation));
+    }
+    // Data fixed in the program, a literal or a constant: copying it builds
+    // new data, as `From` of it does.
+    if let ExprKind::MethodCall(_, receiver, [], _) = expr.kind
+        && matches!(name.as_str(), "to_owned" | "to_vec")
+        && copies::fixed(cx.typeck_results(), receiver)
+    {
+        return None;
     }
     match name.as_str() {
         "to_owned" | "clone_into" => Some(("copy", "conversion to owned data")),

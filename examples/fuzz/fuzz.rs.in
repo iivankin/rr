@@ -1,12 +1,9 @@
 #![no_std]
 #![no_main]
 
-/// # Safety
-/// A nonempty input must reference `size` initialized, readable bytes in one
-/// allocation, valid throughout this call, with `size <= isize::MAX`.
+/// libFuzzer's entry: each input, as size readable bytes at pointer.
 #[unsafe(no_mangle)]
-// rr: escape(unsafe): libFuzzer supplies size readable bytes for the duration of each call.
-pub unsafe extern "C" fn LLVMFuzzerTestOneInput(pointer: *const u8, size: usize) -> i32 {
+extern "C" fn LLVMFuzzerTestOneInput(pointer: *const u8, size: usize) -> i32 {
     // A zero-length input may have a null pointer; from_raw_parts still needs nonnull.
     if size == 0 {
         test_input(&[]);
@@ -26,13 +23,17 @@ fn test_input(input: &[u8]) {
     }
 }
 
-// rr: escape(unsafe): abort is the C library's, taking nothing.
-unsafe extern "C" {
-    fn abort() -> !;
-}
-
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
-    // rr: escape(unsafe): abort lets libFuzzer capture and persist the input causing a panic.
-    unsafe { abort() }
+    sys::abort()
+}
+
+/// What talks to the system.
+mod sys {
+    // rr: escape(unsafe): abort is the C library's, taking nothing.
+    unsafe extern "C" {
+        // rr: escape(unsafe): abort reads nothing and never returns; it lets
+        // libFuzzer keep the input that panicked.
+        pub safe fn abort() -> !;
+    }
 }

@@ -64,13 +64,38 @@ fn init_lays_out_a_project_that_passes_lint() {
     assert!(main.contains("//! demo_app:"), "{main}");
     // Building links alloc, which needs the bundle's panic=abort sysroot:
     // scripts/smoke-distribution.py builds, tests and profiles it there.
-    let lint = Command::new(env!("CARGO_BIN_EXE_rr"))
+    // The entry rr fuz adds for several targets keeps rr's rules.
+    let greet = root.join("src/greet.rs");
+    let mut source = fs::read_to_string(&greet).unwrap();
+    source.push_str(
+        "\n/// Two names.\n#[cfg(fuzzing)]\npub fn fuzz_two(input: &[u8]) {\n    let mut out = Vec::new();\n    assert!(greet(&mut out, input));\n    assert!(greet(&mut out, input));\n}\n",
+    );
+    fs::write(&greet, source).unwrap();
+    let harness = Command::new(env!("CARGO_BIN_EXE_rr"))
         .current_dir(&root)
-        .args(["lint", "src/main.rs", "--crate-name", "demo_app", "-Dwarnings"])
-        .env_remove("CLIPPY_ARGS")
+        .args([
+            "check",
+            "src/main.rs",
+            "--crate-name",
+            "demo_app",
+            "--cfg",
+            "fuzzing",
+            "--rr-harness=fuzz:greet::fuzz_greet,greet::fuzz_two",
+        ])
         .output()
         .unwrap();
-    success(&lint);
+    success(&harness);
+    // Its fuzz targets keep the rules too.
+    for cfg in [&[][..], &["--cfg", "fuzzing"][..]] {
+        let lint = Command::new(env!("CARGO_BIN_EXE_rr"))
+            .current_dir(&root)
+            .args(["lint", "src/main.rs", "--crate-name", "demo_app", "-Dwarnings"])
+            .args(cfg)
+            .env_remove("CLIPPY_ARGS")
+            .output()
+            .unwrap();
+        success(&lint);
+    }
     // It is in rr's one style already.
     let format = Command::new(env!("CARGO_BIN_EXE_rr"))
         .current_dir(&root)

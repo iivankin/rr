@@ -13,83 +13,89 @@ NATIVE_SOURCE = r'''#![no_std]
 
 extern crate alloc;
 
-use core::alloc::{GlobalAlloc, Layout};
 use alloc::vec::Vec;
-use core::ffi::c_void;
-
-struct Heap;
-
-#[link(name = "c")]
-// rr: escape(unsafe): each signature is the C library's, from its headers.
-unsafe extern "C" {
-    fn posix_memalign(output: &mut *mut c_void, alignment: usize, size: usize) -> i32;
-    fn free(pointer: *mut c_void);
-    fn abort() -> !;
-}
-
-/* rr: escape(unsafe): posix_memalign supplies aligned storage and free releases it;
-all GlobalAlloc layouts are supported, not just the byte vector below. */
-unsafe impl GlobalAlloc for Heap {
-    // rr: escape(unsafe): the caller supplies a nonzero valid layout as required by GlobalAlloc.
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let mut output = core::ptr::null_mut();
-        let alignment = layout.align().max(core::mem::size_of::<*mut c_void>());
-        // rr: escape(unsafe): output is writable and the alignment meets POSIX's pointer-size requirement.
-        let status = unsafe { posix_memalign(&mut output, alignment, layout.size()) };
-        if status == 0 {
-            output.cast()
-        } else {
-            core::ptr::null_mut()
-        }
-    }
-
-    // rr: escape(unsafe): GlobalAlloc's caller guarantees this pointer came from this allocator.
-    unsafe fn dealloc(&self, pointer: *mut u8, _: Layout) {
-        // rr: escape(unsafe): this is the original posix_memalign allocation, with no live owners.
-        unsafe { free(pointer.cast()) };
-    }
-}
-
-#[global_allocator]
-static HEAP: Heap = Heap;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> i32 {
     let mut values: Vec<u8> = Vec::new();
     values.push(41);
-    let answer: Option<u8> = Some(values[0] + 1);
+    let answer: Option<u8> = values.first().map(|value| value + 1);
     assert_eq!(answer, Some(42));
-    assert_eq!(assembly_value(), 7);
+    assert_eq!(sys::assembly_value(), 7);
     assert_eq!(concat!("restricted", " rust"), "restricted rust");
     assert!(cfg!(target_pointer_width = "64"));
     let _ = core::format_args!("answer={:?}", answer);
     // rr: escape(copy): this independent snapshot tests Vec allocation and element cloning.
     let snapshot = values.clone();
-    assert_eq!(snapshot[0], 41);
+    assert_eq!(snapshot.first(), Some(&41));
     0
 }
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
-    // rr: escape(unsafe): abort terminates this native process when an assertion or allocation fails.
-    unsafe { abort() }
+    sys::abort()
 }
 
-fn assembly_value() -> u64 {
-    let value: u64;
-    #[cfg(target_arch = "aarch64")]
-    // rr: escape(unsafe): the assembly writes one output register and has no memory or stack effects.
-    unsafe {
-        core::arch::asm!("mov {value}, #7", value = out(reg) value,
-            options(nomem, nostack, preserves_flags));
+/// The C library, the allocator on it and the processor's assembly.
+mod sys {
+    use core::alloc::{GlobalAlloc, Layout};
+    use core::ffi::c_void;
+
+    struct Heap;
+
+    #[link(name = "c")]
+    // rr: escape(unsafe): each signature is the C library's, from its headers.
+    unsafe extern "C" {
+        fn posix_memalign(output: *mut *mut c_void, alignment: usize, size: usize) -> i32;
+        fn free(pointer: *mut c_void);
+        // rr: escape(unsafe): abort reads nothing and never returns; it ends
+        // the process when an assertion or an allocation fails.
+        pub safe fn abort() -> !;
     }
-    #[cfg(target_arch = "x86_64")]
-    // rr: escape(unsafe): the assembly writes one output register and has no memory or stack effects.
-    unsafe {
-        core::arch::asm!("mov {value}, 7", value = out(reg) value,
-            options(nomem, nostack, preserves_flags));
+
+    /* rr: escape(unsafe): posix_memalign supplies aligned storage and free releases it;
+    all GlobalAlloc layouts are supported, not just the byte vector below. */
+    unsafe impl GlobalAlloc for Heap {
+        // rr: escape(unsafe): the caller supplies a nonzero valid layout as required by GlobalAlloc.
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let mut output = core::ptr::null_mut();
+            let alignment = layout.align().max(core::mem::size_of::<*mut c_void>());
+            // rr: escape(unsafe): output is writable and the alignment meets POSIX's pointer-size requirement.
+            let status = unsafe { posix_memalign(&raw mut output, alignment, layout.size()) };
+            if status == 0 {
+                output.cast()
+            } else {
+                core::ptr::null_mut()
+            }
+        }
+
+        // rr: escape(unsafe): GlobalAlloc's caller guarantees this pointer came from this allocator.
+        unsafe fn dealloc(&self, pointer: *mut u8, _: Layout) {
+            // rr: escape(unsafe): this is the original posix_memalign allocation, with no live owners.
+            unsafe { free(pointer.cast()) };
+        }
     }
-    value
+
+    #[global_allocator]
+    static HEAP: Heap = Heap;
+
+    /// Seven, from the processor's assembly.
+    pub fn assembly_value() -> u64 {
+        let value: u64;
+        #[cfg(target_arch = "aarch64")]
+        // rr: escape(unsafe): the assembly writes one output register and has no memory or stack effects.
+        unsafe {
+            core::arch::asm!("mov {value}, #7", value = out(reg) value,
+                options(nomem, nostack, preserves_flags));
+        }
+        #[cfg(target_arch = "x86_64")]
+        // rr: escape(unsafe): the assembly writes one output register and has no memory or stack effects.
+        unsafe {
+            core::arch::asm!("mov {value}, 7", value = out(reg) value,
+                options(nomem, nostack, preserves_flags));
+        }
+        value
+    }
 }
 '''
 
@@ -142,9 +148,9 @@ pub fn builtins() -> &'static str {
         (work / 'included.rs').write_text(included)
         run('check', source, good=False, rule=rule)
     for text in (
-            '#![no_std]\n#[derive(Copy, Clone)] pub struct Data;',
+            '#![no_std]\n#[derive(Clone, Serialize)] pub struct Data;',
             '#![no_std]\nextern crate alloc; pub fn f() { let _ = alloc::vec![1]; }',
-            '#![no_std]\nuse core::matches as concat; pub fn f()->bool { concat!(1, 1) }'):
+            '#![no_std]\nuse core::ptr::addr_of as concat; pub fn f(x: &u8)->*const u8 { concat!(*x) }'):
         source.write_text(text)
         run('check', source, good=False, rule='rr-no-macros')
     # A program of the C library: on Linux, the host's own target and its

@@ -2,52 +2,76 @@
 
 use alloc::vec::Vec;
 
+/// The most bytes of a name a greeting carries; a longer name is cut.
+const NAME_MAX: usize = 64;
+/// The most bytes one greeting adds to out.
+const GREETING_MAX: usize = b"hello, ".len() + NAME_MAX + 1;
+/// The most bytes out holds: a caller writes it and clears it before then.
+pub const OUT_MAX: usize = 4096;
+
 /// "hello, <name>" and a newline, appended to out: a caller that greets
-/// many reuses one buffer.
+/// many reuses one buffer. False, and out as it was, when out is full.
 #[cfg_attr(rr, rr::hot)]
-pub fn greet(out: &mut Vec<u8>, name: &[u8]) {
+pub fn greet(out: &mut Vec<u8>, name: &[u8]) -> bool {
+    if out.len() > OUT_MAX - GREETING_MAX {
+        return false;
+    }
+    let name = name.get(..NAME_MAX).unwrap_or(name);
     out.extend_from_slice(b"hello, ");
     // rr: escape(copy): the greeting carries the name, and out is what
     // the program writes.
     out.extend_from_slice(if name.is_empty() { b"world" } else { name });
     out.push(b'\n');
+    true
 }
 
-/// Any bytes as a name: one greeting, one line.
+/// Any bytes as a name: one greeting, one line, within its limit.
 #[cfg(fuzzing)]
 pub fn fuzz_greet(input: &[u8]) {
     let mut out = Vec::new();
-    greet(&mut out, input);
+    assert!(greet(&mut out, input));
     assert!(out.starts_with(b"hello, "));
     assert!(out.ends_with(b"\n"));
+    assert!(out.len() <= GREETING_MAX);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::greet;
+    use super::{GREETING_MAX, NAME_MAX, OUT_MAX, greet};
     use alloc::vec::Vec;
     use test::Bencher;
 
     #[test]
     fn names_the_name() {
         let mut out = Vec::new();
-        greet(&mut out, b"rr");
+        assert!(greet(&mut out, b"rr"));
         assert_eq!(out, b"hello, rr\n");
     }
 
     #[test]
     fn greets_the_world_without_one() {
         let mut out = Vec::new();
-        greet(&mut out, b"");
+        assert!(greet(&mut out, b""));
         assert_eq!(out, b"hello, world\n");
     }
 
     #[test]
     fn appends_to_what_is_there() {
         let mut out = Vec::new();
-        greet(&mut out, b"a");
-        greet(&mut out, b"b");
+        assert!(greet(&mut out, b"a"));
+        assert!(greet(&mut out, b"b"));
         assert_eq!(out, b"hello, a\nhello, b\n");
+    }
+
+    /// A long name is cut at NAME_MAX; a full buffer is refused, as it was.
+    #[test]
+    fn keeps_to_its_limits() {
+        let mut out = Vec::new();
+        assert!(greet(&mut out, &[b'x'; 2 * NAME_MAX]));
+        assert_eq!(out.len(), GREETING_MAX);
+        out.resize(OUT_MAX, b' ');
+        assert!(!greet(&mut out, b"rr"));
+        assert_eq!(out.len(), OUT_MAX);
     }
 
     /// One greeting into a buffer that is reused: no allocation.
@@ -56,7 +80,7 @@ mod tests {
         let mut out = Vec::new();
         b.iter(|| {
             out.clear();
-            greet(&mut out, b"rr");
+            assert!(greet(&mut out, b"rr"));
         });
     }
 }

@@ -14,7 +14,7 @@ unsafe extern "C" {
     fn calloc(n: usize, size: usize) -> *mut c_void;
     fn realloc(p: *mut c_void, size: usize) -> *mut c_void;
     fn free(p: *mut c_void);
-    fn posix_memalign(p: &mut *mut c_void, align: usize, size: usize) -> c_int;
+    fn posix_memalign(p: *mut *mut c_void, align: usize, size: usize) -> c_int;
     fn write(fd: c_int, p: *const c_void, n: usize) -> isize;
     fn read(fd: c_int, p: *mut c_void, n: usize) -> isize;
     fn strlen(s: *const c_char) -> usize;
@@ -32,7 +32,7 @@ fn aligned(l: Layout) -> *mut u8 {
     let mut p = null_mut();
     let align = l.align().max(size_of::<usize>());
     // rr: escape(unsafe): p is a local out-parameter; align is a power of two.
-    let r = unsafe { posix_memalign(&mut p, align, l.size()) };
+    let r = unsafe { posix_memalign(&raw mut p, align, l.size()) };
     if r != 0 { null_mut() } else { p.cast() }
 }
 
@@ -94,7 +94,9 @@ fn write_all(fd: c_int, mut p: &[u8]) {
         let Some(n) = usize::try_from(n).ok().filter(|n| *n > 0) else {
             return;
         };
-        p = &p[n..];
+        // More than was asked: the system broke its contract; give up.
+        let Some(rest) = p.get(n..) else { return };
+        p = rest;
     }
 }
 
@@ -114,7 +116,11 @@ pub fn stdin(out: &mut Vec<u8>, max: usize) -> bool {
         if out.len() + n > max {
             return false;
         }
-        out.extend_from_slice(&buf[..n]);
+        // More than was asked: the system broke its contract.
+        let Some(read) = buf.get(..n) else {
+            return false;
+        };
+        out.extend_from_slice(read);
     }
 }
 

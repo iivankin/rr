@@ -79,6 +79,7 @@ fn no_std_compiler_attribute_builtins_work() {
 #![feature(alloc_error_handler)]
 #[alloc_error_handler]
 fn oom(_: core::alloc::Layout) -> ! { loop {} }
+mod sys {
 use core::alloc::{GlobalAlloc, Layout};
 struct Heap;
 // rr: escape(unsafe): this test allocator always fails allocation and owns no memory.
@@ -90,6 +91,7 @@ unsafe impl GlobalAlloc for Heap {
 }
 #[global_allocator]
 static HEAP: Heap = Heap;
+}
 ",
     );
 }
@@ -122,7 +124,7 @@ pub const BYTES: &[u8] = include_bytes!(r#"{}"#);
 #[test]
 fn alloc_library_macros_and_derive_stay_forbidden() {
     rejected(
-        "#![no_std]\nuse core::matches as concat; pub fn value() -> bool { concat!(1, 1) }",
+        "#![no_std]\nuse core::ptr::addr_of as concat; pub fn value(x: &u8) -> *const u8 { concat!(*x) }",
         "rr_no_macros",
     );
     rejected(
@@ -133,9 +135,48 @@ fn alloc_library_macros_and_derive_stay_forbidden() {
         "#![no_std]\nextern crate alloc; pub fn run() { let _ = alloc::format!(\"value={}\", 1); }",
         "rr_no_macros",
     );
+    // Only the compiler's own derives.
     rejected(
-        "#![no_std]\n#[derive(Copy, Clone)] pub struct Data(u8);",
+        "#![no_std]\n#[derive(Clone, Serialize)] pub struct Data(u8);",
         "rr_no_macros",
+    );
+}
+
+#[test]
+fn the_compilers_own_derives_and_matches_are_allowed() {
+    accepted(
+        "#![no_std]\n#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]\nstruct Id(u32);\n\
+         #[cfg_attr(test, derive(Debug))]\n#[derive(PartialEq)]\nenum Error {\n Short,\n Bad(u8),\n}\n\
+         struct Out;\nimpl core::fmt::Write for Out {\n fn write_str(&mut self, _: &str) -> core::fmt::Result { Ok(()) }\n}\n\
+         fn smallest(v: &mut [Id]) -> Option<u32> {\n v.sort_unstable();\n let a = v.first().copied()?;\n let b = a;\n if a == b && a < Id(9) { Some(a.0) } else { None }\n}\n\
+         fn short(e: &Error) -> bool { matches!(e, Error::Short) || *e == Error::Bad(1) }\n\
+         fn show(id: Id) -> core::fmt::Result { core::fmt::Write::write_fmt(&mut Out, format_args!(\"{id:?}\")) }\n\
+         pub fn run(v: &[u32]) -> bool {\n let mut ids = [Id(u32::try_from(v.len()).unwrap_or(0) & 7)];\n smallest(&mut ids).is_some() && short(&Error::Short) && show(Id(1)).is_ok()\n}",
+    );
+    for (source, rule) in [
+        // Only the derives ordinary syntax needs.
+        ("#[derive(Hash)] pub struct Key(pub u32);", "rr_no_macros"),
+        ("#[derive(Default)] pub struct Key(pub u32);", "rr_no_macros"),
+        // A derive nothing uses.
+        (
+            "#[derive(Clone, Copy, Debug)]\nstruct Id(u32);\npub fn f() -> u32 { let a = Id(1); a.0 }",
+            "rr_unused_derive",
+        ),
+    ] {
+        rejected(&format!("#![no_std]\n{source}"), rule);
+    }
+    // ok() throws the error away before unwrap: the Result's own says which.
+    rejected(
+        "#![no_std]\npub fn f(r: Result<u8, u8>) -> u8 {\n // rr: escape(panic): r is Ok here.\n r.ok().unwrap()\n}",
+        "rr_unexplained_escape",
+    );
+    // A derived Copy is a Copy: past 64 bytes it needs a reason.
+    rejected(
+        "#![no_std]\n#[derive(Clone, Copy)]\npub struct Big(pub [u8; 128]);",
+        "rr_unexplained_escape",
+    );
+    accepted(
+        "#![no_std]\n// rr: escape(copy): a key read whole on every lookup.\n#[derive(Clone, Copy)]\npub struct Big(pub [u8; 128]);",
     );
 }
 
@@ -143,7 +184,7 @@ fn alloc_library_macros_and_derive_stay_forbidden() {
 fn included_ownership_escape_requires_a_comment() {
     let fixture = |name: &str| {
         format!(
-            "#![no_std]\ninclude!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/tests/fixtures/rr-builtins/\", \"{name}\"));"
+            "#![no_std]\npub mod sys {{ include!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/tests/fixtures/rr-builtins/\", \"{name}\")); }}"
         )
     };
     for name in ["clone.rs", "unsafe.rs", "unsafe_impl.rs"] {
@@ -224,8 +265,8 @@ fn rejects_async_functions_blocks_closures_and_await() {
 fn rejects_macro_definitions_calls_and_derives() {
     for source in [
         "macro_rules! noop { () => {} }",
-        "pub fn run() { let _ = core::matches!(1, 1); }",
-        "#[derive(Clone)] pub struct Data;",
+        "pub fn run(v: u8) { let _ = core::ptr::addr_of!(v); }",
+        "#[derive(Serialize)] pub struct Data;",
     ] {
         rejected(&format!("#![no_std]\n{source}"), "rr_no_macros");
     }
@@ -341,11 +382,11 @@ fn rules_cannot_be_lowered_to_allow() {
 #[test]
 fn nested_macros_and_conditional_derives_are_rejected() {
     rejected(
-        "#![no_std]\npub fn run(v: u8) { assert!(core::matches!(v, 1)); }",
+        "#![no_std]\npub fn run(v: u8) { assert!(!core::ptr::addr_of!(v).is_null()); }",
         "rr_no_macros",
     );
     rejected(
-        "#![no_std]\n#[cfg_attr(all(), derive(Clone))] pub struct Data;",
+        "#![no_std]\n#[cfg_attr(all(), derive(Clone, Serialize))] pub struct Data;",
         "rr_no_macros",
     );
 }
@@ -353,7 +394,7 @@ fn nested_macros_and_conditional_derives_are_rejected() {
 #[test]
 fn nested_release_assertions_and_escape_calls_are_checked() {
     rejected(
-        "#![no_std]\npub fn run(v: u8) { debug_assert!(core::matches!(v, 1)); }",
+        "#![no_std]\npub fn run(v: u8) { debug_assert!(!core::ptr::addr_of!(v).is_null()); }",
         "rr_no_macros",
     );
     rejected(
@@ -374,7 +415,7 @@ fn unsafe_contracts_and_runtime_borrowing_need_reasons() {
         "rr_unexplained_escape",
     );
     accepted(
-        "#![no_std]\n// rr: escape(unsafe): callers must follow the documented raw interface contract.\npub unsafe fn raw() {}",
+        "#![no_std]\npub mod sys {\n// rr: escape(unsafe): callers must follow the documented raw interface contract.\npub unsafe fn raw() {}\n}",
     );
 }
 
@@ -450,7 +491,7 @@ fn a_built_buffer_or_explained_copy_is_accepted() {
         // Several writes build something new.
         "let mut v = Vec::new();\n v.extend_from_slice(s);\n v.push(b'\\n');\n v",
         "let mut v = Vec::new();\n for p in [s, s] { v.extend_from_slice(p); }\n v.push(0);\n v",
-        "let mut v = Vec::new();\n let mut i = 0;\n while i < s.len() { v.extend_from_slice(&s[i..=i]); i += 1; }\n v",
+        "let mut v = Vec::new();\n let mut i = 0;\n while i < s.len() { v.extend_from_slice(s.get(i..=i).unwrap_or_default()); i += 1; }\n v",
         // Transforming items is not copying them.
         "let mut v = Vec::new();\n v.extend(s.iter().map(|b| b + 1));\n v",
         "let mut v = Vec::new();\n for b in s { v.push(b + 1); }\n v",
@@ -583,7 +624,7 @@ fn a_hot_path_makes_no_new_buffer() {
     );
     // Writing into the caller's buffer, or a birth with a reason.
     accepted(&alloc_fixture(
-        "#[rr::hot]\npub fn hot(out: &mut Vec<u8>, x: &[u8]) -> Result<(), Vec<u8>> {\n out.extend_from_slice(b\"ok\");\n if x.is_empty() {\n // rr: escape(alloc): an error, off the hot path's common case.\n return Err(Vec::from(&b\"empty\"[..]));\n }\n Ok(())\n}",
+        "#[rr::hot]\npub fn hot(out: &mut Vec<u8>, x: &[u8]) -> Result<(), Vec<u8>> {\n if out.len() > 4096 {\n return Ok(());\n }\n out.extend_from_slice(b\"ok\");\n if x.is_empty() {\n // rr: escape(alloc): an error, off the hot path's common case.\n return Err(Vec::from(&b\"empty\"[..]));\n }\n Ok(())\n}",
     ));
 }
 
@@ -609,6 +650,7 @@ fn a_hot_path_copies_nothing_it_holds() {
     accepted(&alloc_fixture(
         "fn helper(out: &mut Vec<u8>, x: &[u8]) { out.extend_from_slice(x); }\n\
          #[rr::hot]\npub fn hot(out: &mut Vec<u8>, x: &[u8], n: u32) -> u8 {\n\
+         if out.len() + x.len() > 4096 {\n return 0;\n }\n\
          out.extend_from_slice(&n.to_be_bytes());\n out.extend_from_slice(b\"\\r\\n\");\n\
          for &b in x {\n out.push(b ^ 0x20);\n }\n\
          let mut block = [0u8; 4];\n block.copy_from_slice(x);\n\
@@ -650,11 +692,11 @@ fn an_if_chain_over_one_value_is_a_match() {
 #[test]
 fn a_variadic_c_function_is_declared_with_its_dots() {
     rejected(
-        "#![no_std]\n// rr: escape(unsafe): the C library.\nunsafe extern \"C\" {\n pub fn open(path: *const u8, flags: i32, mode: i32) -> i32;\n}",
+        "#![no_std]\npub mod sys {\n// rr: escape(unsafe): the C library.\nunsafe extern \"C\" {\n pub fn open(path: *const u8, flags: i32, mode: i32) -> i32;\n}\n}",
         "rr_variadic",
     );
     accepted(
-        "#![no_std]\n// rr: escape(unsafe): the C library.\nunsafe extern \"C\" {\n pub fn open(path: *const u8, flags: i32, ...) -> i32;\n pub fn close(fd: i32) -> i32;\n}",
+        "#![no_std]\npub mod sys {\n// rr: escape(unsafe): the C library.\nunsafe extern \"C\" {\n pub fn open(path: *const u8, flags: i32, ...) -> i32;\n pub fn close(fd: i32) -> i32;\n}\n}",
     );
 }
 
@@ -689,11 +731,17 @@ fn a_field_that_grows_is_held_to_a_limit() {
         &alloc_fixture(&format!("{types}pub fn add(q: &mut Q, b: u8) {{ q.items.push(b); }}")),
         "rr_unbounded",
     );
-    // A limit on its length, a clear where a cycle starts over, a reason
-    // at the field, and a value built here.
+    // A clear where a cycle starts over does not bound what one turn adds,
+    // and capacity() is what the allocator gave, not a limit.
+    for body in [
+        "pub fn add(q: &mut Q, b: u8) { q.items.push(b); }\npub fn reset(q: &mut Q) { q.items.clear(); }",
+        "pub fn add(q: &mut Q, b: u8) -> bool {\n if q.items.len() == q.items.capacity() {\n return false;\n }\n q.items.push(b);\n true\n}",
+    ] {
+        rejected(&alloc_fixture(&format!("{types}{body}")), "rr_unbounded");
+    }
+    // A limit on its length, a reason at the field, and a value built here.
     for body in [
         "pub fn add(q: &mut Q, b: u8) -> bool {\n if q.items.len() >= 64 {\n return false;\n }\n q.items.push(b);\n true\n}",
-        "pub fn add(q: &mut Q, b: u8) { q.items.push(b); }\npub fn reset(q: &mut Q) { q.items.clear(); }",
         "pub fn make(b: u8) -> Q {\n let mut q = Q { items: Vec::new() };\n q.items.push(b);\n q\n}",
     ] {
         accepted(&alloc_fixture(&format!("{types}{body}")));
@@ -708,6 +756,12 @@ fn a_hot_path_shows_the_bound_of_each_loop() {
     for body in [
         "let mut n = x;\n loop {\n if n == 0 {\n break;\n }\n n /= 2;\n }",
         "let mut n = x;\n while n != x / 2 {\n n -= 1;\n }",
+        // A count compared for equality with a number may step past it.
+        "let mut n = x;\n while n != 0 {\n n -= 2;\n }",
+        // Nothing in the body moves the count.
+        "let n = 0;\n let mut m = 0;\n while n < x {\n m += 1;\n }",
+        // A count worked out from data only caps a loop that ends by break.
+        "let mut n = x;\n for _ in 0..x {\n if n == 0 {\n break;\n }\n n /= 2;\n }",
     ] {
         rejected(
             &format!("#![no_std]\n#[rr::hot]\npub fn hot(x: u32) {{\n {body}\n}}"),
@@ -717,6 +771,10 @@ fn a_hot_path_shows_the_bound_of_each_loop() {
     for body in [
         "for _ in 0..x {}",
         "let mut n = 0;\n while n < 8 {\n n += 1;\n }",
+        // A fixed limit, stated by a constant, bounds a loop that ends by break.
+        "const TURNS_MAX: u32 = 32;\n let mut n = x;\n for _ in 0..TURNS_MAX {\n if n == 0 {\n break;\n }\n n /= 2;\n }",
+        // A read at a moving index ends with what it reads.
+        "let v = [1u32, 2, 3];\n let mut i = 0;\n let mut sum = 0;\n while let Some(b) = v.get(i) {\n sum += *b;\n i += 1;\n }\n let _: u32 = sum;",
         "let mut n = x;\n // rr: escape(loop): n halves each turn: 32 turns at most.\n loop {\n if n == 0 {\n break;\n }\n n /= 2;\n }",
     ] {
         accepted(&format!("#![no_std]\n#[rr::hot]\npub fn hot(x: u32) {{\n {body}\n}}"));
@@ -732,9 +790,16 @@ fn panics_and_swallowed_errors_need_reasons_in_every_command() {
         "pub fn f(v: Result<u8, u8>) -> Result<u8, ()> { v.map_err(|_| ()) }",
         "#[must_use]\nfn g() -> u8 { 1 }\npub fn f() { let _ = g(); }",
         "pub enum E { A, B, C }\npub fn f(e: E) -> u8 { match e { E::A => 1, _ => 2 } }",
+        "pub fn f(v: &[u8], i: usize) -> u8 { v[i] }",
+        "pub fn f(v: &[u8], i: usize) -> &[u8] { &v[i..] }",
     ] {
         rejected(&format!("#![no_std]\n{source}"), "clippy::");
     }
+    accepted(
+        "#![no_std]\npub fn f(v: &[u8], i: usize) -> Option<u8> { v.get(i).copied() }\n\
+         pub fn g(v: [u8; 16]) -> u8 { v[3] }\n\
+         pub fn h(v: &[u8], i: usize) -> u8 {\n // rr: escape(panic): i comes from position(), which is in v.\n v[i]\n}",
+    );
     accepted(
         "#![no_std]\npub fn f(v: Option<u8>) -> u8 {\n // rr: escape(panic): the caller has checked it is Some.\n v.unwrap()\n}\n\
          pub enum E { A, B, C }\npub fn g(e: &E) -> u8 {\n match e {\n E::A => 1,\n // rr: escape(wildcard): every other kind counts the same.\n _ => 2,\n }\n}",
@@ -783,6 +848,12 @@ fn calls_not_written_as_calls_are_in_the_call_graph() {
         "#[repr(C)]\npub struct O { pub cb: extern \"C\" fn(u8) -> u8 }\n// rr: escape(unsafe): a C library that calls back.\nunsafe extern \"C\" {\n // rr: escape(unsafe): it calls o.cb.\n safe fn walk(o: &O);\n}\n\
          extern \"C\" fn cb(n: u8) -> u8 { run(); n }\npub fn run() { walk(&O { cb }) }",
     ] {
+        // Code that talks to C lives in sys.
+        let source = if source.contains("unsafe") {
+            format!("pub mod sys {{\n{source}\n}}")
+        } else {
+            source.to_owned()
+        };
         rejected(&format!("#![no_std]\n{source}"), "rr_no_recursion");
     }
     accepted(
@@ -791,8 +862,8 @@ fn calls_not_written_as_calls_are_in_the_call_graph() {
     );
     // Foreign code given nothing calls nothing back.
     accepted(
-        "#![no_std]\n// rr: escape(unsafe): a C library.\nunsafe extern \"C\" {\n // rr: escape(unsafe): it writes one byte.\n safe fn put(b: u8);\n}\n\
-         extern \"C\" fn cb(n: u8) -> u8 { put(n); n }\npub fn take() -> extern \"C\" fn(u8) -> u8 { cb }",
+        "#![no_std]\npub mod sys {\n// rr: escape(unsafe): a C library.\nunsafe extern \"C\" {\n // rr: escape(unsafe): it writes one byte.\n safe fn put(b: u8);\n}\n\
+         extern \"C\" fn cb(n: u8) -> u8 { put(n); n }\npub fn take() -> extern \"C\" fn(u8) -> u8 { cb }\n}",
     );
     // A cold call's reason answers only a birth beyond the call.
     rejected(
@@ -842,11 +913,11 @@ fn lossy_casts_dropped_results_and_owned_parameters_need_reasons() {
 fn a_reason_answers_only_the_kinds_it_names() {
     // A reason for the unsafe call does not cover the cast on its line.
     rejected(
-        "#![no_std]\n// rr: escape(unsafe): the test's own declarations.\nunsafe extern \"C\" { fn take(n: u32); }\npub fn f(n: u64) {\n // rr: escape(unsafe): take accepts any value.\n unsafe { take(n as u32) }\n}",
+        "#![no_std]\npub mod sys {\n// rr: escape(unsafe): the test's own declarations.\nunsafe extern \"C\" { fn take(n: u32); }\npub fn f(n: u64) {\n // rr: escape(unsafe): take accepts any value.\n unsafe { take(n as u32) }\n}\n}",
         "cast_possible_truncation",
     );
     accepted(
-        "#![no_std]\n// rr: escape(unsafe): the test's own declarations.\nunsafe extern \"C\" { fn take(n: u32); }\npub fn f(n: u64) {\n // rr: escape(unsafe, cast): take accepts any value, and n is a count below 2^32.\n unsafe { take(n as u32) }\n}",
+        "#![no_std]\npub mod sys {\n// rr: escape(unsafe): the test's own declarations.\nunsafe extern \"C\" { fn take(n: u32); }\npub fn f(n: u64) {\n // rr: escape(unsafe, cast): take accepts any value, and n is a count below 2^32.\n unsafe { take(n as u32) }\n}\n}",
     );
     // The old form names no kind.
     rejected(
@@ -855,7 +926,7 @@ fn a_reason_answers_only_the_kinds_it_names() {
     );
     // A comment inside a statement that spans lines answers its own line only.
     rejected(
-        "#![no_std]\n// rr: escape(unsafe): the test's own declarations.\nunsafe extern \"C\" { fn two(a: u8, b: u8); }\npub fn f(a: u8) {\n unsafe {\n two(\n // rr: escape(unsafe): a reason for something else.\n a,\n 1,\n )\n }\n}",
+        "#![no_std]\npub mod sys {\n// rr: escape(unsafe): the test's own declarations.\nunsafe extern \"C\" { fn two(a: u8, b: u8); }\npub fn f(a: u8) {\n unsafe {\n two(\n // rr: escape(unsafe): a reason for something else.\n a,\n 1,\n )\n }\n}\n}",
         "rr_unexplained_escape",
     );
 }
@@ -972,7 +1043,7 @@ fn leaks_atomics_large_copies_and_provenance_casts_are_checked() {
 fn foreign_declarations_need_reasons() {
     // The block vouches for its signatures.
     rejected(
-        "#![no_std]\nunsafe extern \"C\" {\n fn free(p: *mut u8);\n}",
+        "#![no_std]\npub mod sys {\nunsafe extern \"C\" {\n fn free(p: *mut u8);\n}\n}",
         "rr_unexplained_escape",
     );
     // A safe item is used with no unsafe block: free(p); free(p) would pass.
@@ -982,12 +1053,14 @@ fn foreign_declarations_need_reasons() {
         "pub safe static X: u8;",
     ] {
         rejected(
-            &format!("#![no_std]\n// rr: escape(unsafe): libc.\nunsafe extern \"C\" {{\n {item}\n}}"),
+            &format!(
+                "#![no_std]\npub mod sys {{\n// rr: escape(unsafe): libc.\nunsafe extern \"C\" {{\n {item}\n}}\n}}"
+            ),
             "rr_unexplained_escape",
         );
     }
     accepted(
-        "#![no_std]\n// rr: escape(unsafe): libc.\nunsafe extern \"C\" {\n // rr: escape(unsafe): abs reads only its argument.\n pub safe fn abs(x: i32) -> i32;\n}\npub fn f(x: i32) -> i32 { abs(x) }",
+        "#![no_std]\npub mod sys {\n// rr: escape(unsafe): libc.\nunsafe extern \"C\" {\n // rr: escape(unsafe): abs reads only its argument.\n pub safe fn abs(x: i32) -> i32;\n}\npub fn f(x: i32) -> i32 { abs(x) }\n}",
     );
 }
 
@@ -1013,4 +1086,255 @@ fn checks_for_undefined_behavior_cannot_be_allowed() {
     ] {
         rejected(&format!("#![no_std]\n#![allow({lint})]\n{body}"), "E0453");
     }
+}
+
+#[test]
+fn a_fuzz_target_fails_by_panicking_as_a_test_does() {
+    let source = "#![no_std]\n#[cfg(fuzzing)]\npub fn fuzz(data: &[u8]) {\n if let Ok(text) = core::str::from_utf8(data) {\n assert!(text.len() == data.len());\n }\n let first = data.first().copied();\n if !data.is_empty() {\n assert!(first.unwrap() == data[0]);\n }\n}";
+    let output = compile(source, &["--cfg", "fuzzing"]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+}
+
+#[test]
+fn a_hot_path_states_why_its_arithmetic_cannot_panic() {
+    for body in ["let last = v.len() - 1;\n last", "v.len() / n"] {
+        rejected(
+            &format!("#![no_std]\n#[rr::hot]\npub fn hot(v: &[u8], n: usize) -> usize {{\n {body}\n}}"),
+            "rr_hot_path",
+        );
+    }
+    for body in [
+        "v.len().checked_sub(1).unwrap_or(0)",
+        "v.len() / 2 + (n - 1)",
+        "// rr: escape(panic): the caller passes a nonempty v.\n v.len() - 1",
+    ] {
+        accepted(&format!(
+            "#![no_std]\n#[rr::hot]\npub fn hot(v: &[u8], n: usize) -> usize {{\n {body}\n}}"
+        ));
+    }
+}
+
+#[test]
+fn operations_spelled_another_way_need_the_same_reasons() {
+    for source in [
+        // A truncating or sign-changing cast written as bytes.
+        "pub fn f(x: u32) -> u8 { x.to_le_bytes()[0] }",
+        "pub fn f(x: u32) -> i32 { i32::from_le_bytes(x.to_le_bytes()) }",
+        "pub fn f(x: u64) -> u32 { let b = x.to_le_bytes();\n u32::from_le_bytes([x.to_le_bytes()[0], b[1], b[2], b[3]]) }",
+        // A must_use value bound to a name nothing reads, and an error's cause thrown away.
+        "fn g() -> Result<u8, u8> { Ok(1) }\npub fn f() { let _result = g(); }",
+        "pub fn f(r: Result<u8, u8>) -> Result<u8, ()> { r.ok().ok_or(()) }",
+        // A magic number standing for none.
+        "pub fn f(x: u32) -> bool { x == u32::MAX }",
+        "pub fn f(x: Option<u32>) -> u32 { x.unwrap_or(u32::MAX) }",
+        // An integer saying which kind a value is, and a table of kinds by number.
+        "pub struct T { pub kind: u8 }",
+        "pub fn f() -> u8 {\n let mut n = 0;\n for id in [1u8, 2] {\n n += match id {\n 1 => 1,\n _ => 2,\n };\n }\n n\n}",
+    ] {
+        rejected(&format!("#![no_std]\n{source}"), "rr_unexplained_escape");
+    }
+    accepted(
+        "#![no_std]\npub fn bytes(x: u32) -> [u8; 4] { x.to_le_bytes() }\npub fn back(b: [u8; 4]) -> u32 { u32::from_le_bytes(b) }\n\
+         pub fn clamp(n: usize) -> u16 { u16::try_from(n).unwrap_or(u16::MAX) }\n\
+         pub fn low(x: u32) -> u8 {\n // rr: escape(cast): the checksum keeps the low byte.\n x.to_le_bytes()[0]\n}\n\
+         pub enum Kind { A, B }\npub struct T { pub kind: Kind }",
+    );
+    // A large value built on the stack and copied into a Box.
+    rejected(
+        &alloc_fixture("use alloc::boxed::Box;\npub fn f() -> Box<[u8; 512]> { Box::new([0u8; 512]) }"),
+        "rr_unexplained_escape",
+    );
+}
+
+#[test]
+fn unsafe_code_lives_in_sys_and_c_is_declared_with_pointers() {
+    rejected(
+        "#![no_std]\npub fn f(p: *const u8) -> u8 {\n // rr: escape(unsafe): p points to a byte.\n unsafe { *p }\n}",
+        "rr_unexplained_escape",
+    );
+    accepted(
+        "#![no_std]\npub mod sys {\n pub fn f(p: *const u8) -> u8 {\n // rr: escape(unsafe): p points to a byte.\n unsafe { *p }\n }\n}",
+    );
+    rejected(
+        "#![no_std]\npub mod sys {\n// rr: escape(unsafe): libc.\nunsafe extern \"C\" {\n fn posix_memalign(p: &mut *mut u8, align: usize, size: usize) -> i32;\n}\n}",
+        "rr_c_signature",
+    );
+}
+
+#[test]
+fn a_hot_path_sees_a_value_rebuilt_field_by_field_as_a_copy() {
+    let item = "#[derive(Clone, Copy)]\npub struct Item { pub position: u32, pub weight: u32 }\n";
+    for body in [
+        "for i in 0..out.len().min(input.len()) {\n out[i] = Item { position: input[i].position, weight: input[i].weight };\n }",
+        "for i in 0..out.len().min(input.len()) {\n out[i] = Item { position: input[i].position, weight: 0 };\n }",
+    ] {
+        rejected(
+            &format!(
+                "#![no_std]\n{item}#[rr::hot]\npub fn merge(input: &[Item], out: &mut [Item]) {{\n // rr: escape(panic): i is below both lengths.\n {body}\n}}"
+            ),
+            "rr_hot_path",
+        );
+    }
+    // Built from new values, it is building; a small value moved within one
+    // buffer is a permutation, as swap makes one.
+    accepted(&format!(
+        "#![no_std]\n{item}#[rr::hot]\npub fn scale(out: &mut [Item]) {{\n for o in out.iter_mut() {{\n *o = Item {{ position: o.position + 1, weight: o.weight * 2 }};\n }}\n}}\n\
+         #[rr::hot]\npub fn rotate(ids: &mut [u32]) {{\n for i in 1..ids.len() {{\n // rr: escape(panic): i and i - 1 are below the length.\n ids[i - 1] = ids[i];\n }}\n}}"
+    ));
+    // A constant copied into a Vec builds it, as From of it does.
+    accepted(&alloc_fixture(
+        "const NORMAL: [u32; 3] = [1, 2, 3];\npub fn defaults() -> Vec<u32> { NORMAL.to_vec() }",
+    ));
+}
+
+#[test]
+fn a_closure_parameter_and_dyn_of_a_crate_trait_are_allowed() {
+    accepted(
+        "#![no_std]\npub fn twice(f: impl Fn(u8) -> u8, x: u8) -> u8 { f(f(x)) }\n\
+         pub fn each(v: &[u8], mut f: impl FnMut(u8)) { for &b in v { f(b); } }\n\
+         pub fn run(r: Result<u8, u8>, undo: impl FnOnce()) -> Result<u8, u8> { if r.is_err() { undo(); } r }\n\
+         pub fn use_them(v: &[u8]) -> u8 { let mut n = 0u8; each(v, |b| n = n.wrapping_add(b)); twice(|x| x / 2, n) }\n\
+         pub trait Strategy { fn count(&self) -> usize; }\npub struct A;\nimpl Strategy for A { fn count(&self) -> usize { 1 } }\n\
+         pub fn total(all: &[&dyn Strategy]) -> usize { let mut n = 0; for s in all { n += s.count(); } n }",
+    );
+    for source in [
+        // Other traits behind impl, and impl in return position.
+        "pub fn show(v: impl core::fmt::Debug) {}",
+        "pub fn make() -> impl Fn(u8) -> u8 { |x| x }",
+        "pub fn both(f: impl Fn(u8) -> u8 + Copy) -> u8 { f(1) }",
+    ] {
+        rejected(&format!("#![no_std]\n{source}"), "rr_no_generics");
+    }
+    // A closure is part of the function that writes it: through one, a
+    // function that calls itself is recursion still.
+    rejected(
+        "#![no_std]\npub fn apply(f: impl Fn(u8) -> u8, x: u8) -> u8 { f(x) }\npub fn r(x: u8) -> u8 { if x == 0 { 0 } else { apply(|y| r(y - 1), x) } }",
+        "rr_no_recursion",
+    );
+    // A call through dyn of a crate trait reaches each implementation.
+    rejected(
+        &alloc_fixture(
+            "pub trait Step { fn step(&self) -> usize; }\npub struct Grow;\nimpl Step for Grow { fn step(&self) -> usize { let mut v = Vec::with_capacity(4); v.push(1u8); v.len() } }\n\
+             #[rr::hot]\npub fn run(s: &dyn Step) -> usize { s.step() }",
+        ),
+        "rr_hot_path",
+    );
+}
+
+#[test]
+fn a_hot_path_grows_a_lent_buffer_only_up_to_a_limit() {
+    rejected(
+        &alloc_fixture("#[rr::hot]\npub fn put(out: &mut Vec<u8>, b: u8) { out.push(b); }"),
+        "rr_hot_path",
+    );
+    for body in [
+        "if out.len() >= 4096 {\n return false;\n }\n out.push(b);\n true",
+        "// rr: escape(alloc): one byte per event, which the caller writes out.\n out.push(b);\n true",
+    ] {
+        accepted(&alloc_fixture(&format!(
+            "#[rr::hot]\npub fn put(out: &mut Vec<u8>, b: u8) -> bool {{\n {body}\n}}"
+        )));
+    }
+    // capacity() is what the allocator gave, not a limit.
+    rejected(
+        &alloc_fixture(
+            "#[rr::hot]\npub fn put(out: &mut Vec<u8>, b: u8) -> bool {\n if out.len() == out.capacity() {\n return false;\n }\n out.push(b);\n true\n}",
+        ),
+        "rr_hot_path",
+    );
+    // The allocator is on every path that allocates.
+    rejected(
+        "#![no_std]\npub mod sys {\nuse core::alloc::{GlobalAlloc, Layout};\nuse core::sync::atomic::{AtomicBool, Ordering};\n\
+         // rr: escape(shared): the allocator's lock.\nstatic LOCK: AtomicBool = AtomicBool::new(false);\nstruct Heap;\n\
+         // rr: escape(unsafe): this test allocator never hands out memory.\nunsafe impl GlobalAlloc for Heap {\n\
+         // rr: escape(unsafe): null is the documented failure.\n unsafe fn alloc(&self, _: Layout) -> *mut u8 {\n while LOCK.swap(true, Ordering::Acquire) {}\n LOCK.store(false, Ordering::Release);\n core::ptr::null_mut()\n }\n\
+         // rr: escape(unsafe): nothing is ever allocated.\n unsafe fn dealloc(&self, _: *mut u8, _: Layout) {}\n}\n\
+         #[global_allocator]\nstatic HEAP: Heap = Heap;\n}",
+        "rr_hot_path",
+    );
+}
+
+#[test]
+fn a_hot_mark_goes_where_events_come_in() {
+    // rr follows calls from a hot root: a mark on what it reaches adds nothing.
+    rejected(
+        "#![no_std]\n#[rr::hot]\nfn step(x: u8) -> u8 { x + 1 }\n#[rr::hot]\npub fn on_event(x: u8) -> u8 { step(x) }",
+        "rr_hot_path",
+    );
+    accepted(
+        "#![no_std]\nfn step(x: u8) -> u8 { x + 1 }\n#[rr::hot]\npub fn on_event(x: u8) -> u8 { step(x) }\n#[rr::hot]\npub fn on_tick(x: u8) -> u8 { step(x) }",
+    );
+}
+
+#[test]
+fn a_body_that_repeats_another_is_one_function() {
+    let body =
+        "{\n let mut n = 0u32;\n for &b in data {\n n = n.wrapping_mul(31).wrapping_add(u32::from(b));\n }\n n\n}";
+    rejected(
+        &format!(
+            "#![no_std]\npub mod a {{\n pub fn hash(data: &[u8]) -> u32 {body}\n}}\npub mod b {{\n pub fn sum(data: &[u8]) -> u32 {body}\n}}"
+        ),
+        "rr_duplicate",
+    );
+    accepted(&format!(
+        "#![no_std]\npub mod a {{\n pub fn hash(data: &[u8]) -> u32 {body}\n}}\npub mod b {{\n // rr: escape(duplicate): the wire format fixes this one apart from a's.\n pub fn sum(data: &[u8]) -> u32 {body}\n}}"
+    ));
+}
+
+#[test]
+fn an_arm_that_cannot_run_is_not_an_input_error() {
+    rejected(
+        "#![no_std]\npub fn kind(code: u32) -> Result<u8, ()> {\n match code & 1 {\n 0 => Ok(1),\n 1 => Ok(2),\n _ => Err(()),\n }\n}",
+        "rr_unexplained_escape",
+    );
+    accepted(
+        "#![no_std]\npub fn kind(code: u32) -> u8 {\n match code & 1 {\n 0 => 1,\n 1 => 2,\n // rr: escape(panic): code & 1 is 0 or 1.\n _ => unreachable!(),\n }\n}\n\
+         pub fn some(code: u32) -> Result<u8, ()> {\n match code & 3 {\n 0 => Ok(1),\n 1 => Ok(2),\n _ => Err(()),\n }\n}",
+    );
+}
+
+#[test]
+fn a_closure_taking_function_stays_short_and_a_hot_dyn_call_says_why() {
+    // The compiler copies a function for each closure it is given.
+    rejected(
+        "#![no_std]\npub fn long(f: impl Fn(u32) -> u32) -> u32 {\n let mut n = 0u32;\n n = n.wrapping_add(0);\n n = n.wrapping_add(1);\n n = n.wrapping_add(2);\n n = n.wrapping_add(3);\n n = n.wrapping_add(4);\n n = n.wrapping_add(5);\n n = n.wrapping_add(6);\n n = n.wrapping_add(7);\n n = n.wrapping_add(8);\n n = n.wrapping_add(9);\n n = n.wrapping_add(10);\n n = n.wrapping_add(11);\n n = n.wrapping_add(12);\n n = n.wrapping_add(13);\n n = n.wrapping_add(14);\n n = n.wrapping_add(15);\n n = n.wrapping_add(16);\n n = n.wrapping_add(17);\n n = n.wrapping_add(18);\n n = n.wrapping_add(19);\n n = n.wrapping_add(20);\n n = n.wrapping_add(21);\n n = n.wrapping_add(22);\n n = n.wrapping_add(23);\n n = n.wrapping_add(24);\n n = n.wrapping_add(25);\n n = n.wrapping_add(26);\n n = n.wrapping_add(27);\n n = n.wrapping_add(28);\n n = n.wrapping_add(29);\n n = n.wrapping_add(30);\n n = n.wrapping_add(31);\n f(n)\n}",
+        "rr_no_generics",
+    );
+    // A call through dyn cannot be inlined: on a hot path it says why.
+    let step = "pub trait Step { fn step(&self) -> u8; }\n";
+    rejected(
+        &format!("#![no_std]\n{step}#[rr::hot]\npub fn run(s: &dyn Step) -> u8 {{ s.step() }}"),
+        "rr_hot_path",
+    );
+    accepted(&format!(
+        "#![no_std]\n{step}#[rr::hot]\npub fn run(s: &dyn Step) -> u8 {{\n // rr: escape(dyn): one call per connection, which picks its protocol.\n s.step()\n}}"
+    ));
+}
+
+#[test]
+fn a_hot_path_sees_a_copy_whatever_its_form() {
+    let item = "#[derive(Clone, Copy)]\npub struct Item { pub pos: u32, pub w: u32 }\n\
+                impl Item { fn copy(&self) -> Self { Self { pos: self.pos, w: self.w } } }\n\
+                fn make(pos: u32, w: u32) -> Item { Item { pos, w } }\npub fn keep() -> Item { make(1, 2).copy() }\n";
+    for body in [
+        "let it = &input[i];\n out[i] = Item { pos: it.pos, w: it.w };",
+        "out[i] = make(input[i].pos, input[i].w);",
+        "out[i] = input[i].copy();",
+        "let Item { pos, w } = input[i];\n out[i] = Item { pos, w };",
+    ] {
+        rejected(
+            &format!(
+                "#![no_std]\n{item}#[rr::hot]\npub fn hot(input: &[Item], out: &mut [Item]) {{\n let n = input.len().min(out.len());\n for i in 0..n {{\n // rr: escape(panic): i < n.\n {body}\n }}\n}}"
+            ),
+            "rr_hot_path",
+        );
+    }
+    rejected(
+        "#![no_std]\n#[derive(Clone, Copy)]\npub struct Item { pub pos: u32, pub w: u32 }\n#[rr::hot]\npub fn hot(input: &[Item], out: &mut [Item]) {\n for (o, it) in out.iter_mut().zip(input) {\n *o = Item { pos: it.pos, w: it.w };\n }\n}",
+        "rr_hot_path",
+    );
+    // A value computed from what is read is built, not copied.
+    accepted(
+        "#![no_std]\n#[derive(Clone, Copy)]\npub struct Item { pub pos: u32, pub w: u32 }\n#[rr::hot]\npub fn hot(input: &[Item], out: &mut [u32]) {\n for (o, it) in out.iter_mut().zip(input) {\n *o = it.pos + it.w;\n }\n}",
+    );
 }

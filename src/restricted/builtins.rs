@@ -12,7 +12,8 @@ use rustc_span::hygiene::{ExpnId, ExpnKind, MacroKind};
 use super::RR_NO_MACROS;
 
 // Pinned to register_builtin_macros in Rust 1.99.1. std_panic and the
-// proc_macro quote expander are deliberately excluded; derive stays forbidden.
+// proc_macro quote expander are deliberately excluded; of the derives, only
+// the compiler's own (syntax::DERIVES) are allowed.
 pub(super) fn is_builtin(name: &str) -> bool {
     matches!(
         name,
@@ -50,7 +51,7 @@ pub(super) fn is_builtin(name: &str) -> bool {
 }
 
 // From register_attr! in the same compiler. Test/bench require std; offload_kernel
-// currently generates an explicit std::unimplemented! stub. Derives stay banned.
+// currently generates an explicit std::unimplemented! stub.
 pub(super) fn is_builtin_attribute(name: &str) -> bool {
     matches!(
         name,
@@ -154,7 +155,13 @@ impl<'tcx> LateLintPass<'tcx> for BuiltinOrigins {
 }
 
 fn allowed_definition(name: &str) -> bool {
-    super::syntax::allowed_macro_names(&[name]) || is_builtin_attribute(name)
+    super::syntax::allowed_macro_names(&[name])
+        || is_builtin_attribute(name)
+        // The early pass lets through a derive list only of the compiler's
+        // own derives; under another name, one from elsewhere is refused
+        // here by the crate that defines it.
+        || name == "derive"
+        || super::syntax::DERIVES.contains(&name)
 }
 
 // include! copies user source into an expansion context; desugarings retain the

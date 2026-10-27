@@ -29,6 +29,12 @@ pub struct Allocs {
     /// Births already reported, so that two hot paths through one function
     /// report it once.
     reported: FxHashSet<HirId>,
+    /// Where something was reported, for the copies MIR shows, which the
+    /// check of the source may have seen already.
+    spans: FxHashSet<Span>,
+    /// The functions whose MIR has been read for copies.
+    flowed: FxHashSet<LocalDefId>,
+    summaries: super::copyflow::Summaries,
 }
 
 impl_lint_pass!(Allocs => [RR_UNEXPLAINED_ESCAPE, RR_HOT_PATH]);
@@ -94,13 +100,27 @@ impl<'tcx> LateLintPass<'tcx> for Allocs {
         let hot = Symbol::intern("hot");
         let rr = Symbol::intern("rr");
         let mut graph = None;
+        let mut marked = Vec::new();
+        let mut reached = FxHashMap::default();
         for owner in cx.tcx.hir_body_owners() {
             let id = cx.tcx.local_def_id_to_hir_id(owner);
-            if cx.tcx.hir_attrs(id).iter().any(|attr| attr.path_matches(&[rr, hot])) {
+            let mark = cx
+                .tcx
+                .hir_attrs(id)
+                .iter()
+                .find(|attr| attr.path_matches(&[rr, hot]))
+                .map(rustc_hir::Attribute::span);
+            // The allocator runs under every allocation: it is on every
+            // path that allocates, marked or not.
+            if mark.is_some() || allocator(cx, owner) {
                 let graph = graph.get_or_insert_with(|| Graph::new(cx));
-                self.hot(cx, graph, owner);
+                reached.insert(owner, self.hot(cx, graph, owner));
+            }
+            if let Some(span) = mark {
+                marked.push((owner, span));
             }
         }
+        redundant_marks(cx, &marked, &reached);
     }
 }
 
@@ -114,6 +134,16 @@ pub(super) fn statement(cx: &LateContext<'_>, id: HirId, span: Span) -> Span {
             _ => None,
         })
         .unwrap_or(span)
+}
+
+/// Whether owner is a method of the program's `GlobalAlloc`.
+fn allocator(cx: &LateContext<'_>, owner: LocalDefId) -> bool {
+    cx.tcx.def_kind(owner) == DefKind::AssocFn
+        && cx
+            .tcx
+            .trait_item_of(owner.to_def_id())
+            .and_then(|item| cx.tcx.trait_of_assoc(item))
+            .is_some_and(|t| cx.tcx.def_path_str(t) == "core::alloc::GlobalAlloc")
 }
 
 /// Whether there is an adjacent reason naming kind, without using it.
@@ -448,33 +478,30 @@ fn written_fresh<'tcx>(cx: &LateContext<'tcx>, typeck: &TypeckResults<'tcx>, e: 
 }
 
 /// Whether a loop shows its bound: a `for`, which walks what it is given,
-/// or a `while let` that takes from a collection until it is empty. A
-/// `loop` or another `while` runs as long as its body says.
-fn stated(block: &rustc_hir::Block<'_>, source: LoopSource) -> bool {
+/// or a `while` whose condition shows a bound that the body moves toward.
+/// A `loop` or another `while` runs as long as its body says.
+fn stated<'tcx>(
+    cx: &LateContext<'tcx>,
+    typeck: &TypeckResults<'tcx>,
+    block: &'tcx rustc_hir::Block<'tcx>,
+    source: LoopSource,
+) -> bool {
     match source {
         LoopSource::ForLoop => true,
         LoopSource::Loop => false,
-        LoopSource::While => block
-            .expr
-            .is_some_and(|e| matches!(e.kind, ExprKind::If(cond, ..) if bounds(cond))),
+        LoopSource::While => block.expr.is_some_and(
+            |e| matches!(e.kind, ExprKind::If(cond, then, _) if bounds(cond) && advances(cx, typeck, cond, then)),
+        ),
     }
 }
 
 /// Whether a `while` condition shows a bound: a part of it puts a count
-/// in order against a limit (`i < n`), compares with a length or a
-/// constant, waits for a collection to empty, or takes from one until it
-/// is empty.
+/// in order against a limit (`i < n`), compares with a length, waits for a
+/// collection to empty, takes from one until it is empty, or reads one at
+/// a moving index until it ends (`while let Some(x) = v.get(i)`). A count
+/// compared for equality with a number may step past it.
 fn bounds(cond: &Expr<'_>) -> bool {
-    // A length, or a limit fixed in the program.
-    let length = |e: &Expr<'_>| match e.kind {
-        ExprKind::MethodCall(m, _, [], _) => m.ident.as_str() == "len",
-        ExprKind::Lit(_) => true,
-        ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) => matches!(
-            path.res,
-            rustc_hir::def::Res::Def(DefKind::Const { .. } | DefKind::AssocConst { .. }, _)
-        ),
-        _ => false,
-    };
+    let length = |e: &Expr<'_>| matches!(e.kind, ExprKind::MethodCall(m, _, [], _) if m.ident.as_str() == "len");
     match cond.kind {
         ExprKind::Binary(op, l, r) if op.node == rustc_hir::BinOpKind::And => bounds(l) || bounds(r),
         // A count against a limit: an order, whatever the limit is.
@@ -493,11 +520,139 @@ fn bounds(cond: &Expr<'_>) -> bool {
         ExprKind::Unary(UnOp::Not, inner) => {
             matches!(inner.kind, ExprKind::MethodCall(m, _, [], _) if m.ident.as_str() == "is_empty")
         },
-        ExprKind::Let(l) => matches!(l.init.kind, ExprKind::MethodCall(m, ..)
-            if matches!(m.ident.as_str(), "next" | "pop" | "pop_front" | "pop_back")),
+        ExprKind::Let(l) => taken(l.init).is_some() || read_at(l.init).is_some(),
         ExprKind::DropTemps(inner) => bounds(inner),
         _ => false,
     }
+}
+
+/// The receiver of a call that takes from it, `next`, `pop` and the like,
+/// seen through `?`: each turn removes what it returns.
+fn taken<'tcx>(e: &'tcx Expr<'tcx>) -> Option<&'tcx Expr<'tcx>> {
+    match e.kind {
+        ExprKind::MethodCall(m, receiver, ..)
+            if matches!(m.ident.as_str(), "next" | "pop" | "pop_front" | "pop_back") =>
+        {
+            Some(receiver)
+        },
+        ExprKind::Match(inner, _, rustc_hir::MatchSource::TryDesugar(_)) => match inner.kind {
+            ExprKind::Call(_, [arg]) => taken(arg),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The index of `v.get(i)`, `v.get(i..)` and the like: a read that ends
+/// with v.
+fn read_at<'tcx>(e: &'tcx Expr<'tcx>) -> Option<&'tcx Expr<'tcx>> {
+    match e.kind {
+        ExprKind::MethodCall(m, _, [index], _) if matches!(m.ident.as_str(), "get" | "get_mut") => Some(index),
+        _ => None,
+    }
+}
+
+/// The local a place is part of: `x`, `x.f`, `x[i]`, `*x`.
+fn base_local(mut e: &Expr<'_>) -> Option<HirId> {
+    loop {
+        e = match e.kind {
+            ExprKind::Field(inner, _) | ExprKind::Index(inner, ..) | ExprKind::Unary(UnOp::Deref, inner) => inner,
+            _ => return e.res_local_id(),
+        };
+    }
+}
+
+/// Whether the body of a `while` changes what its condition tests: it
+/// assigns a local the condition reads, lends one mutably, or calls a
+/// method that changes it. A condition that takes from a collection
+/// changes it itself.
+fn advances<'tcx>(
+    cx: &LateContext<'tcx>,
+    typeck: &TypeckResults<'tcx>,
+    cond: &'tcx Expr<'tcx>,
+    body: &'tcx Expr<'tcx>,
+) -> bool {
+    let mut tested = FxHashSet::default();
+    let mut takes = false;
+    for_each_expr(cx.tcx, cond, |e| {
+        if let ExprKind::Let(l) = e.kind
+            && taken(l.init).is_some()
+        {
+            takes = true;
+        }
+        if let Some(id) = e.res_local_id() {
+            tested.insert(id);
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    if takes {
+        return true;
+    }
+    for_each_expr(cx.tcx, body, |e| {
+        let changed = match e.kind {
+            ExprKind::Assign(place, ..)
+            | ExprKind::AssignOp(_, place, _)
+            | ExprKind::AddrOf(BorrowKind::Ref, Mutability::Mut, place) => base_local(place),
+            ExprKind::MethodCall(_, receiver, ..)
+                if typeck
+                    .type_dependent_def_id(e.hir_id)
+                    .is_some_and(|m| takes_mut_self(cx, m)) =>
+            {
+                base_local(receiver)
+            },
+            _ => None,
+        };
+        if changed.is_some_and(|id| tested.contains(&id)) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .is_some()
+}
+
+/// A count fixed in the program: literals and constants, and arithmetic
+/// on them.
+fn fixed_count(typeck: &TypeckResults<'_>, e: &Expr<'_>) -> bool {
+    match e.kind {
+        ExprKind::Lit(_) => true,
+        ExprKind::Path(ref path) => matches!(
+            typeck.qpath_res(path, e.hir_id),
+            rustc_hir::def::Res::Def(DefKind::Const { .. } | DefKind::AssocConst { .. }, _)
+        ),
+        ExprKind::Binary(_, l, r) => fixed_count(typeck, l) && fixed_count(typeck, r),
+        ExprKind::Unary(_, inner) | ExprKind::Cast(inner, _) | ExprKind::DropTemps(inner) => fixed_count(typeck, inner),
+        _ => false,
+    }
+}
+
+/// A `for` over a count whose turns are never used, that ends by `break`,
+/// where the count is worked out from data: a `loop` with a cap, whose
+/// real end is the break, which shows no bound of its own. A count fixed
+/// in the program, a literal or a constant, is a limit stated; a `return`
+/// gives a result found before the count runs out, as a search does.
+fn capped_loop<'tcx>(cx: &LateContext<'tcx>, typeck: &TypeckResults<'tcx>, e: &'tcx Expr<'tcx>) -> bool {
+    let Some(for_loop) = clippy_utils::higher::ForLoop::hir(e) else {
+        return false;
+    };
+    let mut used = false;
+    for_loop.pat.each_binding(|_, id, _, _| {
+        used |= clippy_utils::visitors::is_local_used(cx, for_loop.body, id);
+    });
+    if used {
+        return false;
+    }
+    let Some(range) = clippy_utils::higher::Range::hir(cx, for_loop.arg) else {
+        return false;
+    };
+    if range.end.is_none_or(|end| fixed_count(typeck, end)) {
+        return false;
+    }
+    for_each_expr(cx.tcx, for_loop.body, |x| match x.kind {
+        ExprKind::Break(destination, _) if destination.target_id == Ok(for_loop.loop_id) => ControlFlow::Break(()),
+        _ => ControlFlow::Continue(()),
+    })
+    .is_some()
 }
 
 /// What at e a hot path forbids, with the kind of reason that allows it.
@@ -510,9 +665,26 @@ fn waste<'tcx>(
         return None;
     }
     if let ExprKind::Loop(block, _, source, _) = e.kind
-        && !stated(block, source)
+        && !stated(cx, typeck, block, source)
     {
         return Some(("a loop with no stated bound".to_owned(), "loop"));
+    }
+    if capped_loop(cx, typeck, e) {
+        return Some((
+            "a `for` over a count worked out from data, which only caps a loop that ends by break,".to_owned(),
+            "loop",
+        ));
+    }
+    if let Some(what) = arithmetic_panic(typeck, e) {
+        return Some((what.to_owned(), "panic"));
+    }
+    if let ExprKind::MethodCall(_, receiver, ..) = e.kind
+        && matches!(typeck.expr_ty_adjusted(receiver).peel_refs().kind(), ty::Dynamic(..))
+    {
+        return Some((
+            "a call through dyn, which the compiler cannot inline,".to_owned(),
+            "dyn",
+        ));
     }
     if let Some(size) = large_move(cx, typeck, e) {
         return Some((format!("a move of {size} bytes, which is a memcpy,"), "move"));
@@ -520,6 +692,116 @@ fn waste<'tcx>(
     birth(cx, typeck, e)
         .map(|what| (what.to_owned(), "alloc"))
         .or_else(|| copy(cx, typeck, e).map(|what| (what.to_owned(), "copy")))
+        .or_else(|| unchecked_growth(cx, typeck, e).map(|what| (what, "alloc")))
+}
+
+/// A push, extend or insert at e into a collection the function was lent
+/// as a parameter, when nothing in the function compares that collection's
+/// `len()` with a limit: the path may grow it, and reallocate it, without
+/// end. A field is held to a limit across the crate (`rr_unbounded`), and a
+/// resize to another collection's length follows that one.
+fn unchecked_growth<'tcx>(cx: &LateContext<'tcx>, typeck: &TypeckResults<'tcx>, e: &'tcx Expr<'tcx>) -> Option<String> {
+    let ExprKind::MethodCall(segment, receiver, ..) = e.kind else {
+        return None;
+    };
+    if !super::bounds::GROW.contains(&segment.ident.as_str())
+        || !typeck
+            .type_dependent_def_id(e.hir_id)
+            .is_some_and(|def| std_def(cx, def))
+        || !super::bounds::growable(cx, typeck.expr_ty(receiver))
+    {
+        return None;
+    }
+    // A parameter itself, not a field of one, nor a buffer made here.
+    let mut place = receiver;
+    while let ExprKind::AddrOf(_, _, inner) | ExprKind::Unary(UnOp::Deref, inner) = place.kind {
+        place = inner;
+    }
+    if !place.res_local_id().is_some_and(|id| is_param(cx, id)) {
+        return None;
+    }
+    if let ExprKind::MethodCall(m, _, [size, ..], _) = e.kind
+        && m.ident.as_str() == "resize"
+        && matches!(size.kind, ExprKind::MethodCall(len, _, [], _) if len.ident.as_str() == "len")
+    {
+        return None;
+    }
+    let body = cx.tcx.hir_body_owned_by(typeck.hir_owner.def_id);
+    let checked = for_each_expr(cx.tcx, body.value, |x| {
+        if let ExprKind::Binary(op, l, r) = x.kind
+            && op.node.is_comparison()
+            && [(l, r), (r, l)].iter().any(|(side, other)| {
+                length_of_place(cx, side, receiver)
+                    && !matches!(other.kind, ExprKind::MethodCall(m, _, [], _) if m.ident.as_str() == "capacity")
+            })
+        {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .is_some();
+    (!checked).then(|| format!("`{}` with no limit on the length checked here", segment.ident))
+}
+
+/// Whether e takes the `len()` of the place, or adds to it: `v.len() + n`.
+fn length_of_place(cx: &LateContext<'_>, e: &Expr<'_>, place: &Expr<'_>) -> bool {
+    match e.kind {
+        ExprKind::MethodCall(m, r, [], _) if m.ident.as_str() == "len" => {
+            clippy_utils::SpanlessEq::new(cx).eq_expr(place.span.ctxt(), r, place)
+        },
+        ExprKind::Binary(_, l, r) => length_of_place(cx, l, place) || length_of_place(cx, r, place),
+        _ => false,
+    }
+}
+
+/// Whether the binding at id is a parameter of the function it is in.
+fn is_param(cx: &LateContext<'_>, id: HirId) -> bool {
+    matches!(cx.tcx.parent_hir_node(id), Node::Param(_))
+}
+
+/// Arithmetic at e that panics, or with overflow checks off gives a wrong
+/// number: a subtraction from a length, which underflows when the
+/// collection is empty, and a division or remainder by a value that may be
+/// zero. Other subtractions are mostly checks such as `MAX - len`, kept in
+/// range by what they check; between constants the compiler checks it.
+fn arithmetic_panic(typeck: &TypeckResults<'_>, e: &Expr<'_>) -> Option<&'static str> {
+    use rustc_hir::{AssignOpKind, BinOpKind};
+    let (op, l, r) = match e.kind {
+        ExprKind::Binary(op, l, r) => (op.node, l, r),
+        ExprKind::AssignOp(op, l, r) => (
+            match op.node {
+                AssignOpKind::SubAssign => BinOpKind::Sub,
+                AssignOpKind::DivAssign => BinOpKind::Div,
+                AssignOpKind::RemAssign => BinOpKind::Rem,
+                _ => return None,
+            },
+            l,
+            r,
+        ),
+        _ => return None,
+    };
+    let constant = |x: &Expr<'_>| match x.kind {
+        ExprKind::Lit(_) => true,
+        ExprKind::Path(ref path) => matches!(
+            typeck.qpath_res(path, x.hir_id),
+            rustc_hir::def::Res::Def(DefKind::Const { .. } | DefKind::AssocConst { .. }, _)
+        ),
+        _ => false,
+    };
+    let ty = typeck.expr_ty(l).peel_refs();
+    match op {
+        BinOpKind::Sub
+            if matches!(ty.kind(), ty::Uint(_))
+                && matches!(l.kind, ExprKind::MethodCall(m, _, [], _) if m.ident.as_str() == "len") =>
+        {
+            Some("a subtraction from a length, which underflows when it is empty,")
+        },
+        BinOpKind::Div | BinOpKind::Rem if ty.is_integral() && !constant(r) => {
+            Some("a division by a value that may be zero")
+        },
+        _ => None,
+    }
 }
 
 /// Whether a new buffer is made by copying data, as `to_vec` makes it: a
@@ -574,7 +856,7 @@ impl Allocs {
     /// item, and the callee is not followed from there; such a reason
     /// answers something only when what the path forbids, without its own
     /// reason, lies beyond the call.
-    fn hot<'g>(&mut self, cx: &LateContext<'_>, graph: &'g Graph, root: LocalDefId) {
+    fn hot<'g>(&mut self, cx: &LateContext<'_>, graph: &'g Graph, root: LocalDefId) -> FxHashSet<LocalDefId> {
         // How each function was reached: its caller and the call.
         let mut via: FxHashMap<LocalDefId, (LocalDefId, &Call)> = FxHashMap::default();
         let mut cold: Vec<&'g Call> = Vec::new();
@@ -598,7 +880,11 @@ impl Allocs {
             };
             let typeck = cx.tcx.typeck(owner);
             for_each_expr(cx.tcx, body.value, |e| {
-                if let Some((what, kind)) = waste(cx, typeck, e)
+                let found = waste(cx, typeck, e);
+                if let Some((_, "copy")) = found {
+                    self.spans.insert(e.span);
+                }
+                if let Some((what, kind)) = found
                     && !reason(cx, e.hir_id, e.span, kind)
                     && !(also_copy(&what) && reason(cx, e.hir_id, e.span, "copy"))
                     && self.reported.insert(e.hir_id)
@@ -627,6 +913,8 @@ impl Allocs {
                             match kind {
                                 "alloc" => diag.help("reuse a buffer that lives outside the path"),
                                 "move" => diag.help("lend it by reference, or build it where it ends up through &mut"),
+                                "panic" => diag.help("use checked_sub, checked_div or checked_rem and handle None, or say in a reason what keeps it in range"),
+                                "dyn" => diag.help("call the concrete type, or take a closure as `impl Fn`; or say in a reason why this call is rare"),
                                 _ if what.starts_with("a shift") => diag.help("take from the end, keep a read offset that moves instead of the data, or use a VecDeque when both ends change"),
                                 "loop" => diag.help("bound it: walk what it reads with for, or count its turns against a limit; or say in a reason what bounds it, such as the bytes of one event"),
                                 _ => diag.help("lend the data where it is, or write it once where it ends up"),
@@ -638,12 +926,83 @@ impl Allocs {
                 }
                 ControlFlow::<()>::Continue(())
             });
+            self.flow_copies(cx, owner, &root_name);
         }
         let mut wasted = FxHashMap::default();
         for call in cold {
             if waste_beyond(cx, graph, call.to, &mut wasted) {
                 reason(cx, call.id, call.span, "cold");
             }
+        }
+        seen
+    }
+}
+
+impl Allocs {
+    /// The copies one element at a time that owner's MIR shows and the
+    /// check of its source did not: through locals, destructuring, an
+    /// iterator's items or a function that returns what it was given.
+    fn flow_copies(&mut self, cx: &LateContext<'_>, owner: LocalDefId, root_name: &str) {
+        if !self.flowed.insert(owner) {
+            return;
+        }
+        for span in super::copyflow::element_copies(cx.tcx, owner, &mut self.summaries) {
+            // Whether any span overlaps: the order of the visit does not matter.
+            #[allow(rustc::potential_query_instability, reason = "only whether any overlaps")]
+            let seen = self
+                .spans
+                .iter()
+                .any(|seen| seen.contains(span) || span.contains(*seen));
+            if seen || has_escape_reason(cx, span, span, "copy") {
+                continue;
+            }
+            self.spans.insert(span);
+            span_lint_hir_and_then(
+                cx,
+                RR_HOT_PATH,
+                cx.tcx.local_def_id_to_hir_id(owner),
+                span,
+                "a copy one element at a time on a hot path",
+                |diag| {
+                    diag.note(format!("reached from `#[rr::hot]` {root_name}"));
+                    diag.note("the value is read out of memory the function reaches by reference, and stored into such memory in a loop");
+                    diag.help("lend the data where it is, or write it once where it ends up");
+                    note(diag, cx.sess(), span, span, "copy");
+                },
+            );
+        }
+    }
+}
+
+/// A `#[rr::hot]` mark that adds nothing: another hot root reaches the
+/// function, so rr follows it already, and the mark hides which functions
+/// are where events come in.
+fn redundant_marks(
+    cx: &LateContext<'_>,
+    marked: &[(LocalDefId, rustc_span::Span)],
+    reached: &FxHashMap<LocalDefId, FxHashSet<LocalDefId>>,
+) {
+    for &(f, attr) in marked {
+        let by = marked.iter().find(|&&(g, _)| {
+            g != f
+                && reached.get(&g).is_some_and(|set| set.contains(&f))
+                && !reached.get(&f).is_some_and(|set| set.contains(&g))
+        });
+        if let Some(&(g, _)) = by {
+            span_lint_hir_and_then(
+                cx,
+                RR_HOT_PATH,
+                cx.tcx.local_def_id_to_hir_id(f),
+                attr,
+                format!(
+                    "this mark adds nothing: {}, also hot, reaches {}",
+                    name(cx.tcx, g),
+                    name(cx.tcx, f)
+                ),
+                |diag| {
+                    diag.help("mark the functions where an event comes in; rr follows the calls from there");
+                },
+            );
         }
     }
 }

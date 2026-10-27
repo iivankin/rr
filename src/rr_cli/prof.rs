@@ -169,10 +169,10 @@ fn usage() -> &'static str {
 }
 
 /// One frame: the function and where in it.
-struct Frame {
-    function: String,
-    file: String,
-    line: u32,
+pub struct Frame {
+    pub function: String,
+    pub file: String,
+    pub line: u32,
 }
 
 impl Frame {
@@ -209,9 +209,9 @@ impl Frame {
 
 /// A program's line tables, and where `rr_prof_anchor` is in its file: each
 /// process image has a load slide of its own.
-struct Program {
+pub struct Program {
     loader: addr2line::Loader,
-    anchor: u64,
+    pub anchor: u64,
 }
 
 #[derive(Default)]
@@ -273,7 +273,9 @@ fn report(dir: &Path, o: &Options) -> io::Result<ExitCode> {
             String::from_utf8_lossy(&exe[..exe.iter().position(|c| *c == 0).unwrap_or(exe.len())]).into_owned(),
         );
         images += 1;
-        let program = programs.entry(exe.clone()).or_insert_with(|| load(&exe));
+        let program = programs
+            .entry(exe.clone())
+            .or_insert_with(|| load(&exe, "rr_prof_anchor"));
         let slot = 24 + depth * 8;
         for k in 0..slots {
             let at = HEADER + k * slot;
@@ -341,14 +343,14 @@ fn report(dir: &Path, o: &Options) -> io::Result<ExitCode> {
 }
 
 /// The program's line tables, and the address its symbol table gives
-/// `rr_prof_anchor`.
-fn load(exe: &Path) -> Option<Program> {
+/// the function named anchor, by which the load slide of a process is known.
+pub fn load(exe: &Path, anchor: &str) -> Option<Program> {
     use object::{Object as _, ObjectSymbol as _};
     let data = fs::read(exe).ok()?;
     let file = object::File::parse(&*data).ok()?;
     let at = file
         .symbols()
-        .find(|s| s.name().is_ok_and(|n| n.trim_start_matches('_') == "rr_prof_anchor"))?
+        .find(|s| s.name().is_ok_and(|n| n.trim_start_matches('_') == anchor))?
         .address();
     let loader = addr2line::Loader::new(exe).ok()?;
     Some(Program { loader, anchor: at })
@@ -356,7 +358,7 @@ fn load(exe: &Path) -> Option<Program> {
 
 /// The frames at each return address of an image loaded slide bytes off
 /// its file's addresses, inlined ones innermost first.
-fn frames(p: &Program, slide: u64, pcs: &[u64]) -> Vec<Frame> {
+pub fn frames(p: &Program, slide: u64, pcs: &[u64]) -> Vec<Frame> {
     let mut out = Vec::new();
     for pc in pcs {
         // A return address is past its call; look at the call.

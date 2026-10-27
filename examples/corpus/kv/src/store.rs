@@ -47,6 +47,8 @@ pub struct Store {
     /// The live keys, each with where its value is.
     index: BTreeMap<Vec<u8>, Slot>,
     /// A value read for compaction, kept for the next.
+    // rr: escape(bound): one value at a time, at most VALUE_MAX bytes, as
+    // put checks.
     scratch: Vec<u8>,
 }
 
@@ -81,7 +83,8 @@ impl Store {
             let mut used = 0;
             let mut bad = false;
             while used < buf.len() {
-                match record::read(&buf[used..]) {
+                let Some(rest) = buf.get(used..) else { break };
+                match record::read(rest) {
                     Read::Whole(r, n) => {
                         let at = base + (used + HEADER + r.key.len()) as u64;
                         self.apply(&r.kind, r.key, at, r.value.len())?;
@@ -103,6 +106,7 @@ impl Store {
             let start = buf.len();
             let want = CHUNK.min(usize::try_from(len - read_to).unwrap_or(CHUNK));
             buf.resize(start + want, 0);
+            // rr: escape(panic): start is the length before the resize above.
             let n = self.file.read_at(read_to, &mut buf[start..])?;
             buf.truncate(start + n);
             if n == 0 {
@@ -182,9 +186,12 @@ impl Store {
             return Ok(false);
         };
         let len = slot.len;
+        // rr: escape(alloc): out holds one value, at most VALUE_MAX bytes,
+        // as put checks.
         out.resize(len, 0);
         let mut got = 0;
         while got < len {
+            // rr: escape(panic): got < len, and out holds len bytes.
             let n = self.file.read_at(slot.at + got as u64, &mut out[got..])?;
             if n == 0 {
                 return Err(Error::Sys);

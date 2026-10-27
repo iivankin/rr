@@ -109,7 +109,7 @@ operation, and the simple design is rarely the first one.
     make              # build
     make test         # the #[test] items; FILTER=word narrows
     make bench        # the #[bench] items: time, allocations, copies
-    make fuzz         # when parsing changed; FUZZ=target FUZZTIME=seconds
+    make fuzz         # when parsing changed; FUZZ=target FUZZTIME=seconds in all
     make prof         # allocations and bytes copied, against the baseline
 
 A change is done when all of them are clean and it is right as it
@@ -124,14 +124,19 @@ only with the budgets, and says why.
 Tests sit beside the code they check, in `#[cfg(test)] mod tests`, as
 `#[test]` functions; a path that runs for every event has a `#[bench]`
 there too. They cover invalid input, input that turns invalid midway,
-and every error path, not only the case that works. A parser of outside
-input has a fuzz target: a `fn(&[u8])` under `#[cfg(fuzzing)]`, named in
-FUZZ in the Makefile. State that must survive a failure of the disk,
-the network or the clock is tested under simulation: the module that
-talks to the system has a simulated twin under `cfg(any(test, fuzzing))`
-that injects faults, driven by a seed or by the fuzzer's bytes. The
-commit message says what changed and why: the history keeps nothing
-else.
+and every error path, not only the case that works. Where outside input
+enters the program (a file it reads, a message off the network) there is
+a fuzz target: a `fn(&[u8])` under `#[cfg(fuzzing)]`, named in FUZZ in
+the Makefile, that drives the input as far in as it goes and checks what
+must hold of the result. A function that only takes what the program has
+already parsed gets a test of its properties over the edge values, not a
+fuzz target of its own; helpers that tests and fuzz targets share live
+in one `cfg(any(test, fuzzing))` module. State that must survive a
+failure of the disk, the network or the clock is tested under
+simulation: the module that talks to the system has a simulated twin
+under `cfg(any(test, fuzzing))` that injects faults, driven by a seed or
+by the fuzzer's bytes. The commit message says what changed and why:
+the history keeps nothing else.
 
 ## When rr objects
 

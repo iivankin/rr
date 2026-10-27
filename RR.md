@@ -28,7 +28,7 @@ make test               # rr test: the #[test] items; FILTER=word narrows
 make bench              # rr bench: time, allocations and copies per iteration
 make fmt                # rr fmt: rewrite in rr's one style
 make format check lint  # rr fmt --check, rr's rules, then Clippy's
-make fuzz               # rr fuz --target: each fn named in FUZZ
+make fuzz               # rr fuz: the fns named in FUZZ, sharing FUZZTIME
 make prof               # where the program allocates and copies
 
 rr init library --lib   # src/lib.rs alone, for a crate to depend on
@@ -108,7 +108,27 @@ and is no longer the C entry, and the run's entry takes its place. A fuzz
 target is a `fn(&[u8])` under `#[cfg(fuzzing)]`; `rr fuz src/main.rs --target
 module::function` builds the crate with `--cfg fuzzing` and libFuzzer's entry
 calling it, and keeps its corpus/ and artifacts/ in
-fuzz/module_function/.
+fuzz/module_function/. Several `--target` flags build the crate once, and
+`--budget SECONDS` (60 by default) is the time they share: half evenly,
+the rest to each by the coverage features it found in its share, so a
+target still finding new paths gets the time one that stopped does not
+need. rr runs them one after another, passing `--rr-target=N` (libFuzzer
+ignores flags that start with `--`), keeps each libFuzzer log in
+fuzz/module_function/last.log, stops at the first crash with its code,
+and ends with what each found and which found nothing new in its time:
+a target whose corpus covers what it reaches, or one that checks a
+property of a function that takes already-parsed data, which a test over
+edge values checks too. Fuzz where outside input enters the program.
+Then rr replays each target's corpus with libFuzzer's coverage by PC,
+which the harness lets libFuzzer name by its distance from
+LLVMFuzzerTestOneInput (the same in every run of the binary), and finds
+the program's functions there, inlined ones too, from the line tables.
+It says which target reaches nothing another does not, apart from the
+target itself, and which reaches nothing past its own module, the system
+layer in `sys` aside: a test of its properties over edge values checks as
+much.
+`rr check` and `rr lint` under `--cfg fuzzing` check the targets without
+the harness, so they allow dead code there.
 
 No registry dependency manager or Cargo interface is included. Prebuilt
 libraries must match this compiler and target. Upstream Cargo tools remain in
@@ -122,9 +142,9 @@ Rules are compiler errors and cannot be lowered with `allow`, `-A rr`,
 | Rule | Restriction |
 | --- | --- |
 | rr_no_std | Require #![no_std]; forbid explicit std imports |
-| rr_no_generics | Forbid own type/const generic parameters, impl Trait, async fn/blocks/closures and await |
-| rr_simple_traits | Forbid associated types/GATs, supertraits, where clauses, trait aliases and dyn Trait |
-| rr_no_macros | Allow no_std compiler builtins and core panic/assert; forbid own/library macros, derive and external procedural attributes, including nested calls and cfg_attr derives |
+| rr_no_generics | Forbid own type/const generic parameters, impl Trait other than a closure parameter, async fn/blocks/closures and await |
+| rr_simple_traits | Forbid associated types/GATs, supertraits, where clauses, trait aliases and dyn of a trait from another crate |
+| rr_no_macros | Allow no_std compiler builtins, core panic/assert, matches! and seven of the compiler's own derives; forbid own/library macros, other derives and external procedural attributes, including nested calls and cfg_attr derives |
 | rr_unexplained_escape | Require a nearby real comment with a nonempty explanation for the operations below |
 | rr_hot_path | Forbid a new buffer, a copy of data the program holds, a move of more than 256 bytes, and a loop that shows no bound, on a path marked #[rr::hot] without such a comment |
 | rr_match_chain | Forbid an if chain that compares one value with constants: it is a match |
@@ -132,9 +152,21 @@ Rules are compiler errors and cannot be lowered with `allow`, `-A rr`,
 | rr_unbounded | Forbid growing a collection kept in a field that nothing in the crate holds to a limit, without such a comment |
 | rr_no_recursion | Forbid a call that closes a cycle of the crate's call graph (direct or mutual recursion, see Call graph) without such a comment, such as a bound on the depth, and a type that owns a value of itself, whose drop recurses as deep as the data |
 | rr_unused_escape | Forbid a reason that answers nothing: a kind with no such operation beside it, a kind rr does not know, or the old form that names none |
+| rr_c_signature | Forbid a reference in a C function's declaration: C has pointers |
+| rr_unused_derive | Forbid a derived trait that nothing in the program uses |
+| rr_duplicate | Forbid a function whose body repeats another's, token for token without comments and spacing (60 characters or more), without a `duplicate` reason: one function, called from both places, says it once |
 
 Lifetime parameters, ordinary traits/impls, and concrete uses of existing generic
-library types such as Vec<u8> remain allowed. This policy restricts user-defined
+library types such as Vec<u8> remain allowed. A function's parameter may be
+`impl Fn(..)`, `impl FnMut(..)` or `impl FnOnce(..)`: a closure handed in,
+one bound and nothing else, so that work around a call, such as undoing a
+step when it fails, is written once. The compiler copies such a function
+for each closure it is given, so it has at most 30 lines; a longer one
+calls the rest as an ordinary function. A closure is part of the function that
+writes it: what it calls, that function calls. `dyn` may name a trait of the
+crate: every implementation is then in the crate, and a call through it
+reaches each in the call graph, as a hot path and recursion see it; a
+trait of another crate behind dyn hides what runs. This policy restricts user-defined
 generics, not every generic inside core/alloc. It checks the current crate and
 its local modules, not previously compiled dependencies.
 
@@ -143,11 +175,30 @@ format_args!, stringify!, env!/option_env!, file!/line!/column!/module_path!,
 include!/include_str!/include_bytes!, compile_error!, and compiler assembly and
 other builtin expanders supported by the pinned compiler. Unstable builtins still
 require their normal feature gates. Core panic/assert-family macros, and write!
-and writeln! (sugar for core::fmt::Write::write_fmt), also remain allowed. Both bare and canonical core-qualified paths work, including core::arch.
+and writeln! (sugar for core::fmt::Write::write_fmt), and matches! (a match
+that answers true or false), also remain allowed. Both bare and canonical core-qualified paths work, including core::arch.
 The full allowlist lives in src/restricted/builtins.rs and follows the pinned
 compiler's register_builtin_macros; std_panic and proc_macro quote are excluded.
 
-Own macro definitions, library macros such as vec!, format! and matches!, derive
+The compiler's own derives that ordinary syntax needs on a type of the
+program are allowed: Copy and Clone (passing a value and using it after),
+PartialEq and Eq (`==`, a constant of the type in a pattern), PartialOrd
+and Ord (`<`, sorting), and Debug (unwrap, expect, `{:?}`, assert_eq!).
+They write the impl a reader expects and nothing else. Hash serves the hash
+maps of std, and a constructor says what Default would; neither is
+allowed. A derive the program never uses is an error (rr_unused_derive):
+nothing calls its method or operator, nothing that requires it of the
+type is called (`sort` requires Ord, `unwrap` requires the error's Debug,
+`{:?}` requires Debug), nothing copies a value of the type for Copy, no
+pattern names a constant of it for PartialEq, and no used trait or
+derived type needs it. What only tests use is derived under
+`#[cfg_attr(test, derive(..))]`, and stays out of the program. An
+exported type of a library is not looked at. `ok().unwrap()` and
+`ok().expect()` throw the error away before the failure could name it,
+and are errors in tests too: give the error type Debug for the tests. A
+derived Copy past 64 bytes needs `escape(copy)` above the derive, as an
+`impl Copy` does, and a derived Clone is called as any clone.
+Own macro definitions, library macros such as vec! and format!, other derives
 (including derive_const), and procedural macros remain forbidden. Importing a
 library macro under a builtin's name does not grant an exception. Code brought
 in with include! must obey the same language and ownership-comment restrictions.
@@ -168,7 +219,7 @@ let snapshot = value.clone();
 
 A reason names the kinds of operation it answers, and answers only those:
 `unsafe`, `copy`, `shared`, `leak`, `alloc`, `cold`, `bound`, `recursion`, `panic`, `discard`,
-`wildcard`, `cast`, `move`, `stack`, `loop`, `bools`; several are written
+`wildcard`, `cast`, `move`, `stack`, `loop`, `bools`, `sentinel`, `tag`, `duplicate`, `dyn`; several are written
 `// rr: escape(unsafe, cast): ...`. A reason for one kind does not cover an
 operation of another on the same line. The old `// rr: escape: ...` names no
 kind and answers nothing; a diagnostic points at an adjacent reason that does
@@ -199,7 +250,8 @@ Required for:
   mem::forget and ManuallyDrop; transmute/transmute_copy/transmute_unchecked.
 - Copies of borrowed data spelled as conversions: From/Into from a reference
   into String, Vec, Box or VecDeque, Cow::into_owned/to_mut, and ToString on
-  a string. Literals and constants are exempt: copying them builds new data.
+  a string, and to_vec and to_owned. Literals and constants are exempt:
+  copying them builds new data.
 - A fresh String/Vec/VecDeque whose only write copies borrowed data into it:
   one extend_from_slice, extend or push_str of a reference (outside a loop),
   or a `for` loop over a borrowed collection pushing its own elements. The
@@ -226,6 +278,39 @@ Required for:
 - A call that lends a local String or Vec (`&v`, `&v[..]`, `v.as_slice()`) to a
   local function that makes an owned copy of that parameter, when the caller
   does not use the buffer afterwards: take the parameter by value and move it.
+- The same operations spelled another way. A truncating or sign-changing
+  cast written as bytes (`cast`): a byte of a wider number's bytes,
+  `x.to_le_bytes()[0]`; a number made from some of a wider one's bytes;
+  or one made from all the bytes of a number of the other sign,
+  `i32::from_le_bytes(u.to_le_bytes())`. A must_use value bound to a
+  `_name` nothing reads, which drops it as `let _ =` does (`discard`; a
+  guard that drops at the end of its scope is what a binding is for), and
+  `ok().ok_or(..)`, which throws away the error's cause as `map_err(|_|..)`
+  does. A `Box::new` of more than 256 bytes, which builds the value on the
+  stack and copies it into the heap (`move`).
+- A magic number standing for none (`sentinel`): `x == u32::MAX`, and
+  `u32::MAX` as the default of an Option (`map_or`, `unwrap_or`); an
+  Option says there is none. On a Result, as from try_from, such a default
+  clamps what does not fit, and needs no reason.
+- An integer saying which kind a value is (`tag`): a field named `kind`,
+  `tag`, `mode`, `variant` or ending in `_kind` or `_tag`, and a match,
+  in a `for` over a list of integer literals, on the item it takes, which
+  is a table of kinds by number. An enum names each kind and carries the
+  data only that kind has.
+
+A catch-all arm that returns `Err`, in a match on `x & MASK` or `x % N`
+(x unsigned, the mask or divisor a literal) whose other arms already
+cover every value, cannot run: if it does, it is a bug, not bad input.
+rr asks for `_ => unreachable!()` there, with its `escape(panic)` reason.
+
+Unsafe code and the operating system stay in a module named `sys` (or one
+inside it), behind safe functions: an unsafe block, an unsafe fn, an
+unsafe impl or a foreign block anywhere else is an error that no reason
+answers. The C entry of a `#![no_main]` crate may call into `sys` with
+the raw arguments the system hands it. A C function is declared with C's
+types (rr_c_signature): a pointer, not a reference, which would promise
+Rust's rules about the memory to code that does not keep them; lend a
+reference with `&raw` at the call.
 
 ## Clippy lints rr enforces
 
@@ -236,8 +321,9 @@ error was due), let_underscore_must_use and map_err_ignore (an error thrown
 away, or its cause), wildcard_enum_match_arm (`_ =>` on an enum, which
 would take any variant added later), cast_possible_truncation, cast_sign_loss
 and cast_possible_wrap (an `as` that loses bits or the sign: use `try_from`),
-cast_ptr_alignment, needless_pass_by_value, large_stack_arrays, string_slice
-and unchecked_time_subtraction (panics), infinite_loop (a loop without an
+cast_ptr_alignment, needless_pass_by_value, large_stack_arrays, string_slice,
+indexing_slicing (an index or slice that may be out of bounds: `get`) and
+unchecked_time_subtraction (panics), infinite_loop (a loop without an
 exit in a function that returns: say `-> !`), struct_excessive_bools and
 fn_params_excessive_bools (more than three flags, which are usually the
 states of one enum); and the compiler's unused_must_use (a must_use result
@@ -297,8 +383,10 @@ for each name: match_same_arms, items_after_statements,
 manual_let_else, needless_continue and shadow_unrelated.
 fn_to_numeric_cast_any
 takes `cast` (an address the system asks for). needless_pass_by_ref_mut takes `move` (a signature
-fixed by a table of handlers), missing_asserts_for_indexing `panic` and
-large_stack_frames `stack`.
+fixed by a table of handlers) and large_stack_frames `stack`. In a test,
+and in a fuzz target under `cfg(fuzzing)`, which the fuzzer runs as a test,
+a panic is how the check fails: unwrap, expect, panic and indexing there
+need no reason.
 collapsible_if and collapsible_else_if stay off in rr lint: a nested
 condition is a branch of its own, each a case to handle.
 slow_vector_initialization stays off too: it asks for `vec!`, a macro. The rest of the restriction group are styles that
@@ -306,7 +394,9 @@ contradict one another and stay off.
 
 ## Hot paths
 
-`#[rr::hot]` marks a function that runs for every event. rr registers its
+`#[rr::hot]` marks a function that runs for every event, where an event
+comes in: rr follows the calls from there, and a mark on a function
+another hot root already reaches adds nothing and is an error. rr registers its
 attribute namespace and sets `--cfg rr`, so the portable spelling is
 `#[cfg_attr(rr, rr::hot)]`: plain rustc and rust-analyzer skip it. Rule
 rr_hot_path then forbids in it, and in every local function it reaches
@@ -323,7 +413,18 @@ quadratic), ptr::copy and copy_nonoverlapping and their methods, a
 clone of a value that is not Copy, and a copy one element at a time in a
 loop or a closure: an element or what a reference points to, read as it is
 and stored into an element or through a reference (`out[i] = x[i]`,
-`*d = *s`), or pushed (`for &b in x { out.push(b) }`). Data is held when it
+`*d = *s`), or pushed (`for &b in x { out.push(b) }`), whole or rebuilt
+field by field (`out[i] = Item { position: x[i].position, weight:
+x[i].weight }`, `Id(x[i].0)`). A Copy value of at most 8 bytes moved
+within one buffer (`ids[hole] = ids[next]`) is a permutation, as `swap`
+makes one, and not a copy. rr finds such a copy in the function's MIR
+too, whatever the source looks like: a value read out of memory the
+function reaches by reference, which passes through locals, a
+destructuring, an iterator's item, a struct built of it or a local
+function that returns what it was given (`make(x.pos, x.w)`, a `copy()`
+of one's own), and is stored into an element of a buffer or the whole of
+what a reference points to, or pushed, in a loop. A value computed from
+what was read, such as `x.pos + 1`, is built. Data is held when it
 is reached through a reference or a buffer, by either way of an `if` or a
 `match`; a literal, a constant, a number, an array on the stack and a value
 a call has just made are built, and writing them is not a copy, nor is
@@ -333,10 +434,30 @@ assignment, an argument or a field of a value being built is a memcpy,
 and needs `escape(move)` there; building a value in place and lending
 it move nothing. A `loop`, or a `while` whose condition
 shows no bound, needs `escape(loop)` there too: a `for` walks what it is
-given, and a `while` is bounded when a part of its condition compares
-with a length, a literal or a constant, waits for `is_empty()`, or takes
-by `while let` from `next()` or `pop()`. A reason of the kind allows the
-operation.
+given, and a `while` is bounded when a part of its condition puts a
+count in order against a limit (`i < n`), compares with a length, waits
+for `is_empty()`, takes by `while let` from `next()` or `pop()`, or reads
+at a moving index (`while let Some(x) = v.get(i)`), and its body changes
+what the condition tests. A count compared for equality with a number
+(`while n != 0`) may step past it, and states no bound. A `for _` over a
+count worked out from data, whose turns go unused and which ends by
+`break`, is a `loop` with a cap and needs `escape(loop)` as well: its
+real end is the break. A count fixed in the program, a literal or a
+constant (`for _ in 0..TURNS_MAX`), states a limit; a `return` from such
+a loop gives a result found before the count runs out. A cursor whose
+reads end (a `while let` over it) names its method `next`, or implements
+Iterator. A subtraction from a length (`v.len() - 1`), which underflows
+on an empty collection, and a division or remainder by a value that is
+not a constant need `escape(panic)`, or `checked_sub`, `checked_div` and
+`checked_rem`. A method call through `dyn`, which the compiler cannot
+inline, needs `escape(dyn)`. A push, extend, insert or resize into a collection the
+function takes as a parameter (`out.push(b)`) needs a comparison of that
+collection's `len()` with a limit in the function, or `escape(alloc)`:
+the path may grow it without end; `capacity()` is what the allocator
+gave, not a limit, and a resize to another collection's length follows
+that one. The methods of the program's `GlobalAlloc` are on every path
+that allocates, and rr checks them as hot whether marked or not. A
+reason of the kind allows the operation.
 A `// rr: escape(cold): ...` at a call says that the branch is off the path,
 such as an error or once per item, and the callee is not followed from
 there. Such a reason is used only when what the path forbids, without its
@@ -349,8 +470,9 @@ see by its form still shows in rr prof.
 A collection a value keeps in a field, a Vec, String, VecDeque or a
 B-tree collection, grows by push, extend, insert, append or resize. Rule
 rr_unbounded asks of each field that grows so that something in the
-crate holds it to a limit: a comparison of its len() with anything, or
-a clear() or truncate() that starts it over. Without one, the field's
+crate holds it to a limit: a comparison of its len() with a limit other
+than its capacity(), which is what the allocator gave. A clear() that
+starts it over does not bound what one turn adds. Without one, the field's
 declaration, or each place it grows, takes `// rr: escape(bound): <what
 bounds it>`. A field of a value the function owns and builds is not
 looked at: it grows once, as the value is made.

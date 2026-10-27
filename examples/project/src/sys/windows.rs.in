@@ -127,7 +127,14 @@ fn write_all(which: u32, mut p: &[u8]) {
         if ok == 0 || written == 0 {
             return;
         }
-        p = &p[written as usize..];
+        // More than was asked: the system broke its contract; give up.
+        let Some(rest) = usize::try_from(written)
+            .ok()
+            .and_then(|count| p.get(count..))
+        else {
+            return;
+        };
+        p = rest;
     }
 }
 

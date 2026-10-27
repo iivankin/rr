@@ -11,6 +11,10 @@ mod calls;
 mod chains;
 mod comments;
 mod copies;
+mod copyflow;
+mod derives;
+mod disguises;
+mod duplicates;
 mod escape_hatches;
 mod expanded;
 mod ffi;
@@ -29,6 +33,9 @@ declare_lint! { pub RR_UNUSED_ESCAPE, Deny, "rr forbids a reason that answers no
 declare_lint! { pub RR_HOT_PATH, Deny, "rr forbids new buffers, copies, large moves and loops without a stated bound on a path marked #[rr::hot] without a reason" }
 declare_lint! { pub RR_MATCH_CHAIN, Deny, "rr requires a match for an if chain that compares one value with constants" }
 declare_lint! { pub RR_VARIADIC, Deny, "rr forbids declaring a variadic C library function with a fixed list of arguments" }
+declare_lint! { pub RR_C_SIGNATURE, Deny, "rr requires a C function declared with C's types: pointers, not references" }
+declare_lint! { pub RR_DUPLICATE, Deny, "rr forbids a function body that repeats another's without a reason" }
+declare_lint! { pub RR_UNUSED_DERIVE, Deny, "rr forbids a derived trait that nothing in the program uses" }
 declare_lint! { pub RR_UNBOUNDED, Deny, "rr forbids a collection kept in a field growing with nothing that holds it to a limit" }
 
 /// The kinds of rr's own rules a reason names.
@@ -42,6 +49,10 @@ const RULE_KINDS: &[&str] = &[
     "bound",
     "loop",
     "recursion",
+    "sentinel",
+    "tag",
+    "duplicate",
+    "dyn",
 ];
 
 /// Clippy lints rr enforces as its own: forbidden in every rr command,
@@ -57,6 +68,9 @@ pub const CLIPPY: &[(&str, Option<&str>)] = &[
     ("unimplemented", Some("panic")),
     ("unwrap_in_result", Some("panic")),
     ("string_slice", Some("panic")),
+    // An index or a slice that may be out of bounds panics as unwrap does:
+    // `get` says what happens when it is.
+    ("indexing_slicing", Some("panic")),
     ("unchecked_time_subtraction", Some("panic")),
     ("let_underscore_must_use", Some("discard")),
     ("map_err_ignore", Some("discard")),
@@ -112,8 +126,7 @@ pub const CLIPPY: &[(&str, Option<&str>)] = &[
     ("unused_self", None),
     ("or_fun_call", None),
     ("needless_pass_by_ref_mut", Some("move")),
-    // Bounds: lengths checked once before indexing, stack frames.
-    ("missing_asserts_for_indexing", Some("panic")),
+    // Stack frames.
     ("large_stack_frames", Some("stack")),
     // An allow says why, as a reason does: silencing a lint is a decision.
     ("allow_attributes_without_reason", None),
@@ -252,7 +265,8 @@ fn clippy_escape(
 pub const CLIPPY_OFF: &[&str] = &["collapsible_if", "collapsible_else_if", "slow_vector_initialization"];
 
 /// Inside a test, a panic is how the test fails: `panic!`, `unwrap`,
-/// `expect` and indexing there end the test's child, not the program.
+/// `expect` and indexing there end the test's child, not the program. A
+/// fuzz target under `cfg(fuzzing)` is a test the fuzzer runs.
 pub fn adjust_conf(conf: &mut clippy_config::Conf) {
     conf.allow_panic_in_tests = true;
     conf.allow_unwrap_in_tests = true;
@@ -290,6 +304,9 @@ pub fn register(store: &mut LintStore) {
         RR_UNBOUNDED,
         RR_MATCH_CHAIN,
         RR_VARIADIC,
+        RR_C_SIGNATURE,
+        RR_DUPLICATE,
+        RR_UNUSED_DERIVE,
         RR_NO_RECURSION,
         RR_UNUSED_ESCAPE,
     ];
@@ -301,6 +318,9 @@ pub fn register(store: &mut LintStore) {
     store.register_late_lint_pass(Box::new(|_| Box::new(bounds::Bounds::default())));
     store.register_late_lint_pass(Box::new(|_| Box::new(chains::Chains)));
     store.register_late_lint_pass(Box::new(|_| Box::new(ffi::Ffi)));
+    store.register_late_lint_pass(Box::new(|_| Box::new(disguises::Disguises)));
+    store.register_late_lint_pass(Box::new(|_| Box::new(duplicates::Duplicates)));
+    store.register_late_lint_pass(Box::new(|_| Box::new(derives::Derives::default())));
     store.register_late_lint_pass(Box::new(|_| Box::new(recursion::Recursion)));
     store.register_late_lint_pass(Box::new(|_| Box::new(builtins::BuiltinOrigins::default())));
     store.register_late_lint_pass(Box::new(|_| Box::new(expanded::ExpandedSyntax)));

@@ -65,13 +65,17 @@ def verify(bundle):
         print('PASS: mutated input discovers RR crash; artifact survives and reproduces')
 
         memory_bug = template.replace(marker, '''    if input == b"RR" {
-        let bytes = [0u8; 8];
         // Prevent optimization from folding a provably invalid access away.
-        let index = core::hint::black_box(input.len() + 6);
+        core::hint::black_box(sys::read_past(core::hint::black_box(input.len() + 6)));
+    }''').replace('mod sys {', '''mod sys {
+    /// A byte index bytes past the start of an array of 8, which ASan
+    /// must catch.
+    pub fn read_past(index: usize) -> u8 {
+        let bytes = [0u8; 8];
         // rr: escape(unsafe): intentional invalid access verifies this negative ASan smoke test.
-        let value = unsafe { *bytes.as_ptr().wrapping_add(index) };
-        core::hint::black_box(value);
-    }''')
+        unsafe { *bytes.as_ptr().wrapping_add(index) }
+    }
+''', 1)
         detected = execute(memory_bug, crash, '-runs=1', asan=True)
         assert detected.returncode != 0, detected.stderr
         assert 'AddressSanitizer: stack-buffer-overflow' in detected.stderr, detected.stderr

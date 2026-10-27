@@ -1,8 +1,10 @@
 //! A collection a value keeps grows with no limit unless something holds
 //! it to one. Each field that a push, extend or insert grows must be held
-//! somewhere in the crate: its `len()` compared with a limit, or a
-//! `clear()` or `truncate()` that starts it over; otherwise a reason that
-//! says what bounds it, at the field's declaration or at a growth. A
+//! somewhere in the crate: its `len()` compared with a limit; otherwise a
+//! reason that says what bounds it, at the field's declaration or at a
+//! growth. A `clear()` that starts it over does not bound what one turn
+//! adds, and `capacity()` is what the allocator gave, at least what was
+//! asked, not a limit. A
 //! field of a value this function owns and builds is not looked at: it
 //! grows once, as the value is made. A field that grows on every event
 //! and is never held is a leak that takes hours to show.
@@ -36,7 +38,7 @@ pub struct Bounds {
 impl_lint_pass!(Bounds => [RR_UNBOUNDED]);
 
 /// The methods that make a collection longer.
-const GROW: &[&str] = &[
+pub(super) const GROW: &[&str] = &[
     "push",
     "push_back",
     "push_front",
@@ -51,7 +53,7 @@ const GROW: &[&str] = &[
 ];
 
 /// Collections of the standard library whose length a value can grow.
-fn growable(cx: &LateContext<'_>, ty: Ty<'_>) -> bool {
+pub(super) fn growable(cx: &LateContext<'_>, ty: Ty<'_>) -> bool {
     let ty::Adt(adt, _) = ty.peel_refs().kind() else {
         return false;
     };
@@ -83,8 +85,10 @@ impl<'tcx> LateLintPass<'tcx> for Bounds {
                     BinOpKind::Lt | BinOpKind::Le | BinOpKind::Gt | BinOpKind::Ge | BinOpKind::Eq | BinOpKind::Ne
                 ) =>
             {
-                for side in [l, r] {
-                    if let Some(f) = length_of(cx, side) {
+                for (side, other) in [(l, r), (r, l)] {
+                    if let Some(f) = length_of(cx, side)
+                        && !is_capacity(other)
+                    {
                         self.held.insert(f);
                     }
                 }
@@ -92,10 +96,6 @@ impl<'tcx> LateLintPass<'tcx> for Bounds {
             ExprKind::MethodCall(segment, receiver, ..) => {
                 let name = segment.ident.as_str();
                 let Some(f) = field(cx, receiver) else { return };
-                if matches!(name, "clear" | "truncate") {
-                    self.held.insert(f);
-                    return;
-                }
                 if !GROW.contains(&name)
                     || built_here(cx, receiver)
                     || !super::builtins::is_user_code(e.span)
@@ -172,6 +172,11 @@ fn length_of(cx: &LateContext<'_>, e: &Expr<'_>) -> Option<Field> {
         ExprKind::Binary(_, l, r) => length_of(cx, l).or_else(|| length_of(cx, r)),
         _ => None,
     }
+}
+
+/// Whether e takes a collection's `capacity()`.
+fn is_capacity(e: &Expr<'_>) -> bool {
+    matches!(peel(e).kind, ExprKind::MethodCall(s, _, [], _) if s.ident.as_str() == "capacity")
 }
 
 /// e without the borrows and derefs around it.

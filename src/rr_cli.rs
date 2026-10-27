@@ -40,7 +40,7 @@ fn subcommand(raw0: &str, args: &[String]) -> Option<io::Result<ExitCode>> {
             Ok(ExitCode::SUCCESS)
         },
         "--version" | "-V" => {
-            println!("rr 0.2.0 (Restricted Rust; Clippy and rustc 1.99.1, 58cf8f9c3)");
+            println!("rr 0.3.0 (Restricted Rust; Clippy and rustc 1.99.1, 58cf8f9c3)");
             Ok(ExitCode::SUCCESS)
         },
         "init" => workspace::init(rest),
@@ -125,6 +125,11 @@ fn run() -> io::Result<ExitCode> {
     // Integers to pointers and back are rewritten with addr and with_addr.
     compiler.push("-Zcrate-attr=feature(strict_provenance_lints)".into());
     compiler.extend(["--cfg".into(), "rr".into()]);
+    // Checked under cfg(fuzzing) without the harness rr fuz adds, the fuzz
+    // targets have no caller; the check without the cfg finds dead code.
+    if checking && args.windows(2).any(|pair| pair[0] == "--cfg" && pair[1] == "fuzzing") {
+        compiler.push("-Adead_code".into());
+    }
     if command != "lint" {
         compiler.push("-Aclippy::all".into());
     }

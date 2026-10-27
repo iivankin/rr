@@ -5,15 +5,15 @@
 //! variadic functions are known by name; each needs its `...`.
 
 use clippy_utils::diagnostics::span_lint_and_help;
-use rustc_hir::{ForeignItem, ForeignItemKind};
+use rustc_hir::{ForeignItem, ForeignItemKind, TyKind};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::impl_lint_pass;
 
-use super::RR_VARIADIC;
+use super::{RR_C_SIGNATURE, RR_VARIADIC};
 
 pub struct Ffi;
 
-impl_lint_pass!(Ffi => [RR_VARIADIC]);
+impl_lint_pass!(Ffi => [RR_VARIADIC, RR_C_SIGNATURE]);
 
 /// The C library's functions that take a variable number of arguments.
 const VARIADIC: &[&str] = &[
@@ -28,6 +28,25 @@ impl<'tcx> LateLintPass<'tcx> for Ffi {
             return;
         };
         let name = item.ident.name;
+        // C has pointers: a reference promises Rust's rules about the
+        // memory to code that does not keep them.
+        for input in sig.decl.inputs.iter().chain(match sig.decl.output {
+            rustc_hir::FnRetTy::Return(ty) => Some(ty),
+            rustc_hir::FnRetTy::DefaultReturn(_) => None,
+        }) {
+            if let TyKind::Ref(..) = input.kind
+                && super::builtins::is_user_code(input.span)
+            {
+                span_lint_and_help(
+                    cx,
+                    RR_C_SIGNATURE,
+                    input.span,
+                    format!("`{name}` is declared with a reference, which C does not have"),
+                    None,
+                    "declare it as its header does, with *const or *mut, and lend the reference with `&raw` at the call",
+                );
+            }
+        }
         if sig.decl.c_variadic() || !VARIADIC.contains(&name.as_str()) || !super::builtins::is_user_code(item.span) {
             return;
         }

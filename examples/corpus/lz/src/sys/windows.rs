@@ -135,7 +135,14 @@ fn write_all(which: u32, mut p: &[u8]) {
         if ok == 0 || written == 0 {
             return;
         }
-        p = &p[written as usize..];
+        // More than was asked: the system broke its contract; give up.
+        let Some(rest) = usize::try_from(written)
+            .ok()
+            .and_then(|count| p.get(count..))
+        else {
+            return;
+        };
+        p = rest;
     }
 }
 
@@ -157,7 +164,11 @@ pub fn stdin(out: &mut Vec<u8>, max: usize) -> bool {
         if r == 0 || out.len() + n > max {
             return false;
         }
-        out.extend_from_slice(&buf[..n]);
+        // More than was asked: the system broke its contract.
+        let Some(read) = buf.get(..n) else {
+            return false;
+        };
+        out.extend_from_slice(read);
     }
 }
 

@@ -13,7 +13,14 @@ use super::{RR_NO_GENERICS, RR_NO_MACROS, RR_NO_STD, RR_SIMPLE_TRAITS, RR_UNEXPL
 
 /// The entries of a `#![no_main]` program: C's main, and libFuzzer's for
 /// a harness of rr fuz.
-const ENTRIES: &[&str] = &["main", "LLVMFuzzerTestOneInput", "LLVMFuzzerInitialize"];
+const ENTRIES: &[&str] = &[
+    "main",
+    "LLVMFuzzerTestOneInput",
+    "LLVMFuzzerInitialize",
+    // The symbolizer libFuzzer asks for, which rr fuz's harness gives.
+    "__sanitizer_symbolize_pc",
+    "__sanitizer_get_module_and_offset_for_pc",
+];
 
 #[derive(Default)]
 pub struct RestrictedSyntax {
@@ -22,6 +29,9 @@ pub struct RestrictedSyntax {
     /// `#[unsafe(no_mangle)]` on that entry, a symbol the program must define
     /// under its C name and nothing else defines: no reason.
     entry: Option<ast::AttrId>,
+    /// Where a function's parameter is `impl Fn`, `FnMut` or `FnOnce`: a
+    /// closure handed in, which the function calls.
+    closures: FxHashSet<BytePos>,
 }
 impl_lint_pass!(RestrictedSyntax => [RR_NO_STD, RR_NO_GENERICS, RR_NO_MACROS, RR_SIMPLE_TRAITS, RR_UNEXPLAINED_ESCAPE]);
 
@@ -168,22 +178,17 @@ impl EarlyLintPass for RestrictedSyntax {
     }
 
     fn check_ty(&mut self, cx: &EarlyContext<'_>, ty: &ast::Ty) {
-        match ty.kind {
-            ast::TyKind::ImplTrait(..) => report(
+        // dyn is checked after resolution, which knows whose trait it is.
+        if let ast::TyKind::ImplTrait(..) = ty.kind
+            && !self.closures.contains(&ty.span.lo())
+        {
+            report(
                 cx,
                 RR_NO_GENERICS,
                 ty.span,
                 "impl Trait is forbidden by rr",
-                "use a concrete type",
-            ),
-            ast::TyKind::TraitObject(..) => report(
-                cx,
-                RR_SIMPLE_TRAITS,
-                ty.span,
-                "dyn Trait is forbidden by rr",
-                "use a concrete type or an ordinary trait implementation",
-            ),
-            _ => {},
+                "use a concrete type; a parameter may be `impl Fn`, `impl FnMut` or `impl FnOnce`",
+            );
         }
     }
 
@@ -214,6 +219,32 @@ impl EarlyLintPass for RestrictedSyntax {
     }
 
     fn check_fn(&mut self, cx: &EarlyContext<'_>, kind: FnKind<'_>, span: Span, _: ast::NodeId) {
+        if let FnKind::Fn(_, _, f) = kind {
+            let mut takes = None;
+            for param in &f.sig.decl.inputs {
+                if let ast::TyKind::ImplTrait(_, bounds) = &param.ty.kind
+                    && closure_bounds(bounds)
+                {
+                    self.closures.insert(param.ty.span.lo());
+                    takes = Some(param.ty.span);
+                }
+            }
+            // The compiler copies such a function for each closure it is
+            // given: a long one multiplies the work of the build.
+            if let (Some(param), Some(body)) = (takes, &f.body) {
+                let map = cx.sess().source_map();
+                let lines = map.lookup_char_pos(body.span.hi()).line - map.lookup_char_pos(body.span.lo()).line + 1;
+                if lines > CLOSURE_FN_LINES_MAX {
+                    report(
+                        cx,
+                        RR_NO_GENERICS,
+                        param,
+                        "a function of more than 30 lines that takes a closure is compiled again for every closure",
+                        "keep the part around the closure short, and call the rest from it as an ordinary function",
+                    );
+                }
+            }
+        }
         if let Some(header) = kind.header()
             && let ast::Safety::Unsafe(keyword) = header.safety
         {
@@ -285,11 +316,13 @@ impl EarlyLintPass for RestrictedSyntax {
             && attr
                 .meta_item_list()
                 .is_some_and(|items| items.iter().skip(1).any(forbidden_meta));
+        let derive = attr.has_name(sym::derive);
         let forbidden = conditional_forbidden
-            || attr.has_name(sym::derive)
+            || (derive && !attr.meta_item_list().is_some_and(|items| allowed_derives(&items)))
             || attr.has_name(sym::derive_const)
             || attr.is_proc_macro_attr()
-            || (!is_builtin_attr_name(first)
+            || (!derive
+                && !is_builtin_attr_name(first)
                 && !allowed_builtin_attribute(&path)
                 && !matches!(first.as_str(), "clippy" | "rustfmt" | "rr"));
         if forbidden {
@@ -302,6 +335,33 @@ impl EarlyLintPass for RestrictedSyntax {
             );
         }
     }
+}
+
+/// The most lines of a function that takes a closure: the compiler copies
+/// it for each closure it is given.
+const CLOSURE_FN_LINES_MAX: usize = 30;
+
+/// Whether the bounds of an `impl Trait` say only that it is a closure:
+/// one of `Fn(..)`, `FnMut(..)` or `FnOnce(..)`, and lifetimes.
+fn closure_bounds(bounds: &[ast::GenericBound]) -> bool {
+    let mut closures = 0;
+    for bound in bounds {
+        match bound {
+            ast::GenericBound::Trait(poly) => {
+                let Some(last) = poly.trait_ref.path.segments.last() else {
+                    return false;
+                };
+                let parenthesized = matches!(last.args.as_deref(), Some(ast::GenericArgs::Parenthesized(_)));
+                if !parenthesized || !matches!(last.ident.name.as_str(), "Fn" | "FnMut" | "FnOnce") {
+                    return false;
+                }
+                closures += 1;
+            },
+            ast::GenericBound::Outlives(_) => {},
+            ast::GenericBound::Use(..) => return false,
+        }
+    }
+    closures == 1
 }
 
 fn allowed_macro_path(path: &ast::Path) -> bool {
@@ -339,6 +399,8 @@ pub(super) fn allowed_macro_names(names: &[&str]) -> bool {
                 // Formatting into a core::fmt::Write: sugar for write_fmt.
                 | "write"
                 | "writeln"
+                // A pattern test: sugar for a match that answers true or false.
+                | "matches"
         )
 }
 
@@ -352,12 +414,38 @@ fn forbidden_meta(inner: &ast::MetaItemInner) -> bool {
             .meta_item_list()
             .is_some_and(|items| items.iter().skip(1).any(forbidden_meta));
     }
+    if first == sym::derive {
+        return !meta.meta_item_list().is_some_and(allowed_derives);
+    }
     matches!(
         first.as_str(),
-        "derive" | "derive_const" | "proc_macro" | "proc_macro_attribute" | "proc_macro_derive"
+        "derive_const" | "proc_macro" | "proc_macro_attribute" | "proc_macro_derive"
     ) || (!is_builtin_attr_name(first)
         && !allowed_builtin_attribute(&meta.path.segments.iter().map(|s| s.ident.name).collect::<Vec<_>>())
         && !matches!(first.as_str(), "clippy" | "rustfmt" | "rr"))
+}
+
+/// The compiler's own derives that ordinary syntax needs on a type of the
+/// program: copying it (`Copy`, and `Clone`, which `Copy` requires), `==`
+/// and a constant of it in a pattern (`PartialEq`, `Eq`), `<` and sorting
+/// (`PartialOrd`, `Ord`), and unwrap, `{:?}` and `assert_eq!` (`Debug`). rr
+/// allows these, and no other derive: `Hash` serves the hash maps of std,
+/// and a constructor says what `Default` would.
+pub(super) const DERIVES: &[&str] = &["Clone", "Copy", "Debug", "PartialEq", "Eq", "PartialOrd", "Ord"];
+
+/// Whether every item of a `derive(..)` list is one of the compiler's own
+/// derives, by its name or its path in core.
+fn allowed_derives(items: &[ast::MetaItemInner]) -> bool {
+    items.iter().all(|item| {
+        item.meta_item().is_some_and(|meta| {
+            meta.is_word()
+                && match meta.path.segments.as_slice() {
+                    [name] => DERIVES.contains(&name.ident.name.as_str()),
+                    [root, .., name] => root.ident.name == sym::core && DERIVES.contains(&name.ident.name.as_str()),
+                    [] => false,
+                }
+        })
+    })
 }
 
 fn require_unsafe_reason(cx: &EarlyContext<'_>, span: Span, operation: &'static str) {

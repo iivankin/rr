@@ -2421,15 +2421,16 @@ pub fn is_test_function(tcx: TyCtxt<'_>, fn_def_id: LocalDefId) -> bool {
     }
 }
 
-/// Checks if `id` has a `#[cfg(test)]` attribute applied
+/// Checks if `id` has a `#[cfg(test)]` attribute applied, or in rr
+/// `#[cfg(fuzzing)]`: a fuzz target is a test the fuzzer runs.
 ///
 /// This only checks directly applied attributes, to see if a node is inside a `#[cfg(test)]` parent
 /// use [`is_in_cfg_test`]
 pub fn is_cfg_test(tcx: TyCtxt<'_>, id: HirId) -> bool {
     if let Some(cfgs) = find_attr!(tcx, id, CfgTrace(cfgs) => cfgs)
-        && cfgs
-            .iter()
-            .any(|(cfg, _)| matches!(cfg, CfgEntry::NameValue { name: sym::test, .. }))
+        && cfgs.iter().any(|(cfg, _)| {
+            matches!(cfg, CfgEntry::NameValue { name, .. } if *name == sym::test || name.as_str() == "fuzzing")
+        })
     {
         true
     } else {

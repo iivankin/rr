@@ -67,7 +67,7 @@ with tempfile.TemporaryDirectory(prefix="rr-relocated-", dir=os.environ.get("TMP
         return done
     make()
     tested = make("test").stdout
-    assert "4 passed, 0 failed" in tested, tested
+    assert "5 passed, 0 failed" in tested, tested
     benched = make("bench").stdout
     assert "bench greet::tests::into_one_buffer ... " in benched and "0 allocations/iter" in benched, benched
     make("format", "check", "lint")
