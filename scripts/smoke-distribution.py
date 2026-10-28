@@ -83,6 +83,11 @@ with tempfile.TemporaryDirectory(prefix="rr-relocated-", dir=os.environ.get("TMP
     over = subprocess.run(["make", f"RR={link}", "prof", "PROFCOPIED=1"], cwd=root / "project", env=env,
                           text=True, encoding="utf-8", errors="replace", capture_output=True)
     assert over.returncode != 0 and "bytes copied, above the budget" in over.stdout, over.stdout
+    peak = profiled.split("the heap held at most ", 1)
+    assert len(peak) == 2 and int(peak[1].split(" ", 1)[0]) > 0, profiled
+    over = subprocess.run(["make", f"RR={link}", "prof", "PROFHEAP=1"], cwd=root / "project", env=env,
+                          text=True, encoding="utf-8", errors="replace", capture_output=True)
+    assert over.returncode != 0 and "at once, above the budget" in over.stdout, over.stdout
     # The programs in examples/corpus: every check their Makefiles offer,
     # and a short run of each fuzz target, on this bundle.
     corpus = Path(__file__).resolve().parent.parent / "examples" / "corpus"

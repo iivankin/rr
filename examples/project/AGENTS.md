@@ -24,9 +24,10 @@ operation, and the simple design is rarely the first one.
   path of each event `#[cfg_attr(rr, rr::hot)]`: rr can follow a path,
   not find one.
 - Set the limits: the largest input, the most items, the longest wait.
-  Each is a constant with its unit last (`TIMEOUT_MS`, `QUEUE_MAX`).
-  Decide what happens at each: a full queue refuses, drops or closes; it
-  does not grow.
+  Each is a constant with its unit last (`TIMEOUT_MS`, `QUEUE_MAX`),
+  defined once, beside what it limits, and used from there. Decide
+  what happens at each: a full queue refuses, drops or closes; it does
+  not grow.
 - Ask what can go wrong: a peer that stalls, cuts or lies, input that is
   malformed or turns malformed midway, a slow reader, a full disk.
   Decide each case before writing the one that works.
@@ -34,6 +35,24 @@ operation, and the simple design is rarely the first one.
   make the work quadratic, or make one event stall the rest.
 - Decide where each piece of state lives: one place for each fact, no
   copy of it in another field, no alias to keep in step.
+- Build one system, not a set of parts. Shape it early as the type
+  that runs a request end to end: it owns the data it reads and the
+  workspaces its stages share, and each stage borrows what it needs. A
+  request goes from input to output before any stage is perfected; a
+  part nothing calls is not done.
+- A module is a part of the design with its own state and contract: a
+  format, an index, a stage. It is not a function, a fixture or a fuzz
+  target. Split a file when it holds two such parts, not when it grows.
+- Let Rust's types carry the design. A view borrows the data it reads:
+  a lifetime, not a copy or an id kept in step. An enum holds each
+  variant with its data. A generic or a trait says once what is the
+  same over types, where the domain has such a kind. A type for each
+  state makes a call in the wrong state fail to compile. A value
+  releases what it holds on drop.
+- Memory reserved up front is sized from the limit of what it holds (a
+  query of QUERY_BYTES_MAX bytes needs no more scalars than that), and
+  stages that run one after another share it rather than each keeping
+  its own.
 - Work at the program's own pace: take what came in batches, and bound
   the work of one turn of the event loop.
 
@@ -69,7 +88,9 @@ operation, and the simple design is rarely the first one.
 - An assertion states what the design says must hold: arguments,
   results, invariants, and what must never happen as well as what must.
   A bug or corrupt state stops the program; a failure of the world
-  outside (network, disk, input) is handled. Pair assertions across
+  outside (network, disk, input) is handled. An index computed from the
+  slice's own length is in bounds unless the code is wrong: index it
+  with a reason, not `get(..).ok_or(Error)`. Pair assertions across
   paths: check data before it is written and after it is read back.
   One condition per assertion; an implication is
   `if a { assert!(b) }`. A relation between constants is checked when
@@ -110,16 +131,16 @@ operation, and the simple design is rarely the first one.
     make test         # the #[test] items; FILTER=word narrows
     make bench        # the #[bench] items: time, allocations, copies
     make fuzz         # when parsing changed; FUZZ=target FUZZTIME=seconds in all
-    make prof         # allocations and bytes copied, against the baseline
+    make prof         # allocations, copies and heap against the baseline
 
 A change is done when all of them are clean and it is right as it
 stands: no TODO, no workaround to come back to.
 
 make prof runs PROFRUN, a fixed workload that drives the data path as
-real use does. PROFMAX and PROFCOPIED are its measured maximum over a
-few runs plus 1-2%: lowered in the same commit when a change saves,
-raised only with the reason in the commit message. The workload changes
-only with the budgets, and says why.
+real use does. PROFMAX, PROFCOPIED and PROFHEAP are its measured
+maximum over a few runs plus 1-2%: lowered in the same commit when a
+change saves, raised only with the reason in the commit message. The
+workload changes only with the budgets, and says why.
 
 Tests sit beside the code they check, in `#[cfg(test)] mod tests`, as
 `#[test]` functions; a path that runs for every event has a `#[bench]`

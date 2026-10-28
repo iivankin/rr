@@ -59,17 +59,20 @@ fuzz:
 
 # Where the program allocates and copies: built with --prof, then run
 # under rr prof. PROFRUN is what to run; PROFMAX fails above a budget
-# of allocations, PROFCOPIED above one of bytes copied.
+# of allocations, PROFCOPIED above one of bytes copied, PROFHEAP above
+# one of bytes the heap holds at once.
 PROFRUN = ./$(OUT)/prof/$(NAME)$(EXE) rr prof
 PROFMAX =
 PROFCOPIED =
+PROFHEAP =
 $(OUT)/prof/$(NAME)$(EXE): $(SRC)
 	mkdir -p $(OUT)/prof
 	$(RR) build --prof src/main.rs --crate-name $(NAME) $(RRFLAGS) $(LTOFLAGS) -o $@
 
 prof: $(OUT)/prof/$(NAME)$(EXE)
 	$(RR) prof $(if $(PROFMAX),--max $(PROFMAX)) \
-		$(if $(PROFCOPIED),--max-copied $(PROFCOPIED)) -- $(PROFRUN)
+		$(if $(PROFCOPIED),--max-copied $(PROFCOPIED)) \
+		$(if $(PROFHEAP),--max-heap $(PROFHEAP)) -- $(PROFRUN)
 
 clean:
 	rm -rf $(OUT) $(NAME)$(EXE)

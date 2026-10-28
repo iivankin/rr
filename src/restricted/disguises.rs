@@ -3,8 +3,9 @@
 //! `must_use` value dropped into a binding never read, an error's cause
 //! thrown away by `ok()`, a magic number standing for none, an integer
 //! saying which kind a value is, a large value built on the stack and
-//! copied into a Box, and unsafe code outside the module that talks to
-//! the system.
+//! copied into a Box, a bug reported as bad input (`get(..).ok_or(..)`
+//! with an index computed from the slice's own length), and unsafe code
+//! outside the module that talks to the system.
 
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::is_must_use_func_call;
@@ -26,7 +27,11 @@ use super::RR_UNEXPLAINED_ESCAPE;
 use super::allocs::{reason, statement};
 use super::comments::note;
 
-pub struct Disguises;
+#[derive(Default)]
+pub struct Disguises {
+    /// The locals of the function last looked into.
+    locals: super::inbounds::Locals,
+}
 
 impl_lint_pass!(Disguises => [RR_UNEXPLAINED_ESCAPE]);
 
@@ -78,6 +83,18 @@ impl<'tcx> LateLintPass<'tcx> for Disguises {
             );
         }
         ok_unwrap(cx, typeck, e);
+        if let Some(slice) = self.locals.own_index(cx, e) {
+            ask(
+                cx,
+                e.hir_id,
+                e.span,
+                "panic",
+                format!(
+                    "the index into `{slice}` is computed from its own length: out of bounds, it is a bug, which `ok_or` reports as bad input"
+                ),
+                "index it, and say in a reason why the index is below the length; a bug stops the program where it is",
+            );
+        }
         if let Some(what) = sentinel(cx, typeck, e) {
             ask(
                 cx,
@@ -206,24 +223,40 @@ impl<'tcx> LateLintPass<'tcx> for Disguises {
 }
 
 /// `ok().unwrap()` and `ok().expect(..)` on a Result: the error is thrown
-/// away before the failure could name it.
+/// away before the failure could name it; `ok().unwrap_or(..)` and the
+/// like: the Result's own says the same, shorter.
 fn ok_unwrap<'tcx>(cx: &LateContext<'tcx>, typeck: &TypeckResults<'tcx>, e: &Expr<'_>) {
     if let ExprKind::MethodCall(segment, receiver, ..) = e.kind
-        && matches!(segment.ident.as_str(), "unwrap" | "expect")
+        && matches!(
+            segment.ident.as_str(),
+            "unwrap" | "expect" | "unwrap_or" | "unwrap_or_else" | "unwrap_or_default"
+        )
         && let ExprKind::MethodCall(ok, inner, [], _) = receiver.kind
         && ok.ident.as_str() == "ok"
         && is_result(cx, typeck.expr_ty(inner))
     {
+        let fallback = segment.ident.as_str().starts_with("unwrap_or");
         span_lint_and_then(
             cx,
             RR_UNEXPLAINED_ESCAPE,
             e.span,
-            format!(
-                "`ok().{}()` throws the error away, and a failure cannot say which it was",
-                segment.ident
-            ),
+            if fallback {
+                format!(
+                    "`ok().{}()` makes the Result an Option only to throw its error away",
+                    segment.ident
+                )
+            } else {
+                format!(
+                    "`ok().{}()` throws the error away, and a failure cannot say which it was",
+                    segment.ident
+                )
+            },
             |diag| {
-                diag.help("call it on the Result itself; for tests, give the error type Debug with `#[cfg_attr(test, derive(Debug))]`");
+                if fallback {
+                    diag.help("call it on the Result itself, where the error it replaces is in sight");
+                } else {
+                    diag.help("call it on the Result itself; for tests, give the error type Debug with `#[cfg_attr(test, derive(Debug))]`");
+                }
             },
         );
     }

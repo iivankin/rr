@@ -154,7 +154,7 @@ Rules are compiler errors and cannot be lowered with `allow`, `-A rr`,
 | rr_unused_escape | Forbid a reason that answers nothing: a kind with no such operation beside it, a kind rr does not know, or the old form that names none |
 | rr_c_signature | Forbid a reference in a C function's declaration: C has pointers |
 | rr_unused_derive | Forbid a derived trait that nothing in the program uses |
-| rr_duplicate | Forbid a function whose body repeats another's, token for token without comments and spacing (60 characters or more), without a `duplicate` reason: one function, called from both places, says it once |
+| rr_duplicate | Forbid a function whose body repeats another's, token for token without comments and spacing and type for type, of four statements or more, without a `duplicate` reason: one function, called from both places, says it once. Two types spelled the same way (`Self { memo: Memo::new() }`, `self.workspace.abort()`) are not a copy: one function for both would need a trait |
 
 Lifetime parameters, ordinary traits/impls, and concrete uses of existing generic
 library types such as Vec<u8> remain allowed. A function's parameter may be
@@ -195,7 +195,8 @@ derived type needs it. What only tests use is derived under
 `#[cfg_attr(test, derive(..))]`, and stays out of the program. An
 exported type of a library is not looked at. `ok().unwrap()` and
 `ok().expect()` throw the error away before the failure could name it,
-and are errors in tests too: give the error type Debug for the tests. A
+and are errors in tests too: give the error type Debug for the tests;
+`ok().unwrap_or(..)` and the like say what the Result's own does. A
 derived Copy past 64 bytes needs `escape(copy)` above the derive, as an
 `impl Copy` does, and a derived Clone is called as any clone.
 Own macro definitions, library macros such as vec! and format!, other derives
@@ -288,6 +289,13 @@ Required for:
   `ok().ok_or(..)`, which throws away the error's cause as `map_err(|_|..)`
   does. A `Box::new` of more than 256 bytes, which builds the value on the
   stack and copies it into the heap (`move`).
+- A bug reported as bad input (`panic`): `x.get(i).ok_or(..)` with an
+  index the function computed from x's own length and nothing it was
+  given or read (`x.len() - 1`, the counter of a loop over `0..x.len()`,
+  the index `enumerate` gives). Out of bounds, it is a bug in the
+  function: index it with a reason, and the bug stops the program where
+  it is. A range with both ends, `2..x.len() - 4`, is out of bounds when
+  the input is short, and is not looked at.
 - A magic number standing for none (`sentinel`): `x == u32::MAX`, and
   `u32::MAX` as the default of an Option (`map_or`, `unwrap_or`); an
   Option says there is none. On a Result, as from try_from, such a default
@@ -416,7 +424,8 @@ and stored into an element or through a reference (`out[i] = x[i]`,
 `*d = *s`), or pushed (`for &b in x { out.push(b) }`), whole or rebuilt
 field by field (`out[i] = Item { position: x[i].position, weight:
 x[i].weight }`, `Id(x[i].0)`). A Copy value of at most 8 bytes moved
-within one buffer (`ids[hole] = ids[next]`) is a permutation, as `swap`
+within one buffer (`ids[hole] = ids[next]`, `*ids.get_mut(hole)? =
+*ids.get(next)?`) is a permutation, as `swap`
 makes one, and not a copy. rr finds such a copy in the function's MIR
 too, whatever the source looks like: a value read out of memory the
 function reaches by reference, which passes through locals, a
@@ -509,14 +518,17 @@ standard library's included: each copy is counted by its stack and its
 bytes, then handed to the C library. Small copies of a known size that the
 compiler writes inline are not calls and are not counted. Build every crate
 of the program with --prof; a --prof build keeps its symbols.
-`rr prof [--top N] [--max N] [--max-copied BYTES] [--keep DIR] -- COMMAND`
+`rr prof [--top N] [--max N] [--max-copied BYTES] [--max-heap BYTES] [--keep DIR] -- COMMAND`
 runs a command with RR_PROF_DIR set, so that each process of such a program
 it starts, each image after exec included, writes its counts to a file
 mapped shared there; then reports the program's own lines that allocate
 most, and those that copy the most bytes, with their callers (core, alloc,
 the allocator and memcpy are left out), from DWARF or the dSYM. --max fails
 above a budget of allocations, --max-copied above one of bytes copied: an
-allocation traded for copies shows. Without RR_PROF_DIR a --prof build runs
+allocation traded for copies shows. It reports as well the most bytes the
+heap held at once, in any one process image, and --max-heap fails above a
+budget of them: a buffer reserved for the worst case, so that nothing
+allocates later, shows there. Without RR_PROF_DIR a --prof build runs
 as usual.
 
 Operations are matched using resolved definitions and result types. An unrelated

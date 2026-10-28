@@ -23,7 +23,7 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU64, Ordering};
 const DEPTH: usize = 16;
 /// Distinct stacks; more are counted as lost.
 const SLOTS: usize = 16384;
-const MAGIC: [u8; 8] = *b"RRPROF2\0";
+const MAGIC: [u8; 8] = *b"RRPROF3\0";
 /// What a slot counts.
 const ALLOC: u64 = 0;
 const COPY: u64 = 1;
@@ -37,6 +37,8 @@ struct Header {
     /// The runtime address of rr_prof_anchor, for the load slide.
     anchor: u64,
     lost: u64,
+    /// The most bytes the heap held at once.
+    peak: u64,
     exe: [u8; PATH],
 }
 
@@ -400,6 +402,9 @@ unsafe fn overlapping(dst: *mut u8, src: *const u8, n: usize) {
 /// not RR_PROF_DIR is set: what rr bench reads around a measured loop.
 static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 static COPIED: AtomicU64 = AtomicU64::new(0);
+/// The bytes the heap holds now, and the most it has held.
+static LIVE: AtomicU64 = AtomicU64::new(0);
+static PEAK: AtomicU64 = AtomicU64::new(0);
 
 /// The counts so far, for rr bench.
 #[unsafe(no_mangle)]
@@ -421,23 +426,28 @@ pub extern "C" fn rr_prof_anchor() {}
 
 #[inline(never)]
 pub unsafe fn rr_prof_rust_alloc(size: usize, align: usize) -> *mut u8 {
+    grow(size);
     note(ALLOC, size);
     unsafe { __rg_alloc(size, align) }
 }
 
 #[inline(never)]
 pub unsafe fn rr_prof_rust_dealloc(ptr: *mut u8, size: usize, align: usize) {
+    LIVE.fetch_sub(size as u64, Ordering::Relaxed);
     unsafe { __rg_dealloc(ptr, size, align) }
 }
 
 #[inline(never)]
 pub unsafe fn rr_prof_rust_realloc(ptr: *mut u8, old: usize, align: usize, new: usize) -> *mut u8 {
+    LIVE.fetch_sub(old as u64, Ordering::Relaxed);
+    grow(new);
     note(ALLOC, new);
     unsafe { __rg_realloc(ptr, old, align, new) }
 }
 
 #[inline(never)]
 pub unsafe fn rr_prof_rust_alloc_zeroed(size: usize, align: usize) -> *mut u8 {
+    grow(size);
     note(ALLOC, size);
     unsafe { __rg_alloc_zeroed(size, align) }
 }
@@ -496,6 +506,19 @@ fn stack(pcs: &mut [u64; DEPTH]) {
     let n = unsafe { os::RtlCaptureStackBackTrace(0, DEPTH as u32, frames.as_mut_ptr(), null_mut()) };
     for (pc, frame) in pcs.iter_mut().zip(&frames[..usize::from(n)]) {
         *pc = frame.addr() as u64;
+    }
+}
+
+/// The heap holds size bytes more: raise the peak, here and in the file.
+fn grow(size: usize) {
+    let live = LIVE.fetch_add(size as u64, Ordering::Relaxed).wrapping_add(size as u64);
+    if live <= PEAK.fetch_max(live, Ordering::Relaxed) {
+        return;
+    }
+    let base = BASE.load(Ordering::Acquire);
+    if !base.is_null() {
+        let peak = unsafe { &*(&raw mut (*base.cast::<Header>()).peak).cast::<AtomicU64>() };
+        peak.fetch_max(live, Ordering::Relaxed);
     }
 }
 
@@ -597,6 +620,7 @@ fn map() -> *mut u8 {
     header.depth = DEPTH as u32;
     header.slots = SLOTS as u32;
     header.anchor = rr_prof_anchor as *const () as usize as u64;
+    header.peak = PEAK.load(Ordering::Relaxed);
     os::executable(&mut header.exe);
     base
 }

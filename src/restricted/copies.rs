@@ -8,7 +8,7 @@ use clippy_utils::res::MaybeResPath as _;
 use clippy_utils::visitors::for_each_expr;
 use core::ops::ControlFlow;
 use rustc_hir::def::{DefKind, Res};
-use rustc_hir::{BorrowKind, Expr, ExprKind, HirId, LetStmt, Mutability, Node, PatKind, StmtKind, UnOp};
+use rustc_hir::{BorrowKind, Expr, ExprKind, HirId, LetStmt, MatchSource, Mutability, Node, PatKind, StmtKind, UnOp};
 use rustc_lint::LateContext;
 use rustc_middle::ty::{self, Ty, TypeckResults, TypingEnv};
 use rustc_span::def_id::DefId;
@@ -581,14 +581,15 @@ fn in_memory(mut place: &Expr<'_>) -> bool {
 const MOVE_WITHIN_MAX: u64 = 8;
 
 /// Whether an element of a buffer is stored into another place of the same
-/// buffer, and is a small Copy value: `ids[hole] = ids[next]` in a sort.
+/// buffer, and is a small Copy value: `ids[hole] = ids[next]` in a sort,
+/// `*ids.get_mut(hole)? = value` with `value` read out of `ids`.
 fn small_move_within<'tcx>(
     cx: &LateContext<'tcx>,
     typeck: &TypeckResults<'tcx>,
-    place: &Expr<'_>,
-    value: &Expr<'_>,
+    place: &'tcx Expr<'tcx>,
+    value: &'tcx Expr<'tcx>,
 ) -> bool {
-    let (ExprKind::Index(into, ..), ExprKind::Index(from, ..)) = (place.kind, value.kind) else {
+    let (Some(into), Some(from)) = (buffer(place), buffer(read_into(cx, value))) else {
         return false;
     };
     if !clippy_utils::SpanlessEq::new(cx).eq_expr(place.span.ctxt(), into, from) {
@@ -601,6 +602,44 @@ fn small_move_within<'tcx>(
             .tcx
             .layout_of(env.as_query_input(ty))
             .is_ok_and(|layout| layout.size.bytes() <= MOVE_WITHIN_MAX)
+}
+
+/// What a value is: a binding's initializer, for an immutable binding.
+fn read_into<'tcx>(cx: &LateContext<'tcx>, value: &'tcx Expr<'tcx>) -> &'tcx Expr<'tcx> {
+    value
+        .res_local_id()
+        .and_then(|id| clippy_utils::find_binding_init(cx, id))
+        .unwrap_or(value)
+}
+
+/// The buffer an element is read from or stored into: `ids` of `ids[i]`,
+/// of `*ids.get_mut(i)?` and of `*ids.get(i).ok_or(..)?`.
+fn buffer<'a>(e: &'a Expr<'a>) -> Option<&'a Expr<'a>> {
+    let mut e = match e.kind {
+        ExprKind::Index(base, ..) => return Some(base),
+        ExprKind::Unary(UnOp::Deref, inner) => inner,
+        _ => e,
+    };
+    loop {
+        e = match e.kind {
+            ExprKind::Match(scrutinee, _, MatchSource::TryDesugar(_)) => match scrutinee.kind {
+                ExprKind::Call(_, [inner]) => inner,
+                _ => return None,
+            },
+            ExprKind::MethodCall(segment, inner, ..)
+                if matches!(
+                    segment.ident.as_str(),
+                    "ok_or" | "ok_or_else" | "unwrap" | "expect" | "copied" | "cloned"
+                ) =>
+            {
+                inner
+            },
+            ExprKind::MethodCall(segment, base, [_], _) if matches!(segment.ident.as_str(), "get" | "get_mut") => {
+                return Some(base);
+            },
+            _ => return None,
+        };
+    }
 }
 
 /// Whether e is a value read as it is from memory the program holds: an

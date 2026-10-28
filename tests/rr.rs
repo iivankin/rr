@@ -170,6 +170,12 @@ fn the_compilers_own_derives_and_matches_are_allowed() {
         "#![no_std]\npub fn f(r: Result<u8, u8>) -> u8 {\n // rr: escape(panic): r is Ok here.\n r.ok().unwrap()\n}",
         "rr_unexplained_escape",
     );
+    // ok().unwrap_or(..) says what the Result's own does, after dropping the
+    // error.
+    rejected(
+        "#![no_std]\npub fn f(r: Result<u8, u8>) -> u8 {\n r.ok().unwrap_or(0)\n}",
+        "rr_unexplained_escape",
+    );
     // A derived Copy is a Copy: past 64 bytes it needs a reason.
     rejected(
         "#![no_std]\n#[derive(Clone, Copy)]\npub struct Big(pub [u8; 128]);",
@@ -1179,7 +1185,8 @@ fn a_hot_path_sees_a_value_rebuilt_field_by_field_as_a_copy() {
     // buffer is a permutation, as swap makes one.
     accepted(&format!(
         "#![no_std]\n{item}#[rr::hot]\npub fn scale(out: &mut [Item]) {{\n for o in out.iter_mut() {{\n *o = Item {{ position: o.position + 1, weight: o.weight * 2 }};\n }}\n}}\n\
-         #[rr::hot]\npub fn rotate(ids: &mut [u32]) {{\n for i in 1..ids.len() {{\n // rr: escape(panic): i and i - 1 are below the length.\n ids[i - 1] = ids[i];\n }}\n}}"
+         #[rr::hot]\npub fn rotate(ids: &mut [u32]) {{\n for i in 1..ids.len() {{\n // rr: escape(panic): i and i - 1 are below the length.\n ids[i - 1] = ids[i];\n }}\n}}\n\
+         #[rr::hot]\npub fn shift(ids: &mut [u32], at: usize) -> Option<()> {{\n for i in at..ids.len() {{\n *ids.get_mut(i)? = *ids.get(i.checked_add(1)?)?;\n }}\n Some(())\n}}"
     ));
     // A constant copied into a Vec builds it, as From of it does.
     accepted(&alloc_fixture(
@@ -1279,6 +1286,48 @@ fn a_body_that_repeats_another_is_one_function() {
     accepted(&format!(
         "#![no_std]\npub mod a {{\n pub fn hash(data: &[u8]) -> u32 {body}\n}}\npub mod b {{\n // rr: escape(duplicate): the wire format fixes this one apart from a's.\n pub fn sum(data: &[u8]) -> u32 {body}\n}}"
     ));
+}
+
+#[test]
+fn a_constant_defined_twice_is_one_fact_in_two_places() {
+    rejected(
+        "#![no_std]\npub mod a {\n pub const TOKENS_MAX: usize = 32;\n}\npub mod b {\n pub const TOKENS_MAX: usize = 1 << 5;\n}",
+        "rr_duplicate",
+    );
+    accepted(
+        "#![no_std]\npub mod a {\n pub const TOKENS_MAX: usize = 32;\n pub const VERSION: u8 = 1;\n}\npub mod b {\n pub const TOKENS_MAX: usize = 64;\n pub const VERSION: u16 = 1;\n pub const LIMIT: u32 = 7;\n}\n\
+         pub mod c {\n // rr: escape(duplicate): the wire format fixes this one apart from b's.\n pub const LIMIT: u32 = 7;\n}",
+    );
+}
+
+#[test]
+fn a_body_spelled_the_same_on_other_types_is_not_a_copy() {
+    let body = "{\n self.n = 0;\n self.m = 1;\n self.n += self.m;\n self.m += self.n;\n self.n ^= 3;\n}";
+    accepted(&format!(
+        "#![no_std]\npub struct A {{ n: u32, m: u32 }}\npub struct B {{ n: u64, m: u64 }}\n\
+         impl A {{\n pub fn reset(&mut self) {body}\n}}\nimpl B {{\n pub fn reset(&mut self) {body}\n}}\n\
+         impl A {{\n pub fn new() -> Self {{\n Self {{ n: 7, m: 7 }}\n }}\n}}\nimpl B {{\n pub fn new() -> Self {{\n Self {{ n: 7, m: 7 }}\n }}\n}}"
+    ));
+}
+
+#[test]
+fn an_index_from_its_own_length_is_a_bug_not_bad_input() {
+    for source in [
+        "pub fn last(ids: &[u32]) -> Result<u32, ()> {\n let end = ids.len().checked_sub(1).ok_or(())?;\n ids.get(end).copied().ok_or(())\n}",
+        "pub fn sum(ids: &[u32]) -> Result<u32, ()> {\n let mut n = 0u32;\n for i in (0..ids.len()).rev() {\n n = n.wrapping_add(*ids.get(i).ok_or(())?);\n }\n Ok(n)\n}",
+        "pub fn pairs(ids: &[u32]) -> Result<u32, ()> {\n let mut n = 0u32;\n for (i, _) in ids.iter().enumerate() {\n let j = i / 2;\n n ^= *ids.get(j).ok_or(())?;\n }\n Ok(n)\n}",
+    ] {
+        rejected(&format!("#![no_std]\n{source}"), "rr_unexplained_escape");
+    }
+    // An index from input, or a length the input does not set, may be
+    // out of bounds by the input.
+    accepted(
+        "#![no_std]\npub fn at(data: &[u8], i: usize) -> Result<u8, ()> {\n data.get(i).copied().ok_or(())\n}\n\
+         pub fn header(data: &[u8]) -> Result<u8, ()> {\n let mut n = 0u8;\n for i in 0..4 {\n n ^= *data.get(i).ok_or(())?;\n }\n Ok(n)\n}\n\
+         pub fn body(data: &[u8]) -> Result<&[u8], ()> {\n let end = data.len().checked_sub(4).ok_or(())?;\n data.get(2..end).ok_or(())\n}\n\
+         pub fn zip(a: &[u8], b: &[u8]) -> Result<u8, ()> {\n let mut n = 0u8;\n for i in 0..a.len() {\n n ^= *b.get(i).ok_or(())?;\n }\n Ok(n)\n}\n\
+         pub fn last(ids: &[u32]) -> u32 {\n let end = ids.len().saturating_sub(1);\n // rr: escape(panic): end is below the length of a non-empty ids.\n *ids.get(end).ok_or(()).unwrap_or(&0)\n}",
+    );
 }
 
 #[test]

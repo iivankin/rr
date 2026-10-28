@@ -13,8 +13,8 @@ use std::{fs, io};
 use super::{executable, workspace};
 
 const RUNTIME: &str = include_str!("prof_rt.rs");
-const MAGIC: &[u8; 8] = b"RRPROF2\0";
-const HEADER: usize = 32 + 1024;
+const MAGIC: &[u8; 8] = b"RRPROF3\0";
+const HEADER: usize = 40 + 1024;
 
 /// Build the runtime rlib into dir with this compiler, unrestricted: it
 /// defines the allocator shim's internal symbols, which only the
@@ -104,6 +104,7 @@ struct Options {
     top: usize,
     max: Option<u64>,
     max_copied: Option<u64>,
+    max_heap: Option<u64>,
     keep: Option<PathBuf>,
 }
 
@@ -112,6 +113,7 @@ pub fn run(args: &[String]) -> io::Result<ExitCode> {
         top: 25,
         max: None,
         max_copied: None,
+        max_heap: None,
         keep: None,
     };
     let mut i = 0;
@@ -126,6 +128,7 @@ pub fn run(args: &[String]) -> io::Result<ExitCode> {
             "--top" => o.top = value(i)?.parse().map_err(|_| io::Error::other(usage()))?,
             "--max" => o.max = Some(value(i)?.parse().map_err(|_| io::Error::other(usage()))?),
             "--max-copied" => o.max_copied = Some(value(i)?.parse().map_err(|_| io::Error::other(usage()))?),
+            "--max-heap" => o.max_heap = Some(value(i)?.parse().map_err(|_| io::Error::other(usage()))?),
             "--keep" => o.keep = Some(PathBuf::from(value(i)?)),
             "report" => {
                 report_dir = Some(PathBuf::from(value(i)?));
@@ -165,7 +168,7 @@ pub fn run(args: &[String]) -> io::Result<ExitCode> {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  rr prof [--top N] [--max N] [--max-copied BYTES] [--keep DIR] -- COMMAND [ARGS]\n  rr prof report DIR [--top N] [--max N] [--max-copied BYTES]\n\nRuns COMMAND with RR_PROF_DIR set: each process of a program built with\nrr build --prof records its heap allocations, and the bytes it copies\nthrough memcpy and memmove, by stack. Then reports the places in the\nprogram's own code that allocate and copy most, with their callers.\n--max fails when the allocations are above N, --max-copied when the\nbytes copied are above BYTES: budgets for tests.\nBuild with --prof every crate (for line tables) and the final artifact\n(for the runtime); a --prof build is not stripped."
+    "Usage:\n  rr prof [--top N] [--max N] [--max-copied BYTES] [--max-heap BYTES] [--keep DIR] -- COMMAND [ARGS]\n  rr prof report DIR [--top N] [--max N] [--max-copied BYTES] [--max-heap BYTES]\n\nRuns COMMAND with RR_PROF_DIR set: each process of a program built with\nrr build --prof records its heap allocations, and the bytes it copies\nthrough memcpy and memmove, by stack. Then reports the places in the\nprogram's own code that allocate and copy most, with their callers.\n--max fails when the allocations are above N, --max-copied when the\nbytes copied are above BYTES, --max-heap when the heap held more than\nBYTES at once: budgets for tests.\nBuild with --prof every crate (for line tables) and the final artifact\n(for the runtime); a --prof build is not stripped."
 }
 
 /// One frame: the function and where in it.
@@ -258,7 +261,7 @@ fn report(dir: &Path, o: &Options) -> io::Result<ExitCode> {
     let mut programs: BTreeMap<PathBuf, Option<Program>> = BTreeMap::new();
     let mut allocs = Tally::default();
     let mut copies = Tally::default();
-    let (mut images, mut lost) = (0u64, 0u64);
+    let (mut images, mut lost, mut peak) = (0u64, 0u64, 0u64);
     for entry in fs::read_dir(dir)? {
         let data = fs::read(entry?.path())?;
         if data.len() < HEADER || &data[..8] != MAGIC {
@@ -268,7 +271,8 @@ fn report(dir: &Path, o: &Options) -> io::Result<ExitCode> {
         let half = |at: usize| u32::from_le_bytes(data[at..at + 4].try_into().unwrap_or_default()) as usize;
         let (depth, slots, anchor) = (half(8), half(12), word(16));
         lost += word(24);
-        let exe = &data[32..HEADER];
+        peak = peak.max(word(32));
+        let exe = &data[40..HEADER];
         let exe = PathBuf::from(
             String::from_utf8_lossy(&exe[..exe.iter().position(|c| *c == 0).unwrap_or(exe.len())]).into_owned(),
         );
@@ -317,6 +321,7 @@ fn report(dir: &Path, o: &Options) -> io::Result<ExitCode> {
             .collect::<Vec<_>>()
             .join(", ")
     );
+    println!("rr prof: the heap held at most {peak} bytes at once");
     if lost > 0 {
         println!("rr prof: {lost} counts on stacks past the table, in neither total");
     }
@@ -337,6 +342,12 @@ fn report(dir: &Path, o: &Options) -> io::Result<ExitCode> {
         && copies.bytes > max
     {
         println!("rr prof: {} bytes copied, above the budget of {max}", copies.bytes);
+        code = ExitCode::FAILURE;
+    }
+    if let Some(max) = o.max_heap
+        && peak > max
+    {
+        println!("rr prof: the heap held {peak} bytes at once, above the budget of {max}");
         code = ExitCode::FAILURE;
     }
     Ok(code)

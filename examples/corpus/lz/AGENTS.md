@@ -110,16 +110,16 @@ operation, and the simple design is rarely the first one.
     make test         # the #[test] items; FILTER=word narrows
     make bench        # the #[bench] items: time, allocations, copies
     make fuzz         # when parsing changed; FUZZ=target FUZZTIME=seconds
-    make prof         # allocations and bytes copied, against the baseline
+    make prof         # allocations, copies and heap against the baseline
 
 A change is done when all of them are clean and it is right as it
 stands: no TODO, no workaround to come back to.
 
 make prof runs PROFRUN, a fixed workload that drives the data path as
-real use does. PROFMAX and PROFCOPIED are its measured maximum over a
-few runs plus 1-2%: lowered in the same commit when a change saves,
-raised only with the reason in the commit message. The workload changes
-only with the budgets, and says why.
+real use does. PROFMAX, PROFCOPIED and PROFHEAP are its measured
+maximum over a few runs plus 1-2%: lowered in the same commit when a
+change saves, raised only with the reason in the commit message. The
+workload changes only with the budgets, and says why.
 
 Tests sit beside the code they check, in `#[cfg(test)] mod tests`, as
 `#[test]` functions; a path that runs for every event has a `#[bench]`

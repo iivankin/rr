@@ -116,6 +116,10 @@ struct Flow<'a, 'tcx> {
     /// For a local that holds a value read out of memory, the local through
     /// which it was read: the buffer it came from.
     origin: FxHashMap<Local, Local>,
+    /// For a local that holds a reference into a buffer, the local of the
+    /// buffer: a reference derived from it, or returned by a function
+    /// given it (`ids.get_mut(i)`), points into it.
+    roots: FxHashMap<Local, Local>,
 }
 
 impl<'a, 'tcx> Flow<'a, 'tcx> {
@@ -127,21 +131,35 @@ impl<'a, 'tcx> Flow<'a, 'tcx> {
             tainted: FxHashSet::default(),
             pointing: FxHashSet::default(),
             origin: FxHashMap::default(),
+            roots: FxHashMap::default(),
         }
     }
 
-    /// Spread the taint to a fixed point; with `report`, record each store
-    /// of a tainted value into memory in a loop.
-    fn run(&mut self, summaries: &mut Summaries, mut report: Option<(&FxHashSet<BasicBlock>, &mut Vec<Span>)>) {
+    /// Spread the taint to a fixed point; with `report`, then record each
+    /// store of a tainted value into memory in a loop.
+    fn run(&mut self, summaries: &mut Summaries, report: Option<(&FxHashSet<BasicBlock>, &mut Vec<Span>)>) {
+        while self.pass(summaries, None) {}
+        if report.is_some() {
+            self.pass(summaries, report);
+        }
+    }
+
+    /// One pass over the body: whether it learned something.
+    fn pass(
+        &mut self,
+        summaries: &mut Summaries,
+        mut report: Option<(&FxHashSet<BasicBlock>, &mut Vec<Span>)>,
+    ) -> bool {
         let body = self.body;
-        loop {
-            let before = self.tainted.len() + self.pointing.len();
+        let before = self.tainted.len() + self.pointing.len() + self.origin.len() + self.roots.len();
+        {
             for (block, data) in body.basic_blocks.iter_enumerated() {
                 for statement in &data.statements {
                     let StatementKind::Assign(assign) = &statement.kind else {
                         continue;
                     };
                     let (place, rvalue) = &**assign;
+                    self.root_assign(place, rvalue);
                     if let Rvalue::Ref(_, _, target) | Rvalue::RawPtr(_, target) = rvalue
                         && place.projection.is_empty()
                         && self.place(target)
@@ -181,6 +199,13 @@ impl<'a, 'tcx> Flow<'a, 'tcx> {
                 } = &data.terminator().kind
                     && let ty::FnDef(def, fn_args) = *func.ty(body, self.tcx).kind()
                 {
+                    if destination.projection.is_empty()
+                        && self.holds_ref(destination.local)
+                        && let Some(arg) = args.first()
+                        && let Operand::Copy(given) | Operand::Move(given) = &arg.node
+                    {
+                        self.points_into(destination.local, given);
+                    }
                     let fn_args = self.tcx.instantiate_bound_regions_with_erased(fn_args);
                     let given = args.iter().any(|arg| self.operand(&arg.node) || self.lent(&arg.node));
                     if !given {
@@ -208,9 +233,60 @@ impl<'a, 'tcx> Flow<'a, 'tcx> {
                     }
                 }
             }
-            if self.tainted.len() + self.pointing.len() == before {
-                return;
+        }
+        self.tainted.len() + self.pointing.len() + self.origin.len() + self.roots.len() != before
+    }
+
+    /// The buffer a local points into, or the local itself.
+    fn root(&self, mut local: Local) -> Local {
+        // A chain is no longer than the body has locals.
+        for _ in 0..self.body.local_decls.len() {
+            match self.roots.get(&local) {
+                Some(&next) => local = next,
+                None => break,
             }
+        }
+        local
+    }
+
+    fn holds_ref(&self, local: Local) -> bool {
+        self.body.local_decls[local]
+            .ty
+            .walk()
+            .any(|arg| arg.as_type().is_some_and(|t| t.is_ref() || t.is_raw_ptr()))
+    }
+
+    /// local holds a reference made of what given holds: into its buffer.
+    fn points_into(&mut self, local: Local, given: &Place<'tcx>) {
+        if given.projection.iter().any(|p| matches!(p, ProjectionElem::Deref)) || !self.holds_ref(given.local) {
+            return;
+        }
+        let root = self.root(given.local);
+        if root != local {
+            self.roots.insert(local, root);
+        }
+    }
+
+    /// What an assignment says of where references point.
+    fn root_assign(&mut self, place: &Place<'tcx>, rvalue: &Rvalue<'tcx>) {
+        if !place.projection.is_empty() || !self.holds_ref(place.local) {
+            return;
+        }
+        match rvalue {
+            Rvalue::Ref(_, _, target) | Rvalue::RawPtr(_, target) => {
+                let root = self.root(target.local);
+                if root != place.local {
+                    self.roots.insert(place.local, root);
+                }
+            },
+            Rvalue::Use(Operand::Copy(given) | Operand::Move(given), _)
+            | Rvalue::Cast(_, Operand::Copy(given) | Operand::Move(given), _) => self.points_into(place.local, given),
+            Rvalue::Aggregate(_, fields) => {
+                if let Some(Operand::Copy(given) | Operand::Move(given)) = fields.iter().next() {
+                    self.points_into(place.local, given);
+                }
+            },
+            _ => {},
         }
     }
 
@@ -261,7 +337,7 @@ impl<'a, 'tcx> Flow<'a, 'tcx> {
         } else {
             self.origin.get(&source.local).copied()
         };
-        if from != Some(place.local) {
+        if from.map(|from| self.root(from)) != Some(self.root(place.local)) {
             return false;
         }
         let ty = place.ty(self.body, self.tcx).ty;

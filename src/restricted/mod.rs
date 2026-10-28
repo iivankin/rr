@@ -18,6 +18,7 @@ mod duplicates;
 mod escape_hatches;
 mod expanded;
 mod ffi;
+mod inbounds;
 mod macros;
 mod recursion;
 mod stale;
@@ -318,7 +319,7 @@ pub fn register(store: &mut LintStore) {
     store.register_late_lint_pass(Box::new(|_| Box::new(bounds::Bounds::default())));
     store.register_late_lint_pass(Box::new(|_| Box::new(chains::Chains)));
     store.register_late_lint_pass(Box::new(|_| Box::new(ffi::Ffi)));
-    store.register_late_lint_pass(Box::new(|_| Box::new(disguises::Disguises)));
+    store.register_late_lint_pass(Box::new(|_| Box::<disguises::Disguises>::default()));
     store.register_late_lint_pass(Box::new(|_| Box::new(duplicates::Duplicates)));
     store.register_late_lint_pass(Box::new(|_| Box::new(derives::Derives::default())));
     store.register_late_lint_pass(Box::new(|_| Box::new(recursion::Recursion)));
