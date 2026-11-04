@@ -124,6 +124,19 @@ fn prof_keeps_symbols_and_reports_an_empty_run() {
 }
 
 #[test]
+fn time_reports_the_fastest_run_and_fails_above_a_budget() {
+    let project = Project::new();
+    let rr = env!("CARGO_BIN_EXE_rr");
+    let timed = project.rr(&["time", "--runs", "3", "--", rr, "--version"]);
+    success(&timed);
+    assert!(String::from_utf8_lossy(&timed.stdout).contains("rr time: 3 runs, the fastest"));
+    // No run takes no time at all.
+    let over = project.rr(&["time", "--max-ms", "0", "--", rr, "--version"]);
+    assert!(!over.status.success());
+    assert!(String::from_utf8_lossy(&over.stdout).contains("above the budget of 0 ms"));
+}
+
+#[test]
 fn explicit_prebuilt_dependencies_and_local_modules_work() {
     let project = Project::new();
     success(&project.rr(&["init", "dep", "--lib"]));

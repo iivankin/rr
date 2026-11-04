@@ -80,6 +80,7 @@ with tempfile.TemporaryDirectory(prefix="rr-relocated-", dir=os.environ.get("TMP
     assert over.returncode != 0 and "above the budget" in over.stdout, over.stdout
     copies = profiled.split("copies through memcpy and memmove", 1)
     assert len(copies) == 2 and "greet  src/greet.rs:" in copies[1], profiled
+    assert "the places that copy most often" in copies[1] and " each  greet  src/greet.rs:" in copies[1], profiled
     over = subprocess.run(["make", f"RR={link}", "prof", "PROFCOPIED=1"], cwd=root / "project", env=env,
                           text=True, encoding="utf-8", errors="replace", capture_output=True)
     assert over.returncode != 0 and "bytes copied, above the budget" in over.stdout, over.stdout
@@ -88,13 +89,19 @@ with tempfile.TemporaryDirectory(prefix="rr-relocated-", dir=os.environ.get("TMP
     over = subprocess.run(["make", f"RR={link}", "prof", "PROFHEAP=1"], cwd=root / "project", env=env,
                           text=True, encoding="utf-8", errors="replace", capture_output=True)
     assert over.returncode != 0 and "at once, above the budget" in over.stdout, over.stdout
+    timed = subprocess.run(["make", f"RR={link}", "time"], cwd=root / "project", env=env,
+                           text=True, encoding="utf-8", errors="replace", capture_output=True)
+    assert timed.returncode == 0 and "5 runs, the fastest" in timed.stdout, timed.stdout + timed.stderr
+    over = subprocess.run(["make", f"RR={link}", "time", "TIMEMS=0"], cwd=root / "project", env=env,
+                          text=True, encoding="utf-8", errors="replace", capture_output=True)
+    assert over.returncode != 0 and "above the budget of 0 ms" in over.stdout, over.stdout
     # The programs in examples/corpus: every check their Makefiles offer,
     # and a short run of each fuzz target, on this bundle.
     corpus = Path(__file__).resolve().parent.parent / "examples" / "corpus"
     for program in sorted(p for p in corpus.iterdir() if (p / "Makefile").is_file()):
         copy = root / f"corpus-{program.name}"
         shutil.copytree(program, copy, ignore=shutil.ignore_patterns("build", program.name, "fuzz"))
-        steps = [("all", "test"), ("bench",), ("format", "check", "lint")]
+        steps = [("all", "test"), ("bench",), ("time",), ("prof",), ("format", "check", "lint")]
         if fuzzing:
             steps.append(("fuzz", "FUZZTIME=5"))
         for targets in steps:

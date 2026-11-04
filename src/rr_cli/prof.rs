@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 use std::{fs, io};
 
 use super::{executable, workspace};
@@ -100,12 +100,16 @@ pub fn flags(
     Ok(())
 }
 
+/// The places listed by how often they copy.
+const COUNTED_TOP: usize = 5;
+
 struct Options {
     top: usize,
     max: Option<u64>,
     max_copied: Option<u64>,
     max_heap: Option<u64>,
     keep: Option<PathBuf>,
+    stdin: Option<PathBuf>,
 }
 
 pub fn run(args: &[String]) -> io::Result<ExitCode> {
@@ -115,6 +119,7 @@ pub fn run(args: &[String]) -> io::Result<ExitCode> {
         max_copied: None,
         max_heap: None,
         keep: None,
+        stdin: None,
     };
     let mut i = 0;
     let mut report_dir = None;
@@ -130,6 +135,7 @@ pub fn run(args: &[String]) -> io::Result<ExitCode> {
             "--max-copied" => o.max_copied = Some(value(i)?.parse().map_err(|_| io::Error::other(usage()))?),
             "--max-heap" => o.max_heap = Some(value(i)?.parse().map_err(|_| io::Error::other(usage()))?),
             "--keep" => o.keep = Some(PathBuf::from(value(i)?)),
+            "--stdin" => o.stdin = Some(PathBuf::from(value(i)?)),
             "report" => {
                 report_dir = Some(PathBuf::from(value(i)?));
                 i += 2;
@@ -155,9 +161,13 @@ pub fn run(args: &[String]) -> io::Result<ExitCode> {
         scratch = workspace::Scratch::new()?;
         scratch.path.clone()
     };
+    // What the workload writes is not the report: a filter's output
+    // would land among its lines.
     let status = Command::new(&command[0])
         .args(&command[1..])
         .env("RR_PROF_DIR", &dir)
+        .stdin(super::time::input(o.stdin.as_deref())?)
+        .stdout(Stdio::null())
         .status()?;
     let reported = report(&dir, &o)?;
     if !status.success() {
@@ -168,7 +178,7 @@ pub fn run(args: &[String]) -> io::Result<ExitCode> {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  rr prof [--top N] [--max N] [--max-copied BYTES] [--max-heap BYTES] [--keep DIR] -- COMMAND [ARGS]\n  rr prof report DIR [--top N] [--max N] [--max-copied BYTES] [--max-heap BYTES]\n\nRuns COMMAND with RR_PROF_DIR set: each process of a program built with\nrr build --prof records its heap allocations, and the bytes it copies\nthrough memcpy and memmove, by stack. Then reports the places in the\nprogram's own code that allocate and copy most, with their callers.\n--max fails when the allocations are above N, --max-copied when the\nbytes copied are above BYTES, --max-heap when the heap held more than\nBYTES at once: budgets for tests.\nBuild with --prof every crate (for line tables) and the final artifact\n(for the runtime); a --prof build is not stripped."
+    "Usage:\n  rr prof [--top N] [--max N] [--max-copied BYTES] [--max-heap BYTES] [--keep DIR] [--stdin FILE] -- COMMAND [ARGS]\n  rr prof report DIR [--top N] [--max N] [--max-copied BYTES] [--max-heap BYTES]\n\nRuns COMMAND with RR_PROF_DIR set: each process of a program built with\nrr build --prof records its heap allocations, and the bytes it copies\nthrough memcpy and memmove, by stack. Then reports the places in the\nprogram's own code that allocate and copy most, with their callers.\n--max fails when the allocations are above N, --max-copied when the\nbytes copied are above BYTES, --max-heap when the heap held more than\nBYTES at once: budgets for tests. --stdin gives COMMAND a file to read;\nwhat it writes to stdout is dropped.\nBuild with --prof every crate (for line tables) and the final artifact\n(for the runtime); a --prof build is not stripped."
 }
 
 /// One frame: the function and where in it.
@@ -242,12 +252,18 @@ impl Tally {
         *s.callers.entry(caller.unwrap_or_default()).or_default() += count;
     }
 
-    /// The top sites, ranked by key, each with its first callers.
-    fn print(&self, top: usize, key: fn(&Site) -> u64) {
+    /// The top sites, ranked by key, each with its first callers; with
+    /// average, the bytes of one count beside them.
+    fn print(&self, top: usize, key: fn(&Site) -> u64, average: bool) {
         let mut ranked: Vec<_> = self.sites.iter().collect();
         ranked.sort_by_key(|(_, site)| core::cmp::Reverse(key(site)));
         for (site, s) in ranked.iter().take(top) {
-            println!("{:>9} {:>11}  {site}", s.count, s.bytes);
+            if average {
+                let each = (s.bytes + s.count / 2).checked_div(s.count).unwrap_or(0);
+                println!("{:>9} {:>11} {:>12}  {site}", s.count, s.bytes, format!("{each} each"));
+            } else {
+                println!("{:>9} {:>11}  {site}", s.count, s.bytes);
+            }
             let mut callers: Vec<_> = s.callers.iter().filter(|(c, _)| !c.is_empty()).collect();
             callers.sort_by_key(|(_, n)| core::cmp::Reverse(**n));
             for (caller, n) in callers.iter().take(3) {
@@ -325,12 +341,16 @@ fn report(dir: &Path, o: &Options) -> io::Result<ExitCode> {
     if lost > 0 {
         println!("rr prof: {lost} counts on stacks past the table, in neither total");
     }
-    allocs.print(o.top, |s| s.count);
+    allocs.print(o.top, |s| s.count, false);
     println!(
         "rr prof: {} copies through memcpy and memmove, {} bytes",
         copies.count, copies.bytes
     );
-    copies.print(o.top, |s| s.bytes);
+    copies.print(o.top, |s| s.bytes, true);
+    // A site that copies a few bytes millions of times pays a call for
+    // each value, and ranks low by bytes.
+    println!("rr prof: the places that copy most often, with the bytes of each copy");
+    copies.print(o.top.min(COUNTED_TOP), |s| s.count, true);
     let mut code = ExitCode::SUCCESS;
     if let Some(max) = o.max
         && allocs.count > max

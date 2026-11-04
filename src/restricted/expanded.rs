@@ -88,12 +88,13 @@ impl<'tcx> LateLintPass<'tcx> for ExpandedSyntax {
         match ty.kind {
             hir::TyKind::TraitObject(bounds, ..) => {
                 // A trait of the crate: every implementation is here, and
-                // the call graph follows a call through dyn to each.
+                // the call graph follows a call through dyn to each. `Send`
+                // and `Sync` run nothing: the compiler checks them.
                 if !bounds.iter().all(|bound| {
                     bound
                         .trait_ref
                         .trait_def_id()
-                        .is_some_and(rustc_span::def_id::DefId::is_local)
+                        .is_some_and(|id| id.is_local() || cx.tcx.trait_is_auto(id))
                 }) && super::builtins::is_user_code(ty.span)
                 {
                     span_lint_and_help(
@@ -129,19 +130,27 @@ impl<'tcx> LateLintPass<'tcx> for ExpandedSyntax {
 }
 
 /// Whether the synthetic parameter of an `impl Trait` argument is bound
-/// only by one of the closure traits.
+/// by one of the closure traits, and otherwise only by `Send` and `Sync`,
+/// the compiler's marks that it may go to another thread, which run
+/// nothing.
 fn closure_param(cx: &LateContext<'_>, generics: &hir::Generics<'_>, param: &hir::GenericParam<'_>) -> bool {
     let items = cx.tcx.lang_items();
     let closures = [items.fn_trait(), items.fn_mut_trait(), items.fn_once_trait()];
-    let mut traits = generics
+    let mut count = 0;
+    for bound in generics
         .bounds_for_param(param.def_id)
         .flat_map(|predicate| predicate.bounds)
-        .filter_map(|bound| match bound {
-            hir::GenericBound::Trait(poly) => Some(poly.trait_ref.trait_def_id()),
-            hir::GenericBound::Outlives(_) | hir::GenericBound::Use(..) => None,
-        });
-    let Some(first) = traits.next() else { return false };
-    first.is_some() && closures.contains(&first) && traits.next().is_none()
+    {
+        let hir::GenericBound::Trait(poly) = bound else {
+            continue;
+        };
+        match poly.trait_ref.trait_def_id() {
+            Some(id) if cx.tcx.trait_is_auto(id) => {},
+            id @ Some(_) if closures.contains(&id) => count += 1,
+            _ => return false,
+        }
+    }
+    count == 1
 }
 
 fn require_included_unsafe_reason(cx: &LateContext<'_>, span: Span) {

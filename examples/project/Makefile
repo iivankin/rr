@@ -5,7 +5,7 @@
 
 RR = rr
 NAME = %NAME%
-RRFLAGS = -C opt-level=s -C codegen-units=1 -C overflow-checks=on
+RRFLAGS = -C opt-level=3 -C codegen-units=1 -C overflow-checks=on
 LTOFLAGS = -C lto=fat
 OUT = build
 # Windows names its executables .exe.
@@ -25,10 +25,10 @@ $(NAME)$(EXE): $(SRC)
 test:
 	$(RR) test src/main.rs --crate-name $(NAME) $(RRFLAGS) -- $(FILTER)
 
-# The #[bench] items, optimized: time, allocations and bytes copied per
-# iteration.
+# The #[bench] items, built as the program ships: time, allocations and
+# bytes copied per iteration.
 bench:
-	$(RR) bench src/main.rs --crate-name $(NAME) -- $(FILTER)
+	$(RR) bench src/main.rs --crate-name $(NAME) $(RRFLAGS) -- $(FILTER)
 
 # One style for every rr crate: fmt rewrites, format checks. The root
 # brings the modules it declares.
@@ -58,10 +58,12 @@ fuzz:
 		--crate-name $(NAME)
 
 # Where the program allocates and copies: built with --prof, then run
-# under rr prof. PROFRUN is what to run; PROFMAX fails above a budget
-# of allocations, PROFCOPIED above one of bytes copied, PROFHEAP above
-# one of bytes the heap holds at once.
+# under rr prof. PROFRUN is what to run, PROFIN the file it reads on
+# stdin, if any; PROFMAX fails above a budget of allocations, PROFCOPIED
+# above one of bytes copied, PROFHEAP above one of bytes the heap holds
+# at once.
 PROFRUN = ./$(OUT)/prof/$(NAME)$(EXE) rr prof
+PROFIN =
 PROFMAX =
 PROFCOPIED =
 PROFHEAP =
@@ -72,9 +74,19 @@ $(OUT)/prof/$(NAME)$(EXE): $(SRC)
 prof: $(OUT)/prof/$(NAME)$(EXE)
 	$(RR) prof $(if $(PROFMAX),--max $(PROFMAX)) \
 		$(if $(PROFCOPIED),--max-copied $(PROFCOPIED)) \
-		$(if $(PROFHEAP),--max-heap $(PROFHEAP)) -- $(PROFRUN)
+		$(if $(PROFHEAP),--max-heap $(PROFHEAP)) \
+		$(if $(PROFIN),--stdin $(PROFIN)) -- $(PROFRUN)
+
+# How long the program takes, built as it ships: rr time runs TIMERUN,
+# the workload PROFRUN runs, on PROFIN, five times; TIMEMS fails when
+# the fastest run took more milliseconds.
+TIMERUN = ./$(NAME)$(EXE) rr prof
+TIMEMS =
+time: $(NAME)$(EXE)
+	mkdir -p $(OUT)
+	$(RR) time $(if $(TIMEMS),--max-ms $(TIMEMS)) $(if $(PROFIN),--stdin $(PROFIN)) -- $(TIMERUN)
 
 clean:
 	rm -rf $(OUT) $(NAME)$(EXE)
 
-.PHONY: all test bench fmt format check lint fuzz prof clean
+.PHONY: all test bench fmt format check lint fuzz prof time clean

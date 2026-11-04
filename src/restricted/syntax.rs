@@ -342,7 +342,8 @@ impl EarlyLintPass for RestrictedSyntax {
 const CLOSURE_FN_LINES_MAX: usize = 30;
 
 /// Whether the bounds of an `impl Trait` say only that it is a closure:
-/// one of `Fn(..)`, `FnMut(..)` or `FnOnce(..)`, and lifetimes.
+/// one of `Fn(..)`, `FnMut(..)` or `FnOnce(..)`, lifetimes, and `Send` or
+/// `Sync`, which say it may go to another thread and run nothing.
 fn closure_bounds(bounds: &[ast::GenericBound]) -> bool {
     let mut closures = 0;
     for bound in bounds {
@@ -351,6 +352,9 @@ fn closure_bounds(bounds: &[ast::GenericBound]) -> bool {
                 let Some(last) = poly.trait_ref.path.segments.last() else {
                     return false;
                 };
+                if last.args.is_none() && matches!(last.ident.name.as_str(), "Send" | "Sync") {
+                    continue;
+                }
                 let parenthesized = matches!(last.args.as_deref(), Some(ast::GenericArgs::Parenthesized(_)));
                 if !parenthesized || !matches!(last.ident.name.as_str(), "Fn" | "FnMut" | "FnOnce") {
                     return false;

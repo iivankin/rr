@@ -160,7 +160,10 @@ Lifetime parameters, ordinary traits/impls, and concrete uses of existing generi
 library types such as Vec<u8> remain allowed. A function's parameter may be
 `impl Fn(..)`, `impl FnMut(..)` or `impl FnOnce(..)`: a closure handed in,
 one bound and nothing else, so that work around a call, such as undoing a
-step when it fails, is written once. The compiler copies such a function
+step when it fails, is written once. `Send` and `Sync` may stand beside
+that bound, and beside the trait behind `dyn`: they run nothing, and the
+compiler checks that what goes to another thread may go there
+(`dyn Job + Send`, `impl FnOnce() + Send`). The compiler copies such a function
 for each closure it is given, so it has at most 30 lines; a longer one
 calls the rest as an ordinary function. A closure is part of the function that
 writes it: what it calls, that function calls. `dyn` may name a trait of the
@@ -518,18 +521,32 @@ standard library's included: each copy is counted by its stack and its
 bytes, then handed to the C library. Small copies of a known size that the
 compiler writes inline are not calls and are not counted. Build every crate
 of the program with --prof; a --prof build keeps its symbols.
-`rr prof [--top N] [--max N] [--max-copied BYTES] [--max-heap BYTES] [--keep DIR] -- COMMAND`
+`rr prof [--top N] [--max N] [--max-copied BYTES] [--max-heap BYTES] [--keep DIR] [--stdin FILE] -- COMMAND`
 runs a command with RR_PROF_DIR set, so that each process of such a program
 it starts, each image after exec included, writes its counts to a file
 mapped shared there; then reports the program's own lines that allocate
 most, and those that copy the most bytes, with their callers (core, alloc,
 the allocator and memcpy are left out), from DWARF or the dSYM. --max fails
 above a budget of allocations, --max-copied above one of bytes copied: an
-allocation traded for copies shows. It reports as well the most bytes the
+allocation traded for copies shows. Each place that copies shows the
+bytes of one copy, and the places that copy most often are listed apart:
+millions of copies of a few bytes each, a call for each value, rank low
+by bytes and cost time. It reports as well the most bytes the
 heap held at once, in any one process image, and --max-heap fails above a
 budget of them: a buffer reserved for the worst case, so that nothing
 allocates later, shows there. Without RR_PROF_DIR a --prof build runs
 as usual.
+
+`rr time [--runs N] [--max-ms MS] [--stdin FILE] -- COMMAND` runs a
+command N times (5 by default) and reports its fastest run and its
+middle one, in milliseconds of wall time; --max-ms fails when the
+fastest took longer. --stdin gives each run a file to read, for rr prof
+too, and what the command writes to stdout is dropped by both.
+It times the program as it ships: a --prof build records each copy and
+runs slower. The template's `make time` runs the workload of `make prof`
+on the program `make` builds, with PROFIN on stdin, against TIMEMS: memory saved at a cost in
+time shows there. The template builds with `-C opt-level=3`, and its
+`make bench` with the same flags as the program.
 
 Operations are matched using resolved definitions and result types. An unrelated
 inherent method called clone is not Clone. Arbitrary user functions may hide

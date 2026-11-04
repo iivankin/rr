@@ -5,7 +5,9 @@ Cargo. rr's rules are part of the compiler. An rr error says what the
 design must change, never what to hide from it.
 
 When goals pull apart, safety comes first, then performance, then ease
-of work.
+of work. Performance is first the time an event takes, then the memory
+it holds: an allocation or a copy saved at a cost in time is a
+regression.
 
 ## Before writing code
 
@@ -14,8 +16,8 @@ operation, and the simple design is rarely the first one.
 
 - Sketch the cost. For network, disk, memory and CPU, estimate bandwidth
   and latency per event and in total. Look first at the slowest
-  resource, weighted by how often it is used. Run make prof for a
-  baseline.
+  resource, weighted by how often it is used. Run make time and make
+  prof for a baseline.
 - Work with the grain of the machine: data read in order and kept
   together, few pointer hops on the data plane, branches that mostly go
   the same way.
@@ -35,6 +37,10 @@ operation, and the simple design is rarely the first one.
   make the work quadratic, or make one event stall the rest.
 - Decide where each piece of state lives: one place for each fact, no
   copy of it in another field, no alias to keep in step.
+- Decode once, at open, what every event reads, and index what is
+  looked up again and again. Decoding the same bytes on every access
+  is paid on every event; a table built from the data is a value of its
+  own, not a copy of it.
 - Build one system, not a set of parts. Shape it early as the type
   that runs a request end to end: it owns the data it reads and the
   workspaces its stages share, and each stage borrows what it needs. A
@@ -54,7 +60,9 @@ operation, and the simple design is rarely the first one.
   stages that run one after another share it rather than each keeping
   its own.
 - Work at the program's own pace: take what came in batches, and bound
-  the work of one turn of the event loop.
+  the work of one turn of the event loop. Work is split into steps only
+  where it waits (on the network, the disk) or must give way to other
+  events; work that does neither runs in one call.
 
 ## While writing
 
@@ -111,7 +119,10 @@ operation, and the simple design is rarely the first one.
   answer in pieces, a clock that jumps) and checks what must always
   hold after every step. The fuzzer picks the seed; a failure replays
   from it.
-- One thread unless the design needs more.
+- One thread unless the design needs more. More threads run the same
+  loop, each on its own work and buffers, and share only what they read;
+  a thread's work is a type of the crate behind `dyn Job + Send`, not a
+  queue of closures.
 - Pass options where they matter, at the call, not left to defaults.
 - Names are whole words that mean one thing everywhere, and say what
   the thing is for, not its type (`pending`, not `vec`). Units and
@@ -131,16 +142,20 @@ operation, and the simple design is rarely the first one.
     make test         # the #[test] items; FILTER=word narrows
     make bench        # the #[bench] items: time, allocations, copies
     make fuzz         # when parsing changed; FUZZ=target FUZZTIME=seconds in all
+    make time         # wall time of the workload against the baseline
     make prof         # allocations, copies and heap against the baseline
 
 A change is done when all of them are clean and it is right as it
 stands: no TODO, no workaround to come back to.
 
-make prof runs PROFRUN, a fixed workload that drives the data path as
-real use does. PROFMAX, PROFCOPIED and PROFHEAP are its measured
-maximum over a few runs plus 1-2%: lowered in the same commit when a
-change saves, raised only with the reason in the commit message. The
-workload changes only with the budgets, and says why.
+make time and make prof run a fixed workload (TIMERUN, PROFRUN, on
+PROFIN) that
+drives the data path as real use does, built as the program ships.
+TIMEMS is its fastest run plus 5%; PROFMAX, PROFCOPIED and PROFHEAP are
+its measured maximum over a few runs plus 1-2%. Each is lowered in the
+same commit when a change saves, raised only with the reason in the
+commit message. The workload changes only with the budgets, and says
+why.
 
 Tests sit beside the code they check, in `#[cfg(test)] mod tests`, as
 `#[test]` functions; a path that runs for every event has a `#[bench]`

@@ -1209,9 +1209,29 @@ fn a_closure_parameter_and_dyn_of_a_crate_trait_are_allowed() {
         "pub fn show(v: impl core::fmt::Debug) {}",
         "pub fn make() -> impl Fn(u8) -> u8 { |x| x }",
         "pub fn both(f: impl Fn(u8) -> u8 + Copy) -> u8 { f(1) }",
+        // A trait of the crate named as the compiler's mark runs code.
+        "pub trait Send { fn go(&self); }\npub fn run(f: impl FnOnce() + Send) { f.go(); }",
     ] {
         rejected(&format!("#![no_std]\n{source}"), "rr_no_generics");
     }
+    // Send and Sync run nothing: work that goes to another thread says so,
+    // and the compiler checks it.
+    accepted(
+        "#![no_std]\npub trait Job { fn run(&mut self); }\npub struct Sum<'a> { data: &'a [u8], total: u64 }\n\
+         impl Job for Sum<'_> { fn run(&mut self) { for b in self.data { self.total = self.total.wrapping_add(u64::from(*b)); } } }\n\
+         pub fn scope(jobs: &mut [&mut (dyn Job + Send)]) { for job in jobs { job.run(); } }\n\
+         pub fn once(f: impl FnOnce() + Send + Sync) { f(); }\n\
+         pub fn both(data: &[u8]) -> u64 { let mut a = Sum { data, total: 0 }; scope(&mut [&mut a]); once(|| {}); a.total }",
+    );
+    // A value lent from a Cell cannot go to another thread: the compiler
+    // says so, not rr.
+    rejected(
+        "#![no_std]\npub trait Job { fn run(&mut self); }\npub struct Count<'a> { n: &'a core::cell::Cell<u8> }\n\
+         impl Job for Count<'_> { fn run(&mut self) { self.n.set(1); } }\n\
+         pub fn scope(jobs: &mut [&mut (dyn Job + Send)]) { for job in jobs { job.run(); } }\n\
+         pub fn go(n: &core::cell::Cell<u8>) { let mut j = Count { n }; let r: &mut (dyn Job + Send) = &mut j; scope(&mut [r]); }",
+        "E0277",
+    );
     // A closure is part of the function that writes it: through one, a
     // function that calls itself is recursion still.
     rejected(
