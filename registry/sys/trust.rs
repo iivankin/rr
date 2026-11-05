@@ -1062,13 +1062,21 @@ mod os {
         identifiers: *const *const c_char,
     }
 
-    /// CERT_CHAIN_PARA with its first member, CERT_USAGE_MATCH: the
-    /// usages a chain must allow, all of them (USAGE_MATCH_TYPE_AND).
+    /// CERT_USAGE_MATCH: the usages a chain must allow, all of them
+    /// (USAGE_MATCH_TYPE_AND). It is a struct of its own in
+    /// CERT_CHAIN_PARA, aligned as its pointer is.
+    #[repr(C)]
+    struct UsageMatch {
+        rule: u32,
+        usage: Usage,
+    }
+
+    /// CERT_CHAIN_PARA with its first member: the fields after it are
+    /// those of CERT_CHAIN_PARA_HAS_EXTRA_FIELDS, which size leaves out.
     #[repr(C)]
     struct ChainPara {
         size: u32,
-        rule: u32,
-        usage: Usage,
+        requested: UsageMatch,
     }
 
     /// The start of CERT_CHAIN_CONTEXT: its size and CERT_TRUST_STATUS.
@@ -1112,6 +1120,18 @@ mod os {
         low: u32,
         high: u32,
     }
+
+    // The sizes wincrypt.h gives them on 64-bit Windows, where a struct
+    // within one is aligned as its widest member: CERT_CHAIN_PARA has
+    // RequestedUsage at 8 and its Usage at 16.
+    const _: () = assert!(size_of::<Context>() == 40);
+    const _: () = assert!(size_of::<Usage>() == 16);
+    const _: () = assert!(size_of::<UsageMatch>() == 24);
+    const _: () = assert!(size_of::<ChainPara>() == 32);
+    const _: () = assert!(size_of::<SslPolicyPara>() == 24);
+    const _: () = assert!(size_of::<PolicyPara>() == 16);
+    const _: () = assert!(size_of::<PolicyStatus>() == 24);
+    const _: () = assert!(size_of::<FileTime>() == 8);
 
     #[link(name = "crypt32", kind = "raw-dylib")]
     // rr: escape(unsafe): each signature is crypt32's, from its documentation.
@@ -1403,10 +1423,12 @@ mod os {
         let usages = [SERVER_AUTH_C.as_ptr().cast::<c_char>()];
         let parameters = ChainPara {
             size: size32(size_of::<ChainPara>()),
-            rule: USAGE_MATCH_TYPE_AND,
-            usage: Usage {
-                count: 1,
-                identifiers: usages.as_ptr(),
+            requested: UsageMatch {
+                rule: USAGE_MATCH_TYPE_AND,
+                usage: Usage {
+                    count: 1,
+                    identifiers: usages.as_ptr(),
+                },
             },
         };
         let mut chain = null();
