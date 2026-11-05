@@ -31,8 +31,8 @@ pub enum Error {
 
 /// One key, expanded once: round keys and the hash key H in both forms.
 pub struct AesGcm {
-    /// The round keys as bytes, for the instructions.
-    rk: [u8; 176],
+    /// The round keys as bytes, aligned for the instructions.
+    rk: hw::RoundKeys,
     /// The same, bitsliced for four blocks of the portable code.
     sk: [[u64; 8]; 11],
     /// H as two big-endian words, for the portable GHASH.
@@ -51,19 +51,13 @@ impl AesGcm {
     fn with(key: &[u8; KEY_LEN], hw: bool) -> AesGcm {
         let w = expand(key);
         let mut g = AesGcm {
-            rk: [0; 176],
+            rk: hw::RoundKeys([[0; 16]; 11]),
             sk: [[0; 8]; 11],
             h: [0; 2],
             htbl: [[0; 16]; 16],
             hw,
         };
-        for ((rk, sk), k) in
-            g.rk.as_chunks_mut::<16>()
-                .0
-                .iter_mut()
-                .zip(&mut g.sk)
-                .zip(w)
-        {
+        for ((rk, sk), k) in g.rk.0.iter_mut().zip(&mut g.sk).zip(w) {
             *rk = block_bytes(k);
             *sk = bitslice_key(k);
         }

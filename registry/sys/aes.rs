@@ -21,6 +21,11 @@ use core::sync::atomic::{AtomicU8, Ordering};
 /// Karatsuba's middle product takes.
 pub type Table = [[u8; 16]; 16];
 
+/// AES-128's 11 round keys, aligned as a vector register is: the
+/// instructions read them where the key keeps them, with no copy.
+#[repr(C, align(16))]
+pub struct RoundKeys(pub [[u8; 16]; 11]);
+
 /// What the CPU has: 0 before the first look, then 1 + arch::detect():
 /// 1 none, 2 the instructions, 3 also SHA3 and SHA512 (Rust's "sha3"
 /// feature, which EOR3 is in) for aarch64's asm loop.
@@ -46,7 +51,7 @@ pub fn available() -> bool {
 /// CTR in place over data with round keys rk: the counter blocks are
 /// block (the nonce, then four bytes the counter replaces) with ctr,
 /// ctr + 1, ... big-endian in its last four bytes.
-pub fn ctr(rk: &[u8; 176], block: &[u8; 16], ctr: u32, data: &mut [u8]) -> bool {
+pub fn ctr(rk: &RoundKeys, block: &[u8; 16], ctr: u32, data: &mut [u8]) -> bool {
     if !available() {
         return false;
     }
@@ -78,7 +83,7 @@ pub fn ghash(tbl: &Table, y: &mut [u8; 16], blocks: &[[u8; 16]]) -> bool {
 /// CTR in place over blocks as ctr() does, and y continued over the
 /// ciphertext it makes.
 pub fn seal(
-    rk: &[u8; 176],
+    rk: &RoundKeys,
     tbl: &Table,
     block: &[u8; 16],
     ctr: u32,
@@ -95,7 +100,7 @@ pub fn seal(
 
 /// y continued over the ciphertext in blocks, and CTR in place over it.
 pub fn open(
-    rk: &[u8; 176],
+    rk: &RoundKeys,
     tbl: &Table,
     block: &[u8; 16],
     ctr: u32,
@@ -112,7 +117,7 @@ pub fn open(
 
 #[cfg(target_arch = "aarch64")]
 mod arch {
-    use super::Table;
+    use super::{RoundKeys, Table};
     use core::arch::aarch64::{
         uint8x16_t, uint32x4_t, vaeseq_u8, vaesmcq_u8, vdupq_n_u8, vdupq_n_u64, veorq_u8, vextq_u8,
         vgetq_lane_p64, vld1q_u8, vmull_high_p64, vmull_p64, vrbitq_u8, vreinterpretq_p64_u8,
@@ -222,13 +227,16 @@ mod arch {
     }
 
     #[target_feature(enable = "aes")]
-    fn round_keys(rk: &[u8; 176]) -> [V; 11] {
-        let mut k = [vdupq_n_u8(0); 11];
-        for (v, b) in k.iter_mut().zip(rk.as_chunks::<16>().0) {
-            *v = load(b);
-        }
-        k
+    /// The round keys as vectors, where rk keeps them: loaded into
+    /// stack slots instead, x86-64 copies all 176 bytes with memcpy.
+    fn round_keys(rk: &RoundKeys) -> &[V; 11] {
+        // rr: escape(unsafe): RoundKeys is 11 blocks of 16 bytes aligned
+        // to 16, as [V; 11] is, and every bit pattern is a vector.
+        unsafe { &*core::ptr::from_ref(rk).cast::<[V; 11]>() }
     }
+
+    const _: () = assert!(size_of::<RoundKeys>() == size_of::<[V; 11]>());
+    const _: () = assert!(align_of::<RoundKeys>() == align_of::<[V; 11]>());
 
     /// Counter blocks from ctr on, one for each of s.
     #[target_feature(enable = "aes")]
@@ -275,7 +283,7 @@ mod arch {
     }
 
     #[target_feature(enable = "aes")]
-    pub fn ctr(rk: &[u8; 176], block: &[u8; 16], ctr: u32, data: &mut [u8]) {
+    pub fn ctr(rk: &RoundKeys, block: &[u8; 16], ctr: u32, data: &mut [u8]) {
         let k = round_keys(rk);
         let base = vreinterpretq_u32_u8(load(block));
         let (blocks, tail) = data.as_chunks_mut::<16>();
@@ -285,7 +293,7 @@ mod arch {
         for four in fours {
             counters(base, c, &mut s);
             c = c.wrapping_add(4);
-            aes(&k, &mut s);
+            aes(k, &mut s);
             xor_into(four, &mut s);
         }
         if rest.is_empty() && tail.is_empty() {
@@ -293,7 +301,7 @@ mod arch {
         }
         // Under four blocks and a part: one more batch of key stream.
         counters(base, c, &mut s);
-        aes(&k, &mut s);
+        aes(k, &mut s);
         xor_into(rest, &mut s);
         if let Some(ks) = s.get(rest.len()) {
             let mut t = [0; 16];
@@ -444,7 +452,7 @@ mod arch {
     /// beside its AES, and the last after the loop.
     #[target_feature(enable = "aes")]
     pub fn seal(
-        rk: &[u8; 176],
+        rk: &RoundKeys,
         tbl: &Table,
         block: &[u8; 16],
         ctr: u32,
@@ -471,9 +479,9 @@ mod arch {
             match prev {
                 Some(mut x) => {
                     x[0] = veorq_u8(x[0], yp);
-                    yp = aes8_ghash8(&k, &mut s, &x, &h, &hk);
+                    yp = aes8_ghash8(k, &mut s, &x, &h, &hk);
                 }
-                None => aes(&k, &mut s),
+                None => aes(k, &mut s),
             }
             xor_into(eight, &mut s);
             prev = Some(s.map(|v| vrbitq_u8(v)));
@@ -491,7 +499,7 @@ mod arch {
     /// makes the key stream to decrypt it.
     #[target_feature(enable = "aes")]
     pub fn open(
-        rk: &[u8; 176],
+        rk: &RoundKeys,
         tbl: &Table,
         block: &[u8; 16],
         ctr: u32,
@@ -519,7 +527,7 @@ mod arch {
                 *v = vrbitq_u8(load(b));
             }
             x[0] = veorq_u8(x[0], yp);
-            yp = aes8_ghash8(&k, &mut s, &x, &h, &hk);
+            yp = aes8_ghash8(k, &mut s, &x, &h, &hk);
             xor_into(eight, &mut s);
         }
         yp = ghash_rev(&h, &hk, yp, rest);
@@ -530,7 +538,7 @@ mod arch {
     /// seal() in one asm loop after the first turn, on EOR3 too.
     #[target_feature(enable = "aes,sha3")]
     fn seal_eor3(
-        rk: &[u8; 176],
+        rk: &RoundKeys,
         tbl: &Table,
         block: &[u8; 16],
         ctr: u32,
@@ -548,7 +556,7 @@ mod arch {
             let mut s = [vdupq_n_u8(0); 8];
             counters(vreinterpretq_u32_u8(base), c, &mut s);
             c = c.wrapping_add(8);
-            aes(&k, &mut s);
+            aes(k, &mut s);
             xor_into(first, &mut s);
         }
         yp = turns(rk, tbl, base, &mut c, eights, true, yp);
@@ -563,7 +571,7 @@ mod arch {
     /// open() in one asm loop, on EOR3 too.
     #[target_feature(enable = "aes,sha3")]
     fn open_eor3(
-        rk: &[u8; 176],
+        rk: &RoundKeys,
         tbl: &Table,
         block: &[u8; 16],
         ctr: u32,
@@ -600,7 +608,7 @@ mod arch {
     /// writes the body; its header says how, and why this order.
     #[target_feature(enable = "aes,sha3")]
     fn turns(
-        rk: &[u8; 176],
+        rk: &RoundKeys,
         tbl: &Table,
         base: V,
         c: &mut u32,
@@ -930,7 +938,7 @@ mod arch {
                 "add {c:w}, {c:w}, #8",
                 "subs {n}, {n}, #1",
                 "b.ne 2b",
-                rk = inout(reg) rk.as_ptr() => _,
+                rk = inout(reg) rk.0.as_ptr() => _,
                 tbl = in(reg) tbl.as_ptr(),
                 p = inout(reg) p => _,
                 g = inout(reg) at => _,
@@ -958,7 +966,7 @@ mod arch {
 
 #[cfg(target_arch = "x86_64")]
 mod arch {
-    use super::Table;
+    use super::{RoundKeys, Table};
     use core::arch::x86_64::{
         __cpuid, __m128i, _mm_aesenc_si128, _mm_aesenclast_si128, _mm_and_si128,
         _mm_clmulepi64_si128, _mm_cvtsi32_si128, _mm_loadu_si128, _mm_or_si128, _mm_set_epi64x,
@@ -988,13 +996,16 @@ mod arch {
     }
 
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
-    fn round_keys(rk: &[u8; 176]) -> [V; 11] {
-        let mut k = [_mm_setzero_si128(); 11];
-        for (v, b) in k.iter_mut().zip(rk.as_chunks::<16>().0) {
-            *v = load(b);
-        }
-        k
+    /// The round keys as vectors, where rk keeps them: loaded into
+    /// stack slots instead, x86-64 copies all 176 bytes with memcpy.
+    fn round_keys(rk: &RoundKeys) -> &[V; 11] {
+        // rr: escape(unsafe): RoundKeys is 11 blocks of 16 bytes aligned
+        // to 16, as [V; 11] is, and every bit pattern is a vector.
+        unsafe { &*core::ptr::from_ref(rk).cast::<[V; 11]>() }
     }
+
+    const _: () = assert!(size_of::<RoundKeys>() == size_of::<[V; 11]>());
+    const _: () = assert!(align_of::<RoundKeys>() == align_of::<[V; 11]>());
 
     /// Counter blocks from ctr on, one for each of s: base, which ends in
     /// four zero bytes, with the counter big-endian there.
@@ -1048,7 +1059,7 @@ mod arch {
     }
 
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
-    pub fn ctr(rk: &[u8; 176], block: &[u8; 16], ctr: u32, data: &mut [u8]) {
+    pub fn ctr(rk: &RoundKeys, block: &[u8; 16], ctr: u32, data: &mut [u8]) {
         let k = round_keys(rk);
         let base = load(block);
         let (blocks, tail) = data.as_chunks_mut::<16>();
@@ -1058,7 +1069,7 @@ mod arch {
         for four in fours {
             counters(base, c, &mut s);
             c = c.wrapping_add(4);
-            aes(&k, &mut s);
+            aes(k, &mut s);
             xor_into(four, &mut s);
         }
         if rest.is_empty() && tail.is_empty() {
@@ -1066,7 +1077,7 @@ mod arch {
         }
         // Under four blocks and a part: one more batch of key stream.
         counters(base, c, &mut s);
-        aes(&k, &mut s);
+        aes(k, &mut s);
         xor_into(rest, &mut s);
         if let Some(ks) = s.get(rest.len()) {
             let mut t = [0; 16];
@@ -1223,7 +1234,7 @@ mod arch {
     /// beside its AES, and the last after the loop.
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
     pub fn seal(
-        rk: &[u8; 176],
+        rk: &RoundKeys,
         tbl: &Table,
         block: &[u8; 16],
         ctr: u32,
@@ -1245,9 +1256,9 @@ mod arch {
             match prev {
                 Some(mut x) => {
                     x[0] = _mm_xor_si128(x[0], yp);
-                    yp = aes8_ghash8(&k, &mut s, &x, &h, &hk);
+                    yp = aes8_ghash8(k, &mut s, &x, &h, &hk);
                 }
-                None => aes(&k, &mut s),
+                None => aes(k, &mut s),
             }
             xor_into(eight, &mut s);
             prev = Some(s.map(|v| rbit(v)));
@@ -1265,7 +1276,7 @@ mod arch {
     /// makes the key stream to decrypt it.
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
     pub fn open(
-        rk: &[u8; 176],
+        rk: &RoundKeys,
         tbl: &Table,
         block: &[u8; 16],
         ctr: u32,
@@ -1288,7 +1299,7 @@ mod arch {
                 *v = rbit(load(b));
             }
             x[0] = _mm_xor_si128(x[0], yp);
-            yp = aes8_ghash8(&k, &mut s, &x, &h, &hk);
+            yp = aes8_ghash8(k, &mut s, &x, &h, &hk);
             xor_into(eight, &mut s);
         }
         yp = ghash_rev(&h, &hk, yp, rest);
@@ -1300,14 +1311,14 @@ mod arch {
 /// No instructions to reach: available() is false, so nothing below runs.
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 mod arch {
-    use super::Table;
+    use super::{RoundKeys, Table};
 
     pub fn detect() -> u8 {
         0
     }
 
     // rr: escape(unsafe): a stub, the same signature as the real ones.
-    pub unsafe fn ctr(_rk: &[u8; 176], _block: &[u8; 16], _ctr: u32, _data: &mut [u8]) {}
+    pub unsafe fn ctr(_rk: &RoundKeys, _block: &[u8; 16], _ctr: u32, _data: &mut [u8]) {}
 
     // rr: escape(unsafe): a stub, the same signature as the real ones.
     pub unsafe fn ghash_key(_h: &[u8; 16], _tbl: &mut Table) {}
@@ -1317,7 +1328,7 @@ mod arch {
 
     // rr: escape(unsafe): a stub, the same signature as the real ones.
     pub unsafe fn seal(
-        _rk: &[u8; 176],
+        _rk: &RoundKeys,
         _tbl: &Table,
         _block: &[u8; 16],
         _ctr: u32,
@@ -1329,7 +1340,7 @@ mod arch {
 
     // rr: escape(unsafe): a stub, the same signature as the real ones.
     pub unsafe fn open(
-        _rk: &[u8; 176],
+        _rk: &RoundKeys,
         _tbl: &Table,
         _block: &[u8; 16],
         _ctr: u32,
@@ -1344,12 +1355,14 @@ mod arch {
 #[cfg(test)]
 #[cfg(target_arch = "aarch64")]
 mod tests {
-    use super::{Table, found};
+    use super::{RoundKeys, Table, found};
     use test::Bencher;
 
     /// A key schedule and GHASH table of no key in particular.
-    fn keys() -> ([u8; 176], Table) {
-        let rk: [u8; 176] = core::array::from_fn(|i| u8::try_from((i * 13 + 5) % 256).unwrap());
+    fn keys() -> (RoundKeys, Table) {
+        let rk = RoundKeys(core::array::from_fn(|r| {
+            core::array::from_fn(|j| u8::try_from(((16 * r + j) * 13 + 5) % 256).unwrap())
+        }));
         let mut tbl: Table = [[0; 16]; 16];
         // rr: escape(unsafe): the callers looked for the instructions.
         unsafe { super::arch::ghash_key(&[0x66; 16], &mut tbl) };

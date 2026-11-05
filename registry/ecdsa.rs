@@ -284,7 +284,8 @@ pub fn verify(curve: &Curve, public: &[u8], hash: &[u8], signature: &[u8]) -> bo
     let w = nmul(curve, &invert_scalar(curve, &s), &params.n.rr);
     let u1 = nmul(curve, &e, &w);
     let u2 = nmul(curve, &r, &w);
-    let sum = combine(curve, &u1, &q, &u2);
+    let mut sum = infinity();
+    combine(curve, &u1, &q, &u2, &mut sum);
     if is_zero(&sum.z) {
         return false;
     }
@@ -349,7 +350,7 @@ fn scalar(curve: &Curve, bytes: &[u8]) -> Option<Fe> {
 
 /// The public key as a point in Montgomery form: 04 || X || Y with X and
 /// Y below p and on the curve. Infinity has no such encoding.
-fn public_point(curve: &Curve, public: &[u8]) -> Option<Point> {
+fn public_point(curve: &Curve, public: &[u8]) -> Option<Affine> {
     let params = curve.params();
     let ([4], coordinates) = public.split_at_checked(1)? else {
         return None;
@@ -374,11 +375,7 @@ fn public_point(curve: &Curve, public: &[u8]) -> Option<Point> {
     if fsqr(curve, &y) != right {
         return None;
     }
-    Some(Point {
-        x,
-        y,
-        z: one(curve),
-    })
+    Some(Affine { x, y })
 }
 
 /// The hash as a number mod n: its leftmost bits, as many as n has. Both
@@ -429,29 +426,32 @@ fn x_matches(curve: &Curve, point: &Point, r: &Fe) -> bool {
     fmul(curve, &fmul(curve, &wide, &params.p.rr), &zz) == point.x
 }
 
-/// k1 G + k2 q: both scalars in NAF, one doubling per bit for both and
-/// an addition per nonzero digit of either. q's is width 5, from 8 odd
-/// multiples; G's are constants, affine, whose additions cost less, and
-/// enough on P-256 for width 7.
-fn combine(curve: &Curve, k1: &Fe, q: &Point, k2: &Fe) -> Point {
-    let table = odd_multiples(curve, q);
+/// k1 G + k2 q into acc: both scalars in NAF, one doubling per bit for
+/// both and an addition per nonzero digit of either. q's is width 5,
+/// from 8 odd multiples; G's are constants, affine, whose additions
+/// cost less, and enough on P-256 for width 7. The points are built in
+/// place: a point is 144 bytes, which x86-64 copies by a call to memcpy.
+fn combine(curve: &Curve, k1: &Fe, q: &Affine, k2: &Fe, acc: &mut Point) {
+    let mut table = [const { infinity() }; TABLE];
+    odd_multiples(curve, q, &mut table);
     let width = match curve {
         Curve::P256 => 7,
         Curve::P384 => 5,
     };
-    let (d1, d2) = (naf(k1, width), naf(k2, 5));
-    let mut acc = infinity();
+    let (mut d1, mut d2) = ([0; DIGITS], [0; DIGITS]);
+    naf(k1, width, &mut d1);
+    naf(k2, 5, &mut d2);
+    *acc = infinity();
     for (g_digit, q_digit) in d1.iter().zip(&d2).rev() {
-        acc = double(curve, &acc);
+        double(curve, acc);
         if *g_digit != 0 {
             let entry = base_multiple(curve, *g_digit);
-            acc = add_affine(curve, &acc, &entry);
+            add_affine(curve, acc, &entry);
         }
         if *q_digit != 0 {
-            acc = add_digit(curve, &acc, &table, *q_digit);
+            add_digit(curve, acc, &table, *q_digit);
         }
     }
-    acc
 }
 
 /// digit times G, affine, from the constant table.
@@ -481,50 +481,52 @@ fn base_multiple(curve: &Curve, digit: i8) -> Affine {
     entry
 }
 
-/// acc plus digit times the point whose odd multiples table holds.
-fn add_digit(curve: &Curve, acc: &Point, table: &[Point; TABLE], digit: i8) -> Point {
+/// Adds to acc digit times the point whose odd multiples table holds.
+fn add_digit(curve: &Curve, acc: &mut Point, table: &[Point; TABLE], digit: i8) {
     // rr: escape(panic): as in base_multiple.
     let entry = &table[usize::from(digit.unsigned_abs() >> 1)];
     if digit > 0 {
-        return add(curve, acc, entry);
+        add(curve, acc, entry);
+        return;
     }
     let negated = Point {
         x: entry.x,
         y: fsub(curve, &[0; LIMBS], &entry.y),
         z: entry.z,
     };
-    add(curve, acc, &negated)
+    add(curve, acc, &negated);
 }
 
-/// P, 3P, ..., 15P.
-fn odd_multiples(curve: &Curve, p: &Point) -> [Point; TABLE] {
-    let twice = double(curve, p);
-    let mut table = [const { infinity() }; TABLE];
-    let mut last = Point {
-        x: p.x,
-        y: p.y,
-        z: p.z,
-    };
-    for slot in &mut table {
-        let next = add(curve, &last, &twice);
-        *slot = last;
-        last = next;
+/// P, 3P, ..., 15P into table: P, then each the one before it plus 2P.
+/// Points are written a coordinate at a time, as add writes them.
+fn odd_multiples(curve: &Curve, p: &Affine, table: &mut [Point; TABLE]) {
+    let mut twice = infinity();
+    add_affine(curve, &mut twice, p);
+    double(curve, &mut twice);
+    let [first, rest @ ..] = table;
+    add_affine(curve, first, p);
+    let mut before: &Point = first;
+    for slot in rest {
+        slot.x = before.x;
+        slot.y = before.y;
+        slot.z = before.z;
+        add(curve, slot, &twice);
+        before = slot;
     }
-    table
 }
 
 /// The NAF of k of a width up to 7, least significant digit first: each
 /// digit 0 or odd and below 2^(width - 1) in magnitude, and of any width
 /// in a row at most one is nonzero.
-fn naf(k: &Fe, width: u32) -> [i8; DIGITS] {
+fn naf(k: &Fe, width: u32, digits: &mut [i8; DIGITS]) {
     // One limb more: rounding a digit up may carry past k's top.
     let mut rest = [0_u64; LIMBS + 1];
     for (limb, word) in rest.iter_mut().zip(k) {
         *limb = *word;
     }
     let size = 1 << width;
-    let mut digits = [0; DIGITS];
-    for digit in &mut digits {
+    digits.fill(0);
+    for digit in digits.iter_mut() {
         let low = rest[0] & (size - 1);
         if low & 1 == 1 {
             if low < size / 2 {
@@ -549,7 +551,6 @@ fn naf(k: &Fe, width: u32) -> [i8; DIGITS] {
             high = next;
         }
     }
-    digits
 }
 
 const fn infinity() -> Point {
@@ -560,10 +561,11 @@ const fn infinity() -> Point {
     }
 }
 
-/// 2a by dbl-2001-b, for a = -3.
-fn double(curve: &Curve, a: &Point) -> Point {
+/// a doubled in place, by dbl-2001-b for a = -3.
+fn double(curve: &Curve, a: &mut Point) {
     if is_zero(&a.z) || is_zero(&a.y) {
-        return infinity();
+        *a = infinity();
+        return;
     }
     let delta = fsqr(curve, &a.z);
     let gamma = fsqr(curve, &a.y);
@@ -589,25 +591,24 @@ fn double(curve: &Curve, a: &Point) -> Point {
         &fmul(curve, &alpha, &fsub(curve, &beta4, &x)),
         &gamma16,
     );
-    Point { x, y, z }
+    // Each coordinate on its own: a Point built whole goes through a
+    // copy of all 144 bytes, a call to memcpy on x86-64.
+    a.x = x;
+    a.y = y;
+    a.z = z;
 }
 
-/// a + b by add-2007-bl, with the cases it leaves out: infinity on
-/// either side, a = b and a = -b.
-fn add(curve: &Curve, a: &Point, b: &Point) -> Point {
+/// b added to a in place, by add-2007-bl, with the cases it leaves
+/// out: infinity on either side, a = b and a = -b.
+fn add(curve: &Curve, a: &mut Point, b: &Point) {
     if is_zero(&a.z) {
-        return Point {
-            x: b.x,
-            y: b.y,
-            z: b.z,
-        };
+        a.x = b.x;
+        a.y = b.y;
+        a.z = b.z;
+        return;
     }
     if is_zero(&b.z) {
-        return Point {
-            x: a.x,
-            y: a.y,
-            z: a.z,
-        };
+        return;
     }
     let z1z1 = fsqr(curve, &a.z);
     let z2z2 = fsqr(curve, &b.z);
@@ -618,11 +619,12 @@ fn add(curve: &Curve, a: &Point, b: &Point) -> Point {
     let h = fsub(curve, &u2, &u1);
     let r = fsub(curve, &s2, &s1);
     if is_zero(&h) {
-        return if is_zero(&r) {
-            double(curve, a)
+        if is_zero(&r) {
+            double(curve, a);
         } else {
-            infinity()
-        };
+            *a = infinity();
+        }
+        return;
     }
     let r = fadd(curve, &r, &r);
     let h2 = fadd(curve, &h, &h);
@@ -643,18 +645,21 @@ fn add(curve: &Curve, a: &Point, b: &Point) -> Point {
     let zs = fadd(curve, &a.z, &b.z);
     let zz = fsub(curve, &fsub(curve, &fsqr(curve, &zs), &z1z1), &z2z2);
     let z = fmul(curve, &zz, &h);
-    Point { x, y, z }
+    // Each coordinate on its own: a Point built whole goes through a
+    // copy of all 144 bytes, a call to memcpy on x86-64.
+    a.x = x;
+    a.y = y;
+    a.z = z;
 }
 
-/// a + b for an affine b by madd-2007-bl, with the cases it leaves
-/// out as add has them.
-fn add_affine(curve: &Curve, a: &Point, b: &Affine) -> Point {
+/// An affine b added to a in place, by madd-2007-bl, with the cases
+/// it leaves out as add has them.
+fn add_affine(curve: &Curve, a: &mut Point, b: &Affine) {
     if is_zero(&a.z) {
-        return Point {
-            x: b.x,
-            y: b.y,
-            z: one(curve),
-        };
+        a.x = b.x;
+        a.y = b.y;
+        a.z = one(curve);
+        return;
     }
     let z1z1 = fsqr(curve, &a.z);
     let u2 = fmul(curve, &b.x, &z1z1);
@@ -662,11 +667,12 @@ fn add_affine(curve: &Curve, a: &Point, b: &Affine) -> Point {
     let h = fsub(curve, &u2, &a.x);
     let r = fsub(curve, &s2, &a.y);
     if is_zero(&h) {
-        return if is_zero(&r) {
-            double(curve, a)
+        if is_zero(&r) {
+            double(curve, a);
         } else {
-            infinity()
-        };
+            *a = infinity();
+        }
+        return;
     }
     let hh = fsqr(curve, &h);
     let hh2 = fadd(curve, &hh, &hh);
@@ -687,7 +693,11 @@ fn add_affine(curve: &Curve, a: &Point, b: &Affine) -> Point {
     );
     let zh = fadd(curve, &a.z, &h);
     let z = fsub(curve, &fsub(curve, &fsqr(curve, &zh), &z1z1), &hh);
-    Point { x, y, z }
+    // Each coordinate on its own: a Point built whole goes through a
+    // copy of all 144 bytes, a call to memcpy on x86-64.
+    a.x = x;
+    a.y = y;
+    a.z = z;
 }
 
 /// s^-1 mod n for s in [1, n - 1], plain.
@@ -1069,9 +1079,9 @@ pub fn fuzz_verify(input: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        BASE_P256, Curve, Fe, LIMBS, P256, P384, TABLE, add, add_mod, base_multiple, combine,
-        double, fmul, fsqr, infinity, invert_scalar, is_zero, nmul, product, public_point, reduce,
-        reduce_p256, sub_limbs, verify,
+        BASE_P256, Curve, Fe, LIMBS, P256, P384, TABLE, add, add_affine, add_mod, base_multiple,
+        combine, double, fmul, fsqr, infinity, invert_scalar, is_zero, nmul, product, public_point,
+        reduce, reduce_p256, sub_limbs, verify,
     };
     use alloc::vec::Vec;
     use test::Bencher;
@@ -1322,22 +1332,30 @@ mod tests {
                 }
             }
             let g = public_point(&curve, &key).unwrap();
-            let twice = double(&curve, &g);
-            let mut multiple = add(&curve, &g, &infinity());
+            // G added to infinity is G.
+            let mut twice = infinity();
+            add_affine(&curve, &mut twice, &g);
+            double(&curve, &mut twice);
+            let mut multiple = infinity();
+            add_affine(&curve, &mut multiple, &g);
             for digit in (1..2 * i8::try_from(count).unwrap()).step_by(2) {
                 let entry = base_multiple(&curve, digit);
                 let zz = fsqr(&curve, &multiple.z);
                 assert_eq!(fmul(&curve, &entry.x, &zz), multiple.x);
                 let zzz = fmul(&curve, &zz, &multiple.z);
                 assert_eq!(fmul(&curve, &entry.y, &zzz), multiple.y);
-                multiple = add(&curve, &multiple, &twice);
+                add(&curve, &mut multiple, &twice);
             }
             let mut one = [0; LIMBS];
             one[0] = 1;
-            assert!(is_zero(&combine(&curve, &params.n.m, &g, &[0; LIMBS]).z));
+            let mut sum = infinity();
+            combine(&curve, &params.n.m, &g, &[0; LIMBS], &mut sum);
+            assert!(is_zero(&sum.z));
             let (below_n, _) = sub_limbs(&params.n.m, &one);
-            assert!(is_zero(&combine(&curve, &one, &g, &below_n).z));
-            assert!(!is_zero(&combine(&curve, &one, &g, &one).z));
+            combine(&curve, &one, &g, &below_n, &mut sum);
+            assert!(is_zero(&sum.z));
+            combine(&curve, &one, &g, &one, &mut sum);
+            assert!(!is_zero(&sum.z));
         }
     }
 
