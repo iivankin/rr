@@ -19,7 +19,7 @@ const HEADER: usize = 40 + 1024;
 /// Build the runtime rlib into dir with this compiler, unrestricted: it
 /// defines the allocator shim's internal symbols, which only the
 /// compiler's own attributes can name.
-pub fn build_runtime(raw0: &str, dir: &Path, target: Option<&str>) -> ExitCode {
+pub fn build_runtime(raw0: &str, dir: &Path, target: Option<&str>, sysroot: Option<&str>) -> ExitCode {
     let source = dir.join("rr_prof_rt.rs");
     if let Err(error) = fs::write(&source, RUNTIME) {
         eprintln!("rr: {}: {error}", source.display());
@@ -38,10 +38,7 @@ pub fn build_runtime(raw0: &str, dir: &Path, target: Option<&str>) -> ExitCode {
         "--out-dir".into(),
         dir.to_string_lossy().into_owned(),
     ];
-    super::target::for_runtime(&mut args, target);
-    if let Some(bundle) = bundle() {
-        args.extend(["--sysroot".into(), bundle.to_string_lossy().into_owned()]);
-    }
+    super::target::for_runtime(&mut args, target, sysroot);
     crate::driver_core::run(args, false, true)
 }
 
@@ -53,11 +50,11 @@ pub fn bundle() -> Option<PathBuf> {
 
 /// The runtime rlib for a --prof build of a final artifact, built into
 /// scratch by a child rr.
-pub fn runtime(scratch: &Path, target: Option<&str>) -> io::Result<PathBuf> {
+pub fn runtime(scratch: &Path, target: Option<&str>, sysroot: Option<&str>) -> io::Result<PathBuf> {
     let status = Command::new(executable()?)
         .arg("__prof-runtime")
         .arg(scratch)
-        .args(target.map(|t| ["--target", t]).into_iter().flatten())
+        .args(super::target::for_child(target, sysroot))
         .status()?;
     if !status.success() {
         return Err(io::Error::other("could not build the rr prof runtime"));
@@ -73,6 +70,7 @@ pub fn flags(
     artifact: bool,
     scratch: Option<&Path>,
     target: Option<&str>,
+    sysroot: Option<&str>,
 ) -> io::Result<()> {
     compiler.extend([
         "-Cforce-frame-pointers=yes".into(),
@@ -84,7 +82,7 @@ pub fn flags(
         compiler.push("-Csplit-debuginfo=packed".into());
     }
     if artifact && let Some(scratch) = scratch {
-        let runtime = runtime(scratch, target)?;
+        let runtime = runtime(scratch, target, sysroot)?;
         compiler.extend([
             "-Zunstable-options".into(),
             "--extern".into(),

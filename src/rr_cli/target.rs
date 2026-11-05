@@ -24,11 +24,34 @@ pub fn chosen(args: &[String]) -> Option<String> {
 
 /// The target args name with --target.
 pub fn named(args: &[String]) -> Option<String> {
-    let i = args.iter().position(|arg| super::has_key(arg, "--target"))?;
-    match args[i].strip_prefix("--target=") {
-        Some(name) => Some(name.to_owned()),
+    value(args, "--target")
+}
+
+/// The sysroot args name with --sysroot: a runtime is built against the
+/// same standard library as the crate it links into.
+pub fn sysroot(args: &[String]) -> Option<String> {
+    value(args, "--sysroot")
+}
+
+/// The value of key in args, as `key value` or `key=value`.
+fn value(args: &[String], key: &str) -> Option<String> {
+    let i = args.iter().position(|arg| super::has_key(arg, key))?;
+    match args[i].strip_prefix(key).and_then(|rest| rest.strip_prefix('=')) {
+        Some(value) => Some(value.to_owned()),
         None => args.get(i + 1).cloned(),
     }
+}
+
+/// The arguments that pass target and sysroot on to a child rr that
+/// builds a runtime.
+pub fn for_child(target: Option<&str>, sysroot: Option<&str>) -> Vec<String> {
+    let mut args = Vec::new();
+    for (key, value) in [("--target", target), ("--sysroot", sysroot)] {
+        if let Some(value) = value {
+            args.extend([key.to_owned(), value.to_owned()]);
+        }
+    }
+    args
 }
 
 /// The rr target of this host, when it is not macOS and the sysroot in
@@ -81,11 +104,16 @@ pub fn flags(args: &[String], artifact: bool) -> Vec<String> {
 }
 
 /// The flags that build one of rr's runtimes, an rlib, for target.
-pub fn for_runtime(args: &mut Vec<String>, target: Option<&str>) {
+pub fn for_runtime(args: &mut Vec<String>, target: Option<&str>, sysroot: Option<&str>) {
     if let Some(t) = target {
         args.extend(["--target".to_owned(), t.to_owned()]);
     }
     if is_rr(target) {
         args.push("-Zunstable-options".to_owned());
+    }
+    // The crate's sysroot when it names one, else the distribution's.
+    let sysroot = sysroot.map(std::path::PathBuf::from).or_else(super::prof::bundle);
+    if let Some(sysroot) = sysroot {
+        args.extend(["--sysroot".to_owned(), sysroot.to_string_lossy().into_owned()]);
     }
 }

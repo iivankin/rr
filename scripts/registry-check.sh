@@ -6,6 +6,9 @@
 #   RR=rr RRADD=rr scripts/registry-check.sh DIR COMPONENT...
 #
 # RR runs the checks; RRADD runs rr add (a build with the add command).
+# With SYSROOT, a sysroot holding the standard library of other targets,
+# the code and its tests are also checked and linted for each of them:
+# code under #[cfg(target_os)] compiles only where it is checked.
 set -eu
 RR=${RR:-rr}
 RRADD=${RRADD:-$RR}
@@ -44,5 +47,19 @@ printf '%s\n' "$log" | grep -E '^(test|bench|rr test|rr bench)' || true
 if printf '%s\n' "$log" | grep -E '^(warning|error)' | grep -vE 'never used|never constructed|never read|warnings? emitted' ; then
 	printf '%s\n' "$log"
 	exit 1
+fi
+if [ -n "${SYSROOT:-}" ]; then
+	name=$(sed -n 's/^NAME = //p' Makefile)
+	for t in $(ls "$SYSROOT/lib/rustlib"); do
+		[ -d "$SYSROOT/lib/rustlib/$t/lib" ] || continue
+		for step in "check src/main.rs" "lint src/main.rs" "test src/main.rs --check" "test src/main.rs --lint"; do
+			log=$("$RR" $step --crate-name "$name" --target "$t" --sysroot "$SYSROOT" 2>&1) || { printf '%s\n' "$log"; exit 1; }
+			if printf '%s\n' "$log" | grep -E '^(warning|error)' | grep -vE 'never used|never constructed|never read|warnings? emitted' ; then
+				printf '%s\n' "$log"
+				exit 1
+			fi
+		done
+		echo "registry-check: $t checked"
+	done
 fi
 echo "registry-check: $* passed"

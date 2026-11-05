@@ -1629,7 +1629,7 @@ mod thread {
 mod tests {
     use super::unix::{self, CERT_FILES, ENOENT, Files};
     use super::{Error, Found, pem_block};
-    use crate::x509::{Store, TEST_NOW, test_certificate, verify};
+    use crate::x509::{Store, TEST_NOW, test_certificate};
     use alloc::vec::Vec;
 
     /// x509's test certificates: anchors, intermediates and leaves.
@@ -1789,7 +1789,10 @@ mod tests {
             let certificates = certificates(names);
             // rr: escape(copy): the chain verify takes, borrowed from them.
             let chain: Vec<&[u8]> = certificates.iter().map(Vec::as_slice).collect();
-            assert!(verify(&chain, &store, host, TEST_NOW).is_ok(), "{host}");
+            assert!(
+                crate::x509::verify(&chain, &store, host, TEST_NOW).is_ok(),
+                "{host}"
+            );
         }
     }
 
@@ -1871,7 +1874,7 @@ mod tests {
     /// anchors, which the real chains end at.
     #[cfg(target_os = "linux")]
     #[test]
-    fn anchors() {
+    fn verifies_on_anchors() {
         let mut store = Store::new();
         store.add_pem(TESTS);
         let trust = super::Trust::with(store);

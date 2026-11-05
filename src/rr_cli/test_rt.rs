@@ -64,8 +64,8 @@ mod os {
         unsafe { _exit(code) }
     }
 
-    /// Run test in a child; whether it returned.
-    pub fn in_child(_: usize, test: &dyn Fn()) -> bool {
+    /// Run test in a child; how it ended, 0 when it returned.
+    pub fn in_child(_: usize, test: &dyn Fn()) -> u32 {
         // SAFETY: fork has no preconditions; the child only runs the test
         // and exits.
         let pid = unsafe { fork() };
@@ -76,7 +76,12 @@ mod os {
         let mut status = 0;
         // SAFETY: status is a valid out-parameter.
         unsafe { waitpid(pid, &raw mut status, 0) };
-        pid > 0 && status == 0
+        if pid > 0 { status as u32 } else { u32::MAX }
+    }
+
+    /// How a child ended, from its wait status.
+    pub fn ended(status: u32) {
+        super::wait_status(status);
     }
 }
 
@@ -136,7 +141,7 @@ mod os {
     }
 
     /// Run test in a child, a fork; whether it returned.
-    pub fn in_child(_: usize, test: &dyn Fn()) -> bool {
+    pub fn in_child(_: usize, test: &dyn Fn()) -> u32 {
         // clone with no new stack and SIGCHLD to the parent is fork.
         let pid = syscall(nr::CLONE, SIGCHLD, 0, 0, 0);
         if pid == 0 {
@@ -145,7 +150,12 @@ mod os {
         }
         let mut status: i32 = 0;
         syscall(nr::WAIT4, pid as usize, (&raw mut status) as usize, 0, 0);
-        pid > 0 && status == 0
+        if pid > 0 { status as u32 } else { u32::MAX }
+    }
+
+    /// How a child ended, from its wait status.
+    pub fn ended(status: u32) {
+        super::wait_status(status);
     }
 }
 
@@ -160,7 +170,9 @@ mod os {
         reserved: *mut u16,
         desktop: *mut u16,
         title: *mut u16,
-        geometry: [u32; 8],
+        /// dwX to dwFillAttribute: a new window's geometry and colors.
+        geometry: [u32; 7],
+        flags: u32,
         show_window: u16,
         reserved2: u16,
         reserved3: *mut u8,
@@ -198,9 +210,16 @@ mod os {
         fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
         fn GetExitCodeProcess(process: *mut c_void, code: *mut u32) -> i32;
         fn CloseHandle(handle: *mut c_void) -> i32;
+        fn SetHandleInformation(handle: *mut c_void, mask: u32, flags: u32) -> i32;
     }
 
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
     const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+    /// The child takes hStdInput, hStdOutput and hStdError; without it
+    /// its output goes to a console, which under a pipe there is none of.
+    const STARTF_USESTDHANDLES: u32 = 0x100;
+    const HANDLE_FLAG_INHERIT: u32 = 1;
     const INFINITE: u32 = u32::MAX;
 
     pub fn out(p: &[u8]) {
@@ -235,13 +254,13 @@ mod os {
 
     /// Run test number index in a child: this executable again, with
     /// --rr-one=index; whether it returned.
-    pub fn in_child(index: usize, _: &dyn Fn()) -> bool {
+    pub fn in_child(index: usize, _: &dyn Fn()) -> u32 {
         let mut line = [0u16; 1200];
         line[0] = u16::from(b'"');
         // SAFETY: line has room for the name, past the quote.
         let n = unsafe { GetModuleFileNameW(null_mut(), line.as_mut_ptr().add(1), 1024) } as usize;
         if n == 0 || n >= 1024 {
-            return false;
+            return u32::MAX;
         }
         let mut at = n + 1;
         let mut digits = [0u8; 20];
@@ -265,6 +284,16 @@ mod os {
         unsafe {
             let mut startup: StartupInfo = core::mem::zeroed();
             startup.cb = size_of::<StartupInfo>() as u32;
+            startup.flags = STARTF_USESTDHANDLES;
+            // The handles must be inheritable for the child to take them.
+            for (slot, which) in startup
+                .handles
+                .iter_mut()
+                .zip([STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE])
+            {
+                *slot = GetStdHandle(which);
+                SetHandleInformation(*slot, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+            }
             let mut info: ProcessInformation = core::mem::zeroed();
             let made = CreateProcessW(
                 core::ptr::null(),
@@ -279,14 +308,27 @@ mod os {
                 &raw mut info,
             );
             if made == 0 {
-                return false;
+                return u32::MAX;
             }
             WaitForSingleObject(info.process, INFINITE);
             let mut code = 1;
             GetExitCodeProcess(info.process, &raw mut code);
             CloseHandle(info.thread);
             CloseHandle(info.process);
-            code == 0
+            code
+        }
+    }
+
+    /// How a child ended: its exit code, which for a crash is the
+    /// exception's (0xC0000005 an access violation, 0xC0000409 a fast
+    /// fail, which a panic ends in).
+    pub fn ended(code: u32) {
+        if code >= 0xC000_0000 {
+            out(b"exception 0x");
+            super::hex(code);
+        } else {
+            out(b"exit code ");
+            super::num(u64::from(code));
         }
     }
 }
@@ -416,6 +458,32 @@ fn arg(i: usize) -> Option<&'static [u8]> {
         }
         Some(core::slice::from_raw_parts(s.cast(), n))
     }
+}
+
+/// A Unix wait status: the signal that ended the child, or its exit
+/// code.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn wait_status(status: u32) {
+    if status == u32::MAX {
+        out(b"no child");
+    } else if status & 0x7f != 0 {
+        out(b"signal ");
+        num(u64::from(status & 0x7f));
+    } else {
+        out(b"exit code ");
+        num(u64::from((status >> 8) & 0xff));
+    }
+}
+
+/// v in hexadecimal, eight digits.
+#[cfg(target_os = "windows")]
+fn hex(v: u32) {
+    let mut d = [0u8; 8];
+    for (i, digit) in d.iter_mut().enumerate() {
+        let nibble = (v >> (28 - 4 * i)) & 0xf;
+        *digit = b"0123456789ABCDEF"[nibble as usize];
+    }
+    out(&d);
 }
 
 fn num(mut v: u64) {
@@ -550,10 +618,18 @@ pub fn test_main_static_abort(tests: &[&TestDescAndFn]) {
             ignored += 1;
             continue;
         }
-        let finished = os::in_child(index, &|| run(t));
+        let status = os::in_child(index, &|| run(t));
+        let finished = status == 0;
         let want_panic = !matches!(t.desc.should_panic, ShouldPanic::No);
         if finished == want_panic {
-            out(b"FAILED\n");
+            out(b"FAILED");
+            if !finished {
+                // A panic, an abort or a crash: which, says how it ended.
+                out(b" (");
+                os::ended(status);
+                out(b")");
+            }
+            out(b"\n");
             failed += 1;
         } else {
             out(b"ok\n");

@@ -17,7 +17,7 @@ const RUNTIME: &str = include_str!("test_rt.rs");
 
 /// Build the runtime rlib into dir with this compiler, unrestricted; with
 /// counts, it reads rr prof's counters around each measured loop.
-pub fn build_runtime(raw0: &str, dir: &Path, counts: bool, target: Option<&str>) -> ExitCode {
+pub fn build_runtime(raw0: &str, dir: &Path, counts: bool, target: Option<&str>, sysroot: Option<&str>) -> ExitCode {
     let source = dir.join("rr_test_rt.rs");
     if let Err(error) = fs::write(&source, RUNTIME) {
         eprintln!("rr: {}: {error}", source.display());
@@ -40,10 +40,7 @@ pub fn build_runtime(raw0: &str, dir: &Path, counts: bool, target: Option<&str>)
     if counts {
         args.extend(["--cfg".into(), "rr_counts".into()]);
     }
-    super::target::for_runtime(&mut args, target);
-    if let Some(bundle) = super::prof::bundle() {
-        args.extend(["--sysroot".into(), bundle.to_string_lossy().into_owned()]);
-    }
+    super::target::for_runtime(&mut args, target, sysroot);
     crate::driver_core::run(args, false, false)
 }
 
@@ -88,12 +85,13 @@ pub fn run(args: &[String], bench: bool) -> io::Result<ExitCode> {
     }
     let rr = executable()?;
     let target = super::target::chosen(&flags);
+    let sysroot = super::target::sysroot(&flags);
     let scratch = workspace::Scratch::new()?;
     let status = Command::new(&rr)
         .arg("__test-runtime")
         .arg(&scratch.path)
         .args(bench.then_some("counts"))
-        .args(target.iter().flat_map(|t| ["--target", t.as_str()]))
+        .args(super::target::for_child(target.as_deref(), sysroot.as_deref()))
         .status()?;
     if !status.success() {
         return Err(io::Error::other("could not build the rr test runtime"));

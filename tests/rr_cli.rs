@@ -124,6 +124,20 @@ fn prof_keeps_symbols_and_reports_an_empty_run() {
 }
 
 #[test]
+fn test_builds_its_runtime_against_the_sysroot_the_crate_names() {
+    // A sysroot with no standard library in it: the runtime, built
+    // against the crate's, fails first, and the crate is never compiled
+    // against another.
+    let project = Project::new();
+    fs::write(project.0.join("lib.rs"), "#![no_std]\npub fn value() -> u8 { 1 }").unwrap();
+    let empty = project.0.join("empty");
+    fs::create_dir(&empty).unwrap();
+    let checked = project.rr(&["test", "lib.rs", "--check", "--sysroot", empty.to_str().unwrap()]);
+    assert!(!checked.status.success());
+    assert!(String::from_utf8_lossy(&checked.stderr).contains("could not build the rr test runtime"));
+}
+
+#[test]
 fn time_reports_the_fastest_run_and_fails_above_a_budget() {
     let project = Project::new();
     let rr = env!("CARGO_BIN_EXE_rr");

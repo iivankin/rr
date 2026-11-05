@@ -61,7 +61,7 @@ fn subcommand(raw0: &str, args: &[String]) -> Option<io::Result<ExitCode>> {
         "test" => test::run(rest, false),
         "bench" => test::run(rest, true),
         // Internal: rr test and rr bench build their runtime with this:
-        // DIR [counts] [--target TARGET].
+        // DIR [counts] [--target TARGET] [--sysroot SYSROOT].
         "__test-runtime" if args.len() >= 2 => {
             let counts = args.iter().any(|a| a == "counts");
             Ok(test::build_runtime(
@@ -69,14 +69,16 @@ fn subcommand(raw0: &str, args: &[String]) -> Option<io::Result<ExitCode>> {
                 Path::new(&args[1]),
                 counts,
                 target::named(args).as_deref(),
+                target::sysroot(args).as_deref(),
             ))
         },
         // Internal: rr build --prof builds its runtime with this, in a
-        // child: DIR [--target TARGET].
+        // child: DIR [--target TARGET] [--sysroot SYSROOT].
         "__prof-runtime" if args.len() >= 2 => Ok(prof::build_runtime(
             raw0,
             Path::new(&args[1]),
             target::named(args).as_deref(),
+            target::sysroot(args).as_deref(),
         )),
         _ => return None,
     })
@@ -177,6 +179,7 @@ fn run() -> io::Result<ExitCode> {
             artifact && !checking,
             scratch.as_ref().map(|s| s.path.as_path()),
             target::chosen(&args).as_deref(),
+            target::sysroot(&args).as_deref(),
         )?;
     }
     compiler.append(&mut args);
