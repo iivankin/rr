@@ -1,7 +1,8 @@
 //! SHA-384 (FIPS 180-4: SHA-512's rounds from other initial values, cut
 //! to 48 bytes), HMAC-SHA384 (RFC 2104) and HKDF-SHA384 (RFC 5869).
 //! Whole blocks are compressed straight from the caller's input; only a
-//! part block waits in the state. Portable code only.
+//! part block waits in the state. The rounds run on SHA512 instructions
+//! where crate::sys::sha512 finds them, as portable code elsewhere.
 
 /// The bytes of a digest.
 pub const DIGEST_BYTES: usize = 48;
@@ -23,7 +24,8 @@ const INITIAL: [u64; 8] = [
     0x47b5481dbefa4fa4,
 ];
 
-const ROUND: [u64; 80] = [
+/// The round constants, which crate::sys::sha512 loads too.
+pub const ROUND: [u64; 80] = [
     0x428a2f98d728ae22,
     0x7137449123ef65cd,
     0xb5c0fbcfec4d3b2f,
@@ -264,6 +266,9 @@ pub fn hkdf_expand(key: &[u8; DIGEST_BYTES], info: &[u8], out: &mut [u8]) -> boo
 }
 
 fn compress(state: &mut [u64; 8], blocks: &[[u8; BLOCK_BYTES]]) {
+    if crate::sys::sha512::compress(state, blocks) {
+        return;
+    }
     for block in blocks {
         let mut schedule = [0_u64; 80];
         for (word, bytes) in schedule.iter_mut().zip(block.as_chunks::<8>().0) {

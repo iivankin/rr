@@ -2,6 +2,6 @@
   "name": "sha256",
   "description": "SHA-256 (FIPS 180-4), HMAC-SHA256 (RFC 2104) and HKDF-SHA256 (RFC 5869), with SHA instructions where the CPU has them.",
   "rr": "0.3.2",
-  "dependencies": [],
+  "dependencies": ["cpu"],
   "files": [{ "path": "sha256.rs" }, { "path": "sys/sha256.rs" }]
 }

@@ -12,9 +12,9 @@ copies a component: the project owns the copy, reads it and changes it.
 
 | Name | Needs | What |
 |---|---|---|
-| sha256 | | SHA-256, HMAC, HKDF; SHA instructions where the CPU has them |
-| sha384 | | SHA-384, HMAC, HKDF |
-| aesgcm | | AES-128-GCM in place; AES and carry-less multiply instructions, constant-time portable code elsewhere |
+| sha256 | cpu | SHA-256, HMAC, HKDF; SHA instructions where the CPU has them |
+| sha384 | cpu | SHA-384, HMAC, HKDF; SHA512 instructions where the CPU has them |
+| aesgcm | cpu | AES-128-GCM in place; AES and carry-less multiply instructions, on 256-bit vectors where x86-64 has VAES, constant-time portable code elsewhere |
 | x25519 | | X25519 key agreement, constant time |
 | ecdsa | | ECDSA verification on P-256 and P-384 |
 | rsa | sha256, sha384 | RSA PKCS#1 v1.5 and PSS verification |
@@ -28,6 +28,7 @@ copies a component: the project owns the copy, reads it and changes it.
 | trust | x509, wait, file | the system verifies a chain, as Go does: SecTrust on macOS, CertGetCertificateChain on Windows, x509 with the system's roots on Linux; never blocks |
 | wait | | what a program's loop waits on for any component: descriptors or an event, a timeout; a thread that signals when done |
 | file | | Linux: whole files read by system calls, descriptors closed on drop |
+| cpu | | what the CPU has of the instructions the components use, asked once |
 
 ## A component
 
@@ -38,7 +39,7 @@ One JSON file beside its sources, which sit where they go under `src/`:
   "name": "aesgcm",
   "description": "AES-128-GCM (RFC 5116), with AES and GHASH instructions where the CPU has them.",
   "rr": "0.3.2",
-  "dependencies": [],
+  "dependencies": ["cpu"],
   "files": [{ "path": "aesgcm.rs" }, { "path": "sys/aes.rs" }]
 }
 ```
@@ -85,8 +86,8 @@ place that serves such files: rr.json maps a scope to it,
   it returns its own small enum, or false.
 - **Unsafe only in sys.** CPU instructions (AES, SHA, carry-less
   multiply) are in `sys/<name>.rs` behind a safe function that says
-  whether it ran. The portable code is always there and passes the same
-  vectors.
+  whether it ran; `cpu` says what the CPU has. The portable code is
+  always there and passes the same vectors.
 - **Fast with overflow checks on.** The template keeps them on, and on
   arithmetic they cost: 40% of X25519's time. Where the bounds are
   proven, the arithmetic wraps (`wrapping_*`, `core::num::Wrapping`) and
@@ -105,4 +106,7 @@ place that serves such files: rr.json maps a scope to it,
 index.json lists the components for `rr add --list`;
 `scripts/registry-index.py` writes it from their JSON, and `--check`
 says whether it is current. `scripts/registry-check.sh DIR NAME...` adds components to a fresh
-project and runs those checks.
+project and runs those checks; with `SYSROOT`, a sysroot of other
+targets' standard libraries, it checks them for each target too. The
+Registry workflow runs it on each host for every push that changes
+registry/.

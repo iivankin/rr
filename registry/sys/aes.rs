@@ -1,5 +1,6 @@
 //! AES-128-GCM's CTR and GHASH on the CPU's instructions: AES and PMULL
-//! on aarch64, AES-NI, PCLMULQDQ and SSSE3 on x86_64. Each function
+//! on aarch64, AES-NI, PCLMULQDQ and SSSE3 on x86_64, and VAES with
+//! VPCLMULQDQ where x86_64 has them. Each function
 //! returns false, having done nothing, where the CPU lacks them;
 //! aesgcm.rs then runs its portable code.
 //!
@@ -8,14 +9,20 @@
 //! blocks (seal's from the turn before, open's own input), so the AES and
 //! the carry-less multiply units work at once. GHASH folds the eight with
 //! H^8..H into one unreduced Karatsuba sum, three products a block and
-//! one reduction a turn. The round keys stay in registers for the loop.
+//! one reduction a turn. The round keys are read where the key keeps them.
 //!
-//! GHASH here is in the plain polynomial basis: each byte's bits are
-//! reversed, so bit i of the little-endian 128-bit value is the
-//! coefficient of x^i, and a product is a carry-less multiplication
-//! reduced by x^128 = x^7 + x^2 + x + 1 (0x87).
+//! On aarch64 GHASH is in the plain polynomial basis: each byte's bits
+//! are reversed, one RBIT, so bit i of the little-endian 128-bit value
+//! is the coefficient of x^i, and a product is a carry-less
+//! multiplication reduced by x^128 = x^7 + x^2 + x + 1 (0x87). x86-64
+//! reverses bits in six instructions and bytes in one, so it reverses
+//! only the bytes; its module says how that works.
+//!
+//! Where the CPU has more (FASTER), seal and open take a faster
+//! loop: on aarch64 one in asm on SHA3's EOR3, on x86-64 one on VAES
+//! and VPCLMULQDQ, two blocks to each instruction.
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use crate::sys::cpu;
 
 /// H to H^8, then for each the XOR of its halves in both lanes, which
 /// Karatsuba's middle product takes.
@@ -26,26 +33,16 @@ pub type Table = [[u8; 16]; 16];
 #[repr(C, align(16))]
 pub struct RoundKeys(pub [[u8; 16]; 11]);
 
-/// What the CPU has: 0 before the first look, then 1 + arch::detect():
-/// 1 none, 2 the instructions, 3 also SHA3 and SHA512 (Rust's "sha3"
-/// feature, which EOR3 is in) for aarch64's asm loop.
-// rr: escape(shared): found once, for every thread and every key.
-static FOUND: AtomicU8 = AtomicU8::new(0);
-
-fn found() -> u8 {
-    match FOUND.load(Ordering::Relaxed) {
-        0 => {
-            let found = 1 + arch::detect();
-            FOUND.store(found, Ordering::Relaxed);
-            found
-        }
-        n => n,
-    }
-}
+/// What the faster loop of seal and open runs on besides: SHA3's EOR3
+/// on aarch64, VAES and VPCLMULQDQ on x86_64.
+#[cfg(target_arch = "aarch64")]
+const FASTER: u32 = cpu::AES | cpu::SHA512;
+#[cfg(not(target_arch = "aarch64"))]
+const FASTER: u32 = cpu::WIDE_AES;
 
 /// Whether the CPU has the instructions the functions below need.
 pub fn available() -> bool {
-    found() >= 2
+    cpu::has(cpu::AES)
 }
 
 /// CTR in place over data with round keys rk: the counter blocks are
@@ -94,7 +91,7 @@ pub fn seal(
         return false;
     }
     // rr: escape(unsafe): available() found the instructions it runs on.
-    unsafe { arch::seal(rk, tbl, block, ctr, blocks, y, found() == 3) };
+    unsafe { arch::seal(rk, tbl, block, ctr, blocks, y, cpu::has(FASTER)) };
     true
 }
 
@@ -111,7 +108,7 @@ pub fn open(
         return false;
     }
     // rr: escape(unsafe): available() found the instructions it runs on.
-    unsafe { arch::open(rk, tbl, block, ctr, blocks, y, found() == 3) };
+    unsafe { arch::open(rk, tbl, block, ctr, blocks, y, cpu::has(FASTER)) };
     true
 }
 
@@ -126,93 +123,6 @@ mod arch {
     };
 
     type V = uint8x16_t;
-
-    #[cfg(target_os = "macos")]
-    // rr: escape(unsafe): the signature is libSystem's, from sysctlbyname(3).
-    unsafe extern "C" {
-        fn sysctlbyname(
-            name: *const core::ffi::c_char,
-            old: *mut core::ffi::c_void,
-            oldlen: *mut usize,
-            new: *mut core::ffi::c_void,
-            newlen: usize,
-        ) -> i32;
-    }
-
-    /// A 0 or 1 the kernel reports by name; false when it has no such.
-    #[cfg(target_os = "macos")]
-    fn sysctl_flag(name: &core::ffi::CStr) -> bool {
-        let mut v: i32 = 0;
-        let mut len = size_of::<i32>();
-        // rr: escape(unsafe): name ends in NUL, v and len are this
-        // frame's, and len says how much of v there is.
-        let r = unsafe {
-            sysctlbyname(
-                name.as_ptr(),
-                (&raw mut v).cast(),
-                &raw mut len,
-                core::ptr::null_mut(),
-                0,
-            )
-        };
-        r == 0 && v != 0
-    }
-
-    /// Every Mac on Apple silicon has AES and PMULL (since the A7); SHA3
-    /// and SHA512 are asked, as OpenSSL asks them.
-    #[cfg(target_os = "macos")]
-    pub fn detect() -> u8 {
-        let sha3 = sysctl_flag(c"hw.optional.armv8_2_sha3");
-        let sha512 = sysctl_flag(c"hw.optional.armv8_2_sha512");
-        1 + u8::from(sha3 && sha512)
-    }
-
-    /// ID_AA64ISAR0_EL1: the AES field 2 is AES with PMULL, the SHA2
-    /// field 2 has SHA512, a SHA3 field above 0 has EOR3.
-    #[cfg(target_os = "linux")]
-    pub fn detect() -> u8 {
-        let isar0: u64;
-        // rr: escape(unsafe): Linux emulates this ID register's read for
-        // user space (HWCAP_CPUID, since 4.11); it touches no memory.
-        unsafe {
-            core::arch::asm!(
-                "mrs {}, ID_AA64ISAR0_EL1",
-                out(reg) isar0,
-                options(nomem, nostack, preserves_flags),
-            );
-        }
-        let aes = (isar0 >> 4) & 0xf >= 2;
-        let sha512 = (isar0 >> 12) & 0xf >= 2;
-        let sha3 = (isar0 >> 32) & 0xf != 0;
-        u8::from(aes) + u8::from(aes && sha3 && sha512)
-    }
-
-    #[cfg(target_os = "windows")]
-    #[link(name = "kernel32", kind = "raw-dylib")]
-    // rr: escape(unsafe): the signature is kernel32's, from its documentation.
-    unsafe extern "system" {
-        // rr: escape(unsafe): it takes a number and only reads the CPU's
-        // features.
-        safe fn IsProcessorFeaturePresent(feature: u32) -> i32;
-    }
-
-    /// PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE (30): AES, PMULL and SHA;
-    /// PF_ARM_SHA3_INSTRUCTIONS_AVAILABLE (64) and PF_ARM_SHA512 (65), as
-    /// Rust's std_detect asks them. An older Windows answers false to a
-    /// number it does not know.
-    #[cfg(target_os = "windows")]
-    pub fn detect() -> u8 {
-        let aes = IsProcessorFeaturePresent(30) != 0;
-        let sha3 = IsProcessorFeaturePresent(64) != 0 && IsProcessorFeaturePresent(65) != 0;
-        u8::from(aes) + u8::from(aes && sha3)
-    }
-
-    /// Elsewhere only what the target promises.
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    pub fn detect() -> u8 {
-        let aes = cfg!(target_feature = "aes");
-        u8::from(aes) + u8::from(aes && cfg!(target_feature = "sha3"))
-    }
 
     #[inline(always)]
     fn load(b: &[u8; 16]) -> V {
@@ -966,22 +876,34 @@ mod arch {
 
 #[cfg(target_arch = "x86_64")]
 mod arch {
+    //! GHASH here works on blocks with their bytes reversed and their
+    //! bits as they are, as BoringSSL's aes-gcm-avx2-x86_64 does: x86-64
+    //! reverses bytes in one instruction and bits in six. A carry-less
+    //! product of two such values is the GHASH product times x^-1, so the
+    //! table holds H times x (times_x), and each product with it is
+    //! GHASH's. Read naturally, the bits are a polynomial modulo x^128 +
+    //! x^127 + x^126 + x^121 + 1, whose low 128 bits fold reduces in two
+    //! steps of 64. The counter blocks are kept byte-reversed too, the
+    //! counter a little-endian number in their first lane.
+    //!
+    //! Where the CPU has VAES and VPCLMULQDQ on AVX2 (Zen 3, Ice Lake and
+    //! later), seal and open take each turn's eight blocks as four 256-bit
+    //! vectors, two blocks to each instruction.
+
     use super::{RoundKeys, Table};
     use core::arch::x86_64::{
-        __cpuid, __m128i, _mm_aesenc_si128, _mm_aesenclast_si128, _mm_and_si128,
-        _mm_clmulepi64_si128, _mm_cvtsi32_si128, _mm_loadu_si128, _mm_or_si128, _mm_set_epi64x,
-        _mm_set1_epi8, _mm_setr_epi8, _mm_setzero_si128, _mm_shuffle_epi8, _mm_shuffle_epi32,
-        _mm_slli_epi16, _mm_slli_si128, _mm_srli_epi16, _mm_srli_si128, _mm_storeu_si128,
-        _mm_xor_si128,
+        __m128i, __m256i, _mm_add_epi32, _mm_add_epi64, _mm_aesenc_si128, _mm_aesenclast_si128,
+        _mm_and_si128, _mm_clmulepi64_si128, _mm_cvtsi32_si128, _mm_loadu_si128, _mm_set_epi64x,
+        _mm_setr_epi8, _mm_setzero_si128, _mm_shuffle_epi8, _mm_shuffle_epi32, _mm_srai_epi32,
+        _mm_storeu_si128, _mm_xor_si128, _mm256_add_epi32, _mm256_aesenc_epi128,
+        _mm256_aesenclast_epi128, _mm256_broadcastsi128_si256, _mm256_castsi256_si128,
+        _mm256_clmulepi64_epi128, _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_set_epi32,
+        _mm256_set_m128i, _mm256_setzero_si256, _mm256_shuffle_epi8, _mm256_shuffle_epi32,
+        _mm256_storeu_si256, _mm256_xor_si256, _mm256_zextsi128_si256,
     };
 
     type V = __m128i;
-
-    /// CPUID leaf 1, ECX: AES (25), PCLMULQDQ (1) and SSSE3 (9).
-    pub fn detect() -> u8 {
-        let need = (1 << 25) | (1 << 1) | (1 << 9);
-        u8::from(__cpuid(1).ecx & need == need)
-    }
+    type W = __m256i;
 
     #[inline(always)]
     fn load(b: &[u8; 16]) -> V {
@@ -1007,13 +929,23 @@ mod arch {
     const _: () = assert!(size_of::<RoundKeys>() == size_of::<[V; 11]>());
     const _: () = assert!(align_of::<RoundKeys>() == align_of::<[V; 11]>());
 
-    /// Counter blocks from ctr on, one for each of s: base, which ends in
-    /// four zero bytes, with the counter big-endian there.
+    /// The 16 bytes of v in the other order.
+    #[target_feature(enable = "aes,pclmulqdq,ssse3")]
+    fn reflect(v: V) -> V {
+        let order = _mm_setr_epi8(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+        _mm_shuffle_epi8(v, order)
+    }
+
+    /// Counter blocks from ctr on, one for each of s: base is the block,
+    /// which ends in four zero bytes, reflected, so the counter adds to
+    /// its first lane and wraps there, as GCM's 32-bit counter does.
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
     fn counters(base: V, ctr: u32, s: &mut [V]) {
-        for (x, i) in s.iter_mut().zip(0..) {
-            let c = _mm_cvtsi32_si128(ctr.wrapping_add(i).to_be().cast_signed());
-            *x = _mm_or_si128(base, _mm_slli_si128::<12>(c));
+        let one = _mm_cvtsi32_si128(1);
+        let mut next = _mm_add_epi32(base, _mm_cvtsi32_si128(ctr.cast_signed()));
+        for x in s.iter_mut() {
+            *x = reflect(next);
+            next = _mm_add_epi32(next, one);
         }
     }
 
@@ -1061,7 +993,7 @@ mod arch {
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
     pub fn ctr(rk: &RoundKeys, block: &[u8; 16], ctr: u32, data: &mut [u8]) {
         let k = round_keys(rk);
-        let base = load(block);
+        let base = reflect(load(block));
         let (blocks, tail) = data.as_chunks_mut::<16>();
         let (fours, rest) = blocks.as_chunks_mut::<4>();
         let mut c = ctr;
@@ -1088,20 +1020,6 @@ mod arch {
         }
     }
 
-    /// The bits of each byte reversed, by two nibble lookups.
-    #[target_feature(enable = "aes,pclmulqdq,ssse3")]
-    fn rbit(v: V) -> V {
-        let lo = _mm_setr_epi8(
-            0x00, 0x08, 0x04, 0x0c, 0x02, 0x0a, 0x06, 0x0e, 0x01, 0x09, 0x05, 0x0d, 0x03, 0x0b,
-            0x07, 0x0f,
-        );
-        let hi = _mm_slli_epi16::<4>(lo);
-        let mask = _mm_set1_epi8(0x0f);
-        let l = _mm_and_si128(v, mask);
-        let h = _mm_and_si128(_mm_srli_epi16::<4>(v), mask);
-        _mm_or_si128(_mm_shuffle_epi8(hi, l), _mm_shuffle_epi8(lo, h))
-    }
-
     /// x with its halves XORed, in both lanes: Karatsuba's middle factor.
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
     fn halves(x: V) -> V {
@@ -1120,22 +1038,30 @@ mod arch {
         ];
     }
 
-    /// The 256-bit sum acc holds, reduced: the middle product goes to the
-    /// middle, then hi * x^128 = hi * 0x87 folds into lo, and then its own
-    /// 7-bit overflow.
+    /// x^63 + x^62 + x^57 in the high half, the polynomial's terms below
+    /// x^128 that a 64-bit fold multiplies by; 1 in the low half.
+    #[target_feature(enable = "aes,pclmulqdq,ssse3")]
+    fn polynomial() -> V {
+        _mm_set_epi64x(0xc200_0000_0000_0000_u64.cast_signed(), 1)
+    }
+
+    /// The 256-bit sum acc holds, reduced. Karatsuba's middle product
+    /// comes first; then the low 64 bits are cancelled twice: x^64 A + B
+    /// is x^64 (A + B with its halves swapped + B's low half times x^63 +
+    /// x^62 + x^57) modulo the polynomial, folding the low product into
+    /// the middle and the middle into the high, which is the product.
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
     fn fold(acc: [V; 3]) -> V {
         let [lo, mid, hi] = acc;
         let mid = _mm_xor_si128(mid, _mm_xor_si128(lo, hi));
-        let lo = _mm_xor_si128(lo, _mm_slli_si128::<8>(mid));
-        let hi = _mm_xor_si128(hi, _mm_srli_si128::<8>(mid));
-        let red = _mm_set_epi64x(0x87, 0x87);
-        let f0 = _mm_clmulepi64_si128::<0x00>(hi, red);
-        let f1 = _mm_clmulepi64_si128::<0x01>(hi, red);
-        let g = _mm_clmulepi64_si128::<0x01>(f1, red);
+        let p = polynomial();
+        let mid = _mm_xor_si128(
+            _mm_xor_si128(mid, _mm_shuffle_epi32::<0x4e>(lo)),
+            _mm_clmulepi64_si128::<0x01>(p, lo),
+        );
         _mm_xor_si128(
-            _mm_xor_si128(lo, f0),
-            _mm_xor_si128(_mm_slli_si128::<8>(f1), g),
+            _mm_xor_si128(hi, _mm_shuffle_epi32::<0x4e>(mid)),
+            _mm_clmulepi64_si128::<0x01>(p, mid),
         )
     }
 
@@ -1144,6 +1070,17 @@ mod arch {
         let mut acc = [_mm_setzero_si128(); 3];
         kmul(&mut acc, a, b, halves(b));
         fold(acc)
+    }
+
+    /// v times x modulo the polynomial: v shifted up a bit, each 64-bit
+    /// half doubled and the low half's carry put into the high one, and
+    /// the polynomial added if a bit came off the top.
+    #[target_feature(enable = "aes,pclmulqdq,ssse3")]
+    fn times_x(v: V) -> V {
+        // Lanes 0 and 3 copy bit 127, lane 2 bit 63, each to all its bits.
+        let carries = _mm_srai_epi32::<31>(_mm_shuffle_epi32::<0xd3>(v));
+        let added = _mm_set_epi64x(0xc200_0000_0000_0001_u64.cast_signed(), 1);
+        _mm_xor_si128(_mm_add_epi64(v, v), _mm_and_si128(carries, added))
     }
 
     /// H to H^8 and their halves, from the table.
@@ -1189,49 +1126,51 @@ mod arch {
         fold(acc)
     }
 
+    /// H times x, and its powers to the eighth, with their halves.
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
     pub fn ghash_key(h: &[u8; 16], tbl: &mut Table) {
-        let hp = rbit(load(h));
-        let mut p = hp;
+        let hx = times_x(reflect(load(h)));
+        let mut p = hx;
         let (pw, ks) = tbl.split_at_mut(8);
         for (i, (t, kt)) in pw.iter_mut().zip(ks).enumerate() {
             if i > 0 {
-                p = gmul(p, hp);
+                p = gmul(p, hx);
             }
             store(t, p);
             store(kt, halves(p));
         }
     }
 
-    /// y continued over blocks, in the reversed basis.
+    /// y continued over blocks, all reflected.
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
-    fn ghash_rev(h: &[V; 8], hk: &[V; 8], mut yp: V, blocks: &[[u8; 16]]) -> V {
+    fn ghash_reflected(h: &[V; 8], hk: &[V; 8], mut yr: V, blocks: &[[u8; 16]]) -> V {
         let (eights, rest) = blocks.as_chunks::<8>();
         let mut x = [_mm_setzero_si128(); 8];
         for eight in eights {
             for (v, b) in x.iter_mut().zip(eight) {
-                *v = rbit(load(b));
+                *v = reflect(load(b));
             }
-            x[0] = _mm_xor_si128(x[0], yp);
-            yp = ghash8(&x, h, hk);
+            x[0] = _mm_xor_si128(x[0], yr);
+            yr = ghash8(&x, h, hk);
         }
         for b in rest {
             let mut acc = [_mm_setzero_si128(); 3];
-            kmul(&mut acc, _mm_xor_si128(yp, rbit(load(b))), h[0], hk[0]);
-            yp = fold(acc);
+            kmul(&mut acc, _mm_xor_si128(yr, reflect(load(b))), h[0], hk[0]);
+            yr = fold(acc);
         }
-        yp
+        yr
     }
 
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
     pub fn ghash(tbl: &Table, y: &mut [u8; 16], blocks: &[[u8; 16]]) {
         let (h, hk) = powers(tbl);
-        let yp = ghash_rev(&h, &hk, rbit(load(y)), blocks);
-        store(y, rbit(yp));
+        let yr = ghash_reflected(&h, &hk, reflect(load(y)), blocks);
+        store(y, reflect(yr));
     }
 
     /// Eight blocks a turn; each turn's ciphertext is hashed in the next,
-    /// beside its AES, and the last after the loop.
+    /// beside its AES, and the last after the loop. wide takes the turns
+    /// on 256-bit vectors.
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
     pub fn seal(
         rk: &RoundKeys,
@@ -1240,12 +1179,17 @@ mod arch {
         ctr: u32,
         blocks: &mut [[u8; 16]],
         y: &mut [u8; 16],
-        _eor3: bool,
+        wide: bool,
     ) {
+        if wide {
+            // rr: escape(unsafe): the caller found VAES, VPCLMULQDQ and AVX2.
+            unsafe { seal_wide(rk, tbl, block, ctr, blocks, y) };
+            return;
+        }
         let k = round_keys(rk);
         let (h, hk) = powers(tbl);
-        let base = load(block);
-        let mut yp = rbit(load(y));
+        let base = reflect(load(block));
+        let mut yr = reflect(load(y));
         let (eights, rest) = blocks.as_chunks_mut::<8>();
         let mut c = ctr;
         let mut s = [_mm_setzero_si128(); 8];
@@ -1255,25 +1199,26 @@ mod arch {
             c = c.wrapping_add(8);
             match prev {
                 Some(mut x) => {
-                    x[0] = _mm_xor_si128(x[0], yp);
-                    yp = aes8_ghash8(k, &mut s, &x, &h, &hk);
+                    x[0] = _mm_xor_si128(x[0], yr);
+                    yr = aes8_ghash8(k, &mut s, &x, &h, &hk);
                 }
                 None => aes(k, &mut s),
             }
             xor_into(eight, &mut s);
-            prev = Some(s.map(|v| rbit(v)));
+            prev = Some(s.map(|v| reflect(v)));
         }
         if let Some(mut x) = prev {
-            x[0] = _mm_xor_si128(x[0], yp);
-            yp = ghash8(&x, &h, &hk);
+            x[0] = _mm_xor_si128(x[0], yr);
+            yr = ghash8(&x, &h, &hk);
         }
         self::ctr(rk, block, c, rest.as_flattened_mut());
-        yp = ghash_rev(&h, &hk, yp, rest);
-        store(y, rbit(yp));
+        yr = ghash_reflected(&h, &hk, yr, rest);
+        store(y, reflect(yr));
     }
 
     /// Eight blocks a turn: the ciphertext is hashed beside the AES that
-    /// makes the key stream to decrypt it.
+    /// makes the key stream to decrypt it. wide takes the turns on
+    /// 256-bit vectors.
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
     pub fn open(
         rk: &RoundKeys,
@@ -1282,12 +1227,17 @@ mod arch {
         ctr: u32,
         blocks: &mut [[u8; 16]],
         y: &mut [u8; 16],
-        _eor3: bool,
+        wide: bool,
     ) {
+        if wide {
+            // rr: escape(unsafe): the caller found VAES, VPCLMULQDQ and AVX2.
+            unsafe { open_wide(rk, tbl, block, ctr, blocks, y) };
+            return;
+        }
         let k = round_keys(rk);
         let (h, hk) = powers(tbl);
-        let base = load(block);
-        let mut yp = rbit(load(y));
+        let base = reflect(load(block));
+        let mut yr = reflect(load(y));
         let (eights, rest) = blocks.as_chunks_mut::<8>();
         let mut c = ctr;
         let mut s = [_mm_setzero_si128(); 8];
@@ -1296,15 +1246,241 @@ mod arch {
             counters(base, c, &mut s);
             c = c.wrapping_add(8);
             for (v, b) in x.iter_mut().zip(eight.iter()) {
-                *v = rbit(load(b));
+                *v = reflect(load(b));
             }
-            x[0] = _mm_xor_si128(x[0], yp);
-            yp = aes8_ghash8(k, &mut s, &x, &h, &hk);
+            x[0] = _mm_xor_si128(x[0], yr);
+            yr = aes8_ghash8(k, &mut s, &x, &h, &hk);
             xor_into(eight, &mut s);
         }
-        yp = ghash_rev(&h, &hk, yp, rest);
+        yr = ghash_reflected(&h, &hk, yr, rest);
         self::ctr(rk, block, c, rest.as_flattened_mut());
-        store(y, rbit(yp));
+        store(y, reflect(yr));
+    }
+
+    #[inline(always)]
+    fn wload(b: &[[u8; 16]; 2]) -> W {
+        // rr: escape(unsafe): b is 32 readable bytes; loadu takes any alignment.
+        unsafe { _mm256_loadu_si256(b.as_ptr().cast()) }
+    }
+
+    #[inline(always)]
+    fn wstore(b: &mut [[u8; 16]; 2], v: W) {
+        // rr: escape(unsafe): b is 32 writable bytes; storeu takes any alignment.
+        unsafe { _mm256_storeu_si256(b.as_mut_ptr().cast(), v) }
+    }
+
+    /// Each 128-bit lane of v reflected.
+    #[target_feature(enable = "aes,pclmulqdq,ssse3,avx,avx2,vaes,vpclmulqdq")]
+    fn wreflect(v: W) -> W {
+        let order = _mm_setr_epi8(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+        _mm256_shuffle_epi8(v, _mm256_broadcastsi128_si256(order))
+    }
+
+    /// The counter blocks from ctr on, two to each of s, as counters()
+    /// makes them.
+    #[target_feature(enable = "aes,pclmulqdq,ssse3,avx,avx2,vaes,vpclmulqdq")]
+    fn wcounters(base: V, ctr: u32, s: &mut [W; 4]) {
+        let first = ctr.cast_signed();
+        let second = ctr.wrapping_add(1).cast_signed();
+        let two = _mm256_set_epi32(0, 0, 0, 2, 0, 0, 0, 2);
+        let mut next = _mm256_add_epi32(
+            _mm256_broadcastsi128_si256(base),
+            _mm256_set_epi32(0, 0, 0, second, 0, 0, 0, first),
+        );
+        for x in s.iter_mut() {
+            *x = wreflect(next);
+            next = _mm256_add_epi32(next, two);
+        }
+    }
+
+    /// A round on both lanes, its key in both.
+    #[target_feature(enable = "aes,pclmulqdq,ssse3,avx,avx2,vaes,vpclmulqdq")]
+    fn wround(s: &mut [W; 4], k: V) {
+        let key = _mm256_broadcastsi128_si256(k);
+        for x in s.iter_mut() {
+            *x = _mm256_aesenc_epi128(*x, key);
+        }
+    }
+
+    #[target_feature(enable = "aes,pclmulqdq,ssse3,avx,avx2,vaes,vpclmulqdq")]
+    fn wfirst(s: &mut [W; 4], k: &[V; 11]) {
+        let key = _mm256_broadcastsi128_si256(k[0]);
+        for x in s.iter_mut() {
+            *x = _mm256_xor_si256(*x, key);
+        }
+    }
+
+    #[target_feature(enable = "aes,pclmulqdq,ssse3,avx,avx2,vaes,vpclmulqdq")]
+    fn wlast(s: &mut [W; 4], k: &[V; 11]) {
+        let key = _mm256_broadcastsi128_si256(k[10]);
+        for x in s.iter_mut() {
+            *x = _mm256_aesenclast_epi128(*x, key);
+        }
+    }
+
+    #[target_feature(enable = "aes,pclmulqdq,ssse3,avx,avx2,vaes,vpclmulqdq")]
+    fn waes(k: &[V; 11], s: &mut [W; 4]) {
+        wfirst(s, k);
+        for key in k.iter().skip(1).take(9) {
+            wround(s, *key);
+        }
+        wlast(s, k);
+    }
+
+    /// Both lanes of x with their halves XORed.
+    #[target_feature(enable = "aes,pclmulqdq,ssse3,avx,avx2,vaes,vpclmulqdq")]
+    fn whalves(x: W) -> W {
+        _mm256_xor_si256(x, _mm256_shuffle_epi32::<0x4e>(x))
+    }
+
+    /// kmul on both lanes.
+    #[target_feature(enable = "aes,pclmulqdq,ssse3,avx,avx2,vaes,vpclmulqdq")]
+    fn wkmul(acc: &mut [W; 3], x: W, h: W, hk: W) {
+        let [lo, mid, hi] = *acc;
+        *acc = [
+            _mm256_xor_si256(lo, _mm256_clmulepi64_epi128::<0x00>(x, h)),
+            _mm256_xor_si256(mid, _mm256_clmulepi64_epi128::<0x00>(whalves(x), hk)),
+            _mm256_xor_si256(hi, _mm256_clmulepi64_epi128::<0x11>(x, h)),
+        ];
+    }
+
+    /// The lanes' sums added, then reduced: the sum is linear, so one
+    /// reduction does for both.
+    #[target_feature(enable = "aes,pclmulqdq,ssse3,avx,avx2,vaes,vpclmulqdq")]
+    fn wfold(acc: [W; 3]) -> V {
+        let lanes =
+            |w: W| _mm_xor_si128(_mm256_castsi256_si128(w), _mm256_extracti128_si256::<1>(w));
+        fold(acc.map(lanes))
+    }
+
+    /// The powers in pairs for four vectors of two blocks: blocks 2j and
+    /// 2j + 1 of eight take H^(8 - 2j) and H^(7 - 2j).
+    #[target_feature(enable = "aes,pclmulqdq,ssse3,avx,avx2,vaes,vpclmulqdq")]
+    fn wpowers(h: &[V; 8], hk: &[V; 8], hw: &mut [W; 4], hkw: &mut [W; 4]) {
+        for (j, (p, q)) in hw.iter_mut().zip(hkw.iter_mut()).enumerate() {
+            // rr: escape(panic): j is below 4, so 7 - 2j and 6 - 2j are in
+            // the eight powers.
+            *p = _mm256_set_m128i(h[6 - 2 * j], h[7 - 2 * j]);
+            // rr: escape(panic): as above.
+            *q = _mm256_set_m128i(hk[6 - 2 * j], hk[7 - 2 * j]);
+        }
+    }
+
+    /// y, already XORed into x[0]'s first lane, times H^8 .. H for the
+    /// eight blocks of x.
+    #[target_feature(enable = "aes,pclmulqdq,ssse3,avx,avx2,vaes,vpclmulqdq")]
+    fn wghash(x: &[W; 4], hw: &[W; 4], hkw: &[W; 4]) -> V {
+        let mut acc = [_mm256_setzero_si256(); 3];
+        for ((xb, hp), kp) in x.iter().zip(hw).zip(hkw) {
+            wkmul(&mut acc, *xb, *hp, *kp);
+        }
+        wfold(acc)
+    }
+
+    /// Four vectors of AES chains with wghash of x between their rounds.
+    #[target_feature(enable = "aes,pclmulqdq,ssse3,avx,avx2,vaes,vpclmulqdq")]
+    fn waes_wghash(k: &[V; 11], s: &mut [W; 4], x: &[W; 4], hw: &[W; 4], hkw: &[W; 4]) -> V {
+        let mut acc = [_mm256_setzero_si256(); 3];
+        wfirst(s, k);
+        for (key, ((xb, hp), kp)) in k.iter().skip(1).zip(x.iter().zip(hw).zip(hkw)) {
+            wround(s, *key);
+            wkmul(&mut acc, *xb, *hp, *kp);
+        }
+        for key in k.iter().skip(5).take(5) {
+            wround(s, *key);
+        }
+        wlast(s, k);
+        wfold(acc)
+    }
+
+    /// The blocks of eight XORed with the key stream in s, two at a time;
+    /// s keeps what was stored.
+    #[target_feature(enable = "aes,pclmulqdq,ssse3,avx,avx2,vaes,vpclmulqdq")]
+    fn wxor_into(eight: &mut [[u8; 16]; 8], s: &mut [W; 4]) {
+        for (pair, ks) in eight.as_chunks_mut::<2>().0.iter_mut().zip(s) {
+            *ks = _mm256_xor_si256(wload(pair), *ks);
+            wstore(pair, *ks);
+        }
+    }
+
+    /// seal() with each turn on 256-bit vectors; the blocks after the
+    /// last whole turn take the 128-bit code.
+    #[target_feature(enable = "aes,pclmulqdq,ssse3,avx,avx2,vaes,vpclmulqdq")]
+    fn seal_wide(
+        rk: &RoundKeys,
+        tbl: &Table,
+        block: &[u8; 16],
+        ctr: u32,
+        blocks: &mut [[u8; 16]],
+        y: &mut [u8; 16],
+    ) {
+        let k = round_keys(rk);
+        let (h, hk) = powers(tbl);
+        let mut hw = [_mm256_setzero_si256(); 4];
+        let mut hkw = hw;
+        wpowers(&h, &hk, &mut hw, &mut hkw);
+        let base = reflect(load(block));
+        let mut yr = reflect(load(y));
+        let (eights, rest) = blocks.as_chunks_mut::<8>();
+        let mut c = ctr;
+        let mut s = [_mm256_setzero_si256(); 4];
+        let mut prev: Option<[W; 4]> = None;
+        for eight in eights {
+            wcounters(base, c, &mut s);
+            c = c.wrapping_add(8);
+            match prev {
+                Some(mut x) => {
+                    x[0] = _mm256_xor_si256(x[0], _mm256_zextsi128_si256(yr));
+                    yr = waes_wghash(k, &mut s, &x, &hw, &hkw);
+                }
+                None => waes(k, &mut s),
+            }
+            wxor_into(eight, &mut s);
+            prev = Some(s.map(|v| wreflect(v)));
+        }
+        if let Some(mut x) = prev {
+            x[0] = _mm256_xor_si256(x[0], _mm256_zextsi128_si256(yr));
+            yr = wghash(&x, &hw, &hkw);
+        }
+        self::ctr(rk, block, c, rest.as_flattened_mut());
+        yr = ghash_reflected(&h, &hk, yr, rest);
+        store(y, reflect(yr));
+    }
+
+    /// open() with each turn on 256-bit vectors.
+    #[target_feature(enable = "aes,pclmulqdq,ssse3,avx,avx2,vaes,vpclmulqdq")]
+    fn open_wide(
+        rk: &RoundKeys,
+        tbl: &Table,
+        block: &[u8; 16],
+        ctr: u32,
+        blocks: &mut [[u8; 16]],
+        y: &mut [u8; 16],
+    ) {
+        let k = round_keys(rk);
+        let (h, hk) = powers(tbl);
+        let mut hw = [_mm256_setzero_si256(); 4];
+        let mut hkw = hw;
+        wpowers(&h, &hk, &mut hw, &mut hkw);
+        let base = reflect(load(block));
+        let mut yr = reflect(load(y));
+        let (eights, rest) = blocks.as_chunks_mut::<8>();
+        let mut c = ctr;
+        let mut s = [_mm256_setzero_si256(); 4];
+        let mut x = s;
+        for eight in eights {
+            wcounters(base, c, &mut s);
+            c = c.wrapping_add(8);
+            for (v, pair) in x.iter_mut().zip(eight.as_chunks::<2>().0) {
+                *v = wreflect(wload(pair));
+            }
+            x[0] = _mm256_xor_si256(x[0], _mm256_zextsi128_si256(yr));
+            yr = waes_wghash(k, &mut s, &x, &hw, &hkw);
+            wxor_into(eight, &mut s);
+        }
+        yr = ghash_reflected(&h, &hk, yr, rest);
+        self::ctr(rk, block, c, rest.as_flattened_mut());
+        store(y, reflect(yr));
     }
 }
 
@@ -1312,10 +1488,6 @@ mod arch {
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 mod arch {
     use super::{RoundKeys, Table};
-
-    pub fn detect() -> u8 {
-        0
-    }
 
     // rr: escape(unsafe): a stub, the same signature as the real ones.
     pub unsafe fn ctr(_rk: &RoundKeys, _block: &[u8; 16], _ctr: u32, _data: &mut [u8]) {}
@@ -1353,9 +1525,9 @@ mod arch {
 
 /// What only aarch64 has two of: the asm loop and the intrinsics one.
 #[cfg(test)]
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 mod tests {
-    use super::{RoundKeys, Table, found};
+    use super::{FASTER, RoundKeys, Table, available, cpu};
     use test::Bencher;
 
     /// A key schedule and GHASH table of no key in particular.
@@ -1369,11 +1541,12 @@ mod tests {
         (rk, tbl)
     }
 
-    /// One 16 KiB record through aarch64's one-pass seal loop, the asm one
-    /// or the intrinsics one: where EOR3 is there both run, so a CPU shows
-    /// which is faster on it.
-    fn bench_loop(b: &mut Bencher, eor3: bool) {
-        if found() < 2 + u8::from(eor3) {
+    /// One 16 KiB record through the one-pass seal loop, the faster one
+    /// (aarch64's asm on EOR3, x86_64's on VAES) or the one every CPU
+    /// with the instructions takes: where the CPU has both, both run, so
+    /// it shows which is faster on it.
+    fn bench_loop(b: &mut Bencher, faster: bool) {
+        if !available() || (faster && !cpu::has(FASTER)) {
             return;
         }
         let (rk, tbl) = keys();
@@ -1381,26 +1554,26 @@ mod tests {
         let mut data = alloc::vec::Vec::new();
         data.resize(1024, [0x17; 16]);
         let mut y = [0; 16];
-        // rr: escape(unsafe): found() saw what each loop runs on.
-        b.iter(|| unsafe { super::arch::seal(&rk, &tbl, &block, 2, &mut data, &mut y, eor3) });
+        // rr: escape(unsafe): the CPU has what each loop runs on.
+        b.iter(|| unsafe { super::arch::seal(&rk, &tbl, &block, 2, &mut data, &mut y, faster) });
     }
 
     #[bench]
-    fn seal_loop_16k_asm(b: &mut Bencher) {
+    fn seal_loop_16k_faster(b: &mut Bencher) {
         bench_loop(b, true);
     }
 
     #[bench]
-    fn seal_loop_16k_intrinsics(b: &mut Bencher) {
+    fn seal_loop_16k_base(b: &mut Bencher) {
         bench_loop(b, false);
     }
 
-    /// On aarch64 with EOR3 both one-pass loops run here, the asm and the
-    /// intrinsics one other CPUs take: they agree on every block count to
-    /// past three turns, from a counter that wraps, and open undoes seal.
+    /// Where the CPU has the faster loop, both one-pass loops run here:
+    /// they agree on every block count to past three turns, from a
+    /// counter that wraps, and open undoes seal.
     #[test]
     fn both_loops_agree() {
-        if found() != 3 {
+        if !cpu::has(FASTER) {
             return;
         }
         let (rk, tbl) = keys();
@@ -1415,17 +1588,17 @@ mod tests {
             let plain = data;
             let (mut a, mut b) = (data, data);
             let (mut ya, mut yb, mut yo) = ([3; 16], [3; 16], [3; 16]);
-            // rr: escape(unsafe): found() saw AES, PMULL and EOR3.
+            // rr: escape(unsafe): the CPU has the faster loop's instructions.
             unsafe { super::arch::seal(&rk, &tbl, &block, start, &mut a[..n], &mut ya, true) };
-            // rr: escape(unsafe): found() saw AES and PMULL.
+            // rr: escape(unsafe): the CPU has the base loop's instructions.
             unsafe { super::arch::seal(&rk, &tbl, &block, start, &mut b[..n], &mut yb, false) };
             assert_eq!(a, b, "{n} blocks");
             assert_eq!(ya, yb, "{n} blocks");
-            // rr: escape(unsafe): found() saw AES, PMULL and EOR3.
+            // rr: escape(unsafe): the CPU has the faster loop's instructions.
             unsafe { super::arch::open(&rk, &tbl, &block, start, &mut a[..n], &mut yo, true) };
             assert_eq!(yo, ya, "{n} blocks");
             assert_eq!(a, plain);
-            // rr: escape(unsafe): found() saw AES and PMULL.
+            // rr: escape(unsafe): the CPU has the base loop's instructions.
             unsafe { super::arch::open(&rk, &tbl, &block, start, &mut b[..n], &mut yo, false) };
             assert_eq!(b, plain);
         }

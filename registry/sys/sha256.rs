@@ -3,29 +3,16 @@
 //! compress says whether it ran and the caller keeps its portable rounds.
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-use core::sync::atomic::{AtomicU8, Ordering};
-
-/// What detection found, kept so that the CPU is asked once.
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-const UNKNOWN: u8 = 0;
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-const ABSENT: u8 = 1;
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-const PRESENT: u8 = 2;
-
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-// rr: escape(shared): the CPU's answer, the same for every thread; a race
-// only asks it twice.
-static FOUND: AtomicU8 = AtomicU8::new(UNKNOWN);
+use crate::sys::cpu;
 
 /// Compresses blocks into state, true when the instructions ran; false,
 /// and state untouched, on a CPU without them.
 #[cfg(target_arch = "aarch64")]
 pub fn compress(state: &mut [u32; 8], blocks: &[[u8; 64]]) -> bool {
-    if !present() {
+    if !cpu::has(cpu::SHA256) {
         return false;
     }
-    // rr: escape(unsafe): present() found the SHA2 extension.
+    // rr: escape(unsafe): the CPU has the SHA2 extension.
     unsafe { arm::compress(state, blocks) };
     true
 }
@@ -34,115 +21,18 @@ pub fn compress(state: &mut [u32; 8], blocks: &[[u8; 64]]) -> bool {
 /// and state untouched, on a CPU without them.
 #[cfg(target_arch = "x86_64")]
 pub fn compress(state: &mut [u32; 8], blocks: &[[u8; 64]]) -> bool {
-    if !present() {
+    if !cpu::has(cpu::SHA256) {
         return false;
     }
-    // rr: escape(unsafe): present() found SHA-NI, SSSE3 and SSE4.1.
+    // rr: escape(unsafe): the CPU has SHA-NI, SSSE3 and SSE4.1.
     unsafe { x86::compress(state, blocks) };
     true
 }
 
 /// No SHA-256 instructions this code knows on this architecture.
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-pub fn compress(state: &mut [u32; 8], blocks: &[[u8; 64]]) -> bool {
-    let _ = (state, blocks);
+pub fn compress(_state: &mut [u32; 8], _blocks: &[[u8; 64]]) -> bool {
     false
-}
-
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-fn present() -> bool {
-    match FOUND.load(Ordering::Relaxed) {
-        PRESENT => true,
-        ABSENT => false,
-        _ => {
-            let found = detect();
-            FOUND.store(if found { PRESENT } else { ABSENT }, Ordering::Relaxed);
-            found
-        }
-    }
-}
-
-/// Every arm64 Mac has SHA2, and a build for a CPU with it needs no look.
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_feature = "sha2")
-))]
-fn detect() -> bool {
-    true
-}
-
-/// ID_AA64ISAR0_EL1's SHA2 field, bits 15:12: 1 is SHA-256, 2 adds
-/// SHA-512. Linux traps the read at EL0 and answers it, since 4.11.
-#[cfg(all(
-    target_arch = "aarch64",
-    target_os = "linux",
-    not(target_feature = "sha2")
-))]
-fn detect() -> bool {
-    let features: u64;
-    // rr: escape(unsafe): mrs of an ID register only reads it; the kernel
-    // emulates it for user space.
-    unsafe {
-        core::arch::asm!(
-            "mrs {}, ID_AA64ISAR0_EL1",
-            out(reg) features,
-            options(nomem, nostack, preserves_flags),
-        );
-    }
-    (features >> 12) & 0xf != 0
-}
-
-#[cfg(all(
-    target_arch = "aarch64",
-    target_os = "windows",
-    not(target_feature = "sha2")
-))]
-#[link(name = "kernel32", kind = "raw-dylib")]
-// rr: escape(unsafe): the signature is kernel32's, from its documentation.
-unsafe extern "system" {
-    // rr: escape(unsafe): it takes a number and reads nothing of ours.
-    safe fn IsProcessorFeaturePresent(feature: u32) -> i32;
-}
-
-/// Windows names AES, SHA-1 and SHA-256 together as the crypto feature.
-#[cfg(all(
-    target_arch = "aarch64",
-    target_os = "windows",
-    not(target_feature = "sha2")
-))]
-fn detect() -> bool {
-    const PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE: u32 = 30;
-    IsProcessorFeaturePresent(PF_ARM_V8_CRYPTO_INSTRUCTIONS_AVAILABLE) != 0
-}
-
-/// Other systems: no way to ask that this code knows.
-#[cfg(all(
-    target_arch = "aarch64",
-    not(any(target_os = "macos", target_os = "linux", target_os = "windows")),
-    not(target_feature = "sha2")
-))]
-fn detect() -> bool {
-    false
-}
-
-/// CPUID: leaf 1 for SSSE3 and SSE4.1, leaf 7 for SHA.
-#[cfg(target_arch = "x86_64")]
-fn detect() -> bool {
-    use core::arch::x86_64::__cpuid_count;
-    const SSSE3: u32 = 1 << 9;
-    const SSE41: u32 = 1 << 19;
-    const SHA: u32 = 1 << 29;
-    if __cpuid_count(0, 0).eax < 7 {
-        return false;
-    }
-    let basic = __cpuid_count(1, 0).ecx;
-    if basic & SSSE3 == 0 {
-        return false;
-    }
-    if basic & SSE41 == 0 {
-        return false;
-    }
-    __cpuid_count(7, 0).ebx & SHA != 0
 }
 
 #[cfg(target_arch = "aarch64")]
