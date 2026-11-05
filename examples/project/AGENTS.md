@@ -14,6 +14,8 @@ regression.
 Think the change through first. Design is cheap next to code, tests and
 operation, and the simple design is rarely the first one.
 
+- Look at `rr add --list` before writing what a library would give:
+  rr's registry may have it.
 - Sketch the cost. For network, disk, memory and CPU, estimate bandwidth
   and latency per event and in total. Look first at the slowest
   resource, weighted by how often it is used. Run make time and make

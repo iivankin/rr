@@ -1,0 +1,121 @@
+{
+  "components": [
+    {
+      "name": "aesgcm",
+      "description": "AES-128-GCM (NIST SP 800-38D, TLS 1.3's 12-byte nonce and 16-byte tag), sealed and opened in place, on AES and carry-less multiply instructions where the CPU has them and constant-time portable code elsewhere.",
+      "dependencies": []
+    },
+    {
+      "name": "dns",
+      "description": "DNS wire format (RFC 1035) for a stub resolver without I/O: A and AAAA queries with EDNS0, replies checked against them with CNAME chains and compression pointers bounded, and TCP's length framing.",
+      "dependencies": []
+    },
+    {
+      "name": "ecdsa",
+      "description": "ECDSA signature verification on P-256 and P-384 (FIPS 186-4, SEC 1): strict DER signatures, uncompressed keys checked on the curve, Montgomery field arithmetic with P-256's special reduction and NAF double-scalar multiplies.",
+      "dependencies": []
+    },
+    {
+      "name": "file",
+      "description": "Files on Linux by the kernel's own calls, for components that read the system's configuration: open a path, read a file whole up to a limit, a descriptor closed on drop. Nothing on macOS and Windows.",
+      "dependencies": []
+    },
+    {
+      "name": "http1",
+      "description": "HTTP/1.1 client side (RFC 9112) without I/O: requests written into a buffer, and an incremental response parser that takes any split of the input and hands body bytes back uncopied, for Content-Length, chunked and close-delimited bodies.",
+      "dependencies": []
+    },
+    {
+      "name": "resolve",
+      "description": "Host lookup that never blocks the caller's loop, one API on Linux, macOS and Windows: start, poll, take the addresses, drop to cancel. Linux runs resolver (Go's own resolver) on raw system calls and hands its sockets and deadline to the caller's poll; macOS runs getaddrinfo on a thread; Windows runs GetAddrInfoW on a thread, as Go does; on both, the thread signals through wait, which the caller's poll takes beside its own descriptors.",
+      "dependencies": [
+        "resolver",
+        "wait",
+        "file"
+      ]
+    },
+    {
+      "name": "resolver",
+      "description": "A stub resolver that behaves as Go's, without I/O: resolv.conf, /etc/hosts and nsswitch.conf parsed as Go parses them, files and DNS ordered as Go orders them, one name's lookup as a state machine (search list, A and AAAA, servers rotated, UDP then TCP, timeouts and attempts), and RFC 6724 address order.",
+      "dependencies": [
+        "dns"
+      ]
+    },
+    {
+      "name": "roots",
+      "description": "Mozilla's trust anchors for TLS servers from NSS's certdata.txt at a release tag (MPL 2.0), with Mozilla's distrust-after dates, embedded as PEM and loaded into an x509::Store; scripts/roots-gen.py rebuilds the file from a newer tag.",
+      "dependencies": [
+        "x509"
+      ]
+    },
+    {
+      "name": "rsa",
+      "description": "RSA signature verification (RFC 8017): RSASSA-PKCS1-v1_5 and RSASSA-PSS with MGF1 and a salt of the hash's length, SHA-256 or SHA-384, for moduli of 2048 to 4096 bits and exponents of at most 33 bits.",
+      "dependencies": [
+        "sha256",
+        "sha384"
+      ]
+    },
+    {
+      "name": "sha256",
+      "description": "SHA-256 (FIPS 180-4), HMAC-SHA256 (RFC 2104) and HKDF-SHA256 (RFC 5869), with SHA instructions where the CPU has them.",
+      "dependencies": []
+    },
+    {
+      "name": "sha384",
+      "description": "SHA-384 (FIPS 180-4), HMAC-SHA384 (RFC 2104) and HKDF-SHA384 (RFC 5869), in portable code.",
+      "dependencies": []
+    },
+    {
+      "name": "tls",
+      "description": "A TLS 1.3 client (RFC 8446) without I/O: TLS_AES_128_GCM_SHA256 with an X25519 key share, ECDSA and RSA-PSS server signatures, SNI, ALPN, HelloRetryRequest, KeyUpdate and close_notify; bytes in any split, application records opened in place in the receive buffer and sealed in place in the pending one.",
+      "dependencies": [
+        "sha256",
+        "aesgcm",
+        "x25519",
+        "x509"
+      ],
+      "options": [
+        {
+          "name": "roots",
+          "default": "system",
+          "choices": [
+            "system",
+            "system-mozilla",
+            "mozilla",
+            "none"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "trust",
+      "description": "TLS server authentication by the operating system's trust, as Go's crypto/x509 does it: macOS's SecTrustEvaluateWithError and Windows's CertGetCertificateChain with the SSL policy, on a thread a poll loop waits on, and on Linux x509::verify against the system's anchors (its bundle and certificate directories, or SSL_CERT_FILE and SSL_CERT_DIR, read on raw system calls). system() also loads the anchors themselves on all three: macOS's trust domains with their SSL trust settings, Windows's ROOT store less what is disabled for server authentication or Disallowed.",
+      "dependencies": [
+        "x509",
+        "wait",
+        "file"
+      ]
+    },
+    {
+      "name": "wait",
+      "description": "What a poll loop waits on, one type on every system and for every component that works while the loop runs: descriptors (sockets on Windows) and a timeout; block and ready to wait on it with poll or WSAPoll; and on macOS and Windows a pool of at most 32 threads with a cancellable FIFO line, and the close-on-exec pipe or non-inherited loopback socket pair that says the work is done.",
+      "dependencies": []
+    },
+    {
+      "name": "x25519",
+      "description": "X25519 key agreement (RFC 7748): a constant-time Montgomery ladder over five 51-bit limbs.",
+      "dependencies": []
+    },
+    {
+      "name": "x509",
+      "description": "X.509 (RFC 5280) for TLS server authentication without I/O: a strict DER parser that borrows the certificate, a store of trust anchors from PEM or DER, and chain verification for a host at a given time, with paths built through intermediates in any order, name constraints as Go enforces them, bounded depth and signature checks, and the leaf's key for TLS 1.3's CertificateVerify.",
+      "dependencies": [
+        "sha256",
+        "sha384",
+        "ecdsa",
+        "rsa"
+      ]
+    }
+  ]
+}

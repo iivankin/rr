@@ -97,9 +97,18 @@ pub fn peek(sess: &rustc_session::Session, statement: Span, call: Span, kind: &'
 /// The reason for kind, and where the one that names it starts.
 fn find(sess: &rustc_session::Session, statement: Span, call: Span, kind: &'static str) -> (Escape, Option<BytePos>) {
     let source_map = sess.source_map();
+    // A reason is written where the code is, not inside a macro: a span
+    // from an expansion, such as write!'s, stands for its call site.
+    let statement = statement.source_callsite();
     let file = source_map.lookup_source_file(statement.lo());
     let Some(source) = &file.src else {
         return (Escape::Missing, None);
+    };
+    let call = call.source_callsite();
+    let call = if call.lo() >= file.start_pos && call.lo() <= file.end_position() {
+        call
+    } else {
+        statement
     };
     let start = (statement.lo() - file.start_pos).to_usize();
     let call_start = (call.lo() - file.start_pos).to_usize();

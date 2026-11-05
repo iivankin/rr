@@ -1,0 +1,7 @@
+{
+  "name": "ecdsa",
+  "description": "ECDSA signature verification on P-256 and P-384 (FIPS 186-4, SEC 1): strict DER signatures, uncompressed keys checked on the curve, Montgomery field arithmetic with P-256's special reduction and NAF double-scalar multiplies.",
+  "rr": "0.3.2",
+  "dependencies": [],
+  "files": [{ "path": "ecdsa.rs" }]
+}

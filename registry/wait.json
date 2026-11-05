@@ -1,0 +1,7 @@
+{
+  "name": "wait",
+  "description": "What a poll loop waits on, one type on every system and for every component that works while the loop runs: descriptors (sockets on Windows) and a timeout; block and ready to wait on it with poll or WSAPoll; and on macOS and Windows a pool of at most 32 threads with a cancellable FIFO line, and the close-on-exec pipe or non-inherited loopback socket pair that says the work is done.",
+  "rr": "0.3.2",
+  "dependencies": [],
+  "files": [{ "path": "sys/wait.rs" }]
+}

@@ -1,0 +1,7 @@
+{
+  "name": "dns",
+  "description": "DNS wire format (RFC 1035) for a stub resolver without I/O: A and AAAA queries with EDNS0, replies checked against them with CNAME chains and compression pointers bounded, and TCP's length framing.",
+  "rr": "0.3.2",
+  "dependencies": [],
+  "files": [{ "path": "dns.rs" }]
+}

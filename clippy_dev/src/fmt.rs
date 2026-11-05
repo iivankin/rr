@@ -276,7 +276,7 @@ fn run_rustfmt(update_mode: UpdateMode) {
             let e = expect_action(e, ErrAction::Read, ".");
             // Programs written in restricted Rust keep rr fmt's style, not
             // this repository's.
-            let rr_program = e.path().starts_with("./examples/corpus");
+            let rr_program = e.path().starts_with("./examples/corpus") || e.path().starts_with("./registry");
             (!rr_program && e.path().as_os_str().as_encoded_bytes().ends_with(b".rs"))
                 .then(|| e.into_path().into_os_string())
         })

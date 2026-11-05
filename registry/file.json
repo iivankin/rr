@@ -1,0 +1,7 @@
+{
+  "name": "file",
+  "description": "Files on Linux by the kernel's own calls, for components that read the system's configuration: open a path, read a file whole up to a limit, a descriptor closed on drop. Nothing on macOS and Windows.",
+  "rr": "0.3.2",
+  "dependencies": [],
+  "files": [{ "path": "sys/file.rs" }]
+}

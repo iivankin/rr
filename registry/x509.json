@@ -1,0 +1,7 @@
+{
+  "name": "x509",
+  "description": "X.509 (RFC 5280) for TLS server authentication without I/O: a strict DER parser that borrows the certificate, a store of trust anchors from PEM or DER, and chain verification for a host at a given time, with paths built through intermediates in any order, name constraints as Go enforces them, bounded depth and signature checks, and the leaf's key for TLS 1.3's CertificateVerify.",
+  "rr": "0.3.2",
+  "dependencies": ["sha256", "sha384", "ecdsa", "rsa"],
+  "files": [{ "path": "x509.rs" }, { "path": "x509-tests.pem" }]
+}

@@ -12,13 +12,20 @@ pub struct Scratch {
 
 impl Scratch {
     pub fn new() -> io::Result<Self> {
-        let path = std::env::temp_dir().join(format!(
-            "rr-check-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path)?;
-        Ok(Self { path })
+        // A directory of an earlier process with the same id may be
+        // left: take the next name.
+        loop {
+            let path = std::env::temp_dir().join(format!(
+                "rr-check-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {},
+                Err(error) => return Err(error),
+            }
+        }
     }
 }
 

@@ -1407,3 +1407,16 @@ fn a_hot_path_sees_a_copy_whatever_its_form() {
         "#![no_std]\n#[derive(Clone, Copy)]\npub struct Item { pub pos: u32, pub w: u32 }\n#[rr::hot]\npub fn hot(input: &[Item], out: &mut [u32]) {\n for (o, it) in out.iter_mut().zip(input) {\n *o = it.pos + it.w;\n }\n}",
     );
 }
+
+#[test]
+fn a_buffer_written_with_a_macro_in_a_loop_takes_its_reason_beside_the_code() {
+    // The macro's expansion lies in another file; the reason is looked
+    // for where the call is written, and rr does not panic on it.
+    let body = |reason: &str| {
+        format!(
+            "#![no_std]\nextern crate alloc;\nuse core::fmt::Write as _;\npub fn lines(hosts: &[&str]) -> usize {{\n    let mut n = 0;\n    for host in hosts {{\n        {reason}\n        let mut line = alloc::string::String::new();\n        if write!(line, \"{{host}}\\n\").is_err() {{\n            return 0;\n        }}\n        n += line.len();\n    }}\n    n\n}}\n"
+        )
+    };
+    rejected(&body(""), "rr_unexplained_escape");
+    accepted(&body("// rr: escape(alloc): each line is handed on whole."));
+}

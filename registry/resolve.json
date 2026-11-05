@@ -1,0 +1,7 @@
+{
+  "name": "resolve",
+  "description": "Host lookup that never blocks the caller's loop, one API on Linux, macOS and Windows: start, poll, take the addresses, drop to cancel. Linux runs resolver (Go's own resolver) on raw system calls and hands its sockets and deadline to the caller's poll; macOS runs getaddrinfo on a thread; Windows runs GetAddrInfoW on a thread, as Go does; on both, the thread signals through wait, which the caller's poll takes beside its own descriptors.",
+  "rr": "0.3.2",
+  "dependencies": ["resolver", "wait", "file"],
+  "files": [{ "path": "sys/resolve.rs" }]
+}

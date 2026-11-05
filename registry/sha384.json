@@ -1,0 +1,7 @@
+{
+  "name": "sha384",
+  "description": "SHA-384 (FIPS 180-4), HMAC-SHA384 (RFC 2104) and HKDF-SHA384 (RFC 5869), in portable code.",
+  "rr": "0.3.2",
+  "dependencies": [],
+  "files": [{ "path": "sha384.rs" }]
+}

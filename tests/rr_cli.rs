@@ -205,3 +205,137 @@ fn fuz_cannot_override_native_output_through_an_argument_file() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported flag: -o"));
     assert!(!project.0.join("keep-me").exists());
 }
+
+#[test]
+fn add_copies_a_component_and_what_it_needs_and_keeps_changed_code() {
+    let project = Project::new();
+    let registry = project.0.join("registry");
+    fs::create_dir_all(registry.join("sys")).unwrap();
+    fs::write(
+        registry.join("hash.json"),
+        r#"{"name": "hash", "rr": "0.0.1", "files": [{"path": "hash.rs"}, {"path": "sys/hash.rs"}]}"#,
+    )
+    .unwrap();
+    fs::write(registry.join("hash.rs"), "pub fn hash() {}\n").unwrap();
+    fs::write(registry.join("sys/hash.rs"), "pub fn fast() {}\n").unwrap();
+    fs::write(
+        registry.join("tls.json"),
+        r#"{"name": "tls", "dependencies": ["hash"], "files": [{"path": "tls/mod.rs", "content": "pub fn tls() {}\n"}]}"#,
+    )
+    .unwrap();
+    fs::create_dir(project.0.join("src")).unwrap();
+    fs::write(project.0.join("src/main.rs"), "mod hash;\n").unwrap();
+
+    let output = project.rr(&["add", "registry/tls.json"]);
+    success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        fs::read_to_string(project.0.join("src/hash.rs")).unwrap(),
+        "pub fn hash() {}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(project.0.join("src/sys/hash.rs")).unwrap(),
+        "pub fn fast() {}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(project.0.join("src/tls/mod.rs")).unwrap(),
+        "pub fn tls() {}\n"
+    );
+    // The root declares hash already; tls and the sys module are still to write.
+    assert!(stdout.contains("mod tls;"), "{stdout}");
+    assert!(stdout.contains("each file of sys"), "{stdout}");
+    assert!(
+        !stdout.contains("mod hash;                  in the crate root"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("rr add: hash, tls"), "{stdout}");
+
+    // Again: nothing changes. A file the project changed stops the add,
+    // before anything is written, until --overwrite.
+    success(&project.rr(&["add", "registry/tls.json"]));
+    fs::write(project.0.join("src/hash.rs"), "pub fn mine() {}\n").unwrap();
+    fs::remove_file(project.0.join("src/tls/mod.rs")).unwrap();
+    let output = project.rr(&["add", "registry/tls.json"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--overwrite"));
+    assert!(!project.0.join("src/tls/mod.rs").exists());
+    success(&project.rr(&["add", "--overwrite", "registry/tls.json"]));
+    assert_eq!(
+        fs::read_to_string(project.0.join("src/hash.rs")).unwrap(),
+        "pub fn hash() {}\n"
+    );
+
+    // A component that needs a newer rr, or writes outside src, is refused.
+    fs::write(
+        registry.join("new.json"),
+        r#"{"name": "new", "rr": "99.0.0", "files": []}"#,
+    )
+    .unwrap();
+    let output = project.rr(&["add", "registry/new.json"]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("needs rr 99.0.0"));
+    fs::write(
+        registry.join("out.json"),
+        r#"{"name": "out", "files": [{"path": "../evil.rs", "content": ""}]}"#,
+    )
+    .unwrap();
+    let output = project.rr(&["add", "registry/out.json"]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("leaves the source directory"));
+    assert!(!project.0.join("evil.rs").exists());
+}
+
+#[test]
+fn add_asks_its_questions_through_options_and_puts_scripts_in_scripts() {
+    let project = Project::new();
+    let registry = project.0.join("registry");
+    fs::create_dir_all(&registry).unwrap();
+    for name in ["system", "builtin"] {
+        fs::write(
+            registry.join(format!("{name}.json")),
+            format!(r#"{{"name": "{name}", "files": [{{"path": "{name}.rs", "content": "pub fn {name}() {{}}\n"}}]}}"#),
+        )
+        .unwrap();
+    }
+    fs::write(
+        registry.join("tls.json"),
+        r#"{"name": "tls", "files": [{"path": "tls.rs", "content": ""}, {"path": "gen.py", "target": "scripts", "content": "print(1)\n"}],
+            "options": [{"name": "roots", "question": "Which roots?", "default": "system", "choices": [
+                {"value": "system", "dependencies": ["system"]},
+                {"value": "builtin", "dependencies": ["builtin"]},
+                {"value": "none"}]}]}"#,
+    )
+    .unwrap();
+    // Without a terminal the default is taken, and the way to choose said.
+    let output = project.rr(&["add", "registry/tls.json"]);
+    success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--option roots=VALUE"), "{stdout}");
+    assert!(stdout.contains("rr add: system, tls (roots=system)"), "{stdout}");
+    assert!(project.0.join("src/system.rs").is_file());
+    assert!(!project.0.join("src/builtin.rs").exists());
+    assert_eq!(
+        fs::read_to_string(project.0.join("scripts/gen.py")).unwrap(),
+        "print(1)\n"
+    );
+    assert!(!project.0.join("src/gen.py").exists());
+
+    success(&project.rr(&["add", "--option", "roots=builtin", "registry/tls.json"]));
+    assert!(project.0.join("src/builtin.rs").is_file());
+    let output = project.rr(&["add", "--option", "roots=other", "registry/tls.json"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("one of system, builtin, none"));
+}
+
+#[test]
+fn add_lists_a_registrys_components_with_what_they_need_and_ask() {
+    let project = Project::new();
+    let index = env!("CARGO_MANIFEST_DIR").to_owned() + "/registry/index.json";
+    let output = project.rr(&["add", "--list", &index]);
+    success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("tls  A TLS 1.3 client"), "{stdout}");
+    assert!(stdout.contains("needs: sha256, aesgcm, x25519, x509"), "{stdout}");
+    assert!(
+        stdout.contains("asks: --option roots=system|system-mozilla|mozilla|none (default system)"),
+        "{stdout}"
+    );
+}

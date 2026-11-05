@@ -5,6 +5,9 @@ use std::{env, io};
 #[path = "rr_cli/workspace.rs"]
 mod workspace;
 
+#[path = "rr_cli/add.rs"]
+mod add;
+
 #[path = "rr_cli/fuz.rs"]
 mod fuz;
 
@@ -22,6 +25,9 @@ mod test;
 
 #[path = "rr_cli/target.rs"]
 mod target;
+
+/// What rr add compares with the rr a component was checked with.
+pub const VERSION: &str = "0.4.0";
 
 pub fn main() -> ExitCode {
     match run() {
@@ -43,10 +49,11 @@ fn subcommand(raw0: &str, args: &[String]) -> Option<io::Result<ExitCode>> {
             Ok(ExitCode::SUCCESS)
         },
         "--version" | "-V" => {
-            println!("rr 0.3.2 (Restricted Rust; Clippy and rustc 1.99.1, 58cf8f9c3)");
+            println!("rr {VERSION} (Restricted Rust; Clippy and rustc 1.99.1, 58cf8f9c3)");
             Ok(ExitCode::SUCCESS)
         },
         "init" => workspace::init(rest),
+        "add" => add::run(rest),
         "fmt" => fmt::run(rest),
         "fuz" => fuz::run(rest),
         "prof" => prof::run(rest),
@@ -221,6 +228,6 @@ fn canonical(path: &Path) -> io::Result<PathBuf> {
 
 fn help() {
     println!(
-        "rr — Restricted Rust\n\nUsage:\n  rr FILE [RUSTC FLAGS]          Compile with restrictions\n  rr build FILE [RUSTC FLAGS]    Compile with restrictions\n  rr check FILE [RUSTC FLAGS]    Check without build artifacts\n  rr lint FILE [RUSTC FLAGS]     Check with Clippy lints too\n  rr fmt [--check] FILE...       Format a crate (--check: show what differs)\n  rr init [DIR] [--lib]          Create a project (or src/lib.rs alone)\n  rr test FILE [--check|--lint] [FLAGS] [-- FILTER]\n                                 Build and run the crate's #[test] items\n  rr bench FILE [FLAGS] [-- FILTER]\n                                 Measure the crate's #[bench] items\n  rr fuz FILE --target PATH [FLAGS] -- [ARGS]\n                                 Fuzz the crate's function at PATH\n  rr fuz FILE [FLAGS] -- [ARGS]  Build and run a libFuzzer harness\n  rr fuz init [DIR]             Create fuz.rs, corpus/ and artifacts/\n  rr build --prof FILE ...       Build to record allocations and copies by stack\n  rr prof -- COMMAND [ARGS]      Run COMMAND and report where it allocates and copies\n  rr time -- COMMAND [ARGS]      Run COMMAND a few times and report how long it took\n\nNo Cargo or project manifest. Edition 2024 and panic=abort by default.\nUse -O, -o, --crate-type, --target, --extern and -L like rustc.\nRequires no_std. Type/const generic definitions, impl Trait, dyn Trait,\ncomplex traits, async/await and macros (except no_std compiler builtins and core panic/assert) are forbidden.\nEscape hatches require an adjacent // rr: escape(kind): <reason> naming their kind.\nBundled sysroot is selected automatically; --sysroot can override it."
+        "rr — Restricted Rust\n\nUsage:\n  rr FILE [RUSTC FLAGS]          Compile with restrictions\n  rr build FILE [RUSTC FLAGS]    Compile with restrictions\n  rr check FILE [RUSTC FLAGS]    Check without build artifacts\n  rr lint FILE [RUSTC FLAGS]     Check with Clippy lints too\n  rr fmt [--check] FILE...       Format a crate (--check: show what differs)\n  rr init [DIR] [--lib]          Create a project (or src/lib.rs alone)\n  rr add COMPONENT...            Copy a registry component into src/\n  rr test FILE [--check|--lint] [FLAGS] [-- FILTER]\n                                 Build and run the crate's #[test] items\n  rr bench FILE [FLAGS] [-- FILTER]\n                                 Measure the crate's #[bench] items\n  rr fuz FILE --target PATH [FLAGS] -- [ARGS]\n                                 Fuzz the crate's function at PATH\n  rr fuz FILE [FLAGS] -- [ARGS]  Build and run a libFuzzer harness\n  rr fuz init [DIR]             Create fuz.rs, corpus/ and artifacts/\n  rr build --prof FILE ...       Build to record allocations and copies by stack\n  rr prof -- COMMAND [ARGS]      Run COMMAND and report where it allocates and copies\n  rr time -- COMMAND [ARGS]      Run COMMAND a few times and report how long it took\n\nNo Cargo or project manifest. Edition 2024 and panic=abort by default.\nUse -O, -o, --crate-type, --target, --extern and -L like rustc.\nRequires no_std. Type/const generic definitions, impl Trait, dyn Trait,\ncomplex traits, async/await and macros (except no_std compiler builtins and core panic/assert) are forbidden.\nEscape hatches require an adjacent // rr: escape(kind): <reason> naming their kind.\nBundled sysroot is selected automatically; --sysroot can override it."
     );
 }

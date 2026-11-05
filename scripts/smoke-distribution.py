@@ -109,6 +109,46 @@ with tempfile.TemporaryDirectory(prefix="rr-relocated-", dir=os.environ.get("TMP
                                   text=True, encoding="utf-8", errors="replace", capture_output=True)
             if done.returncode != 0:
                 raise AssertionError(f"{program.name}: make {' '.join(targets)}\n{done.stdout}\n{done.stderr}")
+    # Every component of the registry in one project, on this machine's
+    # CPU: rr add, then the template's checks. Their tests compare the
+    # paths on CPU instructions with the portable ones.
+    registry = Path(__file__).resolve().parent.parent / "registry"
+    run("init", "components")
+    components = root / "components"
+    names = sorted(p.stem for p in registry.glob("*.json") if p.name != "index.json")
+    # The index rr add --list reads is the components' own.
+    subprocess.run([sys.executable, str(registry.parent / "scripts" / "registry-index.py"), "--check"], check=True)
+    listed = run("add", "--list", str(registry / "index.json")).stdout
+    assert all(f"{name}  " in listed for name in names) and "asks: --option roots=" in listed, listed
+    for name in names:
+        done = subprocess.run([str(rr), "add", str(registry / f"{name}.json")], cwd=components, env=env,
+                              text=True, encoding="utf-8", errors="replace", capture_output=True)
+        if done.returncode != 0:
+            raise AssertionError(f"rr add {name}\n{done.stdout}\n{done.stderr}")
+    main = components / "src" / "main.rs"
+    roots = sorted({(p.parts[0][:-3] if p.parts[0].endswith(".rs") else p.parts[0]) for p in
+                    (f.relative_to(components / "src") for f in (components / "src").rglob("*.rs"))
+                    if p.parts[0] not in ("main.rs", "greet.rs", "sys")})
+    text = main.read_text()
+    main.write_text(text.replace("mod greet;\n", "mod greet;\n" + "".join(f"mod {m};\n" for m in roots), 1))
+    for system in ("macos", "linux", "windows"):
+        own = components / "src" / "sys" / f"{system}.rs"
+        added = sorted(p.stem for p in (components / "src" / "sys").glob("*.rs")
+                       if p.stem not in ("macos", "linux", "windows"))
+        own.write_text(own.read_text() + "".join(f"\npub mod {m};\n" for m in added))
+    run("fmt", "components/src/main.rs")
+    for f in (components / "src").rglob("*.rs"):
+        source = registry / f.relative_to(components / "src")
+        if source.is_file() and source.read_text() != f.read_text():
+            raise AssertionError(f"rr fmt changes registry/{source.relative_to(registry)}")
+    for targets in (("check", "lint"), ("test",), ("bench",)):
+        done = subprocess.run(["make", f"RR={link}", *targets], cwd=components, env=env,
+                              text=True, encoding="utf-8", errors="replace", capture_output=True)
+        if done.returncode != 0:
+            raise AssertionError(f"components: make {' '.join(targets)}\n{done.stdout}\n{done.stderr}")
+        if targets == ("bench",):
+            # The numbers of this CPU, for the log.
+            print("\n".join(l for l in done.stdout.splitlines() if l.startswith("bench ")))
     run("init", "library", "--lib")
     run("build", "library/src/lib.rs", "--crate-name", "dep", "-o", "libdep.rlib")
     (root / "local.rs").write_text("pub fn offset() -> u32 { 1 }\n")
