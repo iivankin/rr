@@ -1,0 +1,64 @@
+name: Registry
+
+# Runs scripts/registry-check.sh on every component of registry/ with the
+# published rr, on each host: their code for the CPU and the system
+# compiles only where it is checked, and their tests and benches run on
+# what the runner has. Each job first says what CPU it is on and what of
+# it the components use. A push of any branch that changes them runs it,
+# so a change is checked on every host before it reaches main, which rr
+# add serves.
+on:
+  push:
+    paths:
+      - 'registry/**'
+      - 'scripts/registry-check.sh'
+      - '.github/workflows/rr-registry.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, ubuntu-24.04, ubuntu-24.04-arm, windows-2025, windows-11-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - name: Checkout rr
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The CPU
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux)
+              grep -m1 -E 'model name|CPU part' /proc/cpuinfo || true
+              grep -m1 -E '^(flags|Features)' /proc/cpuinfo | tr ' ' '\n' \
+                | grep -xE 'aes|pclmulqdq|ssse3|avx2|vaes|vpclmulqdq|sha_ni|pmull|sha2|sha3|sha512' \
+                | tr '\n' ' '; echo ;;
+            macOS) sysctl -n machdep.cpu.brand_string ;;
+            Windows) powershell -NoProfile -Command '(Get-CimInstance Win32_Processor).Name' ;;
+          esac
+      - name: rr, by install.sh
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          sh install.sh < /dev/null
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: rr, by install.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:RR_INSTALL = "$env:RUNNER_TEMP\rr"
+          ./install.ps1
+          Add-Content -Path $env:GITHUB_PATH -Value $env:RR_INSTALL
+      - name: Every component, together
+        shell: bash
+        run: |
+          rr --version
+          names=$(ls registry/*.json | sed 's|registry/||; s|\.json$||' | grep -vx index)
+          scripts/registry-check.sh "$RUNNER_TEMP/registry" $names
