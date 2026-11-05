@@ -34,7 +34,11 @@ def build(rustc, destination, target):
         (crate / 'src').mkdir(parents=True)
         (crate / 'Cargo.toml').write_text(
             '[package]\nname = "rr_sysroot"\nversion = "0.0.0"\nedition = "2024"\n\n'
-            '[profile.release]\npanic = "abort"\nopt-level = 2\ncodegen-units = 1\n')
+            '[profile.release]\npanic = "abort"\nopt-level = 2\ncodegen-units = 1\n\n'
+            # As Rust's own library/Cargo.toml has it: each intrinsic in an
+            # object of its own, so that a definition elsewhere, such as rr
+            # prof's memcpy, takes its place instead of clashing with it.
+            '[profile.release.package.compiler_builtins]\ncodegen-units = 10000\n')
         (crate / 'src/lib.rs').write_text('#![no_std]\n')
         flags = '-Cembed-bitcode=yes'
         if rr_target:
