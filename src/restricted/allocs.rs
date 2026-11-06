@@ -22,7 +22,7 @@ use rustc_span::{Span, Symbol};
 use super::calls::{Call, Graph, name};
 use super::comments::{has_escape_reason, note};
 use super::copies::{copy, fresh, of_param, owned_container, params, std_def, takes_mut_self};
-use super::{RR_HOT_PATH, RR_UNEXPLAINED_ESCAPE};
+use super::{RR_HOT_PATH, RR_LOOP_BUFFER, RR_UNEXPLAINED_ESCAPE};
 
 #[derive(Default)]
 pub struct Allocs {
@@ -37,7 +37,7 @@ pub struct Allocs {
     summaries: super::copyflow::Summaries,
 }
 
-impl_lint_pass!(Allocs => [RR_UNEXPLAINED_ESCAPE, RR_HOT_PATH]);
+impl_lint_pass!(Allocs => [RR_UNEXPLAINED_ESCAPE, RR_HOT_PATH, RR_LOOP_BUFFER]);
 
 impl<'tcx> LateLintPass<'tcx> for Allocs {
     fn check_local(&mut self, cx: &LateContext<'tcx>, local: &'tcx LetStmt<'tcx>) {
@@ -45,23 +45,21 @@ impl<'tcx> LateLintPass<'tcx> for Allocs {
             return;
         }
         let Some(write) = loop_buffer(cx, local) else { return };
-        if reason(cx, local.hir_id, local.span, "alloc") || reason(cx, write.hir_id, write.span, "alloc") {
+        // A reason of kind alloc beside it is spent on it, so that it is not
+        // reported again as answering nothing; it answers nothing here.
+        reason(cx, local.hir_id, local.span, "alloc");
+        reason(cx, write.hir_id, write.span, "alloc");
+        // A hot path has reported it as scratch already.
+        if local.init.is_some_and(|init| self.reported.contains(&init.hir_id)) {
             return;
         }
         span_lint_and_then(
             cx,
-            RR_UNEXPLAINED_ESCAPE,
+            RR_LOOP_BUFFER,
             local.span,
-            "a buffer made again on every turn of the loop needs an ownership justification",
+            "a buffer made and freed again on every turn of the loop",
             |diag| {
-                diag.help("make it once before the loop and clear() it at the top of each turn");
-                note(
-                    diag,
-                    cx.sess(),
-                    statement(cx, local.hir_id, local.span),
-                    local.span,
-                    "alloc",
-                );
+                diag.help("make it once before the loop and clear() it at the top of each turn; a reason beside it does not answer this");
             },
         );
     }
@@ -391,8 +389,9 @@ fn whole_copy<'tcx>(
     }
 }
 
-/// What at e makes a new buffer, by name, for a hot path. A fresh buffer
-/// counts only once something writes to it: `Vec::new()` alone is free.
+/// What at e makes a new buffer, by name, for a hot path. A fresh buffer,
+/// map or set counts only once something writes to it: `Vec::new()` alone
+/// is free.
 fn birth<'tcx>(cx: &LateContext<'tcx>, typeck: &TypeckResults<'tcx>, e: &'tcx Expr<'tcx>) -> Option<&'static str> {
     let owned = || owned_container(cx, typeck.expr_ty(e));
     match e.kind {
@@ -408,6 +407,10 @@ fn birth<'tcx>(cx: &LateContext<'tcx>, typeck: &TypeckResults<'tcx>, e: &'tcx Ex
                     Some("a new Box, Rc or Arc")
                 },
                 "new" if owned() && written_fresh(cx, typeck, e) => Some("a new buffer, written here"),
+                // A B-tree map or set allocates a node as it fills.
+                "new" if super::bounds::growable(cx, typeck.expr_ty(e)) && written_fresh(cx, typeck, e) => {
+                    Some("a new map or set, written here")
+                },
                 "from" if owned() => Some("an owned value made from another"),
                 "format" => Some("formatting into a new String"),
                 _ => None,
@@ -425,6 +428,131 @@ fn birth<'tcx>(cx: &LateContext<'tcx>, typeck: &TypeckResults<'tcx>, e: &'tcx Ex
             }
         },
         _ => None,
+    }
+}
+
+/// What `waste` calls a buffer the function makes and frees itself, and
+/// one a call makes for it to read and free. No reason answers either: the
+/// buffer belongs where it outlives the path, and only a call marked cold
+/// takes it off the path.
+const SCRATCH: &str = "scratch";
+const SCRATCH_CALL: &str = "scratch call";
+
+/// Whether no reason answers what a hot path forbids of kind.
+fn unanswerable(kind: &str) -> bool {
+    kind == SCRATCH || kind == SCRATCH_CALL
+}
+
+/// Whether the buffer, map or set made at e is scratch: bound by a `let`, and freed
+/// before the function returns, so a path that runs often makes and frees
+/// it on every run. Such a buffer is only lent, written and read, consumed
+/// by a `for`, or handed by value to a local function that does the same
+/// with it; returned, stored or handed elsewhere, it lives on.
+fn scratch<'tcx>(cx: &LateContext<'tcx>, typeck: &TypeckResults<'tcx>, e: &'tcx Expr<'tcx>) -> bool {
+    let Node::LetStmt(local) = cx.tcx.parent_hir_node(e.hir_id) else {
+        return false;
+    };
+    let PatKind::Binding(_, id, _, None) = local.pat.kind else {
+        return false;
+    };
+    dies_in(cx, typeck.hir_owner.def_id, id, 3)
+}
+
+/// Whether e calls a local function that makes and returns a new buffer,
+/// map or set, which the caller only reads and frees, bound by a `let` or
+/// as a temporary (`&digits(n)`): a scratch buffer made in another
+/// function. A temporary the path makes itself, such as an error's text,
+/// takes a reason as before.
+fn scratch_call<'tcx>(cx: &LateContext<'tcx>, typeck: &TypeckResults<'tcx>, e: &'tcx Expr<'tcx>) -> bool {
+    let def = match e.kind {
+        ExprKind::Call(f, _) if let ExprKind::Path(ref path) = f.kind => typeck.qpath_res(path, f.hir_id).opt_def_id(),
+        ExprKind::MethodCall(..) => typeck.type_dependent_def_id(e.hir_id),
+        _ => None,
+    };
+    let Some(f) = def.and_then(DefId::as_local) else {
+        return false;
+    };
+    if !matches!(cx.tcx.def_kind(f), DefKind::Fn | DefKind::AssocFn) {
+        return false;
+    }
+    let Some(body) = cx.tcx.hir_maybe_body_owned_by(f) else {
+        return false;
+    };
+    let returned = cx.tcx.fn_sig(f).instantiate_identity().skip_binder().output();
+    if !owned_container(cx, returned) && !super::bounds::growable(cx, returned) {
+        return false;
+    }
+    let callee = cx.tcx.typeck(f);
+    let makes = for_each_expr(cx.tcx, body.value, |x| {
+        if birth(cx, callee, x).is_some() {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .is_some();
+    makes && (scratch(cx, typeck, e) || stays(cx, typeck, e, 3))
+}
+
+/// Whether every use in owner of the binding id leaves it to be freed
+/// there; depth bounds how far it is followed into local functions.
+fn dies_in(cx: &LateContext<'_>, owner: LocalDefId, id: HirId, depth: u32) -> bool {
+    let Some(body) = cx.tcx.hir_maybe_body_owned_by(owner) else {
+        return false;
+    };
+    let typeck = cx.tcx.typeck(owner);
+    for_each_expr(cx.tcx, body.value, |u| {
+        if u.res_local_id() == Some(id) && !stays(cx, typeck, u, depth) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .is_none()
+}
+
+/// Whether the use u of a buffer leaves it where it is: lent, written or
+/// read through, consumed by a `for`, or moved into a local function's
+/// parameter that dies there.
+fn stays<'tcx>(cx: &LateContext<'tcx>, typeck: &TypeckResults<'tcx>, u: &'tcx Expr<'tcx>, depth: u32) -> bool {
+    let Node::Expr(p) = cx.tcx.parent_hir_node(u.hir_id) else {
+        return false;
+    };
+    // The parameter of a local function an argument at index i moves into.
+    let moved_into = |def: Option<DefId>, i: usize| {
+        let Some(f) = def.and_then(DefId::as_local) else {
+            return false;
+        };
+        let Some(param) = cx.tcx.hir_maybe_body_owned_by(f).and_then(|body| body.params.get(i)) else {
+            return false;
+        };
+        let PatKind::Binding(_, id, _, None) = param.pat.kind else {
+            return false;
+        };
+        depth > 0 && dies_in(cx, f, id, depth - 1)
+    };
+    match p.kind {
+        ExprKind::AddrOf(..) | ExprKind::Index(..) | ExprKind::Field(..) | ExprKind::Unary(UnOp::Deref, _) => true,
+        ExprKind::MethodCall(_, receiver, args, _) => {
+            let def = typeck.type_dependent_def_id(p.hir_id);
+            if receiver.hir_id == u.hir_id {
+                def.is_some_and(|m| !takes_self_by_value(cx, m))
+            } else {
+                args.iter()
+                    .position(|a| a.hir_id == u.hir_id)
+                    .is_some_and(|i| moved_into(def, i + 1))
+            }
+        },
+        ExprKind::Call(f, args) if let ExprKind::Path(ref path) = f.kind => {
+            if p.span.desugaring_kind() == Some(rustc_span::DesugaringKind::ForLoop) {
+                return true;
+            }
+            let def = typeck.qpath_res(path, f.hir_id).opt_def_id();
+            args.iter()
+                .position(|a| a.hir_id == u.hir_id)
+                .is_some_and(|i| moved_into(def, i))
+        },
+        _ => false,
     }
 }
 
@@ -689,8 +817,20 @@ fn waste<'tcx>(
     if let Some(size) = large_move(cx, typeck, e) {
         return Some((format!("a move of {size} bytes, which is a memcpy,"), "move"));
     }
+    if scratch_call(cx, typeck, e) {
+        return Some((
+            "a buffer a call makes, only read here and freed,".to_owned(),
+            SCRATCH_CALL,
+        ));
+    }
     birth(cx, typeck, e)
-        .map(|what| (what.to_owned(), "alloc"))
+        .map(|what| {
+            if scratch(cx, typeck, e) {
+                ("a scratch buffer, made and freed on every run,".to_owned(), SCRATCH)
+            } else {
+                (what.to_owned(), "alloc")
+            }
+        })
         .or_else(|| copy(cx, typeck, e).map(|what| (what.to_owned(), "copy")))
         .or_else(|| unchecked_growth(cx, typeck, e).map(|what| (what, "alloc")))
 }
@@ -810,6 +950,23 @@ fn also_copy(what: &str) -> bool {
     what.starts_with("a copy")
 }
 
+/// Whether an adjacent reason answers what a hot path forbids at e. A
+/// scratch buffer takes none; a reason of kind alloc beside it is spent
+/// on it, so that it is not reported again as answering nothing.
+fn answered(cx: &LateContext<'_>, e: &Expr<'_>, what: &str, kind: &'static str) -> bool {
+    if unanswerable(kind) {
+        reason(cx, e.hir_id, e.span, "alloc");
+        return false;
+    }
+    reason(cx, e.hir_id, e.span, kind) || also_copy(what) && reason(cx, e.hir_id, e.span, "copy")
+}
+
+/// Whether an adjacent reason would answer what `answered` asks of, without
+/// spending it.
+fn answerable(cx: &LateContext<'_>, e: &Expr<'_>, what: &str, kind: &'static str) -> bool {
+    !unanswerable(kind) && (peek(cx, e.hir_id, e.span, kind) || also_copy(what) && peek(cx, e.hir_id, e.span, "copy"))
+}
+
 /// The most bytes a hot path moves at once without a reason: past about
 /// this, a move is a call to memcpy rather than a few loads and stores.
 const MOVE_MAX: u64 = 256;
@@ -885,8 +1042,7 @@ impl Allocs {
                     self.spans.insert(e.span);
                 }
                 if let Some((what, kind)) = found
-                    && !reason(cx, e.hir_id, e.span, kind)
-                    && !(also_copy(&what) && reason(cx, e.hir_id, e.span, "copy"))
+                    && !answered(cx, e, &what, kind)
                     && self.reported.insert(e.hir_id)
                 {
                     // The calls from the root down to here, outermost first.
@@ -917,10 +1073,14 @@ impl Allocs {
                                 "dyn" => diag.help("call the concrete type, or take a closure as `impl Fn`; or say in a reason why this call is rare"),
                                 _ if what.starts_with("a shift") => diag.help("take from the end, keep a read offset that moves instead of the data, or use a VecDeque when both ends change"),
                                 "loop" => diag.help("bound it: walk what it reads with for, or count its turns against a limit; or say in a reason what bounds it, such as the bytes of one event"),
+                                SCRATCH_CALL => diag.help("lend the function a buffer to write into, `&mut String` or `&mut Vec`, held in a field of what outlives the path and cleared before each use; a reason beside it does not answer this"),
+                                SCRATCH => diag.help("keep it in a field of what outlives the path, such as the parser or the writer, and clear() it before each use; a reason beside it does not answer this"),
                                 _ => diag.help("lend the data where it is, or write it once where it ends up"),
                             };
                             diag.help("a branch off the path, such as an error, takes a `// rr: escape(cold): <reason>` at a call above: rr does not follow a call marked cold, so mark only one that is rare");
-                            note(diag, cx.sess(), statement(cx, e.hir_id, e.span), e.span, kind);
+                            if !unanswerable(kind) {
+                                note(diag, cx.sess(), statement(cx, e.hir_id, e.span), e.span, kind);
+                            }
                         },
                     );
                 }
@@ -1024,8 +1184,7 @@ fn waste_beyond(cx: &LateContext<'_>, graph: &Graph, f: LocalDefId, wasted: &mut
             let typeck = cx.tcx.typeck(owner);
             for_each_expr(cx.tcx, body.value, |e| {
                 if let Some((what, kind)) = waste(cx, typeck, e)
-                    && !peek(cx, e.hir_id, e.span, kind)
-                    && !(also_copy(&what) && peek(cx, e.hir_id, e.span, "copy"))
+                    && !answerable(cx, e, &what, kind)
                 {
                     ControlFlow::Break(())
                 } else {

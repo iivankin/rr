@@ -273,6 +273,28 @@ impl Tally {
     }
 }
 
+impl Tally {
+    /// Says which of the top sites copy a few bytes at a time, often
+    /// enough to be much of all the copying: each piece costs a call.
+    fn small(&self, top: usize) {
+        let mut ranked: Vec<_> = self.sites.iter().collect();
+        ranked.sort_by_key(|(_, site)| core::cmp::Reverse(site.count));
+        for (site, s) in ranked.iter().take(top) {
+            if s.count >= SMALL_MIN && s.count * 10 >= self.count && s.bytes <= s.count * SMALL_BYTES {
+                println!(
+                    "rr prof: {site} copies {SMALL_BYTES} bytes or fewer at a time, {} times: a call to memcpy for each piece. Copy a run at once: the bytes up to the next one that needs handling, such as the next character to escape, or an indent as one slice",
+                    s.count
+                );
+            }
+        }
+    }
+}
+
+/// The most bytes a copy holds, on average, for its site to count as one
+/// that copies piece by piece; and how many times it must copy.
+const SMALL_BYTES: u64 = 8;
+const SMALL_MIN: u64 = 10_000;
+
 fn report(dir: &Path, o: &Options) -> io::Result<ExitCode> {
     let mut programs: BTreeMap<PathBuf, Option<Program>> = BTreeMap::new();
     let mut allocs = Tally::default();
@@ -351,6 +373,7 @@ fn report(dir: &Path, o: &Options) -> io::Result<ExitCode> {
     // each value, and ranks low by bytes.
     println!("rr prof: the places that copy most often, with the bytes of each copy");
     copies.print(o.top.min(COUNTED_TOP), |s| s.count, true);
+    copies.small(o.top.min(COUNTED_TOP));
     let mut code = ExitCode::SUCCESS;
     if let Some(max) = o.max
         && allocs.count > max

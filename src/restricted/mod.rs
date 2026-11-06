@@ -37,6 +37,7 @@ declare_lint! { pub RR_VARIADIC, Deny, "rr forbids declaring a variadic C librar
 declare_lint! { pub RR_C_SIGNATURE, Deny, "rr requires a C function declared with C's types: pointers, not references" }
 declare_lint! { pub RR_DUPLICATE, Deny, "rr forbids a function body that repeats another's without a reason" }
 declare_lint! { pub RR_UNUSED_DERIVE, Deny, "rr forbids a derived trait that nothing in the program uses" }
+declare_lint! { pub RR_LOOP_BUFFER, Deny, "rr forbids a buffer made and freed again on every turn of a loop" }
 declare_lint! { pub RR_UNBOUNDED, Deny, "rr forbids a collection kept in a field growing with nothing that holds it to a limit" }
 
 /// The kinds of rr's own rules a reason names.
@@ -339,6 +340,7 @@ pub fn register(store: &mut LintStore) {
         RR_SIMPLE_TRAITS,
         RR_UNEXPLAINED_ESCAPE,
         RR_HOT_PATH,
+        RR_LOOP_BUFFER,
         RR_UNBOUNDED,
         RR_MATCH_CHAIN,
         RR_VARIADIC,

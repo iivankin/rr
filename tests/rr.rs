@@ -576,13 +576,26 @@ fn write_macros_and_rr_attributes_are_allowed() {
 }
 
 #[test]
-fn a_buffer_made_on_every_turn_of_a_loop_needs_a_reason() {
-    rejected(
+fn a_buffer_made_on_every_turn_of_a_loop_is_made_once() {
+    // A reason beside it answers nothing: the buffer goes before the loop.
+    for reason in ["", "// rr: escape(alloc): each item needs its own scratch.\n "] {
+        let source = alloc_fixture(&format!(
+            "pub fn n(xs: &[u8]) -> usize {{\n let mut n = 0;\n for &x in xs {{\n {reason}let mut t = Vec::new();\n t.push(x);\n n += t.len();\n }}\n n\n}}"
+        ));
+        rejected(&source, "rr_loop_buffer");
+        let out = diagnostics(&source, false);
+        assert!(out.contains("a reason beside it does not answer this"), "{out}");
+        assert!(!out.contains("answers no operation"), "{out}");
+    }
+    // On a hot path it is reported once, as scratch.
+    let out = diagnostics(
         &alloc_fixture(
-            "pub fn n(xs: &[&[u8]]) -> usize {\n let mut n = 0;\n for x in xs {\n let mut t = Vec::new();\n t.extend_from_slice(x);\n t.push(0);\n n += t.len();\n }\n n\n}",
+            "#[rr::hot]\npub fn n(xs: &[u8]) -> usize {\n let mut n = 0;\n for &x in xs {\n let mut t = Vec::new();\n t.push(x);\n n += t.len();\n }\n n\n}",
         ),
-        "rr_unexplained_escape",
+        false,
     );
+    assert!(out.contains("a scratch buffer"), "{out}");
+    assert!(!out.contains("on every turn of the loop"), "{out}");
     // Moved out of the turn, or made once and cleared, it is fine.
     accepted(&alloc_fixture(
         "pub fn keep(xs: &[&[u8]]) -> Vec<Vec<u8>> {\n let mut all = Vec::new();\n for x in xs {\n let mut t = Vec::new();\n t.extend_from_slice(x);\n t.push(0);\n all.push(t);\n }\n all\n}\n\
@@ -634,6 +647,61 @@ fn a_hot_path_makes_no_new_buffer() {
     // Writing into the caller's buffer, or a birth with a reason.
     accepted(&alloc_fixture(
         "#[rr::hot]\npub fn hot(out: &mut Vec<u8>, x: &[u8]) -> Result<(), Vec<u8>> {\n if out.len() > 4096 {\n return Ok(());\n }\n out.extend_from_slice(b\"ok\");\n if x.is_empty() {\n // rr: escape(alloc): an error, off the hot path's common case.\n return Err(Vec::from(&b\"empty\"[..]));\n }\n Ok(())\n}",
+    ));
+}
+
+#[test]
+fn a_scratch_buffer_on_a_hot_path_takes_no_reason() {
+    let reason = "// rr: escape(alloc): the lexeme may span two windows.\n";
+    let sum = "fn sum(v: Vec<u8>) -> usize {\n v.len()\n}\n";
+    // Made and freed here: lent, consumed by a for, or moved into a local
+    // function that frees it; a reason beside it answers nothing.
+    for body in [
+        "let mut s = Vec::new();\n s.push(x);\n s.len()",
+        "let mut s = Vec::new();\n s.push(x);\n let mut n = 0;\n for b in s {\n n += usize::from(b);\n }\n n",
+        "let mut s = Vec::new();\n s.push(x);\n sum(s)",
+        "let mut m = alloc::collections::BTreeMap::new();\n m.insert(x, 1);\n m.len()",
+    ] {
+        let source = alloc_fixture(&format!(
+            "{sum}#[rr::hot]\npub fn hot(x: u8) -> usize {{\n {reason} {body}\n}}"
+        ));
+        rejected(&source, "rr_hot_path");
+        let out = diagnostics(&source, false);
+        assert!(
+            out.contains("a scratch buffer, made and freed on every run, on a hot path"),
+            "{out}"
+        );
+        assert!(out.contains("keep it in a field of what outlives the path"), "{out}");
+        assert!(!out.contains("answers no operation"), "{out}");
+    }
+    // A buffer a call makes, which the caller only reads and frees.
+    for use_it in [
+        "out.extend_from_slice(&digits(x));",
+        "let d = digits(x);\n out.extend_from_slice(&d);",
+    ] {
+        let source = alloc_fixture(&format!(
+            "fn digits(x: u8) -> Vec<u8> {{\n // rr: escape(alloc): the caller keeps it.\n let mut v = Vec::new();\n v.push(x);\n v\n}}\n\
+             #[rr::hot]\npub fn hot(out: &mut Vec<u8>, x: u8) {{\n if out.len() > 64 {{\n return;\n }}\n {reason} // rr: escape(copy): the digits go out.\n {use_it}\n}}"
+        ));
+        rejected(&source, "rr_hot_path");
+        let out = diagnostics(&source, false);
+        assert!(
+            out.contains("a buffer a call makes, only read here and freed, on a hot path"),
+            "{out}"
+        );
+        assert!(out.contains("lend the function a buffer to write into"), "{out}");
+    }
+    // A buffer that outlives the call takes a reason, as before; a scratch
+    // buffer behind a cold call is off the path.
+    accepted(&alloc_fixture(&format!(
+        "pub struct W {{\n pub v: Vec<u8>,\n}}\n\
+         #[rr::hot]\npub fn hot(x: u8) -> (Vec<u8>, W) {{\n\
+         {reason} let mut a = Vec::new();\n a.push(x);\n\
+         {reason} let mut b = Vec::new();\n b.push(x);\n (a, W {{ v: b }})\n}}"
+    )));
+    accepted(&alloc_fixture(
+        "fn rare(x: u8) -> usize {\n let mut s = Vec::new();\n s.push(x);\n s.len()\n}\n\
+         #[rr::hot]\npub fn hot(x: u8) -> usize {\n if x == 0 {\n // rr: escape(cold): an error, off the common case.\n return rare(x);\n }\n 1\n}",
     ));
 }
 
@@ -740,6 +808,22 @@ fn a_field_that_grows_is_held_to_a_limit() {
         &alloc_fixture(&format!("{types}pub fn add(q: &mut Q, b: u8) {{ q.items.push(b); }}")),
         "rr_unbounded",
     );
+    // Every collection of the standard library that grows, by whatever
+    // path the crate names it.
+    for (ty, grow) in [
+        ("String", "push_str(\"x\")"),
+        ("alloc::collections::VecDeque<u8>", "push_back(1)"),
+        ("alloc::collections::BinaryHeap<u8>", "push(1)"),
+        ("alloc::collections::BTreeSet<u8>", "insert(1)"),
+        ("alloc::collections::BTreeMap<u8, u8>", "insert(1, 1)"),
+    ] {
+        rejected(
+            &alloc_fixture(&format!(
+                "pub struct M {{\n pub c: {ty},\n}}\npub fn add(m: &mut M) {{\n m.c.{grow};\n}}"
+            )),
+            "rr_unbounded",
+        );
+    }
     // Bytes are told how to keep a window of them instead; other items are not.
     let help = |source: &str| {
         String::from_utf8_lossy(&compile(&alloc_fixture(source), &[]).stderr).contains("a window at a time")
@@ -1446,16 +1530,20 @@ fn a_hot_path_sees_a_copy_whatever_its_form() {
 }
 
 #[test]
-fn a_buffer_written_with_a_macro_in_a_loop_takes_its_reason_beside_the_code() {
+fn a_buffer_written_with_a_macro_in_a_loop_finds_its_reason_beside_the_code() {
     // The macro's expansion lies in another file; the reason is looked
-    // for where the call is written, and rr does not panic on it.
+    // for where the call is written, and rr does not panic on it. It does
+    // not answer a buffer made on every turn, and is not reported as
+    // answering nothing either.
     let body = |reason: &str| {
         format!(
             "#![no_std]\nextern crate alloc;\nuse core::fmt::Write as _;\npub fn lines(hosts: &[&str]) -> usize {{\n    let mut n = 0;\n    for host in hosts {{\n        {reason}\n        let mut line = alloc::string::String::new();\n        if write!(line, \"{{host}}\\n\").is_err() {{\n            return 0;\n        }}\n        n += line.len();\n    }}\n    n\n}}\n"
         )
     };
-    rejected(&body(""), "rr_unexplained_escape");
-    accepted(&body("// rr: escape(alloc): each line is handed on whole."));
+    rejected(&body(""), "rr_loop_buffer");
+    let source = body("// rr: escape(alloc): each line is handed on whole.");
+    rejected(&source, "rr_loop_buffer");
+    assert!(!diagnostics(&source, false).contains("answers no operation"));
 }
 
 /// What rr's diagnostics say for source, from `rr check`, or with lint

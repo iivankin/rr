@@ -165,9 +165,10 @@ Rules are compiler errors and cannot be lowered with `allow`, `-A rr`,
 | rr_simple_traits | Forbid associated types/GATs, supertraits, where clauses, trait aliases and dyn of a trait from another crate |
 | rr_no_macros | Allow no_std compiler builtins, core panic/assert, matches! and seven of the compiler's own derives; forbid own/library macros, other derives and external procedural attributes, including nested calls and cfg_attr derives |
 | rr_unexplained_escape | Require a nearby real comment with a nonempty explanation for the operations below |
-| rr_hot_path | Forbid a new buffer, a copy of data the program holds, a move of more than 256 bytes, and a loop that shows no bound, on a path marked #[rr::hot] without such a comment |
+| rr_hot_path | Forbid a new buffer, a copy of data the program holds, a move of more than 256 bytes, and a loop that shows no bound, on a path marked #[rr::hot] without such a comment; a scratch buffer, made and freed there or by a call for it, takes none |
 | rr_match_chain | Forbid an if chain that compares one value with constants: it is a match |
 | rr_variadic | Forbid declaring a variadic C library function (open, fcntl, ioctl, syscall, printf and others) without its `...`; rr knows the C library's by name, not other libraries' |
+| rr_loop_buffer | Forbid a fresh buffer made again on every turn of a loop, written there and never moved out of the turn; no reason answers it: make it once before the loop and clear() it |
 | rr_unbounded | Forbid growing a collection kept in a field that nothing in the crate holds to a limit, without such a comment |
 | rr_no_recursion | Forbid a call that closes a cycle of the crate's call graph (direct or mutual recursion, see Call graph) without such a comment, such as a bound on the depth, beside the call or once above a function every such cycle passes through; and a type that owns a value of itself, whose drop recurses as deep as the data |
 | rr_unused_escape | Forbid a reason that answers nothing: a kind with no such operation beside it, a kind rr does not know, or the old form that names none |
@@ -225,6 +226,16 @@ the same way: what a program keeps grows with the value it works on,
 not with its input or output. Copying input into a buffer to hand a
 slice parser all of it holds the whole input twice, once as bytes and
 once parsed.
+
+The window is read as a slice, not a byte at a time through a method:
+the parser scans `bytes()` with an index, a whole string or number at a
+time, and refills only where the slice ends. A `peek()` that matches the
+variant, checks for a refill and returns `Result<Option<u8>, _>` for
+every byte costs more than the parse. A writer takes runs the same way:
+a string from one character that needs escaping to the next, an indent
+as one slice of a constant of spaces, a number formatted into a small
+array on the stack; a `push(char)` per character is a call to memcpy
+for each, which rr prof counts.
 
 Compiler builtin macros that do not require std are allowed: concat!, cfg!,
 format_args!, stringify!, env!/option_env!, file!/line!/column!/module_path!,
@@ -336,8 +347,6 @@ Required for:
   is then used with no unsafe block. The entry of a `#![no_main]` crate (main, or libFuzzer's
   LLVMFuzzerTestOneInput and LLVMFuzzerInitialize) takes its no_mangle
   without a reason.
-- A fresh buffer made again on every turn of a loop, written there and never
-  moved out of the turn: make it once before the loop and clear() it.
 - A call that lends a local String or Vec (`&v`, `&v[..]`, `v.as_slice()`) to a
   local function that makes an owned copy of that parameter, when the caller
   does not use the buffer afterwards: take the parameter by value and move it.
@@ -532,7 +541,18 @@ the path may grow it without end; `capacity()` is what the allocator
 gave, not a limit, and a resize to another collection's length follows
 that one. The methods of the program's `GlobalAlloc` are on every path
 that allocates, and rr checks them as hot whether marked or not. A
-reason of the kind allows the operation.
+reason of the kind allows the operation, except for a scratch buffer: a
+fresh String or Vec bound by a `let` and freed before the function
+returns, because it is only lent, written and read, consumed by a `for`,
+or moved into a local function that does the same. The path makes and
+frees it on every run, and no reason answers that: it belongs in a field
+of what outlives the path, such as the parser or the writer, cleared
+before each use. A buffer the function returns or stores takes a reason
+as before; but a call to a local function that makes and returns one,
+whose caller only reads and frees it (`out.push_str(&number_text(n))`),
+is scratch made one call away, and no reason answers it either: lend the
+function a buffer to write into. A temporary the path makes itself, such
+as an error's text, takes a reason.
 A `// rr: escape(cold): ...` at a call says that the branch is off the path,
 such as an error or once per item, and the callee is not followed from
 there. Such a reason is used only when what the path forbids, without its
@@ -542,7 +562,7 @@ see by its form still shows in rr prof.
 
 ## Bounds
 
-A collection a value keeps in a field, a Vec, String, VecDeque or a
+A collection a value keeps in a field, a Vec, String, VecDeque, BinaryHeap or a
 B-tree collection, grows by push, extend, insert, append or resize. Rule
 rr_unbounded asks of each field that grows so that something in the
 crate holds it to a limit: a comparison of its len() with a limit other

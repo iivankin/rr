@@ -57,11 +57,16 @@ pub(super) fn growable(cx: &LateContext<'_>, ty: Ty<'_>) -> bool {
     let ty::Adt(adt, _) = ty.peel_refs().kind() else {
         return false;
     };
-    let path = cx.tcx.def_path_str(adt.did());
-    matches!(
-        path.as_str(),
-        "alloc::vec::Vec" | "alloc::string::String" | "alloc::collections::vec_deque::VecDeque"
-    ) || path.starts_with("alloc::collections::b")
+    // By the items' names, not their paths: a path is the one the crate
+    // sees, `alloc::collections::BTreeMap` for the B-tree map.
+    cx.tcx
+        .is_lang_item(adt.did(), rustc_hir::attrs::lang_items::LangItem::String)
+        || cx.tcx.get_diagnostic_name(adt.did()).is_some_and(|name| {
+            matches!(
+                name.as_str(),
+                "Vec" | "VecDeque" | "BTreeMap" | "BTreeSet" | "BinaryHeap"
+            )
+        })
 }
 
 /// Whether ty is text or bytes: a `String`, or a `Vec` or `VecDeque` of `u8`.

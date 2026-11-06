@@ -27,7 +27,7 @@ mod test;
 mod target;
 
 /// What rr add compares with the rr a component was checked with.
-pub const VERSION: &str = "0.4.2";
+pub const VERSION: &str = "0.4.3";
 
 pub fn main() -> ExitCode {
     match run() {
