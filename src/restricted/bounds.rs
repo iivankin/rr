@@ -29,8 +29,8 @@ type Field = (DefId, Symbol);
 
 #[derive(Default)]
 pub struct Bounds {
-    /// Each place a field grows.
-    grows: Vec<(Field, HirId, Span, String)>,
+    /// Each place a field grows, and whether it holds bytes.
+    grows: Vec<(Field, HirId, Span, String, bool)>,
     /// The fields something holds.
     held: FxHashSet<Field>,
 }
@@ -62,6 +62,21 @@ pub(super) fn growable(cx: &LateContext<'_>, ty: Ty<'_>) -> bool {
         path.as_str(),
         "alloc::vec::Vec" | "alloc::string::String" | "alloc::collections::vec_deque::VecDeque"
     ) || path.starts_with("alloc::collections::b")
+}
+
+/// Whether ty is text or bytes: a `String`, or a `Vec` or `VecDeque` of `u8`.
+fn holds_bytes(cx: &LateContext<'_>, ty: Ty<'_>) -> bool {
+    let ty::Adt(adt, args) = ty.peel_refs().kind() else {
+        return false;
+    };
+    match cx.tcx.def_path_str(adt.did()).as_str() {
+        "alloc::string::String" => true,
+        "alloc::vec::Vec" | "alloc::collections::vec_deque::VecDeque" => args
+            .types()
+            .next()
+            .is_some_and(|t| matches!(t.kind(), ty::Uint(ty::UintTy::U8))),
+        _ => false,
+    }
 }
 
 /// The field e names, past borrows and derefs.
@@ -112,14 +127,15 @@ impl<'tcx> LateLintPass<'tcx> for Bounds {
                     .source_map()
                     .span_to_snippet(peel(receiver).span)
                     .unwrap_or_else(|_| "this collection".to_owned());
-                self.grows.push((f, e.hir_id, e.span, what));
+                let bytes = holds_bytes(cx, cx.typeck_results().expr_ty(peel(receiver)));
+                self.grows.push((f, e.hir_id, e.span, what, bytes));
             },
             _ => {},
         }
     }
 
     fn check_crate_post(&mut self, cx: &LateContext<'tcx>) {
-        for (f, id, span, what) in &self.grows {
+        for (f, id, span, what, bytes) in &self.grows {
             if self.held.contains(f) || declared(cx, *f) || reason(cx, *id, *span, "bound") {
                 continue;
             }
@@ -136,6 +152,13 @@ impl<'tcx> LateLintPass<'tcx> for Bounds {
                     diag.help(
                         "compare its len() with a limit where it grows, or clear() it where a cycle starts over; or say at the field what bounds it",
                     );
+                    if *bytes {
+                        diag.help(
+                            "when it holds input to parse or output to write, read and write a window at a time: \
+                             a buffer of fixed size the parser refills and the writer drains as they go, so memory \
+                             does not grow with the data",
+                        );
+                    }
                     note(diag, cx.sess(), statement(cx, *id, *span), *span, "bound");
                 },
             );

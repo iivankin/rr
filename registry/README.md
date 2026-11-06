@@ -88,10 +88,11 @@ place that serves such files: rr.json maps a scope to it,
   multiply) are in `sys/<name>.rs` behind a safe function that says
   whether it ran; `cpu` says what the CPU has. The portable code is
   always there and passes the same vectors.
-- **Fast with overflow checks on.** The template keeps them on, and on
-  arithmetic they cost: 40% of X25519's time. Where the bounds are
-  proven, the arithmetic wraps (`wrapping_*`, `core::num::Wrapping`) and
-  a comment states the bounds; the bench is compared with checks off.
+- **Arithmetic that cannot overflow, or says it wraps.** The template
+  builds without overflow checks, as Cargo's release profile does, so
+  nothing stops an overflow there. Arithmetic meant to wrap is written
+  `wrapping_*` or `core::num::Wrapping`; elsewhere a comment states the
+  bounds that keep it in range, or `checked_*` returns the error.
 - **One style, except generated tables.** `#[rustfmt::skip]` stands
   only on a constant a script writes, under a comment naming the script
   and the test that recomputes it. The script sits beside the component

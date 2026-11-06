@@ -169,7 +169,7 @@ Rules are compiler errors and cannot be lowered with `allow`, `-A rr`,
 | rr_match_chain | Forbid an if chain that compares one value with constants: it is a match |
 | rr_variadic | Forbid declaring a variadic C library function (open, fcntl, ioctl, syscall, printf and others) without its `...`; rr knows the C library's by name, not other libraries' |
 | rr_unbounded | Forbid growing a collection kept in a field that nothing in the crate holds to a limit, without such a comment |
-| rr_no_recursion | Forbid a call that closes a cycle of the crate's call graph (direct or mutual recursion, see Call graph) without such a comment, such as a bound on the depth, and a type that owns a value of itself, whose drop recurses as deep as the data |
+| rr_no_recursion | Forbid a call that closes a cycle of the crate's call graph (direct or mutual recursion, see Call graph) without such a comment, such as a bound on the depth, beside the call or once above a function every such cycle passes through; and a type that owns a value of itself, whose drop recurses as deep as the data |
 | rr_unused_escape | Forbid a reason that answers nothing: a kind with no such operation beside it, a kind rr does not know, or the old form that names none |
 | rr_c_signature | Forbid a reference in a C function's declaration: C has pointers |
 | rr_unused_derive | Forbid a derived trait that nothing in the program uses |
@@ -191,6 +191,40 @@ reaches each in the call graph, as a hot path and recursion see it; a
 trait of another crate behind dyn hides what runs. This policy restricts user-defined
 generics, not every generic inside core/alloc. It checks the current crate and
 its local modules, not previously compiled dependencies.
+
+### Instead of a generic
+
+Code that would be generic over the types the crate itself knows takes
+an enum of them, with a variant for each: one parser over a slice or a
+reader, one serializer into a string or to standard output. The match
+that picks the variant costs a branch that goes the same way every
+time; the enum is the whole set, in one place, and the optimizer still
+sees each body. Code that calls what its caller brings, such as the next
+stage of a pipeline, takes `&mut dyn` of a trait of the crate. A JSON
+parser that reads a file and also parses a string:
+
+```rust
+enum Source<'a> {
+    Slice(&'a [u8]),
+    Read(Reader<'a>), // an input, a fixed window of it, and how much is in it
+}
+impl Source<'_> {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Source::Slice(s) => s,
+            Source::Read(r) => r.window.get(..r.end).unwrap_or_default(),
+        }
+    }
+}
+```
+
+The parser keeps its place in `bytes()` and, at its end, asks the
+reader for the next window, keeping the bytes of a token cut in two. It
+never holds a whole file, and a writer drains its own window to output
+the same way: what a program keeps grows with the value it works on,
+not with its input or output. Copying input into a buffer to hand a
+slice parser all of it holds the whole input twice, once as bytes and
+once parsed.
 
 Compiler builtin macros that do not require std are allowed: concat!, cfg!,
 format_args!, stringify!, env!/option_env!, file!/line!/column!/module_path!,
@@ -256,7 +290,13 @@ leaves out of the build are not looked at.
 The comment sits directly above the statement, the operation, or the
 operation's line (such as a match arm), or trails on the operation's own line;
 a reason may continue on the plain comment lines below it. Inside a statement
-that spans lines, a comment answers only what is on its line. A marker inside a
+that spans lines, a comment answers only what is on its line. A `recursion`
+reason may instead stand directly above a function, after its documentation
+and above its attributes: it answers every call back into the function, from
+itself or through others, as the one bound on the depth a descent through it
+keeps, such as a depth parameter it checks. A cycle that does not pass
+through such a function still needs its own reason, and a reason beside a
+call the function's reason answers answers nothing. A marker inside a
 string, documentation comment, empty reason or distant comment is rejected.
 The tool checks that a reason exists, not that the explanation is truthful.
 
@@ -401,7 +441,7 @@ literal_string_with_formatting_args, mut_mut; implicit_clone,
 inefficient_to_string, cloned_instead_of_copied, string_add,
 string_add_assign, clear_with_drain, iter_with_drain,
 unnecessary_struct_initialization, set_contains_or_insert,
-naive_bytecount, stable_sort_primitive, format_collect,
+stable_sort_primitive, format_collect,
 with_capacity_zero; as_underscore, as_pointer_underscore,
 alloc_instead_of_core, non_ascii_literal (non-ASCII in a literal is
 escaped: nothing invisible or look-alike in the source); and for unsafe
@@ -419,7 +459,11 @@ a panic is how the check fails: unwrap, expect, panic and indexing there
 need no reason.
 collapsible_if and collapsible_else_if stay off in rr lint: a nested
 condition is a branch of its own, each a case to handle.
-slow_vector_initialization stays off too: it asks for `vec!`, a macro. The rest of the restriction group are styles that
+slow_vector_initialization stays off too: it asks for `vec!`, a macro. Where another lint's suggestion would write a
+macro or name a crate rr has no way to use (vec_init_then_push's `vec!`,
+the pedantic naive_bytecount's `bytecount`), rr drops the suggestion and
+says what to write instead; to shadow_unrelated, indexing_slicing and
+let_underscore_untyped it adds what each asks for in rr. The rest of the restriction group are styles that
 contradict one another and stay off.
 
 ## Hot paths

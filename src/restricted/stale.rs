@@ -106,16 +106,16 @@ fn check_file(tcx: TyCtxt<'_>, file: &SourceFile, items: &[(Span, bool)], starts
         }
         let span = Span::with_root_ctxt(at(range.start), at(range.end));
         let cold_only = kinds == ["cold"];
+        let unused: Vec<&str> = kinds
+            .iter()
+            .filter_map(|name| kind(name))
+            .filter(|kind| !used(span.lo(), kind))
+            .collect();
         let message = if kinds.is_empty() {
             "this reason names no kind, so it answers nothing".to_owned()
         } else if let Some(unknown) = kinds.iter().find(|name| kind(name).is_none()) {
             format!("`{unknown}` is not a kind rr knows")
         } else {
-            let unused: Vec<&str> = kinds
-                .iter()
-                .filter_map(|name| kind(name))
-                .filter(|kind| !used(span.lo(), kind))
-                .collect();
             match unused.as_slice() {
                 [] => continue,
                 ["cold"] => "`cold` marks a call that leads off a hot path to something the path forbids; this one leads to nothing of the kind"
@@ -141,6 +141,11 @@ fn check_file(tcx: TyCtxt<'_>, file: &SourceFile, items: &[(Span, bool)], starts
                     diag.help("remove the mark: rr follows this call, and finds nothing there for a hot path to avoid");
                 } else {
                     diag.help("remove what the code no longer needs; a reason stands beside the operation it is for");
+                    if unused.contains(&"recursion") {
+                        diag.help(
+                            "a `recursion` reason above a function answers every call back into it, so one beside such a call answers nothing",
+                        );
+                    }
                 }
             }),
         );

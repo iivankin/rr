@@ -2,8 +2,11 @@
 //! then depends on the input. Each call that closes a cycle of the
 //! crate's call graph needs a reason, such as a bound on the depth; the
 //! graph holds the calls that are not written as calls too (see calls).
-//! So does a type that owns another value of itself: its drop glue
-//! recurses as deep as the data goes.
+//! A reason above a function answers every call back into it, as the
+//! one bound a descent through it keeps, such as a depth it checks: the
+//! cycles that pass through it then need nothing more. So does a type
+//! that owns another value of itself: its drop glue recurses as deep as
+//! the data goes.
 
 use clippy_utils::diagnostics::span_lint_hir_and_then;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
@@ -17,8 +20,8 @@ use std::collections::hash_map::Entry;
 
 use super::RR_NO_RECURSION;
 use super::allocs::{reason, statement};
-use super::calls::{Graph, name, owns};
-use super::comments::{has_escape_reason, note};
+use super::calls::{Call, Graph, name, owns};
+use super::comments::{has_escape_reason, note, peek};
 
 pub struct Recursion;
 
@@ -27,15 +30,30 @@ impl_lint_pass!(Recursion => [RR_NO_RECURSION]);
 impl<'tcx> LateLintPass<'tcx> for Recursion {
     fn check_crate(&mut self, cx: &LateContext<'tcx>) {
         let graph = Graph::new(cx);
-        let component = components(&graph);
+        // The functions whose reason answers the calls back into them.
+        let bounded: FxHashSet<LocalDefId> = graph
+            .fns
+            .iter()
+            .copied()
+            .filter(|&f| bounds_depth(cx, f, false))
+            .collect();
+        // Such a reason answers something when a cycle comes back through
+        // the function; otherwise it is left unused, for rr_unused_escape.
+        let whole = components(&graph, |_| true);
+        for &owner in &graph.fns {
+            for call in graph.from(owner) {
+                if bounded.contains(&call.to) && in_cycle(&whole, owner, call.to) {
+                    bounds_depth(cx, call.to, true);
+                }
+            }
+        }
+        // The cycles that pass through no such function.
+        let component = components(&graph, |call| !bounded.contains(&call.to));
         let mut reported = FxHashSet::default();
         for &owner in &graph.fns {
             for call in graph.from(owner) {
-                let cycle = call.to == owner
-                    || component
-                        .get(&owner)
-                        .is_some_and(|c| component.get(&call.to) == Some(c));
-                if !cycle
+                if bounded.contains(&call.to)
+                    || !in_cycle(&component, owner, call.to)
                     || !super::builtins::is_user_code(call.span)
                     || reason(cx, call.id, call.span, "recursion")
                     || !reported.insert((call.id, call.span))
@@ -52,7 +70,11 @@ impl<'tcx> LateLintPass<'tcx> for Recursion {
                     )
                 };
                 span_lint_hir_and_then(cx, RR_NO_RECURSION, call.id, call.span, message, |diag| {
-                    diag.help("make it a loop with an explicit stack, or say in the reason what bounds the depth");
+                    diag.help(format!(
+                        "make it a loop with an explicit stack, or say in a reason what bounds the depth: \
+                         beside this call, or once above `{}` for every call back into it",
+                        name(cx.tcx, call.to)
+                    ));
                     note(
                         diag,
                         cx.sess(),
@@ -64,6 +86,27 @@ impl<'tcx> LateLintPass<'tcx> for Recursion {
             }
         }
         recursive_types(cx);
+    }
+}
+
+/// Whether a call from owner to `to` closes a cycle of the components.
+fn in_cycle(component: &FxHashMap<LocalDefId, usize>, owner: LocalDefId, to: LocalDefId) -> bool {
+    to == owner || component.get(&owner).is_some_and(|c| component.get(&to) == Some(c))
+}
+
+/// Whether f, the program's own, has a recursion reason above it; with
+/// `use_it`, the reason then answered a call.
+fn bounds_depth(cx: &LateContext<'_>, f: LocalDefId, use_it: bool) -> bool {
+    let tcx = cx.tcx;
+    let span = tcx.def_span(f);
+    if !super::builtins::is_user_code(span) {
+        return false;
+    }
+    let item = with_attributes(cx, tcx.hir_span(tcx.local_def_id_to_hir_id(f)));
+    if use_it {
+        has_escape_reason(cx, item, span, "recursion")
+    } else {
+        peek(cx.sess(), item, span, "recursion")
     }
 }
 
@@ -127,8 +170,9 @@ fn with_attributes(cx: &LateContext<'_>, span: Span) -> Span {
 }
 
 /// The strongly connected component of each function that is in a cycle
-/// of two or more, by Tarjan's algorithm, kept iterative.
-fn components(graph: &Graph) -> FxHashMap<LocalDefId, usize> {
+/// of two or more, through the calls keep keeps, by Tarjan's algorithm,
+/// kept iterative.
+fn components(graph: &Graph, keep: impl Fn(&Call) -> bool) -> FxHashMap<LocalDefId, usize> {
     let mut index: FxHashMap<LocalDefId, usize> = FxHashMap::default();
     let mut low: FxHashMap<LocalDefId, usize> = FxHashMap::default();
     let mut on_stack = FxHashSet::default();
@@ -136,7 +180,21 @@ fn components(graph: &Graph) -> FxHashMap<LocalDefId, usize> {
     let mut out = FxHashMap::default();
     let mut next = 0;
     let mut found = 0;
-    let edges = |v: LocalDefId| graph.from(v);
+    let edges: FxHashMap<LocalDefId, Vec<LocalDefId>> = graph
+        .fns
+        .iter()
+        .map(|&f| {
+            (
+                f,
+                graph
+                    .from(f)
+                    .iter()
+                    .filter(|call| keep(call))
+                    .map(|call| call.to)
+                    .collect(),
+            )
+        })
+        .collect();
     for &root in &graph.fns {
         if index.contains_key(&root) {
             continue;
@@ -149,9 +207,8 @@ fn components(graph: &Graph) -> FxHashMap<LocalDefId, usize> {
         stack.push(root);
         on_stack.insert(root);
         while let Some(&mut (v, ref mut at)) = work.last_mut() {
-            if let Some(call) = edges(v).get(*at) {
+            if let Some(&w) = edges.get(&v).and_then(|to| to.get(*at)) {
                 *at += 1;
-                let w = call.to;
                 match index.entry(w) {
                     Entry::Vacant(slot) => {
                         slot.insert(next);

@@ -157,7 +157,6 @@ pub const CLIPPY: &[(&str, Option<&str>)] = &[
     ("iter_with_drain", None),
     ("unnecessary_struct_initialization", None),
     ("set_contains_or_insert", None),
-    ("naive_bytecount", None),
     ("stable_sort_primitive", None),
     // What a cast or an import names, said.
     ("as_underscore", None),
@@ -259,6 +258,43 @@ fn clippy_escape(
     }
 }
 
+/// What rr adds to a Clippy lint's diagnostic: how to do what it asks in
+/// rr, and whether Clippy's own suggestion goes, as one that writes a
+/// macro or names a crate rr has no way to use does.
+fn clippy_hint(lint: &'static rustc_lint::Lint) -> Option<clippy_utils::diagnostics::Hint> {
+    let name = lint.name_lower();
+    let (help, replaces) = match name.strip_prefix("clippy::")? {
+        "shadow_unrelated" => (
+            "give the new value a name of its own that says what it holds; a name is reused only for the same \
+             value in its next form, as `let line = line.trim();` is",
+            false,
+        ),
+        "indexing_slicing" => (
+            "`get` where the index comes from input and a miss is an error to handle; where the code itself keeps it \
+             in bounds (computed from the slice's own length, or checked just above), index it with an \
+             `escape(panic)` reason, and a bug stops the program there; iterating, `split_at`, `split_first`, \
+             `as_chunks` and `first_chunk` need no index",
+            false,
+        ),
+        "let_underscore_untyped" => (
+            "name the type that is dropped, `let _: Result<usize, Error> = ...;`, so a change of what the call \
+             returns is seen; a must_use value dropped on purpose also takes an `escape(discard)` reason",
+            false,
+        ),
+        "vec_init_then_push" => (
+            "rr has no `vec!`: build the vector at once from an array, `Vec::from([a, b, c])`",
+            true,
+        ),
+        "naive_bytecount" => (
+            "rr has no crates: count in a `for` loop over the bytes, or keep the count where the bytes are \
+             written",
+            true,
+        ),
+        _ => return None,
+    };
+    Some(clippy_utils::diagnostics::Hint { help, replaces })
+}
+
 /// Clippy lints that ask the opposite of rr's style: a nested condition is
 /// a branch of its own, as each branch is a case to handle, and an `else
 /// if` chain is an `else` holding an `if`; a zeroed `Vec` is made by
@@ -292,6 +328,7 @@ pub fn force_clippy(opts: &mut rustc_session::config::Options) {
         opts.lint_opts.push((format!("clippy::{l}"), rustc_lint::Level::Allow));
     }
     let _ = clippy_utils::diagnostics::ESCAPE.set(clippy_escape);
+    let _ = clippy_utils::diagnostics::HINT.set(clippy_hint);
 }
 
 pub fn register(store: &mut LintStore) {

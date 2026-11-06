@@ -56,6 +56,10 @@ impl<'tcx> LateLintPass<'tcx> for EscapeHatches {
             format!("{operation} needs an ownership justification"),
             |diag| {
                 diag.help(match kind {
+                    "copy" if operation.starts_with("materializing") => {
+                        "use the values where the iterator gives them, without a collection; or extend a buffer the \
+                         code already holds, cleared and reused; a new collection that must outlive its maker says why"
+                    },
                     "copy" => "borrow it where it is, or move it if its owner is done with it; a copy is for two owners that must both live on",
                     "shared" => "own it in one place and lend it with & or &mut",
                     "leak" => "let it drop; leak only what must live as long as the process",

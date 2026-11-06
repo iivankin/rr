@@ -44,6 +44,25 @@ pub fn reported(span: Span) -> bool {
     REPORTED.lock().is_ok_and(|seen| seen.contains(&span.lo()))
 }
 
+/// What to write instead of a library macro: the ones programs reach
+/// for first, then the rule.
+fn instead_of(name: &str) -> &'static str {
+    match name {
+        "vec" => {
+            "build a vector from an array, `Vec::from([a, b, c])`, or with `Vec::new()` and `resize(n, x)` for n copies"
+        },
+        "format" => {
+            "write into a String the code holds with `write!(s, ...)` (`core::fmt::Write`), or into the output it goes \
+             to; an error is a variant of its enum, formatted where it is shown"
+        },
+        "println" | "print" | "eprintln" | "eprint" | "dbg" => {
+            "rr has no std: output goes through `sys::stdout` and `sys::stderr`, with `write!` into a buffer the code \
+             holds"
+        },
+        _ => "only no_std compiler builtins and core panic/assert macros are allowed",
+    }
+}
+
 fn report(
     cx: &EarlyContext<'_>,
     lint: &'static rustc_lint::Lint,
@@ -162,7 +181,9 @@ impl EarlyLintPass for RestrictedSyntax {
                     RR_NO_GENERICS,
                     param.span(),
                     "type and const parameters are forbidden by rr",
-                    "use concrete types; lifetime parameters are allowed",
+                    "use concrete types: for a set of types the crate knows, an enum with a variant for each \
+                     (a slice or a reader, a string or standard output); for code that must call what the caller \
+                     brings, `&mut dyn` of a trait of the crate; lifetime parameters are allowed",
                 );
             }
         }
@@ -187,7 +208,8 @@ impl EarlyLintPass for RestrictedSyntax {
                 RR_NO_GENERICS,
                 ty.span,
                 "impl Trait is forbidden by rr",
-                "use a concrete type; a parameter may be `impl Fn`, `impl FnMut` or `impl FnOnce`",
+                "use a concrete type, an enum of the types the crate knows, or `&mut dyn` of a trait of the crate; \
+                 a parameter may be `impl Fn`, `impl FnMut` or `impl FnOnce`",
             );
         }
     }
@@ -288,12 +310,13 @@ impl EarlyLintPass for RestrictedSyntax {
             require_unsafe_reason(cx, mac.span(), "global assembly");
         }
         if !allowed_macro_path(&mac.path) {
+            let name = mac.path.segments.last().map_or("", |s| s.ident.name.as_str());
             report(
                 cx,
                 RR_NO_MACROS,
                 mac.span(),
                 "macro calls are forbidden by rr",
-                "only no_std compiler builtins and core panic/assert macros are allowed",
+                instead_of(name),
             );
         }
     }

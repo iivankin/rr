@@ -53,10 +53,16 @@ operation, and the simple design is rarely the first one.
   target. Split a file when it holds two such parts, not when it grows.
 - Let Rust's types carry the design. A view borrows the data it reads:
   a lifetime, not a copy or an id kept in step. An enum holds each
-  variant with its data. A generic or a trait says once what is the
-  same over types, where the domain has such a kind. A type for each
-  state makes a call in the wrong state fail to compile. A value
-  releases what it holds on drop.
+  variant with its data. rr has no generics: code that is the same over
+  the types the crate knows takes an enum of them (a slice or a reader,
+  a string or standard output), and code that calls what the caller
+  brings takes `&mut dyn` of a trait of the crate (see RR.md, "Instead
+  of a generic"). A type for each state makes a call in the wrong state
+  fail to compile. A value releases what it holds on drop.
+- Input and output go a window at a time: a parser reads into a buffer
+  of fixed size and refills it as it goes, a writer fills one and drains
+  it to output. What the program holds grows with the value it works
+  on, never with the size of a file or a stream.
 - Memory reserved up front is sized from the limit of what it holds (a
   query of QUERY_BYTES_MAX bytes needs no more scalars than that), and
   stages that run one after another share it rather than each keeping
@@ -180,4 +186,8 @@ the history keeps nothing else.
 
 Change the design. A `// rr: escape(kind): <reason>` is for an operation
 the design needs, and its reason says why. The same operation spelled a
-way rr does not see is still that operation.
+way rr does not see is still that operation. A reason is written by hand for the
+operation it stands beside; the same reason pasted beside many calls
+says the design has one bound, and that bound is written once: a
+recursion bounded by a depth the function checks has its reason above
+that function.

@@ -5,7 +5,10 @@
 
 RR = rr
 NAME = %NAME%
-RRFLAGS = -C opt-level=3 -C codegen-units=1 -C overflow-checks=on
+RRFLAGS = -C opt-level=3 -C codegen-units=1
+# Tests check arithmetic for overflow, as Rust's debug builds and rr
+# fuz's do; the program and its benches are built without, as it ships.
+TESTFLAGS = $(RRFLAGS) -C overflow-checks=on
 LTOFLAGS = -C lto=fat
 OUT = build
 # Windows names its executables .exe.
@@ -23,7 +26,7 @@ $(NAME)$(EXE): $(SRC)
 # The #[test] items, each in a child; FILTER=word runs those whose name
 # holds it.
 test:
-	$(RR) test src/main.rs --crate-name $(NAME) $(RRFLAGS) -- $(FILTER)
+	$(RR) test src/main.rs --crate-name $(NAME) $(TESTFLAGS) -- $(FILTER)
 
 # The #[bench] items, built as the program ships: time, allocations and
 # bytes copied per iteration.

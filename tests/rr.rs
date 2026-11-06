@@ -241,6 +241,9 @@ fn rejects_generic_definitions_and_impl_trait() {
     ] {
         rejected(&format!("#![no_std]\n{source}"), "rr_no_generics");
     }
+    // What to write instead: an enum of the types, or dyn of a crate trait.
+    let stderr = compile("#![no_std]\npub fn id<T>(v: T) -> T { v }", &[]).stderr;
+    assert!(String::from_utf8_lossy(&stderr).contains("an enum with a variant for each"));
 }
 
 #[test]
@@ -737,6 +740,16 @@ fn a_field_that_grows_is_held_to_a_limit() {
         &alloc_fixture(&format!("{types}pub fn add(q: &mut Q, b: u8) {{ q.items.push(b); }}")),
         "rr_unbounded",
     );
+    // Bytes are told how to keep a window of them instead; other items are not.
+    let help = |source: &str| {
+        String::from_utf8_lossy(&compile(&alloc_fixture(source), &[]).stderr).contains("a window at a time")
+    };
+    assert!(help(&format!(
+        "{types}pub fn add(q: &mut Q, b: u8) {{ q.items.push(b); }}"
+    )));
+    assert!(!help(
+        "pub struct W { pub items: Vec<u32> }\npub fn add(w: &mut W, b: u32) { w.items.push(b); }"
+    ));
     // A clear where a cycle starts over does not bound what one turn adds,
     // and capacity() is what the allocator gave, not a limit.
     for body in [
@@ -829,6 +842,30 @@ fn recursion_needs_a_reason() {
     );
     accepted(
         "#![no_std]\npub fn f(n: u8) -> u8 {\n if n == 0 {\n return 0;\n }\n // rr: escape(recursion): n is at most 4, so is the depth.\n f(n - 1)\n}\npub fn g(n: u8) -> u8 { n + 1 }\npub fn h(n: u8) -> u8 { g(g(n)) }",
+    );
+    // A reason above a function answers every call back into it, from
+    // itself and through others.
+    let bounded = "/// Descends as far as depth allows.\n\
+                   // rr: escape(recursion): depth grows by one each call and stops at 8.\n\
+                   #[inline]\npub fn walk(depth: u8) -> u8 {\n if depth >= 8 {\n return 0;\n }\n walk(depth + 1) + walk(depth + 1) + via(depth)\n}\n\
+                   fn via(depth: u8) -> u8 { walk(depth + 1) }";
+    accepted(&format!("#![no_std]\n{bounded}"));
+    // A cycle that passes the function by needs its own reason.
+    rejected(
+        &format!(
+            "#![no_std]\n{bounded}\npub fn a(n: u8) -> u8 {{ if n == 0 {{ walk(0) }} else {{ b(n - 1) }} }}\nfn b(n: u8) -> u8 {{ a(n) }}"
+        ),
+        "rr_no_recursion",
+    );
+    // A reason above a function no cycle comes back to answers nothing,
+    // and nor does one beside a call the function's reason answers.
+    rejected(
+        "#![no_std]\n// rr: escape(recursion): nothing calls it back.\npub fn once(n: u8) -> u8 { n + 1 }",
+        "rr_unused_escape",
+    );
+    rejected(
+        "#![no_std]\n// rr: escape(recursion): depth stops at 8.\npub fn walk(depth: u8) -> u8 {\n if depth >= 8 {\n return 0;\n }\n // rr: escape(recursion): said above.\n walk(depth + 1)\n}",
+        "rr_unused_escape",
     );
 }
 
@@ -1419,4 +1456,90 @@ fn a_buffer_written_with_a_macro_in_a_loop_takes_its_reason_beside_the_code() {
     };
     rejected(&body(""), "rr_unexplained_escape");
     accepted(&body("// rr: escape(alloc): each line is handed on whole."));
+}
+
+/// What rr's diagnostics say for source, from `rr check`, or with lint
+/// from `rr lint`, which runs Clippy's default lints too.
+fn diagnostics(source: &str, lint: bool) -> String {
+    if !lint {
+        return String::from_utf8_lossy(&compile(source, &[]).stderr).into_owned();
+    }
+    let root = std::env::temp_dir().join(format!(
+        "rr-test-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&root).unwrap();
+    let file = root.join("lib.rs");
+    fs::write(&file, source).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rr"))
+        .args([
+            "lint",
+            "--crate-name",
+            "rr_fixture",
+            "--crate-type=lib",
+            "--edition=2024",
+        ])
+        .arg(&file)
+        .output()
+        .unwrap();
+    fs::remove_dir_all(&root).unwrap();
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn diagnostics_say_what_to_write_in_rr() {
+    // A library macro: what to write instead.
+    for (call, says) in [
+        (
+            "let _v: alloc::vec::Vec<u8> = alloc::vec![1, 2];",
+            "Vec::from([a, b, c])",
+        ),
+        (
+            "let _s: alloc::string::String = alloc::format!(\"{}\", 1);",
+            "write!(s, ...)",
+        ),
+    ] {
+        let found = diagnostics(
+            &format!("#![no_std]\nextern crate alloc;\npub fn f() {{ {call} }}"),
+            false,
+        );
+        assert!(found.contains(says), "{call}: {found}");
+    }
+    // Clippy's lints, in rr's terms; a suggestion of a macro or a crate goes.
+    let shadow = diagnostics(
+        "#![no_std]\npub fn f(a: u8) -> u8 { let b = a + 1; let b = 2u8; b }",
+        false,
+    );
+    assert!(shadow.contains("a name of its own"), "{shadow}");
+    let index = diagnostics("#![no_std]\npub fn f(a: &[u8], i: usize) -> u8 { a[i] }", false);
+    assert!(index.contains("`escape(panic)` reason"), "{index}");
+    let count = diagnostics(
+        "#![no_std]\npub fn f(a: &[u8]) -> usize { a.iter().filter(|&&b| b == b'\\n').count() }",
+        false,
+    );
+    // Counting bytes with filter and count is not forced off a program.
+    assert!(!count.contains("bytecount"), "{count}");
+    let push = diagnostics(
+        "#![no_std]\nextern crate alloc;\npub fn f() -> alloc::vec::Vec<u8> {\n let mut v = alloc::vec::Vec::new();\n v.push(1);\n v.push(2);\n v\n}",
+        true,
+    );
+    assert!(
+        push.contains("Vec::from([a, b, c])") && !push.contains("vec![..]"),
+        "{push}"
+    );
+    // A collect, and a recursion reason the function's own answers.
+    let collect = diagnostics(
+        "#![no_std]\nextern crate alloc;\npub fn f(a: &[u8]) -> alloc::vec::Vec<u8> { a.iter().map(|b| b + 1).collect() }",
+        false,
+    );
+    assert!(collect.contains("without a collection"), "{collect}");
+    let unused = diagnostics(
+        "#![no_std]\n// rr: escape(recursion): depth stops at 8.\npub fn walk(depth: u8) -> u8 {\n if depth >= 8 {\n return 0;\n }\n // rr: escape(recursion): said above.\n walk(depth + 1)\n}",
+        false,
+    );
+    assert!(
+        unused.contains("above a function answers every call back into it"),
+        "{unused}"
+    );
 }

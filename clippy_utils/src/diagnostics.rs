@@ -30,6 +30,28 @@ pub enum Escaped {
 pub static ESCAPE: std::sync::OnceLock<fn(&rustc_session::Session, &'static Lint, Span) -> Escaped> =
     std::sync::OnceLock::new();
 
+/// rr: what rr says of an emission in its own terms.
+pub struct Hint {
+    pub help: &'static str,
+    /// Whether Clippy's suggestion goes: it would write what rr forbids,
+    /// such as a macro or a crate.
+    pub replaces: bool,
+}
+
+/// rr's hint for an emission of a lint. Unset outside rr.
+pub static HINT: std::sync::OnceLock<fn(&'static Lint) -> Option<Hint>> = std::sync::OnceLock::new();
+
+fn rr_hint(diag: &mut Diag<'_, ()>, lint: &'static Lint) {
+    if let Some(hint) = HINT.get()
+        && let Some(Hint { help, replaces }) = hint(lint)
+    {
+        if replaces {
+            diag.disable_suggestions();
+        }
+        diag.help(help);
+    }
+}
+
 fn escaped(sess: &rustc_session::Session, lint: &'static Lint, sp: &MultiSpan) -> Escaped {
     match (ESCAPE.get(), sp.primary_span()) {
         (Some(check), Some(span)) => check(sess, lint, span),
@@ -294,6 +316,7 @@ where
             diag.primary_message(msg);
             diag.span(sp);
             f(diag);
+            rr_hint(diag, lint);
             unnamed_note(diag, hint);
             docs_link(diag, lint);
 
@@ -379,6 +402,7 @@ pub fn span_lint_hir_and_then(
         rustc_errors::DiagDecorator(|diag| {
             diag.primary_message(msg);
             f(diag);
+            rr_hint(diag, lint);
             unnamed_note(diag, hint);
             docs_link(diag, lint);
 
