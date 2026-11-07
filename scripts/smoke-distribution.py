@@ -118,30 +118,23 @@ with tempfile.TemporaryDirectory(prefix="rr-smoke-", dir=os.environ.get("TMPDIR"
     registry = Path(__file__).resolve().parent.parent / "registry"
     run("init", "components")
     components = root / "components"
-    names = sorted(p.stem for p in registry.glob("*.json") if p.name != "index.json")
+    names = sorted(p.stem for p in registry.glob("*/*.json") if p.stem == p.parent.name)
     # The index rr add --list reads is the components' own.
     subprocess.run([sys.executable, str(registry.parent / "scripts" / "registry-index.py"), "--check"], check=True)
     listed = run("add", "--list", str(registry / "index.json")).stdout
     assert all(f"{name}  " in listed for name in names) and "asks: --option roots=" in listed, listed
     for name in names:
-        done = subprocess.run([str(rr), "add", str(registry / f"{name}.json")], cwd=components, env=env,
+        done = subprocess.run([str(rr), "add", str(registry / name / f"{name}.json")], cwd=components, env=env,
                               text=True, encoding="utf-8", errors="replace", capture_output=True)
         if done.returncode != 0:
             raise AssertionError(f"rr add {name}\n{done.stdout}\n{done.stderr}")
+    # rr add declared each in src/base/mod.rs; the root declares base.
     main = components / "src" / "main.rs"
-    roots = sorted({(p.parts[0][:-3] if p.parts[0].endswith(".rs") else p.parts[0]) for p in
-                    (f.relative_to(components / "src") for f in (components / "src").rglob("*.rs"))
-                    if p.parts[0] not in ("main.rs", "greet.rs", "sys")})
     text = main.read_text()
-    main.write_text(text.replace("mod greet;\n", "mod greet;\n" + "".join(f"mod {m};\n" for m in roots), 1))
-    for system in ("unix", "windows"):
-        own = components / "src" / "sys" / f"{system}.rs"
-        added = sorted(p.stem for p in (components / "src" / "sys").glob("*.rs")
-                       if p.stem not in ("unix", "windows"))
-        own.write_text(own.read_text() + "".join(f"\npub mod {m};\n" for m in added))
+    main.write_text(text.replace("mod greet;\n", "mod base;\nmod greet;\n", 1))
     run("fmt", "components/src/main.rs")
-    for f in (components / "src").rglob("*.rs"):
-        source = registry / f.relative_to(components / "src")
+    for f in (components / "src" / "base").rglob("*.rs"):
+        source = registry / f.relative_to(components / "src" / "base")
         if source.is_file() and source.read_text() != f.read_text():
             raise AssertionError(f"rr fmt changes registry/{source.relative_to(registry)}")
     for targets in (("check", "lint"), ("test",), ("bench",)):

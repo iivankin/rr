@@ -274,6 +274,7 @@ fn reach_report(binary: &Path, targets: &[String], runtime: &[String]) -> io::Re
                     || file.starts_with(&format!("{module}/"))
                     || file.starts_with("sys/")
                     || file == "sys.rs"
+                    || file.ends_with("/sys.rs")
             })
         {
             eprintln!(

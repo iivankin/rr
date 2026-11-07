@@ -17,8 +17,9 @@ REGISTRY = Path(__file__).resolve().parent.parent / "registry"
 
 def index():
     items = []
-    for path in sorted(REGISTRY.glob("*.json")):
-        if path.name == "index.json":
+    # A component is a directory with NAME/NAME.json in it.
+    for path in sorted(REGISTRY.glob("*/*.json")):
+        if path.stem != path.parent.name:
             continue
         item = json.loads(path.read_text(encoding="utf-8"))
         entry = {

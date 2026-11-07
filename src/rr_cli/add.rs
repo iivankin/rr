@@ -1,8 +1,11 @@
 //! rr add: copy a component of a registry into the project, as its own
-//! code. A component is one JSON file: its name, the rr it was checked
-//! with, the components it needs, the questions whose answers add more,
-//! and its files, each with its text or beside the JSON, for src/ or
-//! scripts/. A registry is wherever those files are served.
+//! code, in src/base/NAME/, so that what came from a registry stays apart
+//! from what the project wrote. A component is a directory of a registry
+//! with NAME.json in it: its name, the rr it was checked with, the
+//! components it needs, the questions whose answers add more, and its
+//! files, each with its text or beside the JSON, for src/base/NAME/ or
+//! scripts/. A registry is a directory of such directories, served from
+//! anywhere, with index.json at its root.
 
 use std::io::{BufRead as _, IsTerminal as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -11,8 +14,19 @@ use std::{fs, io};
 
 use serde_json::Value;
 
-/// Where a bare name is looked up, unless rr.json names another `@rr`.
-const DEFAULT: &str = "https://raw.githubusercontent.com/iivankin/rr/main/registry/{name}.json";
+/// Where a bare name is looked up, unless rr.json names another `@rr`:
+/// rr's registry as this release of rr has it, so that a later change to
+/// the registry never reaches an rr that does not know it.
+fn default_registry() -> String {
+    format!(
+        "https://raw.githubusercontent.com/iivankin/rr/v{}/registry",
+        super::VERSION
+    )
+}
+
+/// The directory under the source directory that holds what rr add
+/// copied, a module of the crate root.
+const BASE: &str = "base";
 
 struct Options {
     overwrite: bool,
@@ -24,8 +38,8 @@ struct Options {
     defaults: bool,
 }
 
-/// One file of a component: where it goes under src/ or scripts/, and
-/// its text.
+/// One file of a component: where it goes under the source directory or
+/// scripts/, and its text.
 struct File {
     path: String,
     script: bool,
@@ -127,7 +141,8 @@ pub fn run(args: &[String]) -> io::Result<ExitCode> {
         fs::write(target, &file.text)?;
         println!("Added {}", target.display());
     }
-    declarations(&o.dir, &files);
+    modules(&o.dir, &g.names)?;
+    declarations(&o.dir);
     if g.taken.is_empty() {
         println!("rr add: {}", g.names.join(", "));
     } else {
@@ -140,8 +155,8 @@ pub fn run(args: &[String]) -> io::Result<ExitCode> {
 /// rr.json names, or an index's path or URL.
 fn list(registry: Option<&str>, registries: &[(String, String)]) -> io::Result<ExitCode> {
     let location = match registry {
-        None => locate("index", None, registries)?,
-        Some(scope) if scope.starts_with('@') => locate(&format!("{scope}/index"), None, registries)?,
+        None => format!("{}/index.json", root(None, registries)?),
+        Some(scope) if scope.starts_with('@') => format!("{}/index.json", root(Some(scope), registries)?),
         Some(other) => other.to_owned(),
     };
     let text = fetch(&location)?;
@@ -178,7 +193,7 @@ fn list(registry: Option<&str>, registries: &[(String, String)]) -> io::Result<E
 }
 
 /// The registries rr.json names, as `{"registries": {"@scope": URL}}`,
-/// each URL with `{name}` where the component's name goes.
+/// each URL the registry's root directory.
 fn registries() -> io::Result<Vec<(String, String)>> {
     let text = match fs::read_to_string("rr.json") {
         Ok(text) => text,
@@ -189,19 +204,36 @@ fn registries() -> io::Result<Vec<(String, String)>> {
     let mut found = Vec::new();
     if let Some(map) = json.get("registries").and_then(Value::as_object) {
         for (scope, url) in map {
-            let url = url
-                .as_str()
-                .filter(|u| u.contains("{name}"))
-                .ok_or_else(|| io::Error::other(format!("rr.json: {scope} needs a URL with {{name}}")))?;
-            found.push((scope.clone(), url.to_owned()));
+            let url = url.as_str().filter(|u| !u.contains("{name}")).ok_or_else(|| {
+                io::Error::other(format!(
+                    "rr.json: {scope} names the registry's root directory, which holds NAME/NAME.json"
+                ))
+            })?;
+            found.push((scope.clone(), url.trim_end_matches('/').to_owned()));
         }
     }
     Ok(found)
 }
 
+/// The root of a registry: a scope rr.json names, `@rr` if it names
+/// one, or rr's own.
+fn root(scope: Option<&str>, registries: &[(String, String)]) -> io::Result<String> {
+    match scope {
+        Some(scope) => registries
+            .iter()
+            .find(|(s, _)| s == scope)
+            .map(|(_, url)| url.clone())
+            .ok_or_else(|| io::Error::other(format!("{scope}: no such registry in rr.json"))),
+        None => Ok(registries
+            .iter()
+            .find(|(s, _)| s == "@rr")
+            .map_or_else(default_registry, |(_, url)| url.clone())),
+    }
+}
+
 /// Where an item is: a URL, a file, `@scope/name` in a registry of
-/// rr.json, or a name. A dependency's bare name is looked up beside the
-/// component that needs it.
+/// rr.json, or a name. A dependency's bare name is a directory beside the
+/// one of the component that needs it, in the same registry.
 fn locate(item: &str, beside: Option<&str>, registries: &[(String, String)]) -> io::Result<String> {
     if item.starts_with("https://")
         || item.starts_with("http://")
@@ -225,27 +257,24 @@ fn locate(item: &str, beside: Option<&str>, registries: &[(String, String)]) -> 
     {
         return Err(io::Error::other(format!("{item}: not a component name")));
     }
-    let template = match (&scope, beside) {
-        (Some(scope), _) => registries
-            .iter()
-            .find(|(s, _)| s == scope)
-            .map(|(_, url)| url.clone())
-            .ok_or_else(|| io::Error::other(format!("{scope}: no such registry in rr.json")))?,
-        (None, Some(base)) => return Ok(join(base, &format!("{name}.json"))),
-        (None, None) => registries
-            .iter()
-            .find(|(s, _)| s == "@rr")
-            .map_or_else(|| DEFAULT.to_owned(), |(_, url)| url.clone()),
+    let registry = match (&scope, beside) {
+        (None, Some(base)) => parent(&parent(base)),
+        (scope, _) => root(scope.as_deref(), registries)?,
     };
-    Ok(template.replace("{name}", name))
+    Ok(format!("{registry}/{name}/{name}.json"))
+}
+
+/// The directory location is in, without the separator.
+fn parent(location: &str) -> String {
+    match location.rfind(['/', '\\']) {
+        Some(end) => location[..end].to_owned(),
+        None => ".".to_owned(),
+    }
 }
 
 /// path relative to the directory of the component at base.
 fn join(base: &str, path: &str) -> String {
-    match base.rfind(['/', '\\']) {
-        Some(end) => format!("{}/{path}", &base[..end]),
-        None => path.to_owned(),
-    }
+    format!("{}/{path}", parent(base))
 }
 
 /// The component at location and those it needs, those first, each
@@ -300,18 +329,22 @@ fn collect(location: &str, o: &Options, ask: bool, g: &mut Gathered) -> io::Resu
                 )));
             },
         };
+        if !script && !relative(name) {
+            return Err(io::Error::other(format!("{location}: {name} is not a component name")));
+        }
         let text = match file.get("content").and_then(Value::as_str) {
             Some(text) => text.to_owned(),
             None => fetch(&join(location, path))?,
         };
+        let path = if script {
+            path.to_owned()
+        } else {
+            format!("{BASE}/{name}/{path}")
+        };
         if g.files.iter().any(|f| f.path == path && f.script == script) {
             return Err(io::Error::other(format!("{path} comes from two components")));
         }
-        g.files.push(File {
-            path: path.to_owned(),
-            script,
-            text,
-        });
+        g.files.push(File { path, script, text });
     }
     g.names.push(name.to_owned());
     Ok(())
@@ -440,42 +473,49 @@ fn newer(wanted: &str, have: &str) -> bool {
     parts(wanted) > parts(have)
 }
 
-/// The `mod` lines the crate still needs for what was added: a module
-/// of the root, or of sys.
-fn declarations(dir: &Path, files: &[File]) {
+/// Declares each component added in base/mod.rs, which rr add keeps:
+/// the module of everything it copied.
+fn modules(dir: &Path, names: &[String]) -> io::Result<()> {
+    let path = dir.join(BASE).join("mod.rs");
+    let mut text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::from(
+            "//! What rr add copied from a registry: the project's own code now,\n\
+             //! kept apart from what it wrote. rr add declares each component here.\n\n",
+        ),
+        Err(error) => return Err(error),
+    };
+    let old = text.clone();
+    for name in names {
+        let line = format!("pub mod {name};");
+        if !text.lines().any(|l| l.trim() == line) {
+            text.push_str(&line);
+            text.push('\n');
+        }
+    }
+    if text != old {
+        fs::create_dir_all(path.parent().unwrap_or(dir))?;
+        fs::write(&path, text)?;
+        println!("Declared in {}", path.display());
+    }
+    Ok(())
+}
+
+/// Says to declare base in the crate root, if it does not.
+fn declarations(dir: &Path) {
     let root = ["main.rs", "lib.rs"]
         .iter()
         .find_map(|name| fs::read_to_string(dir.join(name)).ok())
         .unwrap_or_default();
-    let mut missing = Vec::new();
-    for file in files.iter().filter(|f| !f.script) {
-        let (parent, module) = match file.path.split_once('/') {
-            None => ("the crate root", file.path.strip_suffix(".rs")),
-            Some((dir, rest)) if !rest.contains('/') && rest != "mod.rs" => {
-                if dir == "sys" {
-                    ("each file of sys", rest.strip_suffix(".rs"))
-                } else {
-                    continue;
-                }
-            },
-            Some((dir, "mod.rs")) => ("the crate root", Some(dir)),
-            Some(_) => continue,
-        };
-        let Some(module) = module else { continue };
-        let line = format!("mod {module};");
-        if parent == "the crate root" && root.contains(&line) {
-            continue;
-        }
-        missing.push(format!("  {line:<24} in {parent}"));
-    }
-    if !missing.is_empty() {
-        println!("Declare the new modules, then make check test:");
-        for line in missing {
-            println!("{line}");
-        }
+    let line = format!("mod {BASE};");
+    if !root
+        .lines()
+        .any(|l| l.trim() == line || l.trim() == format!("pub {line}"))
+    {
+        println!("Declare `{line}` in the crate root, then make check test.");
     }
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  rr add --list [@scope | INDEX]\n  rr add [--overwrite] [--yes] [--option NAME=VALUE]... [--dir DIR] COMPONENT...\n\nCopies each COMPONENT, and those it needs, into DIR (src by default) as\nthe project's own code, and its scripts into scripts/. A component may\nask questions, such as where TLS takes its trusted roots from: at a\nterminal rr add asks; --option answers one, and --yes or a run without\na terminal takes the defaults and says how to choose. COMPONENT is a name in rr's registry, @scope/name\nin a registry rr.json names ({\"registries\": {\"@scope\": \"https://…/{name}.json\"}}),\nor the URL or path of a component's JSON. A file that exists and differs\nstops the add unless --overwrite. --list prints a registry's components\n(its index.json), what each needs and what it asks."
+    "Usage:\n  rr add --list [@scope | INDEX]\n  rr add [--overwrite] [--yes] [--option NAME=VALUE]... [--dir DIR] COMPONENT...\n\nCopies each COMPONENT, and those it needs, into DIR/base/NAME/ (DIR is src\nby default) as the project's own code, declares it in DIR/base/mod.rs,\nand copies its scripts into scripts/. A component may\nask questions, such as where TLS takes its trusted roots from: at a\nterminal rr add asks; --option answers one, and --yes or a run without\na terminal takes the defaults and says how to choose. COMPONENT is a name in rr's registry, @scope/name\nin a registry rr.json names ({\"registries\": {\"@scope\": \"https://…/registry\"}},\nits root, holding NAME/NAME.json),\nor the URL or path of a component's JSON. A file that exists and differs\nstops the add unless --overwrite. --list prints a registry's components\n(its index.json), what each needs and what it asks."
 }

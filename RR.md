@@ -31,7 +31,7 @@ make fmt                # rr fmt: rewrite in rr's one style
 make format check lint  # rr fmt --check, rr's rules, then Clippy's
 make fuzz               # rr fuz: the fns named in FUZZ, sharing FUZZTIME
 make prof               # where the program allocates and copies
-rr add tls              # copy a component, and those it needs, into src/
+rr add tls              # copy a component, and those it needs, into src/base/
 
 rr init library --lib   # src/lib.rs alone, for a crate to depend on
 rustc --edition 2024 -C panic=abort library/src/lib.rs --crate-type rlib --crate-name example -o libexample.rlib
@@ -68,20 +68,26 @@ with the rules for whoever changes the code: format with rr fmt, then rr check
 and rr lint, after every change. `init --lib` writes src/lib.rs alone. No manifest
 is created.
 
-`rr add COMPONENT...` copies code from a registry into src/, as shadcn
-copies a component: the project then owns it. A component is a JSON file
-with its name, the rr it was checked with, the components it needs and
-its files; COMPONENT is a name in rr's registry (registry/ in this
-repository, fetched from GitHub with curl), `@scope/name` in a registry
-that rr.json maps (`{"registries": {"@acme": "https://…/{name}.json"}}`),
-or a component's URL or path. A component may put scripts in scripts/ and
+`rr add COMPONENT...` copies code from a registry into src/base/NAME/, as
+shadcn copies a component: the project then owns it, and src/base/ keeps
+it apart from what the project wrote. rr add declares each component in
+src/base/mod.rs and says when the crate root still needs `mod base;`. A
+component is a directory of a registry, NAME/, with NAME.json in it: its
+name, the rr it was checked with, the components it needs and its files,
+which sit beside it as they go into src/base/NAME/ (its unsafe in
+sys.rs). COMPONENT is a name in rr's registry (registry/ in this
+repository at this release's tag, fetched from GitHub with curl),
+`@scope/name` in a registry that rr.json maps to its root
+(`{"registries": {"@acme": "https://…/registry"}}`), or a component's
+JSON by URL or path; a component's dependencies are directories beside
+its own. A component may put scripts in scripts/ and
 ask questions whose answers add components (tls: where its trusted
 roots come from); at a terminal rr add asks, `--option NAME=VALUE`
 answers, and `--yes` or a run without a terminal takes the defaults and
 says how to choose. A file that exists and differs stops the
 add before anything is written, unless `--overwrite`; a component that
-needs a newer rr, or a path outside src/, is refused. rr add prints the
-`mod` lines still to write. registry/README.md says what a component of
+needs a newer rr, or a path outside its directory, is refused.
+registry/README.md says what a component of
 rr's registry is: no I/O of its own, so one serves a blocking loop, a
 poll loop or a thread; its own errors; unsafe only in sys; and the
 template's checks, which scripts/registry-check.sh runs on it.

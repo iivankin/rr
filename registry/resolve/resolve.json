@@ -1,0 +1,16 @@
+{
+  "name": "resolve",
+  "description": "Host lookup that never blocks the caller's loop, one API on Linux, macOS and Windows: start, poll, take the addresses, drop to cancel. The system answers as it answers every program there: the C library's getaddrinfo on Linux and macOS, GetAddrInfoW on Windows, each on a thread of wait's, which signals the caller's poll when done. A lookup holds a thread while it runs, and one cancelled after it started runs on to the system's timeout.",
+  "rr": "0.5.1",
+  "dependencies": [
+    "wait"
+  ],
+  "files": [
+    {
+      "path": "mod.rs"
+    },
+    {
+      "path": "sys.rs"
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "name": "roots",
+  "description": "Mozilla's trust anchors for TLS servers from NSS's certdata.txt at a release tag (MPL 2.0), with Mozilla's distrust-after dates, embedded as PEM and loaded into an x509::Store; scripts/roots-gen.py rebuilds the file from a newer tag.",
+  "rr": "0.5.1",
+  "dependencies": [
+    "x509"
+  ],
+  "files": [
+    {
+      "path": "mod.rs"
+    },
+    {
+      "path": "roots.pem"
+    },
+    {
+      "path": "roots-gen.py",
+      "target": "scripts"
+    }
+  ]
+}

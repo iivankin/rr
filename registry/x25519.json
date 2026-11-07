@@ -1,7 +1,0 @@
-{
-  "name": "x25519",
-  "description": "X25519 key agreement (RFC 7748): a constant-time Montgomery ladder over five 51-bit limbs.",
-  "rr": "0.3.2",
-  "dependencies": [],
-  "files": [{ "path": "x25519.rs" }]
-}

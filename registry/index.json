@@ -23,29 +23,15 @@
       "dependencies": []
     },
     {
-      "name": "file",
-      "description": "Files on Linux by the kernel's own calls, for components that read the system's configuration: open a path, read a file whole up to a limit, a descriptor closed on drop. Nothing on macOS and Windows.",
-      "dependencies": []
-    },
-    {
       "name": "http1",
       "description": "HTTP/1.1 client side (RFC 9112) without I/O: requests written into a buffer, and an incremental response parser that takes any split of the input and hands body bytes back uncopied, for Content-Length, chunked and close-delimited bodies.",
       "dependencies": []
     },
     {
       "name": "resolve",
-      "description": "Host lookup that never blocks the caller's loop, one API on Linux, macOS and Windows: start, poll, take the addresses, drop to cancel. Linux runs resolver (Go's own resolver) on raw system calls and hands its sockets and deadline to the caller's poll; macOS runs getaddrinfo on a thread; Windows runs GetAddrInfoW on a thread, as Go does; on both, the thread signals through wait, which the caller's poll takes beside its own descriptors.",
+      "description": "Host lookup that never blocks the caller's loop, one API on Linux, macOS and Windows: start, poll, take the addresses, drop to cancel. The system answers as it answers every program there: the C library's getaddrinfo on Linux and macOS, GetAddrInfoW on Windows, each on a thread of wait's, which signals the caller's poll when done. A lookup holds a thread while it runs, and one cancelled after it started runs on to the system's timeout.",
       "dependencies": [
-        "resolver",
-        "wait",
-        "file"
-      ]
-    },
-    {
-      "name": "resolver",
-      "description": "A stub resolver that behaves as Go's, without I/O: resolv.conf, /etc/hosts and nsswitch.conf parsed as Go parses them, files and DNS ordered as Go orders them, one name's lookup as a state machine (search list, A and AAAA, servers rotated, UDP then TCP, timeouts and attempts), and RFC 6724 address order.",
-      "dependencies": [
-        "dns"
+        "wait"
       ]
     },
     {
@@ -101,16 +87,15 @@
     },
     {
       "name": "trust",
-      "description": "TLS server authentication by the operating system's trust, as Go's crypto/x509 does it: macOS's SecTrustEvaluateWithError and Windows's CertGetCertificateChain with the SSL policy, on a thread a poll loop waits on, and on Linux x509::verify against the system's anchors (its bundle and certificate directories, or SSL_CERT_FILE and SSL_CERT_DIR, read on raw system calls). system() also loads the anchors themselves on all three: macOS's trust domains with their SSL trust settings, Windows's ROOT store less what is disabled for server authentication or Disallowed.",
+      "description": "TLS server authentication by the operating system's trust, as Go's crypto/x509 does it: macOS's SecTrustEvaluateWithError and Windows's CertGetCertificateChain with the SSL policy, on a thread a poll loop waits on, and on Linux x509::verify against the system's anchors (its bundle and certificate directories, or SSL_CERT_FILE and SSL_CERT_DIR, read through the C library). system() also loads the anchors themselves on all three: macOS's trust domains with their SSL trust settings, Windows's ROOT store less what is disabled for server authentication or Disallowed.",
       "dependencies": [
         "x509",
-        "wait",
-        "file"
+        "wait"
       ]
     },
     {
       "name": "wait",
-      "description": "What a poll loop waits on, one type on every system and for every component that works while the loop runs: descriptors (sockets on Windows) and a timeout; block and ready to wait on it with poll or WSAPoll; and on macOS and Windows a pool of at most 32 threads with a cancellable FIFO line, and the close-on-exec pipe or non-inherited loopback socket pair that says the work is done.",
+      "description": "What a poll loop waits on, one type on every system and for every component that works while the loop runs: descriptors (sockets on Windows) and a timeout; block and ready to wait on it with poll or WSAPoll; and a pool of at most 32 threads with a cancellable FIFO line, and the close-on-exec pipe (Linux and macOS) or non-inherited loopback socket pair (Windows) that says the work is done.",
       "dependencies": []
     },
     {

@@ -2,10 +2,12 @@
 
 Components `rr add` copies into a project as its own code, the way shadcn
 copies a component: the project owns the copy, reads it and changes it.
+Each goes into src/base/NAME/, apart from what the project wrote, and rr
+add declares it in src/base/mod.rs; the crate root declares `mod base;`.
 
     rr add tls                  # this registry
     rr add @acme/geo            # a registry rr.json names
-    rr add ./x/tls.json         # a component's JSON, by path or URL
+    rr add ./x/tls/tls.json     # a component's JSON, by path or URL
     rr add --list               # what this registry has (index.json)
 
 ## Components
@@ -23,30 +25,31 @@ copies a component: the project owns the copy, reads it and changes it.
 | tls | sha256, aesgcm, x25519, x509; asks for trust or roots | TLS 1.3 client, bytes in any split; the chain verified by x509 or by the caller (the system, through trust) |
 | http1 | | HTTP/1.1 requests and an incremental response parser |
 | dns | | DNS wire format: queries, replies, TCP framing |
-| resolver | dns | Go's resolver without I/O: resolv.conf, hosts, nsswitch, the lookup, RFC 6724 order |
-| resolve | resolver, wait, file | host lookup that never blocks: Linux by its own DNS over the kernel's calls, getaddrinfo on macOS, GetAddrInfoExW on Windows |
-| trust | x509, wait, file | the system verifies a chain, as Go does: SecTrust on macOS, CertGetCertificateChain on Windows, x509 with the system's roots on Linux; never blocks |
+| resolve | wait | host lookup that never blocks the loop: the system's own, getaddrinfo on Linux and macOS, GetAddrInfoW on Windows, on a thread |
+| trust | x509, wait | the system verifies a chain, as Go does: SecTrust on macOS, CertGetCertificateChain on Windows, x509 with the system's roots on Linux; never blocks |
 | wait | | what a program's loop waits on for any component: descriptors or an event, a timeout; a thread that signals when done |
-| file | | Linux: whole files read through the C library's syscall, descriptors closed on drop |
 | cpu | | what the CPU has of the instructions the components use, asked once |
 
 ## A component
 
-One JSON file beside its sources, which sit where they go under `src/`:
+A directory, NAME/, as it goes into src/base/NAME/: NAME.json, mod.rs,
+the component's other files, and its unsafe in sys.rs, the module rr
+lets touch the system. A script that writes a table sits beside them.
 
 ```json
 {
   "name": "aesgcm",
   "description": "AES-128-GCM (RFC 5116), with AES and GHASH instructions where the CPU has them.",
-  "rr": "0.3.2",
+  "rr": "0.5.1",
   "dependencies": ["cpu"],
-  "files": [{ "path": "aesgcm.rs" }, { "path": "sys/aes.rs" }]
+  "files": [{ "path": "mod.rs" }, { "path": "sys.rs" }]
 }
 ```
 
 - `rr`: the rr the component was checked with; an older rr refuses it.
-- `dependencies`: names in the same registry, `@scope/name`, or URLs.
-- `files`: `path` under `src/`, or under `scripts/` with
+- `dependencies`: names in the same registry (directories beside this
+  one), `@scope/name`, or URLs.
+- `files`: `path` under src/base/NAME/, or under `scripts/` with
   `"target": "scripts"`; the text is `content`, or the file at `path`
   beside the JSON.
 - `options`: questions whose answers add components, as shadcn's
@@ -69,12 +72,16 @@ One JSON file beside its sources, which sit where they go under `src/`:
   prints how to choose.
 
 `rr add` refuses a file that exists and differs, unless `--overwrite`,
-and prints the `mod` lines still to write. A registry of your own is any
-place that serves such files: rr.json maps a scope to it,
+and says when the crate root still needs `mod base;`. A registry of your
+own is any place that serves such directories, with index.json at its
+root: rr.json maps a scope to that root,
 
 ```json
-{ "registries": { "@acme": "https://acme.dev/r/{name}.json" } }
+{ "registries": { "@acme": "https://acme.dev/registry" } }
 ```
+
+rr fetches its own registry at the tag of its release, so a change here
+reaches only the rr made with it.
 
 ## What a component here is
 
@@ -85,9 +92,12 @@ place that serves such files: rr.json maps a scope to it,
 - **Its own errors.** A component does not name the project's error type;
   it returns its own small enum, or false.
 - **Unsafe only in sys.** CPU instructions (AES, SHA, carry-less
-  multiply) are in `sys/<name>.rs` behind a safe function that says
-  whether it ran; `cpu` says what the CPU has. The portable code is
-  always there and passes the same vectors.
+  multiply) are in the component's sys.rs behind a safe function that
+  says whether it ran; `cpu` says what the CPU has. The portable code is
+  always there and passes the same vectors. What talks to the system
+  (wait, resolve, trust, cpu) is all in its sys.rs, through the C
+  library on Linux and macOS and the system's DLLs on Windows; mod.rs
+  says what it is and exports it.
 - **Arithmetic that cannot overflow, or says it wraps.** The template
   builds without overflow checks, as Cargo's release profile does, so
   nothing stops an overflow there. Arithmetic meant to wrap is written
@@ -96,7 +106,7 @@ place that serves such files: rr.json maps a scope to it,
 - **One style, except generated tables.** `#[rustfmt::skip]` stands
   only on a constant a script writes, under a comment naming the script
   and the test that recomputes it. The script sits beside the component
-  (registry/NAME-gen.py). It goes to the project's scripts/ only when
+  (registry/NAME/NAME-gen.py). It goes to the project's scripts/ only when
   what it writes goes stale there (roots-gen.py: Mozilla's roots); a
   table that a standard fixes stays in the registry.
 - **Checked as the template checks a program.** Each file passes rr
@@ -106,8 +116,9 @@ place that serves such files: rr.json maps a scope to it,
 
 index.json lists the components for `rr add --list`;
 `scripts/registry-index.py` writes it from their JSON, and `--check`
-says whether it is current. `scripts/registry-check.sh DIR NAME...` adds components to a fresh
-project and runs those checks; with `SYSROOT`, a sysroot of other
-targets' standard libraries, it checks them for each target too. The
+says whether it is current. `scripts/registry-check.sh DIR NAME...` adds
+components to a fresh project and runs those checks; with `TARGETS`,
+other targets whose standard library rustup added, it checks them for
+each target too. The
 Registry workflow runs it on each host for every push that changes
 registry/.

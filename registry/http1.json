@@ -1,7 +1,0 @@
-{
-  "name": "http1",
-  "description": "HTTP/1.1 client side (RFC 9112) without I/O: requests written into a buffer, and an incremental response parser that takes any split of the input and hands body bytes back uncopied, for Content-Length, chunked and close-delimited bodies.",
-  "rr": "0.3.2",
-  "dependencies": [],
-  "files": [{ "path": "http1.rs" }]
-}

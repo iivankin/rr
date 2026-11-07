@@ -7,10 +7,10 @@ use super::{
     Keys, MESSAGE_MAX, PENDING_MAX, RECORD_MAX, RECORDS_PER_INPUT, Reader, State, VERIFY_CONTEXT,
     Verify, derive, expand, handshake_secrets, mac,
 };
-use crate::sha256::{self, Sha256};
-use crate::sha384;
-use crate::x509::{self, Store, TEST_NOW, test_certificate};
-use crate::x25519;
+use crate::base::sha256::{self, Sha256};
+use crate::base::sha384;
+use crate::base::x509::{self, Store, TEST_NOW, test_certificate};
+use crate::base::x25519;
 use alloc::vec::Vec;
 use test::Bencher;
 

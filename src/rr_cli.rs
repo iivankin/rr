@@ -27,7 +27,7 @@ mod test;
 mod target;
 
 /// What rr add compares with the rr a component was checked with.
-pub const VERSION: &str = "0.5.0";
+pub const VERSION: &str = "0.5.1";
 
 pub fn main() -> ExitCode {
     // rr builds on the official compiler, a stable one, and uses what only
