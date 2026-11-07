@@ -1,7 +1,7 @@
 {
   "name": "aesgcm",
   "description": "AES-128-GCM (NIST SP 800-38D, TLS 1.3's 12-byte nonce and 16-byte tag), sealed and opened in place, on AES and carry-less multiply instructions where the CPU has them and constant-time portable code elsewhere.",
-  "rr": "0.5.1",
+  "rr": "0.5.2",
   "dependencies": [
     "cpu"
   ],

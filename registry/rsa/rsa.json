@@ -1,7 +1,7 @@
 {
   "name": "rsa",
   "description": "RSA signature verification (RFC 8017): RSASSA-PKCS1-v1_5 and RSASSA-PSS with MGF1 and a salt of the hash's length, SHA-256 or SHA-384, for moduli of 2048 to 4096 bits and exponents of at most 33 bits.",
-  "rr": "0.5.1",
+  "rr": "0.5.2",
   "dependencies": [
     "sha256",
     "sha384"

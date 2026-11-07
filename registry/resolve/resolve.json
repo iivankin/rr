@@ -1,7 +1,7 @@
 {
   "name": "resolve",
   "description": "Host lookup that never blocks the caller's loop, one API on Linux, macOS and Windows: start, poll, take the addresses, drop to cancel. The system answers: mDNSResponder through DNSServiceGetAddrInfo on macOS, on a socket the caller's poll waits on, sorted by RFC 6724 as getaddrinfo sorts; GetAddrInfoExW on Windows, asynchronous and cancellable, its callback signalling the caller's poll; the C library's getaddrinfo on Linux, on a thread of wait's, where a lookup cancelled after it started runs on to the system's timeout.",
-  "rr": "0.5.1",
+  "rr": "0.5.2",
   "dependencies": [
     "wait"
   ],

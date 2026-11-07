@@ -4,7 +4,7 @@ use alloc::boxed::Box;
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
 use core::ptr::null_mut;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 /// poll's events, the same on Linux and macOS.
 #[cfg(unix)]
@@ -185,7 +185,7 @@ struct Line {
 /// The process's line, under its lock: the threads spawn starts reach
 /// it from outside any caller's call tree, as a signal handler would.
 struct Queue {
-    lock: AtomicBool,
+    lock: os::Lock,
     line: UnsafeCell<Line>,
 }
 
@@ -195,8 +195,7 @@ unsafe impl Sync for Queue {}
 // rr: escape(shared): one line for the process, which the worker threads
 // reach without a caller to lend it to them.
 static QUEUE: Queue = Queue {
-    // rr: escape(shared): the line's lock.
-    lock: AtomicBool::new(false),
+    lock: os::Lock::new(),
     // rr: escape(shared): the line, under the lock.
     line: UnsafeCell::new(Line {
         running: 0,
@@ -207,18 +206,10 @@ static QUEUE: Queue = Queue {
 
 /// Runs f on the line under its lock.
 fn locked(f: impl FnOnce(&mut Line)) {
-    // Another thread holds the lock while it links or unlinks one work:
-    // a few instructions.
-    while QUEUE
-        .lock
-        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
-        core::hint::spin_loop();
-    }
+    QUEUE.lock.lock();
     // rr: escape(unsafe): the lock is held: no one else touches the line.
     f(unsafe { &mut *QUEUE.line.get() });
-    QUEUE.lock.store(false, Ordering::Release);
+    QUEUE.lock.unlock();
 }
 
 /// Runs work(argument) on a thread: a new one while fewer than
@@ -300,6 +291,7 @@ fn begin(first: *mut c_void) {
 #[cfg(unix)]
 mod os {
     use super::Wait;
+    use core::cell::UnsafeCell;
     use core::ffi::{c_int, c_void};
 
     #[repr(C)]
@@ -333,6 +325,8 @@ mod os {
             argument: *mut c_void,
         ) -> c_int;
         fn pthread_detach(thread: Thread) -> c_int;
+        fn pthread_mutex_lock(mutex: *mut u64) -> c_int;
+        fn pthread_mutex_unlock(mutex: *mut u64) -> c_int;
         fn pipe(fds: *mut c_int) -> c_int;
         fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
         fn write(fd: c_int, buffer: *const c_void, size: usize) -> isize;
@@ -375,6 +369,38 @@ mod os {
     extern "C" fn run(start: *mut c_void) -> *mut c_void {
         super::begin(start);
         core::ptr::null_mut()
+    }
+
+    /// PTHREAD_MUTEX_INITIALIZER's first word: macOS's
+    /// _PTHREAD_MUTEX_SIG_init (pthread_impl.h); glibc's and musl's are
+    /// all zeros.
+    #[cfg(target_os = "macos")]
+    const MUTEX_INIT: u64 = 0x32AA_ABA7;
+    #[cfg(not(target_os = "macos"))]
+    const MUTEX_INIT: u64 = 0;
+
+    /// A pthread_mutex_t, made as PTHREAD_MUTEX_INITIALIZER makes it: a
+    /// long and 56 bytes on macOS, 40 bytes in musl and in glibc on
+    /// x86_64, 48 in glibc on aarch64. Eight words hold each.
+    pub struct Lock(UnsafeCell<[u64; 8]>);
+
+    impl Lock {
+        pub const fn new() -> Lock {
+            // rr: escape(shared): the C library's mutex, which threads
+            // share to take turns.
+            Lock(UnsafeCell::new([MUTEX_INIT, 0, 0, 0, 0, 0, 0, 0]))
+        }
+
+        pub fn lock(&self) {
+            // rr: escape(unsafe): the mutex lives as long as self, which
+            // is never moved once shared (a static).
+            unsafe { pthread_mutex_lock(self.0.get().cast()) };
+        }
+
+        pub fn unlock(&self) {
+            // rr: escape(unsafe): this thread locked the mutex.
+            unsafe { pthread_mutex_unlock(self.0.get().cast()) };
+        }
     }
 
     /// Starts a detached thread on start; whether it did.
@@ -449,6 +475,7 @@ mod os {
 #[cfg(target_os = "windows")]
 mod os {
     use super::{AF_INET, SOCK_STREAM, Wait};
+    use core::cell::UnsafeCell;
     use core::ffi::c_void;
     use core::ptr::{null, null_mut, without_provenance_mut};
     use core::sync::atomic::{AtomicBool, Ordering};
@@ -505,6 +532,8 @@ mod os {
         fn CloseHandle(handle: *mut c_void) -> i32;
         fn SetHandleInformation(handle: *mut c_void, mask: u32, flags: u32) -> i32;
         fn Sleep(milliseconds: u32);
+        fn AcquireSRWLockExclusive(lock: *mut *mut c_void);
+        fn ReleaseSRWLockExclusive(lock: *mut *mut c_void);
     }
 
     const IPPROTO_TCP: i32 = 6;
@@ -565,6 +594,28 @@ mod os {
     extern "system" fn run(start: *mut c_void) -> u32 {
         super::begin(start);
         0
+    }
+
+    /// An SRWLOCK, one pointer, made as SRWLOCK_INIT makes it: null.
+    pub struct Lock(UnsafeCell<*mut c_void>);
+
+    impl Lock {
+        pub const fn new() -> Lock {
+            // rr: escape(shared): the system's lock, which threads share
+            // to take turns.
+            Lock(UnsafeCell::new(null_mut()))
+        }
+
+        pub fn lock(&self) {
+            // rr: escape(unsafe): the lock lives as long as self, which is
+            // never moved once shared (a static).
+            unsafe { AcquireSRWLockExclusive(self.0.get()) };
+        }
+
+        pub fn unlock(&self) {
+            // rr: escape(unsafe): this thread holds the lock.
+            unsafe { ReleaseSRWLockExclusive(self.0.get()) };
+        }
     }
 
     /// Starts a detached thread on start; whether it did.

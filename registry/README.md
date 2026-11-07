@@ -39,7 +39,7 @@ lets touch the system. A script that writes a table sits beside them.
 {
   "name": "aesgcm",
   "description": "AES-128-GCM (RFC 5116), with AES and GHASH instructions where the CPU has them.",
-  "rr": "0.5.1",
+  "rr": "0.5.2",
   "dependencies": ["cpu"],
   "files": [{ "path": "mod.rs" }, { "path": "sys.rs" }]
 }

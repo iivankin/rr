@@ -1,7 +1,7 @@
 {
   "name": "cpu",
   "description": "What the CPU has of the instructions the components use (AES, carry-less multiply, SHA-256, SHA-512, VAES), asked once for the process.",
-  "rr": "0.5.1",
+  "rr": "0.5.2",
   "dependencies": [],
   "files": [
     {
