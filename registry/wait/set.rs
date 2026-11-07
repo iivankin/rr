@@ -194,8 +194,9 @@ impl Set {
         let token = self.place(Some(fd), interest, key)?;
         if let Some(other) = self.owners.get(&fd).copied() {
             // Closed without being removed, its number taken by fd: the
-            // system dropped the old entry, or drops it now.
-            self.detach(other);
+            // system dropped the old entry when it was closed, and only
+            // the poller's own record of it is left to forget.
+            self.detach(other, false);
         }
         if !self.poller.add(fd, token_key(token), interest) {
             self.release(token.index);
@@ -249,7 +250,7 @@ impl Set {
             return;
         }
         self.deadline(token, None);
-        self.detach(token.index);
+        self.detach(token.index, true);
         self.release(token.index);
     }
 
@@ -410,7 +411,9 @@ impl Set {
     }
 
     /// The system stops watching the entry's descriptor.
-    fn detach(&mut self, index: u32) {
+    /// The system stops watching the entry's descriptor: told to, while
+    /// it is open; or the poller forgets it, once it was closed.
+    fn detach(&mut self, index: u32, open: bool) {
         let Some(slot) = usize::try_from(index)
             .ok()
             .and_then(|at| self.slots.get_mut(at))
@@ -429,7 +432,11 @@ impl Set {
         if self.owners.get(&fd) == Some(&index) {
             self.owners.remove(&fd);
         }
-        self.poller.remove(fd, key, interest);
+        if open {
+            self.poller.remove(fd, key, interest);
+        } else {
+            self.poller.forget(key);
+        }
     }
 
     fn slot_mut(&mut self, token: Token) -> Option<&mut Slot> {
