@@ -326,9 +326,15 @@ static STATE: AtomicU8 = AtomicU8::new(0);
 static BASE: AtomicPtr<u8> = AtomicPtr::new(null_mut());
 static LOCK: AtomicBool = AtomicBool::new(false);
 
+/// Where the program is loaded, by where this is. Its body is its own: an
+/// empty one would be the same as another empty function's, which MSVC's
+/// linker folds into one (/OPT:ICF), and the PDB names under one name.
 #[unsafe(no_mangle)]
 #[inline(never)]
-pub extern "C" fn rr_prof_anchor() {}
+pub extern "C" fn rr_prof_anchor() -> u64 {
+    // "rr prof" in ASCII.
+    0x0072_7220_7072_6f66
+}
 
 #[inline(never)]
 pub unsafe fn rr_prof_rust_alloc(size: usize, align: usize) -> *mut u8 {
