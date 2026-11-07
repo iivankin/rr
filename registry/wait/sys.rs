@@ -2201,6 +2201,9 @@ mod poller {
         keys: Vec<u64>,
         // rr: escape(bound): as many as fds.
         places: BTreeMap<u64, usize>,
+        /// The sockets a wait found closed, to drop after it.
+        // rr: escape(bound): no more than fds.
+        closed: Vec<u64>,
     }
 
     impl Polled {
@@ -2219,6 +2222,7 @@ mod poller {
                 }]),
                 keys: Vec::from([0]),
                 places: BTreeMap::new(),
+                closed: Vec::new(),
             })
         }
 
@@ -2270,8 +2274,14 @@ mod poller {
                         os::drain(self.reader);
                         found.push((0, 0));
                     }
+                    // Closed here before it was removed (WSAPoll's remarks):
+                    // dropped, as epoll, kqueue and the port drop it.
+                    (revents, key) if revents & POLLNVAL != 0 => self.closed.push(key),
                     (revents, key) => found.push((key, poll_ready(revents))),
                 }
+            }
+            while let Some(key) = self.closed.pop() {
+                self.remove(key);
             }
         }
     }
@@ -2290,11 +2300,7 @@ mod poller {
         };
         let write = if revents & POLLWRNORM == 0 { 0 } else { WRITE };
         let hup = if revents & POLLHUP == 0 { 0 } else { HUP };
-        let error = if revents & (POLLERR | POLLNVAL) == 0 {
-            0
-        } else {
-            ERROR
-        };
+        let error = if revents & POLLERR == 0 { 0 } else { ERROR };
         read | write | hup | error
     }
 }
