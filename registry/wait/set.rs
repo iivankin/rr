@@ -18,15 +18,17 @@
 //! A report may be spurious: a read or write that would block is not an
 //! error.
 //!
-//! One wait reports at most 256 descriptors; the rest, still ready, the
-//! next. Deadlines are never reported early, and may be late by what the
+//! One wait reports at most 256 descriptors (all on WSAPoll); the rest,
+//! still ready, the next. Deadlines are never reported early, and may be late by what the
 //! system's wait counts in: on Linux and Windows a timeout is whole
 //! milliseconds, rounded up, and Windows wakes on its timer's tick, 15.6
 //! ms unless the program asked for a finer one.
 //!
-//! A descriptor is removed before it is closed. One closed first is
-//! dropped by the system; a new descriptor that gets its number is
-//! then added as new, and the old token only lets go of its entry. On
+//! A descriptor is in a Set once, and is removed before it is closed.
+//! One closed first is dropped by the system, and its entry stays, with
+//! its deadline, until it is removed or a new descriptor gets its number:
+//! that one is added as new, the old entry goes, and its token names
+//! nothing. On
 //! Linux that holds only when the closed descriptor was the last open on
 //! its socket: epoll watches the socket, not the number, so after dup or
 //! fork another descriptor keeps it watched, and its events come back
@@ -206,17 +208,18 @@ impl Set {
     /// with key. None when the system refuses it.
     pub fn add(&mut self, fd: Raw, interest: u8, key: u64) -> Option<Token> {
         let token = self.place(Some(fd), interest, key)?;
-        if let Some(other) = self.owners.get(&fd).copied() {
-            // Closed without being removed, its number taken by fd: the
-            // system dropped the old entry when it was closed, and only
-            // the poller's own record of it is left to forget.
-            self.detach(other, false);
-        }
         if !self.poller.add(fd, token_key(token), interest) {
+            // On Linux also the descriptor already in the Set, open.
             self.release(token.index);
             return None;
         }
-        self.owners.insert(fd, token.index);
+        if let Some(other) = self.owners.insert(fd, token.index) {
+            // Closed without being removed, its number taken by fd: the
+            // system dropped the old entry when it was closed, and only
+            // the poller's own record of it is left to forget. The entry
+            // goes, deadline and all; its token names nothing.
+            self.forget(other);
+        }
         Some(token)
     }
 
@@ -230,15 +233,17 @@ impl Set {
         let Some(slot) = self.slot_mut(token) else {
             return false;
         };
-        let (fd, old, attached) = (slot.fd, slot.interest, slot.attached);
-        slot.interest = interest;
-        let Some(fd) = fd else {
-            return true;
+        let (fd, old) = (slot.fd, slot.interest);
+        let changed = match fd {
+            Some(fd) if old != interest => self.poller.modify(fd, token_key(token), old, interest),
+            _ => true,
         };
-        if !attached || old == interest {
-            return true;
+        // What the system refused stays as it was, so that the next
+        // modify asks it again.
+        if let (true, Some(taken)) = (changed, self.slot_mut(token)) {
+            taken.interest = interest;
         }
-        self.poller.modify(fd, token_key(token), old, interest)
+        changed
     }
 
     /// Sets or clears the entry's deadline. Once it passes, wait reports
@@ -321,13 +326,22 @@ impl Set {
     /// now). false when the system refused a descriptor. Its entries are
     /// unfollowed before the component goes, which closes them.
     pub fn follow(&mut self, watch: &mut Watch, wait: &Wait, key: u64) -> bool {
+        let mut wanted = [None; 2];
+        for ((at, fd), want) in wait.fds.iter().enumerate().zip(&mut wanted) {
+            if at < wait.count && fd.fd != Fd::NONE.fd {
+                *want = Some((fd.fd, interest(fd)));
+            }
+        }
+        // A descriptor named twice is one entry, for both interests: a
+        // Set holds each once.
+        if let [Some((first, one)), Some((second, other))] = wanted
+            && first == second
+        {
+            wanted = [Some((first, one | other)), None];
+        }
         let mut added = true;
-        for (at, fd) in wait.fds.iter().enumerate() {
-            let wanted = (at < wait.count && fd.fd != Fd::NONE.fd).then(|| (fd.fd, interest(fd)));
-            let Some(place) = watch.fds.get_mut(at) else {
-                break;
-            };
-            added &= self.keep(place, wanted, key);
+        for (place, want) in watch.fds.iter_mut().zip(wanted) {
+            added &= self.keep(place, want, key);
         }
         if watch.timer.is_none() {
             watch.timer = self.timer(key);
@@ -404,6 +418,26 @@ impl Set {
             index,
             generation: slot.generation,
         })
+    }
+
+    /// The entry of a descriptor closed before it was removed goes.
+    fn forget(&mut self, index: u32) {
+        self.detach(index, false);
+        self.clear(index);
+        self.release(index);
+    }
+
+    /// Clears the entry's deadline.
+    fn clear(&mut self, index: u32) {
+        let Some(slot) = usize::try_from(index)
+            .ok()
+            .and_then(|at| self.slots.get_mut(at))
+        else {
+            return;
+        };
+        if let Some(at) = slot.deadline.take() {
+            self.deadlines.remove(&(at.ns, index));
+        }
     }
 
     /// Frees the place: the next entry there has another generation.
@@ -536,11 +570,9 @@ fn interest(fd: &Fd) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::super::sys::net::{self, Io};
-    use super::super::{Raw, Signal, Wait};
-    use super::{ERROR, EXPIRED, HUP, Instant, READ, Set, Token, WOKEN, WRITE, Watch};
+    use super::super::{Signal, Wait};
+    use super::{EXPIRED, Instant, READ, Set, WOKEN, Watch};
     use alloc::vec::Vec;
-    use test::Bencher;
 
     /// Every way the system has to wait: on Windows, socket notifications
     /// and WSAPoll both.
@@ -586,406 +618,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// A connection: the client's socket and the server's.
-    fn pair(set: &mut Set) -> (Raw, Raw) {
-        let (listener, port) = net::listener();
-        let client = net::dial(port).unwrap();
-        let token = set.add(listener, READ, u64::MAX).unwrap();
-        until(set, u64::MAX, READ);
-        let server = net::take(listener).unwrap();
-        set.remove(token);
-        net::close(listener);
-        (client, server)
-    }
-
-    /// What each client sends and gets back: its seed's bytes.
-    const SIZE: usize = 32 * 1024;
-    const LISTENER: u64 = 1;
-    const SERVER: u64 = 2 << 32;
-    const CLIENT: u64 = 3 << 32;
-    const INDEX: u64 = 0xFFFF_FFFF;
-
-    fn byte(seed: usize, at: usize) -> u8 {
-        u8::try_from((seed * 31 + at * 7) % 251).unwrap()
-    }
-
-    struct Client {
-        fd: Raw,
-        token: Token,
-        sent: usize,
-        got: usize,
-        done: bool,
-    }
-
-    struct Peer {
-        fd: Raw,
-        token: Token,
-        pending: Vec<u8>,
-        ended: bool,
-        closed: bool,
-    }
-
-    /// Hundreds of clients and their server in one loop: each client
-    /// sends 32 KiB in whatever pieces the system takes, the server sends
-    /// back what it reads as it can, and the client checks every byte;
-    /// the server sees each client's end and closes.
-    #[test]
-    fn echo_many() {
-        let files = net::files(4096);
-        let count = usize::try_from(files.saturating_sub(64) / 2)
-            .unwrap()
-            .min(500);
-        assert!(count >= 100, "only {files} descriptors");
-        for mut set in sets() {
-            echo(&mut set, count);
-        }
-    }
-
-    fn echo(set: &mut Set, count: usize) {
-        let (listener, port) = net::listener();
-        let listening = set.add(listener, READ, LISTENER).unwrap();
-        let mut clients: Vec<Client> = Vec::new();
-        let mut peers: Vec<Peer> = Vec::new();
-        let (mut finished, mut closed) = (0, 0);
-        let mut buffer = [0u8; 16 * 1024];
-        let end = Instant::now().after_ms(60_000);
-        while finished < count || closed < count {
-            // 64 clients at most at a time: macOS caps a listen queue at
-            // 128.
-            while clients.len() < count && clients.len() - finished < 64 {
-                let fd = net::dial(port).unwrap();
-                let key = CLIENT | u64::try_from(clients.len()).unwrap();
-                let token = set.add(fd, READ | WRITE, key).unwrap();
-                clients.push(Client {
-                    fd,
-                    token,
-                    sent: 0,
-                    got: 0,
-                    done: false,
-                });
-            }
-            let now = Instant::now();
-            assert!(
-                !end.reached_by(now),
-                "{finished} of {count} done, {closed} closed"
-            );
-            for (key, ready) in wait(set, end) {
-                let index = usize::try_from(key & INDEX).unwrap();
-                match key & !INDEX {
-                    0 => {
-                        while let Some(fd) = net::take(listener) {
-                            let peer_key = SERVER | u64::try_from(peers.len()).unwrap();
-                            let token = set.add(fd, READ, peer_key).unwrap();
-                            peers.push(Peer {
-                                fd,
-                                token,
-                                pending: Vec::new(),
-                                ended: false,
-                                closed: false,
-                            });
-                        }
-                    }
-                    SERVER => closed += serve(set, &mut peers[index], ready, &mut buffer),
-                    CLIENT => finished += talk(set, &mut clients[index], index, ready, &mut buffer),
-                    _ => panic!("key {key}"),
-                }
-            }
-        }
-        set.remove(listening);
-        net::close(listener);
-    }
-
-    /// A client's turn: send what the system takes, check what came
-    /// back; 1 when it got all of it back, and closed.
-    fn talk(
-        set: &mut Set,
-        client: &mut Client,
-        seed: usize,
-        ready: u8,
-        buffer: &mut [u8],
-    ) -> usize {
-        if client.done {
-            return 0;
-        }
-        assert_eq!(ready & ERROR, 0, "client {seed}: {}", net::error(client.fd));
-        while ready & WRITE != 0 && client.sent < SIZE {
-            let piece = buffer.len().min(SIZE - client.sent);
-            for (at, slot) in buffer[..piece].iter_mut().enumerate() {
-                *slot = byte(seed, client.sent + at);
-            }
-            match net::write(client.fd, &buffer[..piece]) {
-                Io::Done(sent) => client.sent += sent,
-                Io::Blocked => break,
-                Io::Failed(error) => panic!("client {seed} sending: {error}"),
-            }
-            if client.sent == SIZE {
-                assert!(set.modify(client.token, READ));
-            }
-        }
-        if ready & (READ | HUP) == 0 {
-            return 0;
-        }
-        loop {
-            match net::read(client.fd, buffer) {
-                Io::Done(0) => panic!("client {seed}: the server ended at {}", client.got),
-                Io::Done(got) => {
-                    for (at, &byte_got) in buffer[..got].iter().enumerate() {
-                        assert_eq!(byte_got, byte(seed, client.got + at), "client {seed}");
-                    }
-                    client.got += got;
-                }
-                Io::Blocked => return 0,
-                Io::Failed(error) => panic!("client {seed} receiving: {error}"),
-            }
-            if client.got == SIZE {
-                set.remove(client.token);
-                net::close(client.fd);
-                client.done = true;
-                return 1;
-            }
-        }
-    }
-
-    /// The server's turn for one client: read while there is room, send
-    /// back what it can, watch for what is left; 1 when the client ended
-    /// and all went back, and closed.
-    fn serve(set: &mut Set, peer: &mut Peer, ready: u8, buffer: &mut [u8]) -> usize {
-        if peer.closed {
-            return 0;
-        }
-        assert_eq!(ready & ERROR, 0, "server: {}", net::error(peer.fd));
-        while ready & (READ | HUP) != 0 && !peer.ended && peer.pending.len() < 256 * 1024 {
-            match net::read(peer.fd, buffer) {
-                Io::Done(0) => peer.ended = true,
-                Io::Done(got) => peer.pending.extend_from_slice(&buffer[..got]),
-                Io::Blocked => break,
-                Io::Failed(error) => panic!("server receiving: {error}"),
-            }
-        }
-        while !peer.pending.is_empty() {
-            match net::write(peer.fd, &peer.pending) {
-                Io::Done(sent) => drop(peer.pending.drain(..sent)),
-                Io::Blocked => break,
-                Io::Failed(error) => panic!("server sending: {error}"),
-            }
-        }
-        if peer.ended && peer.pending.is_empty() {
-            set.remove(peer.token);
-            net::close(peer.fd);
-            peer.closed = true;
-            return 1;
-        }
-        let read = if peer.ended { 0 } else { READ };
-        let write = if peer.pending.is_empty() { 0 } else { WRITE };
-        assert!(set.modify(peer.token, read | write));
-        0
-    }
-
-    /// A writer fills what the system takes until it blocks; the reader
-    /// then drains it, and the writer is told when it may go on, to the
-    /// last of 8 MiB, which arrive whole and in order.
-    #[test]
-    fn backpressure() {
-        let mut chunk = Vec::new();
-        chunk.resize(64 * 1024, 0u8);
-        for mut set in sets() {
-            let (client, server) = pair(&mut set);
-            let total = 8 << 20;
-            let (mut sent, mut got) = (0, 0);
-            let mut blocked = false;
-            while !blocked && sent < 1 << 30 {
-                for (at, slot) in chunk.iter_mut().enumerate() {
-                    *slot = byte(1, sent + at);
-                }
-                match net::write(client, &chunk) {
-                    Io::Done(count) => sent += count,
-                    Io::Blocked => blocked = true,
-                    Io::Failed(error) => panic!("sending: {error}"),
-                }
-            }
-            assert!(blocked, "sent {sent} without blocking");
-            let total = total.max(sent + 1);
-            let writer = set.add(client, WRITE, 1).unwrap();
-            let reader = set.add(server, READ, 2).unwrap();
-            let end = Instant::now().after_ms(30_000);
-            while got < total {
-                assert!(!end.reached_by(Instant::now()), "got {got} of {total}");
-                for (key, ready) in wait(&mut set, end) {
-                    if key == 2 && ready & READ != 0 {
-                        while let Io::Done(count) = net::read(server, &mut chunk) {
-                            assert!(count > 0, "ended at {got}");
-                            for (at, &found) in chunk[..count].iter().enumerate() {
-                                assert_eq!(found, byte(1, got + at));
-                            }
-                            got += count;
-                        }
-                    }
-                    if key == 1 && ready & WRITE != 0 && sent < total {
-                        let piece = chunk.len().min(total - sent);
-                        for (at, slot) in chunk[..piece].iter_mut().enumerate() {
-                            *slot = byte(1, sent + at);
-                        }
-                        if let Io::Done(count) = net::write(client, &chunk[..piece]) {
-                            sent += count;
-                        }
-                        if sent == total {
-                            assert!(set.modify(writer, 0));
-                        }
-                    }
-                }
-            }
-            set.remove(writer);
-            set.remove(reader);
-            net::close(client);
-            net::close(server);
-        }
-    }
-
-    /// A connection to a port nobody listens on fails, and the Set says
-    /// so: the case WSAPoll missed before Windows 10 2004.
-    #[test]
-    fn refused() {
-        for mut set in sets() {
-            let (listener, port) = net::listener();
-            net::close(listener);
-            match net::dial(port) {
-                Err(error) => assert_eq!(error, net::REFUSED),
-                Ok(fd) => {
-                    let token = set.add(fd, READ | WRITE, 1).unwrap();
-                    until(&mut set, 1, ERROR | HUP);
-                    assert_eq!(net::error(fd), net::REFUSED);
-                    set.remove(token);
-                    net::close(fd);
-                }
-            }
-        }
-    }
-
-    /// The peer's close reads as the end; its reset as an error.
-    #[test]
-    fn hangup() {
-        for mut set in sets() {
-            let (client, server) = pair(&mut set);
-            let token = set.add(client, READ, 1).unwrap();
-            net::close(server);
-            until(&mut set, 1, READ | HUP);
-            assert_eq!(net::read(client, &mut [0; 8]), Io::Done(0));
-            set.remove(token);
-            net::close(client);
-
-            let (reset_client, reset_server) = pair(&mut set);
-            let reset_token = set.add(reset_client, READ, 2).unwrap();
-            net::reset(reset_server);
-            until(&mut set, 2, READ | HUP | ERROR);
-            assert_eq!(net::read(reset_client, &mut [0; 8]), Io::Failed(net::RESET));
-            set.remove(reset_token);
-            net::close(reset_client);
-        }
-    }
-
-    /// Interest is what is reported: none, then writing alone, changed
-    /// while the system still watches for the old; then reading, until
-    /// there is nothing left to read.
-    #[test]
-    fn interest() {
-        for mut set in sets() {
-            let (client, server) = pair(&mut set);
-            let token = set.add(client, 0, 1).unwrap();
-            assert_eq!(net::write(server, b"x"), Io::Done(1));
-            quiet(&mut set, 1, READ | WRITE, 50);
-            assert!(set.modify(token, WRITE));
-            assert_eq!(until(&mut set, 1, WRITE) & READ, 0);
-            assert!(set.modify(token, READ));
-            until(&mut set, 1, READ);
-            assert_eq!(net::read(client, &mut [0; 8]), Io::Done(1));
-            quiet(&mut set, 1, READ | WRITE, 50);
-            set.remove(token);
-            net::close(client);
-            net::close(server);
-        }
-    }
-
-    /// An entry with no interest is not watched, not even for the
-    /// peer's reset, which shows once it has one again; its deadline
-    /// still counts.
-    #[test]
-    fn paused() {
-        for mut set in sets() {
-            let (client, server) = pair(&mut set);
-            let token = set.add(client, 0, 1).unwrap();
-            net::reset(server);
-            quiet(&mut set, 1, u8::MAX, 50);
-            set.deadline(token, Some(Instant::now().after_ms(10)));
-            assert_eq!(until(&mut set, 1, EXPIRED), EXPIRED);
-            assert!(set.modify(token, READ));
-            assert_ne!(
-                until(&mut set, 1, READ | HUP | ERROR) & (READ | HUP | ERROR),
-                0
-            );
-            assert!(set.modify(token, 0));
-            quiet(&mut set, 1, u8::MAX, 50);
-            set.remove(token);
-            net::close(client);
-        }
-    }
-
-    /// A removed entry's token names nothing, even once a new socket
-    /// takes its number and its place in the Set.
-    #[test]
-    fn stale_token() {
-        for mut set in sets() {
-            let (client, server) = pair(&mut set);
-            let old = set.add(client, READ, 1).unwrap();
-            assert_eq!(net::write(server, b"x"), Io::Done(1));
-            until(&mut set, 1, READ);
-            set.remove(old);
-            net::close(client);
-            net::close(server);
-            let (new_client, new_server) = pair(&mut set);
-            let new = set.add(new_client, READ, 2).unwrap();
-            assert!(!set.modify(old, READ | WRITE));
-            set.deadline(old, Some(Instant::now()));
-            set.remove(old);
-            assert_eq!(net::write(new_server, b"y"), Io::Done(1));
-            until(&mut set, 2, READ);
-            quiet(&mut set, 1, u8::MAX, 30);
-            set.remove(new);
-            net::close(new_client);
-            net::close(new_server);
-        }
-    }
-
-    /// A socket closed before its entry is removed: a new one with its
-    /// number is watched for itself, and removing the old entry does not
-    /// take the new one's watch away.
-    #[test]
-    fn closed_before_removed() {
-        closed_first(&mut Set::new().unwrap());
-    }
-
-    /// As closed_before_removed, on WSAPoll.
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn closed_before_removed_polled() {
-        closed_first(&mut Set::polled().unwrap());
-    }
-
-    fn closed_first(set: &mut Set) {
-        let (old_client, old_server) = pair(set);
-        let old = set.add(old_client, READ, 1).unwrap();
-        net::close(old_client);
-        let (client, server) = pair(set);
-        let new = set.add(client, READ, 2).unwrap();
-        set.remove(old);
-        assert_eq!(net::write(server, b"z"), Io::Done(1));
-        until(set, 2, READ);
-        quiet(set, 1, u8::MAX, 30);
-        set.remove(new);
-        net::close(client);
-        net::close(server);
-        net::close(old_server);
     }
 
     /// Timers: each deadline that stands is reported once, never before
@@ -1076,38 +708,6 @@ mod tests {
             let woken = wait(&mut set, Instant::now().after_ms(1000));
             assert_eq!(woken, Vec::from([(9, WOKEN)]));
             quiet(&mut set, 9, u8::MAX, 30);
-        }
-    }
-
-    /// A thousand connections, all idle but one, which gets a byte: a
-    /// wait and a read for each, as a server with many idle clients
-    /// pays for each request.
-    #[bench]
-    fn one_of_a_thousand(b: &mut Bencher) {
-        assert!(net::files(4096) >= 2100);
-        let mut set = Set::new().unwrap();
-        let mut pairs = Vec::new();
-        for key in 0..1000u64 {
-            let (client, server) = pair(&mut set);
-            let token = set.add(server, READ, key).unwrap();
-            pairs.push((client, server, token));
-        }
-        let (writer, reader, _) = pairs[500];
-        let mut byte = [0u8; 1];
-        b.iter(|| {
-            assert_eq!(net::write(writer, b"x"), Io::Done(1));
-            loop {
-                let ready = set.wait(None);
-                if ready.iter().any(|event| event.key == 500) {
-                    break;
-                }
-            }
-            assert_eq!(net::read(reader, &mut byte), Io::Done(1));
-        });
-        for (client, server, token) in pairs {
-            set.remove(token);
-            net::close(client);
-            net::close(server);
         }
     }
 }

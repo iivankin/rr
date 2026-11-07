@@ -386,7 +386,7 @@ mod unix {
 mod os {
     use super::unix::{self, Files};
     use super::{Error, Found, Wait};
-    use crate::base::wait::O_CLOEXEC;
+    use crate::base::wait::{EINTR, O_CLOEXEC};
     use crate::base::x509;
     use alloc::vec::Vec;
     use core::ffi::{CStr, c_char, c_int, c_void};
@@ -422,7 +422,6 @@ mod os {
     const O_RDONLY: c_int = 0;
     const DT_UNKNOWN: u8 = 0;
     const DT_LNK: u8 = 10;
-    const EINTR: i32 = 4;
     const EINVAL: i32 = 22;
     const EFBIG: i32 = 27;
     /// A bundle larger than this is not one.

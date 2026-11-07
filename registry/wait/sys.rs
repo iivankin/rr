@@ -6,8 +6,14 @@ use core::ffi::c_void;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
-#[cfg(test)]
-pub(super) use os::net;
+/// fcntl.h's close-on-exec, for net's sockets as for the signal's pipe.
+#[cfg(unix)]
+pub use os::{F_SETFD, FD_CLOEXEC};
+/// Winsock's, for net's sockets as for the signal's pair.
+#[cfg(target_os = "windows")]
+pub use os::{
+    FIONBIO, HANDLE_FLAG_INHERIT, INVALID_SOCKET, IPPROTO_TCP, WSA_FLAG_NO_HANDLE_INHERIT,
+};
 /// Linux's close-on-exec flag, which epoll, eventfd and open take.
 #[cfg(target_os = "linux")]
 pub use poller::O_CLOEXEC;
@@ -33,10 +39,20 @@ pub const POLLERR: i16 = 0x0001;
 #[cfg(target_os = "windows")]
 pub const POLLHUP: i16 = 0x0002;
 
-/// Winsock's IPv4 family, which the signal's pair and resolve's lookup
-/// both name.
-#[cfg(target_os = "windows")]
+/// The address families, as a sockaddr names them in two bytes: IPv4's
+/// is 2 everywhere, IPv6's Linux's 10, macOS's 30 and Winsock's 23; for
+/// the signal's pair, resolve's lookups and net's sockets.
 pub const AF_INET: u16 = 2;
+#[cfg(target_os = "linux")]
+pub const AF_INET6: u16 = 10;
+#[cfg(target_os = "macos")]
+pub const AF_INET6: u16 = 30;
+#[cfg(target_os = "windows")]
+pub const AF_INET6: u16 = 23;
+/// errno.h's interrupted call, 4 on Linux and macOS, for trust's reads
+/// and net's sockets.
+#[cfg(unix)]
+pub const EINTR: i32 = 4;
 /// Stream sockets: 1 in Winsock and in the C libraries of Linux and
 /// macOS, for the signal's pair, resolve's lookups and the tests.
 pub const SOCK_STREAM: i32 = 1;
@@ -500,291 +516,6 @@ mod os {
             }
         }
     }
-
-    /// TCP over loopback for the tests: non-blocking sockets, as a
-    /// server and its clients use them.
-    #[cfg(test)]
-    pub mod net {
-        use super::{F_SETFD, FD_CLOEXEC, fcntl};
-        use crate::base::wait::SOCK_STREAM;
-        use core::ffi::{c_int, c_void};
-
-        /// struct rlimit: two rlim_t, 64 bits on both.
-        #[repr(C)]
-        struct Rlimit {
-            current: u64,
-            most: u64,
-        }
-
-        #[link(name = "c")]
-        // rr: escape(unsafe): each signature is the C library's, from its
-        // headers.
-        unsafe extern "C" {
-            fn socket(domain: c_int, kind: c_int, protocol: c_int) -> c_int;
-            fn bind(fd: c_int, address: *const u8, length: u32) -> c_int;
-            fn listen(fd: c_int, backlog: c_int) -> c_int;
-            fn accept(fd: c_int, address: *mut u8, length: *mut u32) -> c_int;
-            fn connect(fd: c_int, address: *const u8, length: u32) -> c_int;
-            fn getsockname(fd: c_int, address: *mut u8, length: *mut u32) -> c_int;
-            fn getsockopt(
-                fd: c_int,
-                level: c_int,
-                name: c_int,
-                value: *mut c_void,
-                length: *mut u32,
-            ) -> c_int;
-            fn setsockopt(
-                fd: c_int,
-                level: c_int,
-                name: c_int,
-                value: *const c_void,
-                length: u32,
-            ) -> c_int;
-            fn send(fd: c_int, buffer: *const c_void, length: usize, flags: c_int) -> isize;
-            fn recv(fd: c_int, buffer: *mut c_void, length: usize, flags: c_int) -> isize;
-            fn getrlimit(resource: c_int, limit: *mut Rlimit) -> c_int;
-            fn setrlimit(resource: c_int, limit: *const Rlimit) -> c_int;
-            #[cfg(target_os = "macos")]
-            fn __error() -> *mut c_int;
-            #[cfg(target_os = "linux")]
-            fn __errno_location() -> *mut c_int;
-        }
-
-        // sys/socket.h's, errno.h's, fcntl.h's and sys/resource.h's: macOS's
-        // from its SDK, Linux's from asm-generic, as x86_64 and aarch64 have.
-        const AF_INET: c_int = 2;
-        const F_GETFL: c_int = 3;
-        const F_SETFL: c_int = 4;
-        #[cfg(target_os = "macos")]
-        const SOL_SOCKET: c_int = 0xffff;
-        #[cfg(target_os = "linux")]
-        const SOL_SOCKET: c_int = 1;
-        #[cfg(target_os = "macos")]
-        const SO_ERROR: c_int = 0x1007;
-        #[cfg(target_os = "linux")]
-        const SO_ERROR: c_int = 4;
-        #[cfg(target_os = "macos")]
-        const SO_LINGER: c_int = 0x80;
-        #[cfg(target_os = "linux")]
-        const SO_LINGER: c_int = 13;
-        #[cfg(target_os = "macos")]
-        const SO_NOSIGPIPE: c_int = 0x1022;
-        #[cfg(target_os = "linux")]
-        const MSG_NOSIGNAL: c_int = 0x4000;
-        #[cfg(target_os = "macos")]
-        const SEND_FLAGS: c_int = 0;
-        #[cfg(target_os = "linux")]
-        const SEND_FLAGS: c_int = MSG_NOSIGNAL;
-        #[cfg(target_os = "macos")]
-        const O_NONBLOCK: c_int = 0x4;
-        #[cfg(target_os = "linux")]
-        use super::super::poller::O_NONBLOCK;
-        #[cfg(target_os = "macos")]
-        const EAGAIN: c_int = 35;
-        #[cfg(target_os = "linux")]
-        const EAGAIN: c_int = 11;
-        #[cfg(target_os = "macos")]
-        const EINPROGRESS: c_int = 36;
-        #[cfg(target_os = "linux")]
-        const EINPROGRESS: c_int = 115;
-        #[cfg(target_os = "macos")]
-        pub const REFUSED: i32 = 61;
-        #[cfg(target_os = "linux")]
-        pub const REFUSED: i32 = 111;
-        #[cfg(target_os = "macos")]
-        pub const RESET: i32 = 54;
-        #[cfg(target_os = "linux")]
-        pub const RESET: i32 = 104;
-        #[cfg(target_os = "macos")]
-        const RLIMIT_NOFILE: c_int = 8;
-        #[cfg(target_os = "linux")]
-        const RLIMIT_NOFILE: c_int = 7;
-        const ADDRESS_BYTES: u32 = 16;
-
-        /// What a read or write did.
-        #[derive(Debug, PartialEq)]
-        pub enum Io {
-            /// So many bytes; a read of 0 is the peer's end.
-            Done(usize),
-            /// It would block: wait for readiness.
-            Blocked,
-            Failed(i32),
-        }
-
-        #[cfg(target_os = "macos")]
-        fn errno_place() -> *mut c_int {
-            // rr: escape(unsafe): the C library's thread-local errno.
-            unsafe { __error() }
-        }
-
-        #[cfg(target_os = "linux")]
-        fn errno_place() -> *mut c_int {
-            // rr: escape(unsafe): the C library's thread-local errno.
-            unsafe { __errno_location() }
-        }
-
-        fn errno() -> i32 {
-            let place = errno_place();
-            // rr: escape(unsafe): the place is this thread's errno.
-            unsafe { place.read() }
-        }
-
-        /// sockaddr_in for 127.0.0.1 and port: macOS's starts with its
-        /// length, Linux's family is a u16 in the host's order, little on
-        /// both targets.
-        fn address(port: u16) -> [u8; 16] {
-            let [high, low] = port.to_be_bytes();
-            #[cfg(target_os = "macos")]
-            let [first, second] = [16, 2];
-            #[cfg(target_os = "linux")]
-            let [first, second] = 2u16.to_le_bytes();
-            [
-                first, second, high, low, 127, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0,
-            ]
-        }
-
-        /// A socket that does not block or outlive exec, and does not
-        /// raise SIGPIPE on macOS.
-        fn prepare(fd: c_int) -> c_int {
-            // rr: escape(unsafe): fd is open.
-            let flags = unsafe { fcntl(fd, F_GETFL) };
-            // rr: escape(unsafe): fd is open.
-            assert_eq!(unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) }, 0);
-            // rr: escape(unsafe): fd is open.
-            assert_eq!(unsafe { fcntl(fd, F_SETFD, FD_CLOEXEC) }, 0);
-            #[cfg(target_os = "macos")]
-            set(fd, SO_NOSIGPIPE, &1i32.to_le_bytes());
-            fd
-        }
-
-        fn set(fd: c_int, name: c_int, value: &[u8]) {
-            let length = u32::try_from(value.len()).unwrap();
-            // rr: escape(unsafe): value holds length bytes.
-            let done = unsafe { setsockopt(fd, SOL_SOCKET, name, value.as_ptr().cast(), length) };
-            assert_eq!(done, 0);
-        }
-
-        fn stream() -> c_int {
-            // rr: escape(unsafe): socket takes plain numbers.
-            let fd = unsafe { socket(AF_INET, SOCK_STREAM, 0) };
-            assert!(fd >= 0);
-            prepare(fd)
-        }
-
-        /// A listener on a free port of 127.0.0.1, and the port.
-        pub fn listener() -> (i32, u16) {
-            let fd = stream();
-            let any = address(0);
-            // rr: escape(unsafe): any is a sockaddr_in of its length.
-            assert_eq!(unsafe { bind(fd, any.as_ptr(), ADDRESS_BYTES) }, 0);
-            // rr: escape(unsafe): fd is bound.
-            assert_eq!(unsafe { listen(fd, 1024) }, 0);
-            let mut bound = [0u8; 16];
-            let mut length = ADDRESS_BYTES;
-            // rr: escape(unsafe): bound holds length bytes.
-            let named = unsafe { getsockname(fd, bound.as_mut_ptr(), &raw mut length) };
-            assert_eq!(named, 0);
-            (fd, u16::from_be_bytes([bound[2], bound[3]]))
-        }
-
-        /// A connection to port begun; Err with the error when it failed
-        /// at once.
-        pub fn dial(port: u16) -> Result<i32, i32> {
-            let fd = stream();
-            let peer = address(port);
-            // rr: escape(unsafe): peer is a sockaddr_in of its length.
-            if unsafe { connect(fd, peer.as_ptr(), ADDRESS_BYTES) } == 0 {
-                return Ok(fd);
-            }
-            match errno() {
-                EINPROGRESS => Ok(fd),
-                error => {
-                    close(fd);
-                    Err(error)
-                }
-            }
-        }
-
-        /// The next connection waiting on listener.
-        pub fn take(listener: i32) -> Option<i32> {
-            // rr: escape(unsafe): no address is asked for.
-            let fd = unsafe { accept(listener, core::ptr::null_mut(), core::ptr::null_mut()) };
-            (fd >= 0).then(|| prepare(fd))
-        }
-
-        fn io(done: isize) -> Io {
-            match usize::try_from(done) {
-                Ok(count) => Io::Done(count),
-                Err(_) => match errno() {
-                    EAGAIN => Io::Blocked,
-                    error => Io::Failed(error),
-                },
-            }
-        }
-
-        pub fn write(fd: i32, bytes: &[u8]) -> Io {
-            // rr: escape(unsafe): bytes holds its length.
-            io(unsafe { send(fd, bytes.as_ptr().cast(), bytes.len(), SEND_FLAGS) })
-        }
-
-        pub fn read(fd: i32, bytes: &mut [u8]) -> Io {
-            // rr: escape(unsafe): bytes holds its length.
-            io(unsafe { recv(fd, bytes.as_mut_ptr().cast(), bytes.len(), 0) })
-        }
-
-        pub fn close(fd: i32) {
-            // rr: escape(unsafe): the tests close each socket once.
-            unsafe { super::close(fd) };
-        }
-
-        /// Closes with a reset, as linger 0 makes it.
-        pub fn reset(fd: i32) {
-            // struct linger: l_onoff 1, l_linger 0, two ints.
-            let [a, b, c, d] = 1i32.to_le_bytes();
-            set(fd, SO_LINGER, &[a, b, c, d, 0, 0, 0, 0]);
-            close(fd);
-        }
-
-        /// The socket's pending error, as SO_ERROR reads and clears it.
-        pub fn error(fd: i32) -> i32 {
-            let mut error = [0u8; 4];
-            let mut length = 4u32;
-            // rr: escape(unsafe): error holds length bytes.
-            let done = unsafe {
-                getsockopt(
-                    fd,
-                    SOL_SOCKET,
-                    SO_ERROR,
-                    error.as_mut_ptr().cast(),
-                    &raw mut length,
-                )
-            };
-            assert_eq!(done, 0);
-            i32::from_le_bytes(error)
-        }
-
-        /// Raises this process's descriptors to want, or as many as the
-        /// system lets it; how many it has.
-        pub fn files(want: u64) -> u64 {
-            let mut limit = Rlimit {
-                current: 0,
-                most: 0,
-            };
-            // rr: escape(unsafe): limit is a local rlimit.
-            assert_eq!(unsafe { getrlimit(RLIMIT_NOFILE, &raw mut limit) }, 0);
-            if limit.current < want {
-                let raised = Rlimit {
-                    current: want.min(limit.most),
-                    most: limit.most,
-                };
-                // rr: escape(unsafe): raised is a local rlimit.
-                if unsafe { setrlimit(RLIMIT_NOFILE, &raw const raised) } == 0 {
-                    limit.current = raised.current;
-                }
-            }
-            limit.current
-        }
-    }
 }
 
 #[cfg(target_os = "windows")]
@@ -824,11 +555,11 @@ mod os {
             group: u32,
             flags: u32,
         ) -> usize;
-        fn bind(socket: usize, address: *const SockaddrIn, length: i32) -> i32;
+        fn bind(socket: usize, address: *const u8, length: i32) -> i32;
         fn listen(socket: usize, backlog: i32) -> i32;
-        fn getsockname(socket: usize, address: *mut SockaddrIn, length: *mut i32) -> i32;
-        fn connect(socket: usize, address: *const SockaddrIn, length: i32) -> i32;
-        fn accept(socket: usize, address: *mut SockaddrIn, length: *mut i32) -> usize;
+        fn getsockname(socket: usize, address: *mut u8, length: *mut i32) -> i32;
+        fn connect(socket: usize, address: *const u8, length: i32) -> i32;
+        fn accept(socket: usize, address: *mut u8, length: *mut i32) -> usize;
         fn send(socket: usize, buffer: *const u8, length: i32, flags: i32) -> i32;
         fn closesocket(socket: usize) -> i32;
         fn WSAPoll(fds: *mut PollFd, count: u32, timeout: i32) -> i32;
@@ -854,13 +585,13 @@ mod os {
         fn ReleaseSRWLockExclusive(lock: *mut *mut c_void);
     }
 
-    const IPPROTO_TCP: i32 = 6;
-    const WSA_FLAG_NO_HANDLE_INHERIT: u32 = 0x80;
-    const HANDLE_FLAG_INHERIT: u32 = 1;
-    const INVALID_SOCKET: usize = usize::MAX;
+    pub const IPPROTO_TCP: i32 = 6;
+    pub const WSA_FLAG_NO_HANDLE_INHERIT: u32 = 0x80;
+    pub const HANDLE_FLAG_INHERIT: u32 = 1;
+    pub const INVALID_SOCKET: usize = usize::MAX;
     pub const INFINITE: u32 = u32::MAX;
     /// winsock2.h's _IOW('f', 126, u_long).
-    const FIONBIO: i32 = 0x8004_667E_u32.cast_signed();
+    pub const FIONBIO: i32 = 0x8004_667E_u32.cast_signed();
 
     // rr: escape(shared): Winsock is started once for the process; a race
     // only starts it twice, which it counts.
@@ -902,7 +633,12 @@ mod os {
             },
         ];
         let count = u32::try_from(wait.count.min(2)).unwrap_or(0);
-        let timeout = i32::try_from(milliseconds).unwrap_or(-1);
+        // -1 waits with no limit; a finite wait past i32's milliseconds
+        // waits as long as it can.
+        let timeout = match milliseconds {
+            INFINITE => -1,
+            finite => i32::try_from(finite).unwrap_or(i32::MAX),
+        };
         // rr: escape(unsafe): fds holds count entries.
         if unsafe { WSAPoll(fds.as_mut_ptr(), count, timeout) } <= 0 {
             return [0, 0];
@@ -983,7 +719,7 @@ mod os {
         let mut address = loopback(0);
         let mut length = i32::try_from(size_of::<SockaddrIn>()).ok()?;
         // rr: escape(unsafe): address and length are locals of their size.
-        let failed = unsafe { getsockname(socket.0, &raw mut address, &raw mut length) };
+        let failed = unsafe { getsockname(socket.0, (&raw mut address).cast(), &raw mut length) };
         if failed == 0 { Some(address) } else { None }
     }
 
@@ -1010,7 +746,7 @@ mod os {
         let size = i32::try_from(size_of::<SockaddrIn>()).ok()?;
         let any = loopback(0);
         // rr: escape(unsafe): any is a local SOCKADDR_IN of size bytes.
-        if unsafe { bind(listener.0, &raw const any, size) } != 0 {
+        if unsafe { bind(listener.0, (&raw const any).cast(), size) } != 0 {
             return None;
         }
         // rr: escape(unsafe): listen takes plain numbers.
@@ -1020,13 +756,13 @@ mod os {
         let bound = name(&listener)?;
         let writer = tcp()?;
         // rr: escape(unsafe): bound is a local SOCKADDR_IN of size bytes.
-        if unsafe { connect(writer.0, &raw const bound, size) } != 0 {
+        if unsafe { connect(writer.0, (&raw const bound).cast(), size) } != 0 {
             return None;
         }
         let mut peer = loopback(0);
         let mut length = size;
         // rr: escape(unsafe): peer and length are locals of their size.
-        let reader = Socket(unsafe { accept(listener.0, &raw mut peer, &raw mut length) });
+        let reader = Socket(unsafe { accept(listener.0, (&raw mut peer).cast(), &raw mut length) });
         if reader.0 == INVALID_SOCKET || !same(&peer, &name(&writer)?) {
             return None;
         }
@@ -1038,11 +774,14 @@ mod os {
         if kept == 0 {
             return None;
         }
-        let mut on = 1u32;
-        // rr: escape(unsafe): on is a local u_long; the reader is drained
-        // without blocking.
-        if unsafe { ioctlsocket(reader.0, FIONBIO, &raw mut on) } != 0 {
-            return None;
+        // Neither end blocks: the reader is drained, and a byte the writer
+        // cannot send while the reader is full is not missed.
+        for socket in [&reader, &writer] {
+            let mut on = 1u32;
+            // rr: escape(unsafe): on is a local u_long.
+            if unsafe { ioctlsocket(socket.0, FIONBIO, &raw mut on) } != 0 {
+                return None;
+            }
         }
         Some((reader, writer))
     }
@@ -1093,188 +832,6 @@ mod os {
             if unsafe { recv(reader, bytes.as_mut_ptr(), length, 0) } <= 0 {
                 return;
             }
-        }
-    }
-
-    /// TCP over loopback for the tests: non-blocking sockets, as a
-    /// server and its clients use them.
-    #[cfg(test)]
-    pub mod net {
-        use super::{
-            FIONBIO, INVALID_SOCKET, IPPROTO_TCP, SockaddrIn, WSA_FLAG_NO_HANDLE_INHERIT,
-            WSASocketW, accept, bind, closesocket, connect, getsockname, ioctlsocket, listen,
-            loopback, recv, send, startup,
-        };
-        use crate::base::wait::{AF_INET, SOCK_STREAM};
-        use core::ptr::null;
-
-        #[link(name = "ws2_32", kind = "raw-dylib")]
-        // rr: escape(unsafe): each signature is ws2_32's, from its
-        // documentation.
-        unsafe extern "system" {
-            fn WSAGetLastError() -> i32;
-            fn getsockopt(
-                socket: usize,
-                level: i32,
-                name: i32,
-                value: *mut u8,
-                length: *mut i32,
-            ) -> i32;
-            fn setsockopt(
-                socket: usize,
-                level: i32,
-                name: i32,
-                value: *const u8,
-                length: i32,
-            ) -> i32;
-        }
-
-        // winsock2.h's and winerror.h's.
-        const SOL_SOCKET: i32 = 0xffff;
-        const SO_ERROR: i32 = 0x1007;
-        const SO_LINGER: i32 = 0x80;
-        const WSAEWOULDBLOCK: i32 = 10035;
-        pub const REFUSED: i32 = 10061;
-        pub const RESET: i32 = 10054;
-
-        /// What a read or write did.
-        #[derive(Debug, PartialEq)]
-        pub enum Io {
-            /// So many bytes; a read of 0 is the peer's end.
-            Done(usize),
-            /// It would block: wait for readiness.
-            Blocked,
-            Failed(i32),
-        }
-
-        fn last() -> i32 {
-            // rr: escape(unsafe): the thread's last Winsock error.
-            unsafe { WSAGetLastError() }
-        }
-
-        fn prepare(socket: usize) -> usize {
-            let mut on = 1u32;
-            // rr: escape(unsafe): on is a local u_long.
-            assert_eq!(unsafe { ioctlsocket(socket, FIONBIO, &raw mut on) }, 0);
-            socket
-        }
-
-        fn stream() -> usize {
-            startup();
-            let family = i32::from(AF_INET);
-            let flags = WSA_FLAG_NO_HANDLE_INHERIT;
-            // rr: escape(unsafe): WSASocketW takes plain numbers.
-            let socket = unsafe { WSASocketW(family, SOCK_STREAM, IPPROTO_TCP, null(), 0, flags) };
-            assert_ne!(socket, INVALID_SOCKET);
-            prepare(socket)
-        }
-
-        fn size() -> i32 {
-            i32::try_from(size_of::<SockaddrIn>()).unwrap()
-        }
-
-        /// A listener on a free port of 127.0.0.1, and the port.
-        pub fn listener() -> (usize, u16) {
-            let socket = stream();
-            let any = loopback(0);
-            // rr: escape(unsafe): any is a local SOCKADDR_IN of its size.
-            assert_eq!(unsafe { bind(socket, &raw const any, size()) }, 0);
-            // rr: escape(unsafe): the socket is bound.
-            assert_eq!(unsafe { listen(socket, 1024) }, 0);
-            let mut bound = loopback(0);
-            let mut length = size();
-            // rr: escape(unsafe): bound and length are locals of their size.
-            let named = unsafe { getsockname(socket, &raw mut bound, &raw mut length) };
-            assert_eq!(named, 0);
-            (socket, u16::from_be(bound.port))
-        }
-
-        /// A connection to port begun; Err with the error when it failed
-        /// at once.
-        pub fn dial(port: u16) -> Result<usize, i32> {
-            let socket = stream();
-            let peer = loopback(port.to_be());
-            // rr: escape(unsafe): peer is a local SOCKADDR_IN of its size.
-            if unsafe { connect(socket, &raw const peer, size()) } == 0 {
-                return Ok(socket);
-            }
-            match last() {
-                WSAEWOULDBLOCK => Ok(socket),
-                error => {
-                    close(socket);
-                    Err(error)
-                }
-            }
-        }
-
-        /// The next connection waiting on listener.
-        pub fn take(listener: usize) -> Option<usize> {
-            let mut peer = loopback(0);
-            let mut length = size();
-            // rr: escape(unsafe): peer and length are locals of their size.
-            let socket = unsafe { accept(listener, &raw mut peer, &raw mut length) };
-            (socket != INVALID_SOCKET).then(|| prepare(socket))
-        }
-
-        fn io(done: i32) -> Io {
-            match usize::try_from(done) {
-                Ok(count) => Io::Done(count),
-                Err(_) => match last() {
-                    WSAEWOULDBLOCK => Io::Blocked,
-                    error => Io::Failed(error),
-                },
-            }
-        }
-
-        pub fn write(socket: usize, bytes: &[u8]) -> Io {
-            let length = i32::try_from(bytes.len()).unwrap_or(i32::MAX);
-            // rr: escape(unsafe): bytes holds at least length bytes.
-            io(unsafe { send(socket, bytes.as_ptr(), length, 0) })
-        }
-
-        pub fn read(socket: usize, bytes: &mut [u8]) -> Io {
-            let length = i32::try_from(bytes.len()).unwrap_or(i32::MAX);
-            // rr: escape(unsafe): bytes holds at least length bytes.
-            io(unsafe { recv(socket, bytes.as_mut_ptr(), length, 0) })
-        }
-
-        pub fn close(socket: usize) {
-            // rr: escape(unsafe): the tests close each socket once.
-            unsafe { closesocket(socket) };
-        }
-
-        /// Closes with a reset, as linger 0 makes it.
-        pub fn reset(socket: usize) {
-            // struct linger: l_onoff 1, l_linger 0, two u_shorts.
-            let [a, b] = 1u16.to_le_bytes();
-            let linger = [a, b, 0, 0];
-            // rr: escape(unsafe): linger holds 4 bytes.
-            let done = unsafe { setsockopt(socket, SOL_SOCKET, SO_LINGER, linger.as_ptr(), 4) };
-            assert_eq!(done, 0);
-            close(socket);
-        }
-
-        /// The socket's pending error, as SO_ERROR reads it.
-        pub fn error(socket: usize) -> i32 {
-            let mut error = [0u8; 4];
-            let mut length = 4i32;
-            // rr: escape(unsafe): error holds length bytes.
-            let done = unsafe {
-                getsockopt(
-                    socket,
-                    SOL_SOCKET,
-                    SO_ERROR,
-                    error.as_mut_ptr(),
-                    &raw mut length,
-                )
-            };
-            assert_eq!(done, 0);
-            i32::from_le_bytes(error)
-        }
-
-        /// Windows has no limit to raise: as many as asked.
-        pub fn files(want: u64) -> u64 {
-            want
         }
     }
 }
@@ -1685,8 +1242,10 @@ mod poller {
         /// Waits up to timeout nanoseconds (None: no limit); what is
         /// ready goes to found by key, 0 for a wake.
         pub fn wait(&mut self, timeout: Option<u64>, found: &mut Vec<(u64, u8)>) {
+            // xnu converts tv_sec to 32 bits (tstoabstime): a longer wait
+            // is cut to what it holds.
             let time = timeout.map(|ns| Timespec {
-                seconds: i64::try_from(ns / 1_000_000_000).unwrap_or(i64::MAX),
+                seconds: i64::from(u32::try_from(ns / 1_000_000_000).unwrap_or(u32::MAX)),
                 nanoseconds: i64::try_from(ns % 1_000_000_000).unwrap_or(0),
             });
             let limit = time.as_ref().map_or(null(), core::ptr::from_ref);
@@ -1754,6 +1313,7 @@ mod poller {
     use alloc::vec::Vec;
     use core::ffi::{c_char, c_void};
     use core::ptr::{null_mut, without_provenance_mut};
+    use core::sync::atomic::{AtomicBool, Ordering};
 
     /// SOCK_NOTIFY_REGISTRATION, from winsock2.h.
     #[repr(C)]
@@ -1810,7 +1370,7 @@ mod poller {
         fn QueryPerformanceFrequency(frequency: *mut i64) -> i32;
     }
 
-    // winsock2.h's SOCK_NOTIFY_* values; winerror.h's WAIT_TIMEOUT.
+    // winsock2.h's SOCK_NOTIFY_* values.
     const REGISTER_IN: u16 = 0x1;
     const REGISTER_OUT: u16 = 0x2;
     const REGISTER_HANGUP: u16 = 0x4;
@@ -1818,9 +1378,8 @@ mod poller {
     const EVENT_REMOVE: u32 = 0x80;
     const OP_ENABLE: u8 = 0x1;
     const OP_REMOVE: u8 = 0x4;
-    const TRIGGER_ONESHOT: u8 = 0x1;
+    const TRIGGER_PERSISTENT: u8 = 0x2;
     const TRIGGER_LEVEL: u8 = 0x4;
-    const WAIT_TIMEOUT: u32 = 258;
     // winsock2.h's WSAPoll events.
     const POLLRDNORM: i16 = 0x100;
     const POLLRDBAND: i16 = 0x200;
@@ -1858,28 +1417,36 @@ mod poller {
     }
 
     /// What wakes a Set: a packet on its completion port, or a byte on
-    /// its signal.
+    /// its signal; one until the Set takes it, as neither holds them
+    /// together as an eventfd does.
     pub enum Wake {
         Port(Port),
-        Signal(Signal),
+        Signal(Signal, AtomicBool),
     }
 
     impl Wake {
         pub fn wake(&self) {
             match self {
                 Wake::Port(port) => {
-                    // rr: escape(unsafe): the port lives as long as self;
-                    // key 0 names the waker.
-                    unsafe { PostQueuedCompletionStatus(port.handle, 0, 0, null_mut()) };
+                    if !port.pending.swap(true, Ordering::AcqRel) {
+                        // rr: escape(unsafe): the port lives as long as
+                        // self; key 0 names the waker.
+                        unsafe { PostQueuedCompletionStatus(port.handle, 0, 0, null_mut()) };
+                    }
                 }
-                Wake::Signal(signal) => signal.set(),
+                Wake::Signal(signal, pending) => {
+                    if !pending.swap(true, Ordering::AcqRel) {
+                        signal.set();
+                    }
+                }
             }
         }
     }
 
-    /// A completion port, closed on drop.
+    /// A completion port, closed on drop, and whether a wake is on it.
     pub struct Port {
         handle: *mut c_void,
+        pending: AtomicBool,
     }
 
     // rr: escape(unsafe): a completion port is a kernel handle, which any
@@ -1917,14 +1484,14 @@ mod poller {
 
         pub fn add(&mut self, socket: usize, key: u64, interest: u8) -> bool {
             match self {
-                Poller::Notified(notified) => notified.add(socket, key, interest),
+                Poller::Notified(notified) => notified.enable(socket, key, interest),
                 Poller::Polled(polled) => polled.add(socket, key, interest),
             }
         }
 
-        pub fn modify(&mut self, _socket: usize, key: u64, _old: u8, interest: u8) -> bool {
+        pub fn modify(&mut self, socket: usize, key: u64, _old: u8, interest: u8) -> bool {
             match self {
-                Poller::Notified(notified) => notified.modify(key, interest),
+                Poller::Notified(notified) => notified.enable(socket, key, interest),
                 Poller::Polled(polled) => polled.modify(key, interest),
             }
         }
@@ -1937,12 +1504,10 @@ mod poller {
         }
 
         /// The system dropped a closed socket itself: closesocket ends its
-        /// registration; the poller forgets its own record.
+        /// registration; WSAPoll's fds forget it.
         pub fn forget(&mut self, key: u64) {
             match self {
-                Poller::Notified(notified) => {
-                    notified.sockets.remove(&key);
-                }
+                Poller::Notified(_) => {}
                 Poller::Polled(polled) => polled.remove(key),
             }
         }
@@ -1985,26 +1550,11 @@ mod poller {
         Some(unsafe { core::mem::transmute::<*mut c_void, Notify>(address) })
     }
 
-    /// A socket's registration: what the loop wants of it, and whether
-    /// it is enabled, as a one-shot one is until its notification.
-    struct Watched {
-        socket: usize,
-        interest: u8,
-        armed: bool,
-    }
-
     pub struct Notified {
         notify: Notify,
         /// The port's handle, which wake keeps open.
         port: *mut c_void,
         wake: Arc<Wake>,
-        // rr: escape(bound): one for each socket the Set watches.
-        sockets: BTreeMap<u64, Watched>,
-        /// The registrations that delivered and wait to be enabled again.
-        // rr: escape(bound): no more than the sockets.
-        spent: Vec<u64>,
-        // rr: escape(bound): no more than the sockets.
-        enable: Vec<Registration>,
         /// What a wait takes from the port: BATCH entries.
         entries: Vec<Entry>,
     }
@@ -2028,10 +1578,12 @@ mod poller {
                 notify,
                 port: handle,
                 // rr: escape(shared): the poller and each Waker hold the port.
-                wake: Arc::new(Wake::Port(Port { handle })),
-                sockets: BTreeMap::new(),
-                spent: Vec::new(),
-                enable: Vec::new(),
+                wake: Arc::new(Wake::Port(Port {
+                    handle,
+                    // rr: escape(shared): set by any thread's wake, cleared
+                    // by the Set's.
+                    pending: AtomicBool::new(false),
+                })),
                 entries,
             })
         }
@@ -2054,40 +1606,13 @@ mod poller {
             done == 0 && registration.result == 0
         }
 
-        /// A socket with no interest is not enabled: no notification
-        /// comes for it until it has one.
-        fn add(&mut self, socket: usize, key: u64, interest: u8) -> bool {
-            let armed = interest != 0;
-            if armed && !self.register(enable(socket, key, interest)) {
-                return false;
-            }
-            let watched = Watched {
-                socket,
-                interest,
-                armed,
-            };
-            self.sockets.insert(key, watched);
-            true
+        /// Enables the socket's registration for its interest, or for
+        /// nothing: one enabled already takes the new filter.
+        fn enable(&self, socket: usize, key: u64, interest: u8) -> bool {
+            self.register(enable(socket, key, interest))
         }
 
-        /// An interest is enabled at once: on an enabled registration
-        /// again, as Pony does; none is left to the notification on its
-        /// way, which the Set masks, and which leaves it spent.
-        fn modify(&mut self, key: u64, interest: u8) -> bool {
-            let Some(watched) = self.sockets.get_mut(&key) else {
-                return false;
-            };
-            watched.interest = interest;
-            if interest == 0 {
-                return true;
-            }
-            watched.armed = true;
-            let registration = enable(watched.socket, key, interest);
-            self.register(registration)
-        }
-
-        fn remove(&mut self, socket: usize, key: u64) {
-            self.sockets.remove(&key);
+        fn remove(&self, socket: usize, key: u64) {
             let registration = Registration {
                 socket,
                 key: key_pointer(key),
@@ -2102,83 +1627,37 @@ mod poller {
         }
 
         fn wait(&mut self, timeout: Option<u64>, found: &mut Vec<(u64, u8)>) {
-            self.enable.clear();
-            while let Some(key) = self.spent.pop() {
-                if let Some(watched) = self.sockets.get_mut(&key)
-                    && !watched.armed
-                    && watched.interest != 0
-                {
-                    watched.armed = true;
-                    self.enable
-                        .push(enable(watched.socket, key, watched.interest));
-                }
-            }
-            let count = u32::try_from(self.enable.len()).unwrap_or(0);
-            let registrations = if count == 0 {
-                null_mut()
-            } else {
-                self.enable.as_mut_ptr()
-            };
             let room = u32::try_from(self.entries.len()).unwrap_or(0);
             let mut received = 0u32;
-            // rr: escape(unsafe): registrations holds count entries or is
-            // null for none; entries holds room.
+            // rr: escape(unsafe): entries holds room; no registrations.
             let done = unsafe {
                 (self.notify)(
                     self.port,
-                    count,
-                    registrations,
+                    0,
+                    null_mut(),
                     milliseconds(timeout),
                     room,
                     self.entries.as_mut_ptr(),
                     &raw mut received,
                 )
             };
-            let made = done == 0 || done == WAIT_TIMEOUT;
-            let enabled = core::mem::take(&mut self.enable);
-            for registration in &enabled {
-                let key = u64::try_from(registration.key.addr()).unwrap_or(0);
-                match (made, registration.result) {
-                    (true, 0) => {}
-                    // Nothing was made: enabled at the next wait.
-                    (false, _) => self.disarm(key),
-                    // Refused, as for a socket closed: reported, and tried
-                    // again at the next wait until the Set removes it.
-                    (true, _) => {
-                        self.disarm(key);
-                        found.push((key, ERROR));
-                    }
-                }
-            }
-            self.enable = enabled;
-            if !made {
+            if done != 0 {
+                // WAIT_TIMEOUT, or the wait failed: nothing taken.
                 return;
             }
             let received = usize::try_from(received).unwrap_or(0);
-            for at in 0..received {
-                let Some(entry) = self.entries.get(at) else {
-                    break;
-                };
+            for entry in self.entries.iter().take(received) {
                 let (key, events) = (u64::try_from(entry.key).unwrap_or(0), entry.bytes);
                 if key == 0 {
+                    if let Wake::Port(port) = &*self.wake {
+                        port.pending.store(false, Ordering::Release);
+                    }
                     found.push((0, 0));
                 } else if events & EVENT_REMOVE == 0 {
-                    self.disarm(key);
                     found.push((key, ready(events)));
                 } else {
                     // A removed registration's last word.
                 }
-            }
-        }
-
-        /// The registration delivered, or was not made: it waits to be
-        /// enabled again.
-        fn disarm(&mut self, key: u64) {
-            if let Some(watched) = self.sockets.get_mut(&key)
-                && watched.armed
-            {
-                watched.armed = false;
-                self.spent.push(key);
             }
         }
     }
@@ -2187,8 +1666,9 @@ mod poller {
         without_provenance_mut(usize::try_from(key).unwrap_or(0))
     }
 
-    /// Enables a socket's registration, one-shot and level-triggered,
-    /// for its interest and its hangup.
+    /// Enables a socket's registration, persistent and level-triggered,
+    /// as Microsoft's single-threaded replacement for poll has it: for its
+    /// interest and the hangup, or for nothing when it has none.
     fn enable(socket: usize, key: u64, interest: u8) -> Registration {
         let read = if interest & READ == 0 { 0 } else { REGISTER_IN };
         let write = if interest & WRITE == 0 {
@@ -2196,12 +1676,13 @@ mod poller {
         } else {
             REGISTER_OUT
         };
+        let hangup = if interest == 0 { 0 } else { REGISTER_HANGUP };
         Registration {
             socket,
             key: key_pointer(key),
-            filter: read | write | REGISTER_HANGUP,
+            filter: read | write | hangup,
             operation: OP_ENABLE,
-            trigger: TRIGGER_ONESHOT | TRIGGER_LEVEL,
+            trigger: TRIGGER_PERSISTENT | TRIGGER_LEVEL,
             result: 0,
         }
     }
@@ -2246,7 +1727,12 @@ mod poller {
                 reader,
                 // rr: escape(shared): the poller and each Waker hold the
                 // signal.
-                wake: Arc::new(Wake::Signal(signal)),
+                wake: Arc::new(Wake::Signal(
+                    signal,
+                    // rr: escape(shared): set by any thread's wake, cleared
+                    // by the Set's.
+                    AtomicBool::new(false),
+                )),
                 fds: Vec::from([PollFd {
                     fd: reader,
                     events: POLLRDNORM,
@@ -2310,7 +1796,10 @@ mod poller {
         }
 
         fn wait(&mut self, timeout: Option<u64>, found: &mut Vec<(u64, u8)>) {
-            let ms = i32::try_from(milliseconds(timeout)).unwrap_or(-1);
+            let ms = match milliseconds(timeout) {
+                INFINITE => -1,
+                finite => i32::try_from(finite).unwrap_or(i32::MAX),
+            };
             if os::poll(&mut self.fds, ms) <= 0 {
                 return;
             }
@@ -2320,6 +1809,9 @@ mod poller {
                 match (revents, key) {
                     (0, _) => {}
                     (_, 0) => {
+                        if let Wake::Signal(_, pending) = &*self.wake {
+                            pending.store(false, Ordering::Release);
+                        }
                         os::drain(self.reader);
                         found.push((0, 0));
                     }
@@ -2472,9 +1964,7 @@ mod tests {
         // rr: escape(leak): the thread takes it back.
         let argument = Box::into_raw(Box::new(waker));
         let _ticket = spawn(wake, argument.cast()).unwrap();
-        let start = Instant::now();
-        let events = set.wait(None);
+        let events = set.wait(Some(Instant::now().after_ms(10_000)));
         assert!(events.len() == 1 && events[0].key == 9 && events[0].ready == WOKEN);
-        assert!(Instant::now().since(start) < 5_000_000_000);
     }
 }

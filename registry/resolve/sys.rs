@@ -108,7 +108,7 @@ fn c_string(name: &[u8]) -> Option<Vec<u8>> {
 #[cfg(target_os = "linux")]
 mod os {
     use super::{Address, Error, Wait, c_string};
-    use crate::base::wait::{self, SOCK_STREAM, Signal};
+    use crate::base::wait::{self, AF_INET, AF_INET6, SOCK_STREAM, Signal};
     use alloc::boxed::Box;
     use alloc::vec::Vec;
     use core::cell::UnsafeCell;
@@ -142,10 +142,8 @@ mod os {
         fn freeaddrinfo(info: *mut AddrInfo);
     }
 
-    // sys/socket.h's families and netdb.h's errors, glibc's and musl's;
+    // netdb.h's errors, glibc's and musl's;
     // EAI_NODATA is glibc's, and musl keeps its number.
-    const AF_INET: u16 = 2;
-    const AF_INET6: u16 = 10;
     const EAI_AGAIN: c_int = -3;
     const EAI_NODATA: c_int = -5;
     const EAI_NONAME: c_int = -2;
@@ -790,7 +788,7 @@ mod os {
 #[cfg(target_os = "windows")]
 mod os {
     use super::{Address, Error, Wait, finish};
-    use crate::base::wait::{self, AF_INET, SOCK_STREAM, Signal};
+    use crate::base::wait::{self, AF_INET, AF_INET6, SOCK_STREAM, Signal};
     use alloc::boxed::Box;
     use alloc::vec::Vec;
     use core::cell::UnsafeCell;
@@ -849,7 +847,6 @@ mod os {
 
     /// Every namespace, as GetAddrInfoW asks.
     const NS_ALL: u32 = 0;
-    const AF_INET6: u16 = 23;
     const WSA_IO_PENDING: i32 = 997;
     const WSAETIMEDOUT: u32 = 10060;
     const WSAHOST_NOT_FOUND: u32 = 11001;

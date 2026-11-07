@@ -1,0 +1,19 @@
+{
+  "name": "net",
+  "description": "TCP over the system's sockets for a loop that serves many: a Listener and the Streams it accepts or that connect out, non-blocking, closed on exec or never inherited, no SIGPIPE; each owns its socket and its entry in a wait Set, which close removes before the socket is closed; errors by kind, IPv4 and IPv6.",
+  "rr": "0.5.2",
+  "dependencies": [
+    "wait"
+  ],
+  "files": [
+    {
+      "path": "mod.rs"
+    },
+    {
+      "path": "sys.rs"
+    },
+    {
+      "path": "tests.rs"
+    }
+  ]
+}
