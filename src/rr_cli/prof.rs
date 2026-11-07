@@ -407,11 +407,17 @@ pub fn load(exe: &Path, anchor: &str) -> Option<Program> {
         };
         let pdb = pdb_addr2line::pdb::PDB::open(fs::File::open(path).ok()?).ok()?;
         let lines = pdb_addr2line::ContextPdbData::try_from_pdb(pdb).ok()?;
-        let at = lines
-            .make_context()
+        // A PDB names a function by its path, `crate::module::name`, even
+        // one whose symbol is the bare name.
+        let at = pdb_context(&lines)
             .ok()?
             .functions()
-            .find(|f| f.name.as_deref().is_some_and(|n| n.trim_start_matches('_') == anchor))?
+            .find(|f| {
+                f.name
+                    .as_deref()
+                    .and_then(|n| n.rsplit("::").next())
+                    .is_some_and(|n| n.trim_start_matches('_') == anchor)
+            })?
             .start_rva;
         return Some(Program {
             lines: Lines::Pdb(Box::new(lines)),
@@ -467,6 +473,15 @@ pub fn frames(p: &Program, slide: u64, pcs: &[u64]) -> Vec<Frame> {
     out
 }
 
+/// A PDB's lookups, with functions named without their argument lists,
+/// as DWARF names them.
+fn pdb_context<'a>(
+    lines: &'a pdb_addr2line::ContextPdbData<'static, 'static, fs::File>,
+) -> Result<pdb_addr2line::Context<'a, 'static>, pdb_addr2line::Error> {
+    use pdb_addr2line::TypeFormatterFlags as Flags;
+    lines.make_context_with_formatter_flags(Flags::default() | Flags::NO_ARGUMENTS)
+}
+
 /// frames, from a PDB: each return address less slide is an RVA.
 fn pdb_frames(
     lines: &pdb_addr2line::ContextPdbData<'static, 'static, fs::File>,
@@ -474,7 +489,7 @@ fn pdb_frames(
     pcs: &[u64],
 ) -> Vec<Frame> {
     let mut out = Vec::new();
-    let Ok(context) = lines.make_context() else {
+    let Ok(context) = pdb_context(lines) else {
         return out;
     };
     for pc in pcs {
