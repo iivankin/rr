@@ -1377,6 +1377,7 @@ mod poller {
     const EVENT_ERR: u32 = 0x40;
     const EVENT_REMOVE: u32 = 0x80;
     const OP_ENABLE: u8 = 0x1;
+    const OP_DISABLE: u8 = 0x2;
     const OP_REMOVE: u8 = 0x4;
     const TRIGGER_PERSISTENT: u8 = 0x2;
     const TRIGGER_LEVEL: u8 = 0x4;
@@ -1484,13 +1485,20 @@ mod poller {
 
         pub fn add(&mut self, socket: usize, key: u64, interest: u8) -> bool {
             match self {
+                // A socket with no interest is registered once it has one.
+                Poller::Notified(_) if interest == 0 => true,
                 Poller::Notified(notified) => notified.enable(socket, key, interest),
                 Poller::Polled(polled) => polled.add(socket, key, interest),
             }
         }
 
-        pub fn modify(&mut self, socket: usize, key: u64, _old: u8, interest: u8) -> bool {
+        pub fn modify(&mut self, socket: usize, key: u64, old: u8, interest: u8) -> bool {
             match self {
+                // No interest disables the registration: enabled for none,
+                // the system refuses it.
+                Poller::Notified(notified) if interest == 0 => {
+                    old == 0 || notified.change(socket, key, OP_DISABLE)
+                }
                 Poller::Notified(notified) => notified.enable(socket, key, interest),
                 Poller::Polled(polled) => polled.modify(key, interest),
             }
@@ -1606,24 +1614,29 @@ mod poller {
             done == 0 && registration.result == 0
         }
 
-        /// Enables the socket's registration for its interest, or for
-        /// nothing: one enabled already takes the new filter.
+        /// Enables the socket's registration for its interest: one enabled
+        /// already takes the new filter.
         fn enable(&self, socket: usize, key: u64, interest: u8) -> bool {
             self.register(enable(socket, key, interest))
         }
 
-        fn remove(&self, socket: usize, key: u64) {
-            let registration = Registration {
+        /// Disables or removes the socket's registration.
+        fn change(&self, socket: usize, key: u64, operation: u8) -> bool {
+            self.register(Registration {
                 socket,
                 key: key_pointer(key),
                 filter: 0,
-                operation: OP_REMOVE,
+                operation,
                 trigger: 0,
                 result: 0,
-            };
-            // A socket already closed lost its registration with it; what
-            // the port still holds for it the Set drops by its key.
-            self.register(registration);
+            })
+        }
+
+        fn remove(&self, socket: usize, key: u64) {
+            // A socket already closed, or never registered, has nothing to
+            // remove; what the port still holds for it the Set drops by its
+            // key.
+            self.change(socket, key, OP_REMOVE);
         }
 
         fn wait(&mut self, timeout: Option<u64>, found: &mut Vec<(u64, u8)>) {
@@ -1668,7 +1681,7 @@ mod poller {
 
     /// Enables a socket's registration, persistent and level-triggered,
     /// as Microsoft's single-threaded replacement for poll has it: for its
-    /// interest and the hangup, or for nothing when it has none.
+    /// interest and the hangup.
     fn enable(socket: usize, key: u64, interest: u8) -> Registration {
         let read = if interest & READ == 0 { 0 } else { REGISTER_IN };
         let write = if interest & WRITE == 0 {
@@ -1676,11 +1689,10 @@ mod poller {
         } else {
             REGISTER_OUT
         };
-        let hangup = if interest == 0 { 0 } else { REGISTER_HANGUP };
         Registration {
             socket,
             key: key_pointer(key),
-            filter: read | write | hangup,
+            filter: read | write | REGISTER_HANGUP,
             operation: OP_ENABLE,
             trigger: TRIGGER_PERSISTENT | TRIGGER_LEVEL,
             result: 0,
