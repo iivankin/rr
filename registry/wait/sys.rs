@@ -1433,10 +1433,6 @@ mod poller {
             self.control(EPOLL_CTL_DEL, fd, key, 0);
         }
 
-        /// The system dropped a closed descriptor itself; the poller keeps
-        /// nothing of it.
-        pub fn forget(&self, _key: u64) {}
-
         pub fn waker(&self) -> Arc<Wake> {
             // rr: escape(copy): a Waker's holder of the eventfd.
             Arc::clone(&self.wake)
@@ -1672,10 +1668,6 @@ mod poller {
             // A descriptor already closed lost its filters with it.
             self.modify(fd, key, interest, 0);
         }
-
-        /// The system dropped a closed descriptor itself; the poller keeps
-        /// nothing of it.
-        pub fn forget(&self, _key: u64) {}
 
         pub fn waker(&self) -> Arc<Wake> {
             // rr: escape(copy): a Waker's holder of the kqueue.
