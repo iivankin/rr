@@ -1420,17 +1420,25 @@ mod poller {
             unsafe { epoll_ctl(self.epoll, operation, fd, &raw mut event) == 0 }
         }
 
+        /// A descriptor with no interest is not in the epoll at all:
+        /// epoll reports its errors and hangup whatever it is asked, and
+        /// would wake the loop for them again and again.
         pub fn add(&self, fd: c_int, key: u64, interest: u8) -> bool {
-            self.control(EPOLL_CTL_ADD, fd, key, events(interest))
+            self.modify(fd, key, 0, interest)
         }
 
-        pub fn modify(&self, fd: c_int, key: u64, _old: u8, interest: u8) -> bool {
-            self.control(EPOLL_CTL_MOD, fd, key, events(interest))
+        pub fn modify(&self, fd: c_int, key: u64, old: u8, interest: u8) -> bool {
+            match (old, interest) {
+                (0, 0) => true,
+                (0, _) => self.control(EPOLL_CTL_ADD, fd, key, events(interest)),
+                (_, 0) => self.control(EPOLL_CTL_DEL, fd, key, 0),
+                (_, _) => self.control(EPOLL_CTL_MOD, fd, key, events(interest)),
+            }
         }
 
-        pub fn remove(&self, fd: c_int, key: u64, _interest: u8) {
+        pub fn remove(&self, fd: c_int, key: u64, interest: u8) {
             // A descriptor already closed is already out: no error to act on.
-            self.control(EPOLL_CTL_DEL, fd, key, 0);
+            self.modify(fd, key, interest, 0);
         }
 
         pub fn waker(&self) -> Arc<Wake> {
@@ -2046,29 +2054,34 @@ mod poller {
             done == 0 && registration.result == 0
         }
 
+        /// A socket with no interest is not enabled: no notification
+        /// comes for it until it has one.
         fn add(&mut self, socket: usize, key: u64, interest: u8) -> bool {
-            if !self.register(enable(socket, key, interest)) {
+            let armed = interest != 0;
+            if armed && !self.register(enable(socket, key, interest)) {
                 return false;
             }
             let watched = Watched {
                 socket,
                 interest,
-                armed: true,
+                armed,
             };
             self.sockets.insert(key, watched);
             true
         }
 
-        /// An enabled registration is enabled again with the new
-        /// interest; a spent one takes it when it is.
+        /// An interest is enabled at once: on an enabled registration
+        /// again, as Pony does; none is left to the notification on its
+        /// way, which the Set masks, and which leaves it spent.
         fn modify(&mut self, key: u64, interest: u8) -> bool {
             let Some(watched) = self.sockets.get_mut(&key) else {
                 return false;
             };
             watched.interest = interest;
-            if !watched.armed {
+            if interest == 0 {
                 return true;
             }
+            watched.armed = true;
             let registration = enable(watched.socket, key, interest);
             self.register(registration)
         }
@@ -2091,7 +2104,10 @@ mod poller {
         fn wait(&mut self, timeout: Option<u64>, found: &mut Vec<(u64, u8)>) {
             self.enable.clear();
             while let Some(key) = self.spent.pop() {
-                if let Some(watched) = self.sockets.get_mut(&key) {
+                if let Some(watched) = self.sockets.get_mut(&key)
+                    && !watched.armed
+                    && watched.interest != 0
+                {
                     watched.armed = true;
                     self.enable
                         .push(enable(watched.socket, key, watched.interest));
@@ -2215,6 +2231,11 @@ mod poller {
         /// The sockets a wait found closed, to drop after it.
         // rr: escape(bound): no more than fds.
         closed: Vec<u64>,
+        /// Every socket the Set watches, by key: those with no interest
+        /// are left out of fds, where WSAPoll would report their errors
+        /// and hangup on every wait.
+        // rr: escape(bound): one for each socket the Set watches.
+        sockets: BTreeMap<u64, usize>,
     }
 
     impl Polled {
@@ -2234,29 +2255,47 @@ mod poller {
                 keys: Vec::from([0]),
                 places: BTreeMap::new(),
                 closed: Vec::new(),
+                sockets: BTreeMap::new(),
             })
         }
 
         fn add(&mut self, socket: usize, key: u64, interest: u8) -> bool {
-            self.places.insert(key, self.fds.len());
-            self.fds.push(PollFd {
-                fd: socket,
-                events: poll_events(interest),
-                revents: 0,
-            });
-            self.keys.push(key);
-            true
+            self.sockets.insert(key, socket);
+            self.modify(key, interest)
         }
 
         fn modify(&mut self, key: u64, interest: u8) -> bool {
-            let Some(fd) = self.places.get(&key).and_then(|&at| self.fds.get_mut(at)) else {
+            let Some(&socket) = self.sockets.get(&key) else {
                 return false;
             };
-            fd.events = poll_events(interest);
+            let events = poll_events(interest);
+            match self.places.get(&key).copied() {
+                _ if interest == 0 => self.leave(key),
+                Some(at) => {
+                    if let Some(fd) = self.fds.get_mut(at) {
+                        fd.events = events;
+                    }
+                }
+                None => {
+                    self.places.insert(key, self.fds.len());
+                    self.fds.push(PollFd {
+                        fd: socket,
+                        events,
+                        revents: 0,
+                    });
+                    self.keys.push(key);
+                }
+            }
             true
         }
 
         fn remove(&mut self, key: u64) {
+            self.sockets.remove(&key);
+            self.leave(key);
+        }
+
+        /// Takes the socket out of fds: the last takes its place.
+        fn leave(&mut self, key: u64) {
             let Some(at) = self.places.remove(&key) else {
                 return;
             };
@@ -2265,7 +2304,6 @@ mod poller {
             }
             self.fds.swap_remove(at);
             self.keys.swap_remove(at);
-            // The last took its place.
             if let Some(&moved) = self.keys.get(at) {
                 self.places.insert(moved, at);
             }

@@ -10,13 +10,27 @@
 //! Readiness is level-triggered on every system: an entry is reported
 //! on each wait while its condition holds, so the loop may read or write
 //! a part and come back. Interest in writing is for when there is
-//! something to write: a socket is nearly always writable. Errors and
-//! the peer's hangup come whatever the interest, and a report may be
-//! spurious: a read or write that would block is not an error.
+//! something to write: a socket is nearly always writable. With an
+//! interest, errors and the peer's hangup come with it; an entry with
+//! none is not watched at all, as when the loop stops reading to let a
+//! slow peer catch up, and what happened to it shows when it has one
+//! again, or at its next read or write. Only its deadline still counts.
+//! A report may be spurious: a read or write that would block is not an
+//! error.
+//!
+//! One wait reports at most 256 descriptors; the rest, still ready, the
+//! next. Deadlines are never reported early, and may be late by what the
+//! system's wait counts in: on Linux and Windows a timeout is whole
+//! milliseconds, rounded up, and Windows wakes on its timer's tick, 15.6
+//! ms unless the program asked for a finer one.
 //!
 //! A descriptor is removed before it is closed. One closed first is
 //! dropped by the system; a new descriptor that gets its number is
-//! then added as new, and the old token only lets go of its entry.
+//! then added as new, and the old token only lets go of its entry. On
+//! Linux that holds only when the closed descriptor was the last open on
+//! its socket: epoll watches the socket, not the number, so after dup or
+//! fork another descriptor keeps it watched, and its events come back
+//! on every wait for an entry the Set no longer reports.
 //!
 //! A Set is one thread's; a Waker wakes it from another.
 
@@ -447,16 +461,23 @@ impl Set {
         (slot.live && slot.generation == token.generation).then_some(slot)
     }
 
-    /// What the system reported for key: dropped when its entry is gone
-    /// or no longer watched.
+    /// What the system reported for key, as the entry's interest asks:
+    /// dropped when the entry is gone, no longer watched or has none, as
+    /// a notification sent before the interest changed may be.
     fn found_ready(&mut self, key: u64, ready: u8) {
         let token = Token {
             index: u32::try_from(key & u64::from(u32::MAX)).unwrap_or(u32::MAX),
             generation: u32::try_from(key >> 32).unwrap_or(0),
         };
-        let attached = self.slot_mut(token).is_some_and(|slot| slot.attached);
-        if attached {
-            self.report(token.index, ready);
+        let Some(slot) = self.slot_mut(token) else {
+            return;
+        };
+        let shown = match (slot.attached, slot.interest) {
+            (false, _) | (_, 0) => 0,
+            (true, interest) => ready & (interest | HUP | ERROR),
+        };
+        if shown != 0 {
+            self.report(token.index, shown);
         }
     }
 
@@ -883,6 +904,30 @@ mod tests {
             set.remove(token);
             net::close(client);
             net::close(server);
+        }
+    }
+
+    /// An entry with no interest is not watched, not even for the
+    /// peer's reset, which shows once it has one again; its deadline
+    /// still counts.
+    #[test]
+    fn paused() {
+        for mut set in sets() {
+            let (client, server) = pair(&mut set);
+            let token = set.add(client, 0, 1).unwrap();
+            net::reset(server);
+            quiet(&mut set, 1, u8::MAX, 50);
+            set.deadline(token, Some(Instant::now().after_ms(10)));
+            assert_eq!(until(&mut set, 1, EXPIRED), EXPIRED);
+            assert!(set.modify(token, READ));
+            assert_ne!(
+                until(&mut set, 1, READ | HUP | ERROR) & (READ | HUP | ERROR),
+                0
+            );
+            assert!(set.modify(token, 0));
+            quiet(&mut set, 1, u8::MAX, 50);
+            set.remove(token);
+            net::close(client);
         }
     }
 
