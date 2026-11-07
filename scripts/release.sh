@@ -43,6 +43,7 @@ if [ ! -d "$rr_llvm_source/compiler-rt/lib/fuzzer" ]; then
     rr_git config core.sparseCheckout true
     printf '%s\n' /compiler-rt/lib/fuzzer/ /compiler-rt/LICENSE.TXT \
         /compiler-rt/lib/sanitizer_common/sanitizer_coverage_win_sections.cpp \
+        /compiler-rt/lib/sanitizer_common/sanitizer_platform.h \
         > "$rr_llvm_source/.git/info/sparse-checkout"
     rr_git -c protocol.version=2 fetch -q --depth 1 --filter=blob:none origin "$rr_llvm"
     rr_git checkout -q FETCH_HEAD
