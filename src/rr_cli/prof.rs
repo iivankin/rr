@@ -35,10 +35,6 @@ pub fn build_runtime(raw0: &str, dir: &Path, target: Option<&str>, sysroot: Opti
         "-Cpanic=abort".into(),
         "-Copt-level=2".into(),
         "-Cforce-frame-pointers=yes".into(),
-        // Its anchor needs a function record of its own in the program's
-        // line tables: a PDB, which has no symbol table beside it, names
-        // only functions with debug information.
-        "-Cdebuginfo=line-tables-only".into(),
         "--out-dir".into(),
         dir.to_string_lossy().into_owned(),
     ];
@@ -418,19 +414,7 @@ pub fn load(exe: &Path, anchor: &str) -> Result<Program, String> {
         let open = fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let pdb = pdb_addr2line::pdb::PDB::open(open).map_err(|e| format!("{}: {e}", path.display()))?;
         let lines = pdb_addr2line::ContextPdbData::try_from_pdb(pdb).map_err(|e| format!("{}: {e}", path.display()))?;
-        // A PDB names a function by its path, `crate::module::name`, even
-        // one whose symbol is the bare name.
-        let at = pdb_context(&lines)
-            .map_err(|e| format!("{}: {e}", path.display()))?
-            .functions()
-            .find(|f| {
-                f.name
-                    .as_deref()
-                    .and_then(|n| n.rsplit("::").next())
-                    .is_some_and(|n| n.trim_start_matches('_') == anchor)
-            })
-            .ok_or_else(|| format!("{}: no function {anchor}", path.display()))?
-            .start_rva;
+        let at = pdb_public(&path, anchor)?;
         return Ok(Program {
             lines: Lines::Pdb(Box::new(lines)),
             anchor: u64::from(at),
@@ -484,6 +468,28 @@ pub fn frames(p: &Program, slide: u64, pcs: &[u64]) -> Vec<Frame> {
         }
     }
     out
+}
+
+/// The RVA of the public symbol anchor in the PDB at path: the linker
+/// records every external symbol there, with or without debug
+/// information, as a symbol table would.
+fn pdb_public(path: &Path, anchor: &str) -> Result<u32, String> {
+    use pdb_addr2line::pdb::{self, FallibleIterator as _};
+    let failed = |e: pdb::Error| format!("{}: {e}", path.display());
+    let open = fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut pdb = pdb::PDB::open(open).map_err(failed)?;
+    let symbols = pdb.global_symbols().map_err(failed)?;
+    let map = pdb.address_map().map_err(failed)?;
+    let mut iter = symbols.iter();
+    while let Some(symbol) = iter.next().map_err(failed)? {
+        if let Ok(pdb::SymbolData::Public(public)) = symbol.parse()
+            && public.name.to_string().trim_start_matches('_') == anchor
+            && let Some(rva) = public.offset.to_rva(&map)
+        {
+            return Ok(rva.0);
+        }
+    }
+    Err(format!("{}: no public symbol {anchor}", path.display()))
 }
 
 /// A PDB's lookups, with functions named without their argument lists,
