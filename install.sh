@@ -73,8 +73,10 @@ echo "Installing Rust $release with rustup"
 "$rustup" toolchain install "$release" --profile minimal --no-self-update
 toolchain="$("$rustup" run "$release" rustc --print sysroot)"
 [ -d "$toolchain/bin" ] || die "no toolchain at $toolchain"
-# rr's own files are replaced whole; the toolchain's are not touched.
-rm -rf "$toolchain/lib/rustlib/rr"
+# rr's own files are replaced whole; the toolchain's are not touched. The
+# old rr is removed, not written over: macOS keeps a signed executable's
+# signature by its file, and kills a process from one rewritten in place.
+rm -rf "$toolchain/lib/rustlib/rr" "$toolchain/bin/rr"
 cp -R "$tmp/rr/." "$toolchain/"
 "$toolchain/bin/rr" --version >/dev/null || die "the installed rr does not run"
 echo "Installed $("$toolchain/bin/rr" --version) in $toolchain"
