@@ -403,13 +403,15 @@ pub fn load(exe: &Path, anchor: &str) -> Result<Program, String> {
     let data = fs::read(exe).map_err(|e| format!("{}: {e}", exe.display()))?;
     let file = object::File::parse(&*data).map_err(|e| format!("{}: {e}", exe.display()))?;
     if let Ok(Some(info)) = file.pdb_info() {
-        // The PDB the linker named, or the one beside the executable when
-        // the program has moved.
+        // The PDB the linker named. rustc has it name the file alone
+        // (/PDBALTPATH:%_PDB%), which is beside the executable; a full path
+        // that is gone means the program has moved, with its PDB beside it.
         let named = PathBuf::from(String::from_utf8_lossy(info.path()).into_owned());
-        let path = if named.is_file() {
+        let beside = exe.with_file_name(named.file_name().unwrap_or(named.as_os_str()));
+        let path = if named.is_absolute() && named.is_file() {
             named
         } else {
-            exe.with_extension("pdb")
+            beside
         };
         let open = fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let pdb = pdb_addr2line::pdb::PDB::open(open).map_err(|e| format!("{}: {e}", path.display()))?;
