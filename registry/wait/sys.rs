@@ -204,7 +204,9 @@ static QUEUE: Queue = Queue {
     }),
 };
 
-/// Runs f on the line under its lock.
+/// Runs f on the line under its lock. f never calls locked: the lock
+/// is not taken twice by one thread, which POSIX leaves undefined for
+/// the mutex PTHREAD_MUTEX_INITIALIZER makes.
 fn locked(f: impl FnOnce(&mut Line)) {
     QUEUE.lock.lock();
     // rr: escape(unsafe): the lock is held: no one else touches the line.
@@ -327,6 +329,7 @@ mod os {
         fn pthread_detach(thread: Thread) -> c_int;
         fn pthread_mutex_lock(mutex: *mut u64) -> c_int;
         fn pthread_mutex_unlock(mutex: *mut u64) -> c_int;
+        fn abort() -> !;
         fn pipe(fds: *mut c_int) -> c_int;
         fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
         fn write(fd: c_int, buffer: *const c_void, size: usize) -> isize;
@@ -372,16 +375,19 @@ mod os {
     }
 
     /// PTHREAD_MUTEX_INITIALIZER's first word: macOS's
-    /// _PTHREAD_MUTEX_SIG_init (pthread_impl.h); glibc's and musl's are
-    /// all zeros.
+    /// _PTHREAD_MUTEX_SIG_init (its SDK's pthread/pthread_impl.h); glibc's
+    /// (sysdeps/nptl/bits/struct_mutex.h, whose kind PTHREAD_MUTEX_TIMED_NP
+    /// is 0) and musl's (include/pthread.h) are all zeros.
     #[cfg(target_os = "macos")]
     const MUTEX_INIT: u64 = 0x32AA_ABA7;
     #[cfg(not(target_os = "macos"))]
     const MUTEX_INIT: u64 = 0;
 
     /// A pthread_mutex_t, made as PTHREAD_MUTEX_INITIALIZER makes it: a
-    /// long and 56 bytes on macOS, 40 bytes in musl and in glibc on
-    /// x86_64, 48 in glibc on aarch64. Eight words hold each.
+    /// long and 56 bytes on macOS (sys/_pthread/_pthread_types.h), 40
+    /// bytes in musl (include/alltypes.h.in) and in glibc on x86_64, 48 in
+    /// glibc on aarch64 (sysdeps/*/nptl/bits/pthreadtypes-arch.h). Eight
+    /// words hold each.
     pub struct Lock(UnsafeCell<[u64; 8]>);
 
     impl Lock {
@@ -391,15 +397,24 @@ mod os {
             Lock(UnsafeCell::new([MUTEX_INIT, 0, 0, 0, 0, 0, 0, 0]))
         }
 
+        /// Takes the mutex. It fails only on a mutex never made or
+        /// taken twice, which leaves the line in no known state: the
+        /// process stops there.
         pub fn lock(&self) {
             // rr: escape(unsafe): the mutex lives as long as self, which
             // is never moved once shared (a static).
-            unsafe { pthread_mutex_lock(self.0.get().cast()) };
+            if unsafe { pthread_mutex_lock(self.0.get().cast()) } != 0 {
+                // rr: escape(unsafe): abort takes nothing and never returns.
+                unsafe { abort() }
+            }
         }
 
         pub fn unlock(&self) {
             // rr: escape(unsafe): this thread locked the mutex.
-            unsafe { pthread_mutex_unlock(self.0.get().cast()) };
+            if unsafe { pthread_mutex_unlock(self.0.get().cast()) } != 0 {
+                // rr: escape(unsafe): abort takes nothing and never returns.
+                unsafe { abort() }
+            }
         }
     }
 
@@ -596,7 +611,10 @@ mod os {
         0
     }
 
-    /// An SRWLOCK, one pointer, made as SRWLOCK_INIT makes it: null.
+    /// An SRWLOCK, one pointer, made as SRWLOCK_INIT makes it: null
+    /// (synchapi.h). Taken only exclusive: the shared mode's bug that
+    /// Rust's std left SRWLOCK for (rust-lang/rust#121949) is not met.
+    /// Acquire and Release return nothing, and cannot fail.
     pub struct Lock(UnsafeCell<*mut c_void>);
 
     impl Lock {
