@@ -9,7 +9,16 @@
 //! and a Signal says it is done: a pipe on Linux and macOS; on Windows,
 //! where WSAPoll takes only sockets, a connected pair of loopback
 //! sockets, as Python's asyncio does there.
+//!
+//! A loop that serves many connections waits on a Set (set.rs): any
+//! number of descriptors, each with what the loop wants of it and a key,
+//! and deadlines on the monotonic clock. It takes what scales on each
+//! system: epoll on Linux, kqueue on macOS, socket notifications on
+//! Windows 11 and Server 2022 and WSAPoll on the Windows before them.
+//! follow keeps a component's Wait in a Set.
 
+mod set;
 mod sys;
 
+pub use set::*;
 pub use sys::*;

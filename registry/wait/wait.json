@@ -1,11 +1,14 @@
 {
   "name": "wait",
-  "description": "What a poll loop waits on, one type on every system and for every component that works while the loop runs: descriptors (sockets on Windows) and a timeout; block and ready to wait on it with poll or WSAPoll; and a pool of at most 32 threads with a cancellable FIFO line, and the close-on-exec pipe (Linux and macOS) or non-inherited loopback socket pair (Windows) that says the work is done.",
+  "description": "What a program's loop waits on, for every component that works while it runs: a Set of any number of descriptors (sockets on Windows), each with its interest and a key, and deadlines on the monotonic clock, level-triggered on epoll (Linux), kqueue (macOS), socket notifications (Windows 11, Server 2022) or WSAPoll (earlier Windows), and a Waker for other threads; a component's Wait (up to two descriptors and a timeout), which a Set follows or block waits on alone; and a pool of at most 32 threads with a cancellable FIFO line, and the close-on-exec pipe (Linux and macOS) or non-inherited loopback socket pair (Windows) that says the work is done.",
   "rr": "0.5.2",
   "dependencies": [],
   "files": [
     {
       "path": "mod.rs"
+    },
+    {
+      "path": "set.rs"
     },
     {
       "path": "sys.rs"

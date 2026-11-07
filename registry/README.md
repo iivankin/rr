@@ -26,7 +26,7 @@ add declares it in src/base/mod.rs; the crate root declares `mod base;`.
 | http1 | | HTTP/1.1 requests and an incremental response parser |
 | resolve | wait | host lookup that never blocks the loop, by the system: DNSServiceGetAddrInfo on macOS and GetAddrInfoExW on Windows, asynchronous and cancellable; getaddrinfo on a thread on Linux |
 | trust | x509, wait | the system verifies a chain, as Go does: SecTrust on macOS, CertGetCertificateChain on Windows, x509 with the system's roots on Linux; never blocks |
-| wait | | what a program's loop waits on for any component: descriptors or an event, a timeout; a thread that signals when done |
+| wait | | what a program's loop waits on: a Set of many sockets with deadlines (epoll, kqueue, socket notifications or WSAPoll) and wakes from other threads; a component's Wait; a thread that signals when done |
 | cpu | | what the CPU has of the instructions the components use, asked once |
 
 ## A component

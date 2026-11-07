@@ -108,7 +108,7 @@ fn c_string(name: &[u8]) -> Option<Vec<u8>> {
 #[cfg(target_os = "linux")]
 mod os {
     use super::{Address, Error, Wait, c_string};
-    use crate::base::wait::{self, Signal};
+    use crate::base::wait::{self, SOCK_STREAM, Signal};
     use alloc::boxed::Box;
     use alloc::vec::Vec;
     use core::cell::UnsafeCell;
@@ -146,7 +146,6 @@ mod os {
     // EAI_NODATA is glibc's, and musl keeps its number.
     const AF_INET: u16 = 2;
     const AF_INET6: u16 = 10;
-    const SOCK_STREAM: c_int = 1;
     const EAI_AGAIN: c_int = -3;
     const EAI_NODATA: c_int = -5;
     const EAI_NONAME: c_int = -2;
@@ -1138,6 +1137,7 @@ mod os {
 #[cfg(test)]
 mod tests {
     use super::{Error, Lookup, resolve};
+    use crate::base::wait::{Instant, Set, Watch};
 
     fn loopback(addresses: &[super::Address]) -> bool {
         !addresses.is_empty() && addresses.iter().all(|address| address.ip.is_loopback())
@@ -1157,6 +1157,26 @@ mod tests {
             crate::base::wait::block(&lookup.wait());
         }
         panic!("localhost did not resolve");
+    }
+
+    /// localhost through a Set, as a loop that serves many connections
+    /// runs a lookup beside them.
+    #[test]
+    fn in_a_set() {
+        let mut set = Set::new().unwrap();
+        let mut watch = Watch::NONE;
+        let mut lookup = Lookup::start(b"localhost");
+        let end = Instant::now().after_ms(10_000);
+        loop {
+            if let Some(result) = lookup.poll() {
+                assert!(loopback(result.unwrap()));
+                break;
+            }
+            assert!(set.follow(&mut watch, &lookup.wait(), 1));
+            set.wait(Some(end));
+            assert!(!end.reached_by(Instant::now()), "localhost did not resolve");
+        }
+        set.unfollow(&mut watch);
     }
 
     /// Literal addresses are themselves.
