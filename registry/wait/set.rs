@@ -246,6 +246,16 @@ impl Set {
         changed
     }
 
+    /// Reports the entry with key from now on: the system is not asked,
+    /// as it names the entry by its token, which stays.
+    pub fn rekey(&mut self, token: Token, key: u64) -> bool {
+        let Some(slot) = self.slot_mut(token) else {
+            return false;
+        };
+        slot.key = key;
+        true
+    }
+
     /// Sets or clears the entry's deadline. Once it passes, wait reports
     /// EXPIRED for the entry and clears it.
     pub fn deadline(&mut self, token: Token, at: Option<Instant>) {

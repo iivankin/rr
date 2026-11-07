@@ -41,17 +41,19 @@ struct Socket {
 }
 
 impl Socket {
+    /// The socket's entry: added once, then changed in place, its key as
+    /// well, as the system holds a registration for each socket once
+    /// (socket notifications take another only after the first is gone).
     fn watch(&mut self, set: &mut Set, interest: u8, key: u64) -> bool {
-        match self.entry {
-            Some((token, same)) if same == key => set.modify(token, interest),
-            entry => {
-                if let Some((token, _)) = entry {
-                    set.remove(token);
-                }
-                self.entry = set.add(self.fd, interest, key).map(|token| (token, key));
-                self.entry.is_some()
-            }
+        let Some((token, old)) = self.entry else {
+            self.entry = set.add(self.fd, interest, key).map(|token| (token, key));
+            return self.entry.is_some();
+        };
+        if old != key && !set.rekey(token, key) {
+            return false;
         }
+        self.entry = Some((token, key));
+        set.modify(token, interest)
     }
 
     fn token(&self) -> Option<Token> {
