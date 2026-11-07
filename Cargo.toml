@@ -34,6 +34,9 @@ ctrlc = "=3.5.1"
 # rr prof: stack addresses to functions and lines, from DWARF or a dSYM.
 addr2line = { version = "0.25.1", default-features = false, features = ["loader", "rustc-demangle"] }
 object = { version = "0.37.3", default-features = false, features = ["read", "std"] }
+# rr prof and rr fuz name a Windows program's functions and lines from its
+# PDB, where rustc writes them for the MSVC targets.
+pdb-addr2line = "0.12.1"
 # rr fmt: rustfmt's library at the compiler's own commit (rustfmt/).
 rustfmt-nightly = { path = "rustfmt" }
 # rr add: a registry component is a JSON file.

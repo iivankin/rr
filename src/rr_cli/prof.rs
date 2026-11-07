@@ -209,8 +209,16 @@ impl Frame {
 /// A program's line tables, and where `rr_prof_anchor` is in its file: each
 /// process image has a load slide of its own.
 pub struct Program {
-    loader: addr2line::Loader,
+    lines: Lines,
     pub anchor: u64,
+}
+
+/// Where a program's functions and lines are: DWARF, in the executable or
+/// beside it; or for an MSVC target the PDB its debug directory names,
+/// whose addresses are relative to the image (RVAs), as the anchor then is.
+enum Lines {
+    Dwarf(Box<addr2line::Loader>),
+    Pdb(Box<pdb_addr2line::ContextPdbData<'static, 'static, fs::File>>),
 }
 
 #[derive(Default)]
@@ -388,23 +396,52 @@ pub fn load(exe: &Path, anchor: &str) -> Option<Program> {
     use object::{Object as _, ObjectSymbol as _};
     let data = fs::read(exe).ok()?;
     let file = object::File::parse(&*data).ok()?;
+    if let Ok(Some(info)) = file.pdb_info() {
+        // The PDB the linker named, or the one beside the executable when
+        // the program has moved.
+        let named = PathBuf::from(String::from_utf8_lossy(info.path()).into_owned());
+        let path = if named.is_file() {
+            named
+        } else {
+            exe.with_extension("pdb")
+        };
+        let pdb = pdb_addr2line::pdb::PDB::open(fs::File::open(path).ok()?).ok()?;
+        let lines = pdb_addr2line::ContextPdbData::try_from_pdb(pdb).ok()?;
+        let at = lines
+            .make_context()
+            .ok()?
+            .functions()
+            .find(|f| f.name.as_deref().is_some_and(|n| n.trim_start_matches('_') == anchor))?
+            .start_rva;
+        return Some(Program {
+            lines: Lines::Pdb(Box::new(lines)),
+            anchor: u64::from(at),
+        });
+    }
     let at = file
         .symbols()
         .find(|s| s.name().is_ok_and(|n| n.trim_start_matches('_') == anchor))?
         .address();
     let loader = addr2line::Loader::new(exe).ok()?;
-    Some(Program { loader, anchor: at })
+    Some(Program {
+        lines: Lines::Dwarf(Box::new(loader)),
+        anchor: at,
+    })
 }
 
 /// The frames at each return address of an image loaded slide bytes off
 /// its file's addresses, inlined ones innermost first.
 pub fn frames(p: &Program, slide: u64, pcs: &[u64]) -> Vec<Frame> {
+    let loader = match &p.lines {
+        Lines::Dwarf(loader) => loader,
+        Lines::Pdb(lines) => return pdb_frames(lines, slide, pcs),
+    };
     let mut out = Vec::new();
     for pc in pcs {
         // A return address is past its call; look at the call.
         let probe = pc.wrapping_sub(slide).wrapping_sub(1);
         let mut found = false;
-        if let Ok(mut it) = p.loader.find_frames(probe) {
+        if let Ok(mut it) = loader.find_frames(probe) {
             while let Ok(Some(f)) = it.next() {
                 found = true;
                 let function = f
@@ -419,12 +456,40 @@ pub fn frames(p: &Program, slide: u64, pcs: &[u64]) -> Vec<Frame> {
                 out.push(Frame { function, file, line });
             }
         }
-        if !found && let Some(name) = p.loader.find_symbol(probe) {
+        if !found && let Some(name) = loader.find_symbol(probe) {
             out.push(Frame {
                 function: strip_hash(&addr2line::demangle_auto(name.into(), None)),
                 file: String::new(),
                 line: 0,
             });
+        }
+    }
+    out
+}
+
+/// frames, from a PDB: each return address less slide is an RVA.
+fn pdb_frames(
+    lines: &pdb_addr2line::ContextPdbData<'static, 'static, fs::File>,
+    slide: u64,
+    pcs: &[u64],
+) -> Vec<Frame> {
+    let mut out = Vec::new();
+    let Ok(context) = lines.make_context() else {
+        return out;
+    };
+    for pc in pcs {
+        // A return address is past its call; look at the call.
+        let Ok(probe) = u32::try_from(pc.wrapping_sub(slide).wrapping_sub(1)) else {
+            continue;
+        };
+        if let Ok(Some(found)) = context.find_frames(probe) {
+            for f in found.frames {
+                out.push(Frame {
+                    function: f.function.as_deref().map(strip_hash).unwrap_or_default(),
+                    file: f.file.map(std::borrow::Cow::into_owned).unwrap_or_default(),
+                    line: f.line.unwrap_or(0),
+                });
+            }
         }
     }
     out
