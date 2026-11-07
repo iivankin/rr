@@ -907,21 +907,30 @@ mod tests {
     /// take the new one's watch away.
     #[test]
     fn closed_before_removed() {
-        for mut set in sets() {
-            let (old_client, old_server) = pair(&mut set);
-            let old = set.add(old_client, READ, 1).unwrap();
-            net::close(old_client);
-            let (client, server) = pair(&mut set);
-            let new = set.add(client, READ, 2).unwrap();
-            set.remove(old);
-            assert_eq!(net::write(server, b"z"), Io::Done(1));
-            until(&mut set, 2, READ);
-            quiet(&mut set, 1, u8::MAX, 30);
-            set.remove(new);
-            net::close(client);
-            net::close(server);
-            net::close(old_server);
-        }
+        closed_first(&mut Set::new().unwrap());
+    }
+
+    /// As closed_before_removed, on WSAPoll.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn closed_before_removed_polled() {
+        closed_first(&mut Set::polled().unwrap());
+    }
+
+    fn closed_first(set: &mut Set) {
+        let (old_client, old_server) = pair(set);
+        let old = set.add(old_client, READ, 1).unwrap();
+        net::close(old_client);
+        let (client, server) = pair(set);
+        let new = set.add(client, READ, 2).unwrap();
+        set.remove(old);
+        assert_eq!(net::write(server, b"z"), Io::Done(1));
+        until(set, 2, READ);
+        quiet(set, 1, u8::MAX, 30);
+        set.remove(new);
+        net::close(client);
+        net::close(server);
+        net::close(old_server);
     }
 
     /// Timers: each deadline that stands is reported once, never before
