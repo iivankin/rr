@@ -231,9 +231,12 @@ fn schedule(binary: &Path, targets: &[String], budget: u64, runtime: &[String]) 
 /// corpus reaches; then which target reaches nothing another does not,
 /// and which reaches nothing past its own module.
 fn reach_report(binary: &Path, targets: &[String], runtime: &[String]) -> io::Result<()> {
-    let Some(program) = super::prof::load(binary, "LLVMFuzzerTestOneInput") else {
-        eprintln!("rr fuz: no line tables to name what the targets reach");
-        return Ok(());
+    let program = match super::prof::load(binary, "LLVMFuzzerTestOneInput") {
+        Ok(program) => program,
+        Err(why) => {
+            eprintln!("rr fuz: no line tables to name what the targets reach: {why}");
+            return Ok(());
+        },
     };
     let source = std::env::current_dir()?.join("src");
     let mut reach = Vec::new();

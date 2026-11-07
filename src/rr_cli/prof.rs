@@ -35,6 +35,10 @@ pub fn build_runtime(raw0: &str, dir: &Path, target: Option<&str>, sysroot: Opti
         "-Cpanic=abort".into(),
         "-Copt-level=2".into(),
         "-Cforce-frame-pointers=yes".into(),
+        // Its anchor needs a function record of its own in the program's
+        // line tables: a PDB, which has no symbol table beside it, names
+        // only functions with debug information.
+        "-Cdebuginfo=line-tables-only".into(),
         "--out-dir".into(),
         dir.to_string_lossy().into_owned(),
     ];
@@ -179,7 +183,11 @@ impl Frame {
     /// program's own code.
     fn plumbing(&self) -> bool {
         let f = self.function.as_str();
+        // The runtime's own: by its crate, by its no_mangle names, which
+        // line tables give bare, and by its file.
         f.starts_with("rr_prof_rt::")
+            || f.starts_with("rr_prof_")
+            || self.file.ends_with("rr_prof_rt.rs")
             || matches!(f.trim_start_matches('_'), "memcpy" | "memmove")
             || f.contains("__rg_")
             || f.contains("__rust_")
@@ -309,9 +317,11 @@ fn report(dir: &Path, o: &Options) -> io::Result<ExitCode> {
             String::from_utf8_lossy(&exe[..exe.iter().position(|c| *c == 0).unwrap_or(exe.len())]).into_owned(),
         );
         images += 1;
-        let program = programs
-            .entry(exe.clone())
-            .or_insert_with(|| load(&exe, "rr_prof_anchor"));
+        let program = programs.entry(exe.clone()).or_insert_with(|| {
+            load(&exe, "rr_prof_anchor")
+                .inspect_err(|why| println!("rr prof: no line tables to name the program's code: {why}"))
+                .ok()
+        });
         let slot = 24 + depth * 8;
         for k in 0..slots {
             let at = HEADER + k * slot;
@@ -392,10 +402,10 @@ fn report(dir: &Path, o: &Options) -> io::Result<ExitCode> {
 
 /// The program's line tables, and the address its symbol table gives
 /// the function named anchor, by which the load slide of a process is known.
-pub fn load(exe: &Path, anchor: &str) -> Option<Program> {
+pub fn load(exe: &Path, anchor: &str) -> Result<Program, String> {
     use object::{Object as _, ObjectSymbol as _};
-    let data = fs::read(exe).ok()?;
-    let file = object::File::parse(&*data).ok()?;
+    let data = fs::read(exe).map_err(|e| format!("{}: {e}", exe.display()))?;
+    let file = object::File::parse(&*data).map_err(|e| format!("{}: {e}", exe.display()))?;
     if let Ok(Some(info)) = file.pdb_info() {
         // The PDB the linker named, or the one beside the executable when
         // the program has moved.
@@ -405,31 +415,34 @@ pub fn load(exe: &Path, anchor: &str) -> Option<Program> {
         } else {
             exe.with_extension("pdb")
         };
-        let pdb = pdb_addr2line::pdb::PDB::open(fs::File::open(path).ok()?).ok()?;
-        let lines = pdb_addr2line::ContextPdbData::try_from_pdb(pdb).ok()?;
+        let open = fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let pdb = pdb_addr2line::pdb::PDB::open(open).map_err(|e| format!("{}: {e}", path.display()))?;
+        let lines = pdb_addr2line::ContextPdbData::try_from_pdb(pdb).map_err(|e| format!("{}: {e}", path.display()))?;
         // A PDB names a function by its path, `crate::module::name`, even
         // one whose symbol is the bare name.
         let at = pdb_context(&lines)
-            .ok()?
+            .map_err(|e| format!("{}: {e}", path.display()))?
             .functions()
             .find(|f| {
                 f.name
                     .as_deref()
                     .and_then(|n| n.rsplit("::").next())
                     .is_some_and(|n| n.trim_start_matches('_') == anchor)
-            })?
+            })
+            .ok_or_else(|| format!("{}: no function {anchor}", path.display()))?
             .start_rva;
-        return Some(Program {
+        return Ok(Program {
             lines: Lines::Pdb(Box::new(lines)),
             anchor: u64::from(at),
         });
     }
     let at = file
         .symbols()
-        .find(|s| s.name().is_ok_and(|n| n.trim_start_matches('_') == anchor))?
+        .find(|s| s.name().is_ok_and(|n| n.trim_start_matches('_') == anchor))
+        .ok_or_else(|| format!("{}: no symbol {anchor}", exe.display()))?
         .address();
-    let loader = addr2line::Loader::new(exe).ok()?;
-    Some(Program {
+    let loader = addr2line::Loader::new(exe).map_err(|e| format!("{}: {e}", exe.display()))?;
+    Ok(Program {
         lines: Lines::Dwarf(Box::new(loader)),
         anchor: at,
     })
