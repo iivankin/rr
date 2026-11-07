@@ -917,6 +917,50 @@ mod tests {
         closed_first(&mut Set::polled().unwrap());
     }
 
+    /// Diagnosis, step by step: the new socket is watched while the
+    /// old entry stands.
+    #[test]
+    fn diagnose_a_new_watched() {
+        let mut set = Set::new().unwrap();
+        let (old_client, old_server) = pair(&mut set);
+        set.add(old_client, READ, 1).unwrap();
+        net::close(old_client);
+        let (client, server) = pair(&mut set);
+        set.add(client, READ, 2).unwrap();
+        assert_eq!(net::write(server, b"z"), Io::Done(1));
+        until(&mut set, 2, READ);
+        net::close(old_server);
+    }
+
+    /// Diagnosis: the old entry removed, then the new one is watched.
+    #[test]
+    fn diagnose_b_old_removed() {
+        let mut set = Set::new().unwrap();
+        let (old_client, old_server) = pair(&mut set);
+        let old = set.add(old_client, READ, 1).unwrap();
+        net::close(old_client);
+        let (client, server) = pair(&mut set);
+        set.add(client, READ, 2).unwrap();
+        set.remove(old);
+        assert_eq!(net::write(server, b"z"), Io::Done(1));
+        until(&mut set, 2, READ);
+        net::close(old_server);
+    }
+
+    /// Diagnosis: the second pair alone, after a socket closed while
+    /// watched.
+    #[test]
+    fn diagnose_c_pair_after_close() {
+        let mut set = Set::new().unwrap();
+        let (old_client, old_server) = pair(&mut set);
+        set.add(old_client, READ, 1).unwrap();
+        net::close(old_client);
+        let (client, server) = pair(&mut set);
+        net::close(client);
+        net::close(server);
+        net::close(old_server);
+    }
+
     fn closed_first(set: &mut Set) {
         let (old_client, old_server) = pair(set);
         let old = set.add(old_client, READ, 1).unwrap();
