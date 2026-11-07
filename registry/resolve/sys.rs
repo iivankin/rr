@@ -100,14 +100,22 @@ fn c_string(name: &[u8]) -> Option<Vec<u8>> {
 
 /// Linux: the C library's getaddrinfo, which reads nsswitch.conf and
 /// asks what it names (files, DNS, systemd-resolved, mDNS) and sorts the
-/// addresses by RFC 6724, on a thread.
+/// addresses by RFC 6724. It blocks, and nothing asks the system without
+/// blocking, so a lookup runs it on one of wait's threads. The thread
+/// and the lookup share a block, which the last of the two to let go
+/// frees, so a lookup dropped while the thread runs never waits; one
+/// dropped while still in spawn's line never starts.
 #[cfg(target_os = "linux")]
 mod os {
-    use super::{Address, Error, c_string};
+    use super::{Address, Error, Wait, c_string};
+    use crate::base::wait::{self, Signal};
+    use alloc::boxed::Box;
     use alloc::vec::Vec;
-    use core::ffi::{c_char, c_int};
+    use core::cell::UnsafeCell;
+    use core::ffi::{c_char, c_int, c_void};
     use core::net::IpAddr;
     use core::ptr::null_mut;
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// struct addrinfo, as glibc's and musl's netdb.h lay it out.
     #[repr(C)]
@@ -143,15 +151,6 @@ mod os {
     const EAI_NODATA: c_int = -5;
     const EAI_NONAME: c_int = -2;
 
-    pub use super::thread::State;
-
-    /// A name as getaddrinfo takes it: NUL-terminated.
-    pub type Name = Vec<u8>;
-
-    pub fn name(name: &[u8]) -> Option<Name> {
-        c_string(name)
-    }
-
     fn error(code: c_int) -> Error {
         match code {
             EAI_NONAME | EAI_NODATA => Error::NotFound,
@@ -161,7 +160,7 @@ mod os {
     }
 
     /// getaddrinfo's addresses of name, as it orders them (RFC 6724).
-    pub fn lookup(name: &[u8]) -> Result<Vec<Address>, Error> {
+    fn lookup(name: &[u8]) -> Result<Vec<Address>, Error> {
         let hints = AddrInfo {
             flags: 0,
             family: 0,
@@ -224,6 +223,130 @@ mod os {
                 scope: u32::from_le_bytes(<[u8; 4]>::try_from(scope).ok()?),
             }),
             _ => None,
+        }
+    }
+
+    /// The thread writes result, then sets done and the signal; the
+    /// lookup reads result only after it saw done.
+    struct Shared {
+        holders: AtomicUsize,
+        done: AtomicBool,
+        /// The name, NUL-terminated.
+        name: Vec<u8>,
+        result: UnsafeCell<Result<Vec<Address>, Error>>,
+        signal: Signal,
+    }
+
+    /// Lets go of shared; the last holder frees it.
+    fn release(shared: *mut Shared) {
+        // rr: escape(unsafe): shared lives until its holders let go.
+        let holders = unsafe { &(*shared).holders };
+        if holders.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // rr: escape(unsafe): no one else holds it now.
+            drop(unsafe { Box::from_raw(shared) });
+        }
+    }
+
+    fn run(argument: *mut c_void) {
+        let shared = argument.cast::<Shared>();
+        // rr: escape(unsafe): the thread is a holder of shared.
+        let state = unsafe { &*shared };
+        let result = lookup(&state.name);
+        // rr: escape(unsafe): only this thread touches result before done.
+        unsafe { *state.result.get() = result };
+        state.done.store(true, Ordering::Release);
+        state.signal.set();
+        release(shared);
+    }
+
+    pub struct State {
+        shared: *mut Shared,
+        /// The result, once taken from the thread.
+        taken: Option<Result<Vec<Address>, Error>>,
+        /// The work, to take out of spawn's line when dropped before it
+        /// started.
+        ticket: Option<wait::Ticket>,
+    }
+
+    impl State {
+        pub fn start(name: &[u8]) -> State {
+            let mut state = State {
+                shared: null_mut(),
+                taken: None,
+                ticket: None,
+            };
+            let Some(name) = c_string(name) else {
+                state.taken = Some(Err(Error::NotFound));
+                return state;
+            };
+            let Some(signal) = Signal::new() else {
+                state.taken = Some(Err(Error::Failed));
+                return state;
+            };
+            let shared = Box::new(Shared {
+                // rr: escape(shared): the lookup and the thread both hold it.
+                holders: AtomicUsize::new(2),
+                // rr: escape(shared): the thread says it is done.
+                done: AtomicBool::new(false),
+                name,
+                // rr: escape(shared): the thread's answer, handed over once.
+                result: UnsafeCell::new(Err(Error::Failed)),
+                signal,
+            });
+            // rr: escape(leak): the lookup and the thread hold it, and
+            // release frees it.
+            let raw = Box::into_raw(shared);
+            state.shared = raw;
+            state.ticket = wait::spawn(run, raw.cast());
+            if state.ticket.is_none() {
+                // The thread never held it.
+                release(raw);
+                state.taken = Some(Err(Error::Failed));
+            }
+            state
+        }
+
+        pub fn poll(&mut self) -> Option<Result<&[Address], Error>> {
+            if self.taken.is_none() && !self.shared.is_null() {
+                // rr: escape(unsafe): this lookup holds shared.
+                let shared = unsafe { &*self.shared };
+                if !shared.done.load(Ordering::Acquire) {
+                    return None;
+                }
+                // rr: escape(unsafe): the thread is done with result.
+                let result = unsafe { &mut *shared.result.get() };
+                self.taken = Some(core::mem::replace(result, Err(Error::Failed)));
+                release(self.shared);
+                self.shared = null_mut();
+            }
+            match &self.taken {
+                Some(Ok(addresses)) => Some(Ok(addresses)),
+                Some(Err(error)) => Some(Err(*error)),
+                None => None,
+            }
+        }
+
+        pub fn wait(&self) -> Wait {
+            if self.taken.is_some() || self.shared.is_null() {
+                return Wait::READY;
+            }
+            // rr: escape(unsafe): this lookup holds shared.
+            let shared = unsafe { &*self.shared };
+            shared.signal.wait()
+        }
+    }
+
+    impl Drop for State {
+        fn drop(&mut self) {
+            if self.shared.is_null() {
+                return;
+            }
+            // Work still in line never runs: its holder is let go here.
+            if self.ticket.as_ref().is_some_and(wait::Ticket::cancel) {
+                release(self.shared);
+            }
+            // The thread, when it runs on, frees what is left.
+            release(self.shared);
         }
     }
 
@@ -1009,147 +1132,6 @@ mod os {
     /// The lookup, waited on.
     pub fn resolve(name: &[u8]) -> Result<Vec<Address>, Error> {
         finish(super::Lookup::start(name))
-    }
-}
-
-/// A lookup on a thread of its own, on Linux, where the C library's
-/// getaddrinfo blocks and nothing asks the system without blocking. The
-/// thread and the lookup share a block, which the last of the two to
-/// let go frees, so a lookup dropped while the thread runs never waits;
-/// one dropped while still in spawn's line never starts.
-#[cfg(target_os = "linux")]
-mod thread {
-    use super::os::{self, Name};
-    use super::{Address, Error, Wait};
-    use crate::base::wait::{self, Signal};
-    use alloc::boxed::Box;
-    use alloc::vec::Vec;
-    use core::cell::UnsafeCell;
-    use core::ffi::c_void;
-    use core::ptr::null_mut;
-    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-    /// The thread writes result, then sets done and the signal; the
-    /// lookup reads result only after it saw done.
-    struct Shared {
-        holders: AtomicUsize,
-        done: AtomicBool,
-        name: Name,
-        result: UnsafeCell<Result<Vec<Address>, Error>>,
-        signal: Signal,
-    }
-
-    /// Lets go of shared; the last holder frees it.
-    fn release(shared: *mut Shared) {
-        // rr: escape(unsafe): shared lives until its holders let go.
-        let holders = unsafe { &(*shared).holders };
-        if holders.fetch_sub(1, Ordering::AcqRel) == 1 {
-            // rr: escape(unsafe): no one else holds it now.
-            drop(unsafe { Box::from_raw(shared) });
-        }
-    }
-
-    fn run(argument: *mut c_void) {
-        let shared = argument.cast::<Shared>();
-        // rr: escape(unsafe): the thread is a holder of shared.
-        let state = unsafe { &*shared };
-        let result = os::lookup(&state.name);
-        // rr: escape(unsafe): only this thread touches result before done.
-        unsafe { *state.result.get() = result };
-        state.done.store(true, Ordering::Release);
-        state.signal.set();
-        release(shared);
-    }
-
-    pub struct State {
-        shared: *mut Shared,
-        /// The result, once taken from the thread.
-        taken: Option<Result<Vec<Address>, Error>>,
-        /// The work, to take out of spawn's line when dropped before it
-        /// started.
-        ticket: Option<wait::Ticket>,
-    }
-
-    impl State {
-        pub fn start(name: &[u8]) -> State {
-            let mut state = State {
-                shared: null_mut(),
-                taken: None,
-                ticket: None,
-            };
-            let Some(name) = os::name(name) else {
-                state.taken = Some(Err(Error::NotFound));
-                return state;
-            };
-            let Some(signal) = Signal::new() else {
-                state.taken = Some(Err(Error::Failed));
-                return state;
-            };
-            let shared = Box::new(Shared {
-                // rr: escape(shared): the lookup and the thread both hold it.
-                holders: AtomicUsize::new(2),
-                // rr: escape(shared): the thread says it is done.
-                done: AtomicBool::new(false),
-                name,
-                // rr: escape(shared): the thread's answer, handed over once.
-                result: UnsafeCell::new(Err(Error::Failed)),
-                signal,
-            });
-            // rr: escape(leak): the lookup and the thread hold it, and
-            // release frees it.
-            let raw = Box::into_raw(shared);
-            state.shared = raw;
-            state.ticket = wait::spawn(run, raw.cast());
-            if state.ticket.is_none() {
-                // The thread never held it.
-                release(raw);
-                state.taken = Some(Err(Error::Failed));
-            }
-            state
-        }
-
-        pub fn poll(&mut self) -> Option<Result<&[Address], Error>> {
-            if self.taken.is_none() && !self.shared.is_null() {
-                // rr: escape(unsafe): this lookup holds shared.
-                let shared = unsafe { &*self.shared };
-                if !shared.done.load(Ordering::Acquire) {
-                    return None;
-                }
-                // rr: escape(unsafe): the thread is done with result.
-                let result = unsafe { &mut *shared.result.get() };
-                self.taken = Some(core::mem::replace(result, Err(Error::Failed)));
-                release(self.shared);
-                self.shared = null_mut();
-            }
-            match &self.taken {
-                Some(Ok(addresses)) => Some(Ok(addresses)),
-                Some(Err(error)) => Some(Err(*error)),
-                None => None,
-            }
-        }
-
-        pub fn wait(&self) -> Wait {
-            if self.taken.is_some() || self.shared.is_null() {
-                return Wait::READY;
-            }
-            // rr: escape(unsafe): this lookup holds shared.
-            let shared = unsafe { &*self.shared };
-            shared.signal.wait()
-        }
-    }
-
-    impl Drop for State {
-        fn drop(&mut self) {
-            if self.shared.is_null() {
-                return;
-            }
-            // Work still in line never runs: its holder is let go here.
-            if self.ticket.as_ref().is_some_and(wait::Ticket::cancel) {
-                release(self.shared);
-            }
-            // The thread, when it runs on, frees what is left.
-            release(self.shared);
-        }
     }
 }
 

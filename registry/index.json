@@ -13,11 +13,6 @@
       "dependencies": []
     },
     {
-      "name": "dns",
-      "description": "DNS wire format (RFC 1035) for a stub resolver without I/O: A and AAAA queries with EDNS0, replies checked against them with CNAME chains and compression pointers bounded, and TCP's length framing.",
-      "dependencies": []
-    },
-    {
       "name": "ecdsa",
       "description": "ECDSA signature verification on P-256 and P-384 (FIPS 186-4, SEC 1): strict DER signatures, uncompressed keys checked on the curve, Montgomery field arithmetic with P-256's special reduction and NAF double-scalar multiplies.",
       "dependencies": []

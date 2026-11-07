@@ -16,10 +16,6 @@
 //!   at most wait::THREADS_MAX at once, the rest in line, and one
 //!   cancelled once its thread took it runs on to the C library's
 //!   timeout (resolv.conf's timeout and attempts), its answer dropped.
-//!
-//! A program that looks up many names at once on Linux, such as a
-//! crawler, wants its own resolver on the dns component in its own loop
-//! instead.
 
 #[cfg(any(target_os = "macos", test))]
 mod sort;

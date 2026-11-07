@@ -24,7 +24,6 @@ add declares it in src/base/mod.rs; the crate root declares `mod base;`.
 | roots | x509 | Mozilla's trust anchors |
 | tls | sha256, aesgcm, x25519, x509; asks for trust or roots | TLS 1.3 client, bytes in any split; the chain verified by x509 or by the caller (the system, through trust) |
 | http1 | | HTTP/1.1 requests and an incremental response parser |
-| dns | | DNS wire format: queries, replies, TCP framing |
 | resolve | wait | host lookup that never blocks the loop, by the system: DNSServiceGetAddrInfo on macOS and GetAddrInfoExW on Windows, asynchronous and cancellable; getaddrinfo on a thread on Linux |
 | trust | x509, wait | the system verifies a chain, as Go does: SecTrust on macOS, CertGetCertificateChain on Windows, x509 with the system's roots on Linux; never blocks |
 | wait | | what a program's loop waits on for any component: descriptors or an event, a timeout; a thread that signals when done |
