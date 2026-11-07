@@ -691,3 +691,57 @@ fn one_of_a_thousand(b: &mut Bencher) {
         server.close(&mut set);
     }
 }
+
+/// Probe on the branch: is a connecting socket reported writable by
+/// socket notifications before it is connected?
+#[cfg(target_os = "windows")]
+#[test]
+fn probe_a_notified_writable_is_connected() {
+    let mut set = Set::new().unwrap();
+    let mut listener = Listener::bind(v4(), 16).unwrap();
+    let mut client = Stream::connect(listener.local().unwrap()).unwrap();
+    assert!(listener.watch(&mut set, READ, LISTENER));
+    assert!(client.watch(&mut set, WRITE, 7));
+    until(&mut set, 7, WRITE | ERROR | HUP);
+    assert!(client.peer().is_some());
+}
+
+/// Probe: once connected for sure, does peer say so on Windows?
+#[cfg(target_os = "windows")]
+#[test]
+fn probe_b_peer_after_a_while() {
+    let mut set = Set::new().unwrap();
+    let mut listener = Listener::bind(v4(), 16).unwrap();
+    let client = Stream::connect(listener.local().unwrap()).unwrap();
+    assert!(listener.watch(&mut set, READ, LISTENER));
+    until(&mut set, LISTENER, READ);
+    set.wait(Some(Instant::now().after_ms(300)));
+    assert!(client.peer().is_some());
+}
+
+/// Probe: is a connecting socket reported writable by WSAPoll before it
+/// is connected?
+#[cfg(target_os = "windows")]
+#[test]
+fn probe_c_polled_writable_is_connected() {
+    let mut set = Set::polled().unwrap();
+    let mut listener = Listener::bind(v4(), 16).unwrap();
+    let mut client = Stream::connect(listener.local().unwrap()).unwrap();
+    assert!(listener.watch(&mut set, READ, LISTENER));
+    assert!(client.watch(&mut set, WRITE, 7));
+    until(&mut set, 7, WRITE | ERROR | HUP);
+    assert!(client.peer().is_some());
+}
+
+/// Probe: once connected, pending says no error on Windows.
+#[cfg(target_os = "windows")]
+#[test]
+fn probe_d_pending_after_a_while() {
+    let mut set = Set::new().unwrap();
+    let mut listener = Listener::bind(v4(), 16).unwrap();
+    let client = Stream::connect(listener.local().unwrap()).unwrap();
+    assert!(listener.watch(&mut set, READ, LISTENER));
+    until(&mut set, LISTENER, READ);
+    set.wait(Some(Instant::now().after_ms(300)));
+    assert!(client.connected().is_ok());
+}
