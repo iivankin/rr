@@ -1504,8 +1504,6 @@ mod poller {
 
         pub fn add(&mut self, socket: usize, key: u64, interest: u8) -> bool {
             match self {
-                // A socket with no interest is registered once it has one.
-                Poller::Notified(_) if interest == 0 => true,
                 Poller::Notified(notified) => notified.enable(socket, key, interest),
                 Poller::Polled(polled) => polled.add(socket, key, interest),
             }
@@ -1513,11 +1511,7 @@ mod poller {
 
         pub fn modify(&mut self, socket: usize, key: u64, old: u8, interest: u8) -> bool {
             match self {
-                // No interest disables the registration: enabled for none,
-                // the system refuses it.
-                Poller::Notified(notified) if interest == 0 => {
-                    old == 0 || notified.change(socket, key, OP_DISABLE)
-                }
+                Poller::Notified(notified) if interest == 0 => notified.disable(socket, key, old),
                 Poller::Notified(notified) => notified.enable(socket, key, interest),
                 Poller::Polled(polled) => polled.modify(key, interest),
             }
@@ -1584,6 +1578,17 @@ mod poller {
         wake: Arc<Wake>,
         /// What a wait takes from the port: BATCH entries.
         entries: Vec<Entry>,
+        /// Sockets removed whose SOCK_NOTIFY_EVENT_REMOVE has not come, by
+        /// the key they had: the port takes a socket again only after it.
+        // rr: escape(bound): one for each socket removed, until its event.
+        removing: BTreeMap<u64, usize>,
+        /// Sockets added again before then: their key and interest, which
+        /// the event enables.
+        // rr: escape(bound): no more than removing.
+        waiting: BTreeMap<usize, (u64, u8)>,
+        /// The keys whose removal a wait took, to settle after it.
+        // rr: escape(bound): no more than a wait's entries.
+        removed: Vec<u64>,
     }
 
     impl Notified {
@@ -1612,6 +1617,9 @@ mod poller {
                     pending: AtomicBool::new(false),
                 })),
                 entries,
+                removing: BTreeMap::new(),
+                waiting: BTreeMap::new(),
+                removed: Vec::new(),
             })
         }
 
@@ -1635,8 +1643,28 @@ mod poller {
 
         /// Enables the socket's registration for its interest: one enabled
         /// already takes the new filter.
-        fn enable(&self, socket: usize, key: u64, interest: u8) -> bool {
-            self.register(enable(socket, key, interest))
+        fn enable(&mut self, socket: usize, key: u64, interest: u8) -> bool {
+            if let Some(waiting) = self.waiting.get_mut(&socket) {
+                *waiting = (key, interest);
+                return true;
+            }
+            if self.removing.values().any(|&removed| removed == socket) {
+                self.waiting.insert(socket, (key, interest));
+                return true;
+            }
+            // A socket with no interest is registered once it has one:
+            // enabled for none, the system refuses it.
+            interest == 0 || self.register(enable(socket, key, interest))
+        }
+
+        /// No interest: a registration is disabled, one waiting for its
+        /// socket's removal waits for none.
+        fn disable(&mut self, socket: usize, key: u64, old: u8) -> bool {
+            if let Some(waiting) = self.waiting.get_mut(&socket) {
+                *waiting = (key, 0);
+                return true;
+            }
+            old == 0 || self.change(socket, key, OP_DISABLE)
         }
 
         /// Disables or removes the socket's registration.
@@ -1651,11 +1679,31 @@ mod poller {
             })
         }
 
-        fn remove(&self, socket: usize, key: u64) {
+        fn remove(&mut self, socket: usize, key: u64) {
+            // Added again while its removal is under way: never registered.
+            if self.waiting.remove(&socket).is_some() {
+                return;
+            }
             // A socket already closed, or never registered, has nothing to
             // remove; what the port still holds for it the Set drops by its
             // key.
-            self.change(socket, key, OP_REMOVE);
+            if self.change(socket, key, OP_REMOVE) {
+                self.removing.insert(key, socket);
+            }
+        }
+
+        /// A removal the port confirmed: a socket added again meanwhile is
+        /// enabled now, or reported in error if the port refuses it.
+        fn removed(&mut self, key: u64, found: &mut Vec<(u64, u8)>) {
+            let Some(socket) = self.removing.remove(&key) else {
+                return;
+            };
+            if let Some((again, interest)) = self.waiting.remove(&socket)
+                && interest != 0
+                && !self.register(enable(socket, again, interest))
+            {
+                found.push((again, ERROR));
+            }
         }
 
         fn wait(&mut self, timeout: Option<u64>, found: &mut Vec<(u64, u8)>) {
@@ -1688,8 +1736,11 @@ mod poller {
                 } else if events & EVENT_REMOVE == 0 {
                     found.push((key, ready(events)));
                 } else {
-                    // A removed registration's last word.
+                    self.removed.push(key);
                 }
+            }
+            while let Some(key) = self.removed.pop() {
+                self.removed(key, found);
             }
         }
     }
