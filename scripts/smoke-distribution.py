@@ -5,6 +5,7 @@ corpus programs and every registry component, through their Makefiles."""
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -70,13 +71,19 @@ with tempfile.TemporaryDirectory(prefix="rr-smoke-", dir=os.environ.get("TMPDIR"
     if fuzzing:
         make("fuzz", "FUZZTIME=5")
     profiled = make("prof").stdout
-    assert "greet  src/greet.rs:" in profiled and "<- run  src/main.rs:" in profiled, profiled
+    # A function as its line tables name it: alone in DWARF's, by its path
+    # (project::greet::greet) in a PDB's.
+    def named(function):
+        return r"(\S+::)?" + function
+    assert re.search(named("greet") + "  src/greet.rs:", profiled), profiled
+    assert re.search("<- " + named("run") + "  src/main.rs:", profiled), profiled
     over = subprocess.run(["make", f"RR={link}", "prof", "PROFMAX=1"], cwd=root / "project", env=env,
                           text=True, encoding="utf-8", errors="replace", capture_output=True)
     assert over.returncode != 0 and "above the budget" in over.stdout, over.stdout
     copies = profiled.split("copies through memcpy and memmove", 1)
     assert len(copies) == 2 and "greet  src/greet.rs:" in copies[1], profiled
-    assert "the places that copy most often" in copies[1] and " each  greet  src/greet.rs:" in copies[1], profiled
+    assert "the places that copy most often" in copies[1], profiled
+    assert re.search(" each  " + named("greet") + "  src/greet.rs:", copies[1]), profiled
     over = subprocess.run(["make", f"RR={link}", "prof", "PROFCOPIED=1"], cwd=root / "project", env=env,
                           text=True, encoding="utf-8", errors="replace", capture_output=True)
     assert over.returncode != 0 and "bytes copied, above the budget" in over.stdout, over.stdout
