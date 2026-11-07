@@ -63,11 +63,9 @@ unsafe extern "Rust" {
     fn __rg_alloc_zeroed(size: usize, align: usize) -> *mut u8;
 }
 
-/// The system, as each reaches it: macOS through its C library, Linux by
-/// system calls, Windows through kernel32.dll.
-/// The system, as each reaches it: macOS through its C library, Linux by
-/// system calls, Windows through kernel32.dll.
-#[cfg(target_os = "macos")]
+/// The system, as each reaches it: macOS and Linux through their C
+/// library, Windows through kernel32.dll.
+#[cfg(unix)]
 mod os {
     use core::ffi::{c_char, c_int, c_void};
     use core::ptr::null_mut;
@@ -82,11 +80,18 @@ mod os {
         fn close(fd: c_int) -> c_int;
         fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
         fn abort() -> !;
-        fn _NSGetExecutablePath(buf: *mut c_char, size: *mut u32) -> c_int;
     }
+    // glibc before 2.34 keeps dlsym in libdl; later ones in libc, with a
+    // libdl that is empty.
+    #[cfg(target_os = "linux")]
+    #[link(name = "dl")]
+    unsafe extern "C" {}
 
     /// RDWR CREAT EXCL CLOEXEC.
+    #[cfg(target_os = "macos")]
     const O_FLAGS: c_int = 0x0002 | 0x0200 | 0x0800 | 0x0100_0000;
+    #[cfg(target_os = "linux")]
+    const O_FLAGS: c_int = 0o2 | 0o100 | 0o200 | 0o2_000_000;
     /// For dlsym: the libraries loaded after the program.
     const RTLD_NEXT: *mut c_void = -1isize as *mut c_void;
 
@@ -148,121 +153,22 @@ mod os {
     }
 
     /// The executable's path into out, NUL-terminated.
+    #[cfg(target_os = "macos")]
     pub fn executable(out: &mut [u8]) {
+        unsafe extern "C" {
+            fn _NSGetExecutablePath(buf: *mut c_char, size: *mut u32) -> c_int;
+        }
         let mut size = (out.len() - 1) as u32;
         unsafe { _NSGetExecutablePath(out.as_mut_ptr().cast(), &mut size) };
     }
-}
-
-#[cfg(target_os = "linux")]
-mod os {
-    use core::ffi::{c_char, c_void};
-    use core::ptr::null_mut;
-
-    #[cfg(target_arch = "x86_64")]
-    mod nr {
-        pub const CLOSE: usize = 3;
-        pub const MMAP: usize = 9;
-        pub const GETPID: usize = 39;
-        pub const FTRUNCATE: usize = 77;
-        pub const OPENAT: usize = 257;
-        pub const READLINKAT: usize = 267;
-    }
-    #[cfg(target_arch = "aarch64")]
-    mod nr {
-        pub const CLOSE: usize = 57;
-        pub const MMAP: usize = 222;
-        pub const GETPID: usize = 172;
-        pub const FTRUNCATE: usize = 46;
-        pub const OPENAT: usize = 56;
-        pub const READLINKAT: usize = 78;
-    }
-
-    unsafe extern "C" {
-        /// rr_crt's: the environment, as the kernel gave it.
-        fn rr_crt_environ() -> *const *const c_char;
-    }
-
-    fn syscall(n: usize, a: [usize; 6]) -> isize {
-        let r: isize;
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            core::arch::asm!("syscall", inlateout("rax") n => r, in("rdi") a[0], in("rsi") a[1],
-                in("rdx") a[2], in("r10") a[3], in("r8") a[4], in("r9") a[5],
-                lateout("rcx") _, lateout("r11") _, options(nostack));
-        }
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            core::arch::asm!("svc #0", in("x8") n, inlateout("x0") a[0] => r, in("x1") a[1],
-                in("x2") a[2], in("x3") a[3], in("x4") a[4], in("x5") a[5], options(nostack));
-        }
-        r
-    }
-
-    const AT_FDCWD: usize = -100isize as usize;
-    /// RDWR CREAT EXCL CLOEXEC.
-    const O_FLAGS: usize = 0o2 | 0o100 | 0o200 | 0o2_000_000;
-
-    pub unsafe fn copy(dst: *mut c_void, src: *const c_void, n: usize) {
-        unsafe { super::forward(dst.cast(), src.cast(), n) };
-    }
-
-    pub unsafe fn moved(dst: *mut c_void, src: *const c_void, n: usize) {
-        unsafe { super::overlapping(dst.cast(), src.cast(), n) };
-    }
-
-    /// RR_PROF_DIR into out; its length, 0 when unset.
-    pub fn env_dir(out: &mut [u8]) -> usize {
-        let mut env = unsafe { rr_crt_environ() };
-        if env.is_null() {
-            return 0;
-        }
-        let name = b"RR_PROF_DIR=";
-        loop {
-            let entry = unsafe { *env };
-            if entry.is_null() {
-                return 0;
-            }
-            let mut k = 0;
-            while k < name.len() && unsafe { *entry.add(k) } as u8 == name[k] {
-                k += 1;
-            }
-            if k == name.len() {
-                return super::c_string(unsafe { entry.add(k) }.cast(), out);
-            }
-            env = unsafe { env.add(1) };
-        }
-    }
-
-    pub fn pid() -> u64 {
-        syscall(nr::GETPID, [0; 6]) as u64
-    }
-
-    /// A new file at path, NUL-terminated, of size bytes, mapped shared;
-    /// null when it cannot be made.
-    pub fn create_mapped(path: &[u8], size: usize) -> *mut u8 {
-        let fd = syscall(nr::OPENAT, [AT_FDCWD, path.as_ptr() as usize, O_FLAGS, 0o600, 0, 0]);
-        if fd < 0 {
-            return null_mut();
-        }
-        let fd = fd as usize;
-        if syscall(nr::FTRUNCATE, [fd, size, 0, 0, 0, 0]) != 0 {
-            syscall(nr::CLOSE, [fd, 0, 0, 0, 0, 0]);
-            return null_mut();
-        }
-        let p = syscall(nr::MMAP, [0, size, 3, 1, fd, 0]);
-        syscall(nr::CLOSE, [fd, 0, 0, 0, 0, 0]);
-        if p < 0 { null_mut() } else { p as usize as *mut u8 }
-    }
 
     /// The executable's path into out, NUL-terminated.
+    #[cfg(target_os = "linux")]
     pub fn executable(out: &mut [u8]) {
-        let path = c"/proc/self/exe";
-        let to = out.as_mut_ptr() as usize;
-        syscall(
-            nr::READLINKAT,
-            [AT_FDCWD, path.as_ptr() as usize, to, out.len() - 1, 0, 0],
-        );
+        unsafe extern "C" {
+            fn readlink(path: *const c_char, buf: *mut c_char, size: usize) -> isize;
+        }
+        unsafe { readlink(c"/proc/self/exe".as_ptr(), out.as_mut_ptr().cast(), out.len() - 1) };
     }
 }
 

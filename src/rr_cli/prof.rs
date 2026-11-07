@@ -42,12 +42,6 @@ pub fn build_runtime(raw0: &str, dir: &Path, target: Option<&str>, sysroot: Opti
     crate::driver_core::run(args, false, true)
 }
 
-/// The bundle directory when rr runs from one with its own sysroot.
-pub fn bundle() -> Option<PathBuf> {
-    let dir = executable().ok()?.parent()?.to_owned();
-    dir.join("lib/rustlib").is_dir().then_some(dir)
-}
-
 /// The runtime rlib for a --prof build of a final artifact, built into
 /// scratch by a child rr.
 pub fn runtime(scratch: &Path, target: Option<&str>, sysroot: Option<&str>) -> io::Result<PathBuf> {
@@ -88,14 +82,6 @@ pub fn flags(
             "--extern".into(),
             format!("force:rr_prof_rt={}", runtime.display()),
         ]);
-        // The runtime's memcpy and memmove stand for compiler_builtins',
-        // which on ELF are weak. On COFF they are not: each is an object
-        // of its own in the sysroot (build-target-sysroot.py), so the
-        // linker, which has the runtime's, takes none of them; should one
-        // come anyway, the first definition, the runtime's, wins.
-        if super::target::is_rr(target) && super::target::is_windows(target) {
-            compiler.push("-Clink-arg=--allow-multiple-definition".into());
-        }
     }
     Ok(())
 }

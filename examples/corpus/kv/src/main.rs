@@ -9,11 +9,8 @@ extern crate alloc;
 
 mod record;
 mod store;
-// The operating system, one file for each: the rest of the crate calls
-// the same functions on all of them.
-#[cfg_attr(target_os = "macos", path = "sys/macos.rs")]
-#[cfg_attr(target_os = "linux", path = "sys/linux.rs")]
-#[cfg_attr(target_os = "windows", path = "sys/windows.rs")]
+#[cfg_attr(unix, path = "sys/unix.rs")]
+#[cfg_attr(windows, path = "sys/windows.rs")]
 mod sys;
 
 use alloc::vec::Vec;
@@ -91,6 +88,15 @@ fn fail(e: &store::Error) -> i32 {
     });
     3
 }
+
+/// The standard library rustup installs is built to unwind, and its alloc
+/// names the routine that would unwind a panic. A panic here aborts, so
+/// nothing calls it; the linker only needs it to exist when the build
+/// keeps alloc's code whole, as a test build does.
+// rr: escape(unsafe): the name is the one alloc calls, and no other crate
+// of the program defines it.
+#[unsafe(no_mangle)]
+extern "C" fn rust_eh_personality() {}
 
 #[unsafe(no_mangle)]
 extern "C" fn main(argc: i32, argv: *const *const c_char) -> i32 {

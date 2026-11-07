@@ -263,10 +263,16 @@ fn fmt_syms(update_mode: UpdateMode) {
     );
 }
 
+/// The toolchain whose rustfmt formats rr's own code.
+const RUSTFMT_TOOLCHAIN: &str = "nightly-2026-08-15";
+
 fn run_rustfmt(update_mode: UpdateMode) {
+    // rr builds on a Rust release, whose rustfmt refuses the unstable
+    // options of rustfmt.toml; the nightly the release branched from formats
+    // as the repository always has.
     let mut rustfmt_path = String::from_utf8(run_with_output(
         "rustup which rustfmt",
-        Command::new("rustup").args(["which", "rustfmt"]),
+        Command::new("rustup").args(["which", "--toolchain", RUSTFMT_TOOLCHAIN, "rustfmt"]),
     ))
     .expect("invalid rustfmt path");
     rustfmt_path.truncate(rustfmt_path.trim_end().len());

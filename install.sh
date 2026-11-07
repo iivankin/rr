@@ -4,10 +4,11 @@
 #
 #     curl -fsSL https://raw.githubusercontent.com/iivankin/rr/main/install.sh | sh
 #
-# By default the distribution goes to ~/.local/share/rr and a link to rr to
-# ~/.local/bin. RR_INSTALL names another directory for the distribution and
-# links nothing: rr is then RR_INSTALL/rr. RR_VERSION picks a release tag
-# instead of the latest.
+# rr is a Clippy-like tool on the official Rust release it is built on:
+# rustup installs that toolchain, rr goes into its bin/ beside rustc, as
+# clippy-driver does, with what is its own in lib/rustlib/rr/, and a link
+# to it into ~/.local/bin. RR_VERSION picks a release tag instead of the
+# latest.
 set -eu
 
 repo=iivankin/rr
@@ -29,15 +30,16 @@ if [ -n "${RR_VERSION:-}" ]; then
 else
     url="https://github.com/$repo/releases/latest/download"
 fi
-dest="${RR_INSTALL:-$HOME/.local/share/rr}"
 bin="$HOME/.local/bin"
 
-# Replace only a directory that holds rr, never someone's other files.
-if [ -e "$dest" ] && ! { [ -f "$dest/rr" ] && [ -d "$dest/lib/rustlib" ]; }; then
-    [ -d "$dest" ] && [ -z "$(ls -A "$dest")" ] ||
-        die "$dest exists and is not an rr distribution"
+# rustup, also where its installer leaves it when PATH does not have it yet.
+if command -v rustup >/dev/null; then
+    rustup=rustup
+elif [ -x "${CARGO_HOME:-$HOME/.cargo}/bin/rustup" ]; then
+    rustup="${CARGO_HOME:-$HOME/.cargo}/bin/rustup"
+else
+    die "needs rustup, which installs Rust: https://rustup.rs"
 fi
-
 if command -v curl >/dev/null; then
     fetch() { curl -fsSL --retry 3 -o "$2" "$1"; }
 elif command -v wget >/dev/null; then
@@ -53,11 +55,7 @@ else
     die "needs sha256sum or shasum"
 fi
 
-# The new distribution is unpacked beside its destination, so that it
-# replaces the old one by a rename on the same file system.
-parent="$(dirname "$dest")"
-mkdir -p "$parent"
-tmp="$(mktemp -d "$parent/.rr-install.XXXXXX")"
+tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
 echo "Downloading $name from $url"
@@ -66,22 +64,23 @@ fetch "$url/SHA256SUMS" "$tmp/SHA256SUMS"
 want="$(awk -v f="$name.tar.gz" '$2 == f || $2 == "*" f { print $1 }' "$tmp/SHA256SUMS")"
 [ -n "$want" ] || die "SHA256SUMS has no $name.tar.gz"
 [ "$(sha256 "$tmp/$name.tar.gz")" = "$want" ] || die "$name.tar.gz: checksum mismatch"
-tar -xzf "$tmp/$name.tar.gz" -C "$tmp"
-"$tmp/$name/rr" --version >/dev/null || die "the downloaded rr does not run"
+mkdir "$tmp/rr"
+tar -xzf "$tmp/$name.tar.gz" -C "$tmp/rr"
+release="$(cat "$tmp/rr/lib/rustlib/rr/rust-version")"
+[ -n "$release" ] || die "the archive names no Rust release"
 
-if [ -e "$dest" ]; then
-    mv "$dest" "$tmp/old"
-fi
-mv "$tmp/$name" "$dest"
-echo "Installed $("$dest/rr" --version) in $dest"
+echo "Installing Rust $release with rustup"
+"$rustup" toolchain install "$release" --profile minimal --no-self-update
+toolchain="$("$rustup" run "$release" rustc --print sysroot)"
+[ -d "$toolchain/bin" ] || die "no toolchain at $toolchain"
+# rr's own files are replaced whole; the toolchain's are not touched.
+rm -rf "$toolchain/lib/rustlib/rr"
+cp -R "$tmp/rr/." "$toolchain/"
+"$toolchain/bin/rr" --version >/dev/null || die "the installed rr does not run"
+echo "Installed $("$toolchain/bin/rr" --version) in $toolchain"
 
-if [ -n "${RR_INSTALL:-}" ]; then
-    echo "Run it as $dest/rr, or add $dest to PATH."
-    exit 0
-fi
-# rr finds its distribution through the link.
 mkdir -p "$bin"
-ln -sf "$dest/rr" "$bin/rr"
+ln -sf "$toolchain/bin/rr" "$bin/rr"
 echo "Linked $bin/rr"
 case ":$PATH:" in
 *":$bin:"*) ;;

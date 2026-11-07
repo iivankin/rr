@@ -99,22 +99,22 @@ fn crate_name(dir: &std::path::Path) -> String {
 
 /// A program as rr projects are laid out: one crate, src/main.rs with
 /// its allocator, panic handler and entry, the system in src/sys/, one
-/// file for each of macOS, Linux and Windows, a
+/// file for macOS and Linux and one for Windows, a
 /// module with its tests, bench and fuzz target beside its code, a
-/// Makefile for every check, and the instructions for whoever changes
-/// it.
+/// Makefile that builds with rustc and checks with rr, the Rust release
+/// rr is built on, and the instructions for whoever changes it.
 const PROJECT: &[(&str, &str)] = &[
     ("AGENTS.md", include_str!("../../examples/project/AGENTS.md")),
     ("Makefile", include_str!("../../examples/project/Makefile")),
     (".gitignore", include_str!("../../examples/project/gitignore")),
     ("src/main.rs", include_str!("../../examples/project/src/main.rs.in")),
     (
-        "src/sys/macos.rs",
-        include_str!("../../examples/project/src/sys/macos.rs.in"),
+        "rust-toolchain.toml",
+        include_str!("../../examples/project/rust-toolchain.toml"),
     ),
     (
-        "src/sys/linux.rs",
-        include_str!("../../examples/project/src/sys/linux.rs.in"),
+        "src/sys/unix.rs",
+        include_str!("../../examples/project/src/sys/unix.rs.in"),
     ),
     (
         "src/sys/windows.rs",

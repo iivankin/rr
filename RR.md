@@ -1,29 +1,30 @@
 # rr — Restricted Rust
 
-A compiler and linter forked from Clippy, at the Clippy of Rust 1.99.1 (Clippy's
-`rust-1.99.0` tag with that release's own changes). Its matching private
-compiler API is **rustc 1.99.1 (58cf8f9c3, 2026-10-13)**: rr's compiler is built
-from that source with nightly features enabled. Development builds use
-`nightly-2026-08-15`, the nightly before 1.99 branched from master.
+A checker forked from Clippy, at the Clippy of Rust 1.99.1 (Clippy's
+`rust-1.99.0` tag with that release's own changes). It runs on the official
+**Rust 1.99.1 (58cf8f9c3, 2026-10-13)** that rustup installs, as clippy-driver
+does: rr sits in that toolchain's bin/ and loads its compiler, with all of
+LLVM's backends. rustc builds a program; rr checks it with its rules and
+Clippy's, and builds only what its own commands run (tests, benches, fuzz
+targets, profiles). Development builds use the same release, with
+RUSTC_BOOTSTRAP for the compiler's private crates.
 
 ## Use
 
-Keep the whole distribution directory together. Static release builds embed
-the compiler driver and LLVM, with the host's backend only, in `rr`;
-core/alloc/compiler_builtins object archives and metadata remain in the bundled
-sysroots: the host's, and on Linux and Windows that of the host's rr target
-(see Targets), which the bundled rust-lld links. A small rust-objcopy utility
-supports -Cstrip on macOS. It works without installed Rust, rustup or Cargo.
-Each distribution builds for its own host only. Distributions are built for
-macOS arm64, Linux x86_64 and aarch64 (glibc 2.31 or later) and Windows x86_64
-and aarch64. On macOS, native executable linking still requires the macOS
-linker and SDK (Xcode Command Line Tools); on Linux and Windows nothing else is
-needed, except for fuzzing.
+install.sh (macOS arm64, Linux x86_64 and aarch64 with glibc 2.31 or later) and
+install.ps1 (Windows x86_64 and aarch64) install Rust 1.99.1 with rustup, put rr
+and what is its own (libFuzzer and rr fuz's flags, in lib/rustlib/rr/) into
+that toolchain, and put rr on PATH: a link in ~/.local/bin, or on Windows the
+toolchain's bin\ at the end of the user's PATH, after rustup's own tools. A
+project's rust-toolchain.toml names the same release, so its rustc is the
+compiler rr checks with. Other targets are rustup's: `rustup target add`, then
+`--target` for rustc and rr alike; where to build for what is rustc's and the
+project's business.
 
 ```sh
 rr init demo            # a project: see below
 cd demo
-make                    # build
+make                    # rustc builds the program
 make test               # rr test: the #[test] items; FILTER=word narrows
 make bench              # rr bench: time, allocations and copies per iteration
 make fmt                # rr fmt: rewrite in rr's one style
@@ -33,16 +34,19 @@ make prof               # where the program allocates and copies
 rr add tls              # copy a component, and those it needs, into src/
 
 rr init library --lib   # src/lib.rs alone, for a crate to depend on
-rr library/src/lib.rs --crate-name example -o libexample.rlib
-rr main.rs --extern example=libexample.rlib -o app
+rustc --edition 2024 -C panic=abort library/src/lib.rs --crate-type rlib --crate-name example -o libexample.rlib
+rr check main.rs --extern example=libexample.rlib
 ```
 
-`rr FILE` and `rr build FILE` compile; `rr check FILE` and `rr lint FILE` write
-metadata to a temporary directory and remove it on return, including compiler
-errors. `lint` also enables Clippy's normal default lints; build/check run the rr
-rules plus ordinary compiler diagnostics. Rustc flags are forwarded, including
-`-O`, `-o`, `--cfg`, `--extern`, `-L`, `--crate-type`, `--target`, `--sysroot` and
-`@argument-file`. Check/lint reject explicit output flags.
+`rr check FILE` and `rr lint FILE` write metadata to a temporary directory and
+remove it on return, including compiler errors. `lint` also enables Clippy's
+normal default lints; check runs the rr rules plus ordinary compiler
+diagnostics. Rustc flags are forwarded, including `--cfg`, `--extern`, `-L`,
+`--crate-type`, `--target`, `--sysroot` and `@argument-file`; `--print` asks
+the compiler and builds nothing. Check/lint reject explicit output flags. rr
+does not build a program: `rr build` takes `--prof`, for rr prof (below), and
+otherwise says to build with rustc; rr test, rr bench and rr fuz build what
+they run themselves.
 
 `rr fmt FILE...` formats crates with rustfmt, which rr links at its compiler's
 own commit (rustfmt/ in the source): each root and the modules it declares,
@@ -54,10 +58,12 @@ separate steps: rustfmt, the compiler with rr's rules, and Clippy.
 Defaults: edition 2024, panic=abort, and rlib for an input named lib.rs. Otherwise
 rustc's normal binary default applies. `init` lays out a project and refuses to
 overwrite any of it: src/main.rs (the program, one crate, with a malloc-backed
-global allocator, a panic handler and the C entry), src/sys.rs (the operating
-system and unsafe), src/greet.rs (a module with its tests, a bench and a fuzz
-target beside the code), a Makefile with build, test, bench, fmt, format,
-check, lint, fuzz and prof targets, and AGENTS.md
+global allocator, a panic handler and the C entry, which the C library calls),
+src/sys/unix.rs and src/sys/windows.rs (the operating system and unsafe),
+src/greet.rs (a module with its tests, a bench and a fuzz target beside the
+code), rust-toolchain.toml (Rust 1.99.1), a Makefile whose build is rustc and
+whose test, bench, fmt, format, check, lint, fuzz and prof targets are rr's,
+and AGENTS.md
 with the rules for whoever changes the code: format with rr fmt, then rr check
 and rr lint, after every change. `init --lib` writes src/lib.rs alone. No manifest
 is created.
@@ -82,18 +88,18 @@ template's checks, which scripts/registry-check.sh runs on it.
 
 ## Targets
 
-On macOS a program links against the system's C library, as Apple requires.
-On Linux and Windows it needs none: rr's own targets, `x86_64-rr-linux`,
-`aarch64-rr-linux`, `x86_64-rr-windows` and `aarch64-rr-windows`, are the
-default there, each in the distribution for its host. A Linux program is a static executable that calls the
-kernel itself; a Windows program calls kernel32.dll through `raw-dylib`
-imports, with no C runtime and no Visual Studio. Both start in `rr_crt`, which
-hands argc and argv (UTF-8, split as the Microsoft C runtime splits them, on
-Windows) to the program's `extern "C" fn main`, so a program's entry is the
-same everywhere; its `src/sys/` has a file for each system with the same
-functions. The targets are described in targets/*.json, made from the pinned
-compiler's own by scripts/make-target-specs.py; scripts/build-target-sysroot.py
-builds their sysroots.
+A program links the system's C library, on Rust's own targets: on macOS
+libSystem, as Apple requires; on Linux `*-unknown-linux-gnu` and its glibc; on
+Windows `*-pc-windows-msvc` and the C runtime (the DLL one, or the static one
+with `-C target-feature=+crt-static`), which the build tools of Visual Studio
+link. The C library starts the program in its `extern "C" fn main(argc, argv)`
+and gives what the compiler calls, such as memcpy. src/sys/unix.rs reaches
+macOS and Linux through the C library; src/sys/windows.rs calls kernel32.dll
+through `raw-dylib` imports, and takes its arguments from Windows's own command
+line, in UTF-8, since the C runtime's argv is in the system's code page. The
+standard library rustup installs is built to unwind, and its alloc names the
+routine that would unwind a panic; a program aborts on panic and defines an
+empty `rust_eh_personality` for the linker.
 
 `RR_RUNNER`, a command and its arguments split at spaces, runs what rr test and
 rr bench build under another program, such as a debugger or a container. Tests run in a child
@@ -639,166 +645,71 @@ absent. Comments document a decision; they do not make unsafe code sound.
 
 ## Fuzzing user programs
 
-The distribution includes a pinned libFuzzer runtime for its host, an optional
-matching AddressSanitizer runtime, and a no_std harness. Fuzzing runs on the
-host and needs its C and C++ libraries: a fuzz target is built for the host's
-own target (on Linux `*-unknown-linux-gnu`, linked by the system's cc with
-libstdc++; on Windows `*-pc-windows-msvc`, with Visual Studio's tools), not
-rr's library-free one; a program's `src/sys/` is the same. Cargo is not needed. The compiler
-and ordinary builds retain the same behavior; fuzzing instrumentation is opt-in.
+rr keeps a libFuzzer for its host, built from the LLVM of Rust 1.99.1, in the
+toolchain's lib/rustlib/rr/, with rr fuz's coverage flags; AddressSanitizer is
+the toolchain's own runtime. Fuzzing runs on the host and needs its C and C++
+libraries (on Linux the system's cc with libstdc++; on Windows Visual Studio's
+tools). Cargo is not needed. Ordinary builds retain the same behavior;
+fuzzing instrumentation is opt-in.
+
+A fuzz target is a function of the crate, `fn(&[u8])` under `#[cfg(fuzzing)]`,
+beside the code it fuzzes; a project's Makefile names them in FUZZ, and
+`make fuzz` runs them:
 
 ```sh
-rr fuz init
-# Replace test_input in fuz.rs with your parser/API and its invariants.
-rr fuz fuz.rs -- -runs=100000
+rr fuz src/main.rs --target parse::fuzz_parse -- -runs=100000
+rr fuz src/main.rs --target parse::fuzz_parse --asan -- -runs=100000
 ```
 
-To check memory errors in instrumented unsafe code, add ASan when compiling:
+rr fuz builds the crate with libFuzzer's entry in place of the program's,
+calling the target, using this rr; it never invokes Cargo or a separate rustc.
+Compiler flags go before `--`, and libFuzzer arguments go after it. Coverage,
+native library paths and ASan's Darwin rpath are set automatically. Each
+target keeps its corpus/ and artifacts/ in fuzz/PATH/; explicit libFuzzer paths
+are relative to the current directory. The temporary executable is removed
+after completion, a crash or terminal Ctrl-C; corpus and crash files persist. A
+captured failure is replayed by naming its file after `--` with `-runs=1`.
+Targets retain all rr restrictions and escape-comment requirements. ASan does
+not instrument precompiled core/alloc or external libraries. The precompiled
+C++ fuzzing engine uses system libc/libc++.
 
-```sh
-rr fuz fuz.rs --asan -- -runs=100000
-```
-
-The native `fuz` command compiles and launches the harness using this rr executable;
-it never invokes Cargo or a separate rustc. Compiler flags go before `--`, and
-libFuzzer arguments go after it. Coverage, native library paths and ASan's Darwin
-rpath are set automatically. Default corpus/ and artifacts/ directories live
-beside the source file; explicit libFuzzer paths are relative to the current directory.
-The temporary executable is removed after completion, a crash or terminal Ctrl-C;
-corpus and crash files persist. A captured failure can be replayed with
-`rr fuz fuz.rs -- artifacts/crash-HASH -runs=1`. Harnesses retain all rr restrictions and
-escape-comment requirements. ASan does not instrument precompiled core/alloc or
-external libraries. The precompiled C++ fuzzing engine uses system libc/libc++.
-
-The pinned LLVM fuzzer is built separately with scripts/build-fuzz-runtime.py;
-scripts/add-fuzz-runtime.py adds its libraries and templates to a distribution.
-The optional ASan library is a test runtime, not a dynamic compiler/LLVM driver.
+scripts/build-fuzz-runtime.py builds libFuzzer and lays out rr fuz's flags.
 scripts/smoke-fuzz.py checks the native CLI, actual coverage, mutation-driven crash
 discovery, artifact replay, rr restrictions, cleanup on Ctrl-C, and a deliberate
-memory error detected by ASan in a relocated bundle without Rust/Cargo in PATH.
+memory error detected by ASan, with rr run through a link as install.sh makes it.
 
 ## Development and packaging
 
 The Clippy fork itself uses upstream Cargo build/test infrastructure. This is
-separate from compiling rr projects, which never invokes Cargo. Cargo.lock pins
-resolved dependency versions. Build with the pinned toolchain from
-rust-toolchain.toml, including rustc-dev, rust-src, rustfmt and clippy.
+separate from checking rr projects, which never invokes Cargo. Cargo.lock pins
+resolved dependency versions. rust-toolchain.toml names Rust 1.99.1 with
+rustc-dev, rust-src and rustfmt; rr uses the compiler's private crates, so
+Cargo runs with RUSTC_BOOTSTRAP=1, and rr sets it for itself at its start, for
+what only a nightly compiler takes (a tool attribute, a no_std test harness, a
+forced extern for its runtimes). `cargo dev fmt` formats rr's own code with the
+rustfmt of nightly-2026-08-15, the nightly the release branched from, whose
+unstable options rustfmt.toml uses.
 
 ```sh
-scripts/build-toolchain.sh /path/to/pinned/rust-source /path/to/scratch /path/to/toolchain
-scripts/release.sh /path/to/pinned/rust-source /path/to/toolchain /path/to/scratch rr-linux-x86_64
+RUSTC_BOOTSTRAP=1 cargo test -- --skip 5041_allow_dev_build
+scripts/release.sh /path/to/scratch rr-macos-arm64
 ```
 
-release.sh builds rr with the toolchain, the sysroots of the host and of rr's
-targets (scripts/build-target-sysroot.py), libFuzzer, then packages
-(scripts/package-rr.sh), verifies (scripts/verify-bundle.py and the smoke
-checks) and archives the distribution in dist/.
-
-The packaging script takes a static rr executable,
-matching development toolchain, abort client sysroot and new destination. The
-compiler driver and LLVM are embedded in rr. Full core/alloc/compiler_builtins
-object archives and separate metadata are compiler inputs beside it. The client
-libraries are built with panic=abort; their complete upstream APIs are retained.
-The stock toolchain's unwind alloc would require an exception personality at
-native link time. This distribution is tested with panic=abort, not unwind.
-
-The real LLVM rust-objcopy helper supports Darwin -Cstrip. Executables are
-stripped and ad-hoc signed; compiler version and license notices are included.
-Only system macOS dynamic libraries are needed. No Cargo/rustup/rustc executable
-or Cargo cache is included. The development toolchain must come from the static
-bootstrap below, rather than a stock dynamic compiler installation.
-
-## Local verification (2026-10-08)
-
-24 rr restriction tests and 4 CLI tests pass. Formatting, cargo check, Clippy with all targets/features and
--D warnings, and the release build pass. The upstream suite and dogfood pass
-with one old Cargo fixture excluded: nix 0.9.0 in
-5041_allow_dev_build is incompatible with libc 0.2.190 on macOS. The unfiltered
-run and the final successful run are preserved in verification/. See
-verification/summary.txt for commands and limitations.
-
-The release bundle was copied to a path containing spaces and exercised with no
-Rust/Cargo binaries in PATH or loader/sysroot overrides. Native compilation and
-execution, checks, lints, local modules, explicit dependencies and alloc work.
-Temporary build/Cargo caches and generated fixture lockfiles were removed.
-
-
-## Distribution size
-
-The earlier static macOS ARM64 bundle was 217.37 MiB unpacked, compared with
-296.33 MiB for the previous stripped stock-toolchain bundle (329 MiB unstripped).
-The reduction is 78.95 MiB, or 26.64%. The executable embeds rustc_driver and
-AArch64-only LLVM with ThinLTO; it depends dynamically only on system macOS
-libraries. It is stripped and ad-hoc signed. Compiler-crash stacks can therefore
-have fewer function names; source diagnostics and compiler inputs are retained.
-
-| Part | Size |
-| --- | ---: |
-| rr, including compiler driver and LLVM | 125.21 MiB |
-| Complete core/alloc/compiler_builtins objects and metadata | 76.86 MiB |
-| License notices | 15.29 MiB |
-| Version, configuration and documentation | about 0.01 MiB |
-
-The bundle passed relocated init/check/lint/build, native execution, explicit
-dependency, local module, alloc and restriction checks without Rust/Cargo tools
-in PATH or loader/sysroot overrides. Compiler libraries were built from the
-pinned source; core and alloc source code was not modified. The compiler keeps
-its language machinery and auxiliary interfaces.
-
-Only the macOS ARM64 target sysroot and AArch64 backend are bundled. Other ARM64
-targets need their own libraries and linker/SDK. This executable cannot generate
-code for x86_64 or other LLVM architectures. Detailed build/check logs are in
-verification/static-compiler-2026-10-08/.
-
-
-## Builtin update (2026-10-08)
-
-The updated ordinary rr release is 219.89 MiB unpacked. The executable is
-125.23 MiB; the bundle now includes rust-objcopy and full abort client libraries.
-Compiler builtins, their attributes and source brought in with include! are
-covered by the rr tests and scripts/smoke-builtins.py. The native smoke executes
-Option, an actually allocating Vec and explained clone, assertions, format_args
-and inline assembly, with no Rust/Cargo tools or loader overrides.
-
-The full check suite passes with the same documented upstream fixture exclusion.
-Logs and the current report are in verification/builtins-2026-10-08/.
-
-## GitHub Actions: static compiler driver
-
-The release workflow builds stage2 Rust at commit
-58cf8f9c35b355199727627d07ae34a4e2846d67 with its exact LLVM submodule, LLVM's
-backend for the host and rust-lld, and compiles rr against that matching
-compiler on each host. No prebuilt LLVM or compiler driver is substituted.
-LLVM, stage2 compiler libraries and the release rr executable use ThinLTO.
-As in official Rust builds, the compiler on Linux and Windows is optimized by
-profile: it is built once with its Rust crates and once with LLVM
-instrumented, each run over scripts/pgo-train.py's work (checking and
-building rr's crates and their dependencies, core and alloc, and compiling
-the example programs), and the release compiler is built with both profiles.
-Linux compiles LLVM with clang 23, the version of the compiler's own LLVM,
-since the compiler's profile flags reach the C and C++ code that clang
-compiles; macOS, whose Apple clang is older, has no PGO, as in official
-builds. On AArch64 LLVM's profile has branch counts but no value profiles,
-whose runtime lists hang the instrumented compiler's codegen threads there.
-Every compiler has one codegen unit per crate; off Windows it
-allocates with jemalloc, and on Linux x86_64 BOLT lays out the rr executable
-by a profile of the smoke checks.
-On Windows LLVM is compiled with LLVM 20.1.3's clang-cl, named in CC, and
-the compiler and rr link with the lld-link beside it, which reads LLVM's bitcode.
-LLVM and rustc_driver are statically linked into rr; system libraries remain
-dynamic; core/alloc objects and metadata stay external as compiler inputs. The
-bootstrap artifact filter also retains private compiler rlibs, because
-metadata-only rustc-dev packages cannot support static linking. Put the
-source, scratch and installation directories, CARGO_HOME, CARGO_TARGET_DIR and
-TMPDIR on the build volume; RR_BUILD_JOBS sets parallelism. Set SYSROOT to the
-installed compiler directory when checking or testing the unpackaged static
-development drivers. The packaged rr selects its adjacent sysroot itself.
+release.sh builds rr in release, fetches libFuzzer's source from
+rust-lang/llvm-project at the release's LLVM commit and builds it
+(scripts/build-fuzz-runtime.py), lays out rr for a toolchain
+(scripts/package-rr.sh: bin/rr and lib/rustlib/rr/, with the Rust release it
+needs in rust-version), installs it into the toolchain, runs the smoke checks
+there (scripts/smoke-distribution.py and scripts/smoke-fuzz.py: a project,
+the corpus programs and every registry component through their Makefiles,
+with only that toolchain on PATH) and archives it in dist/.
 
 ## Releases
 
-`.github/workflows/rr-release.yml` builds the static compiler and rr on each
-host, verifies each distribution and, on a `v*` tag or a dispatch naming one,
-publishes them as a GitHub release with their SHA256SUMS:
+`.github/workflows/rr-release.yml` builds rr on each host, installs and checks
+it, and on a `v*` tag or a dispatch naming one publishes the archives as a
+GitHub release with their SHA256SUMS; then it runs the installers on each host
+(rr-install.yml).
 
 | Archive | Host |
 | --- | --- |
@@ -808,11 +719,6 @@ publishes them as a GitHub release with their SHA256SUMS:
 | rr-windows-x86_64.zip | Windows 10+ x86_64 |
 | rr-windows-aarch64.zip | Windows 11 on ARM |
 
-Each holds rr with LLVM's backend for its host, the host's sysroot, on Linux
-and Windows that of the host's rr target and rust-lld, and libFuzzer. scripts/build-toolchain.sh
-builds the compiler on any of these hosts, scripts/release.sh the rest; the
-Linux ones build in an Ubuntu 20.04 container, for an old glibc.
-
-Keep core and alloc intact. Do not remove compiler language machinery or
-auxiliary rustc interfaces in this pass; the current compiler changes only
-enable static driver linking and retain the necessary object archives.
+Each holds rr and its lib/rustlib/rr/ for the official Rust 1.99.1, which the
+installers add with rustup. The Linux ones build in an Ubuntu 20.04 container,
+for an old glibc.

@@ -24,10 +24,10 @@ copies a component: the project owns the copy, reads it and changes it.
 | http1 | | HTTP/1.1 requests and an incremental response parser |
 | dns | | DNS wire format: queries, replies, TCP framing |
 | resolver | dns | Go's resolver without I/O: resolv.conf, hosts, nsswitch, the lookup, RFC 6724 order |
-| resolve | resolver, wait, file | host lookup that never blocks: Linux on its own syscalls, getaddrinfo on macOS, GetAddrInfoExW on Windows |
+| resolve | resolver, wait, file | host lookup that never blocks: Linux by its own DNS over the kernel's calls, getaddrinfo on macOS, GetAddrInfoExW on Windows |
 | trust | x509, wait, file | the system verifies a chain, as Go does: SecTrust on macOS, CertGetCertificateChain on Windows, x509 with the system's roots on Linux; never blocks |
 | wait | | what a program's loop waits on for any component: descriptors or an event, a timeout; a thread that signals when done |
-| file | | Linux: whole files read by system calls, descriptors closed on drop |
+| file | | Linux: whole files read through the C library's syscall, descriptors closed on drop |
 | cpu | | what the CPU has of the instructions the components use, asked once |
 
 ## A component

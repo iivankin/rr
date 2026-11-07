@@ -1,9 +1,5 @@
 name: Install rr
 
-# Runs install.sh and install.ps1 from this commit against a published
-# release on each host, both ways: the default install, which puts rr on
-# PATH, and one into the directory RR_INSTALL names. The release workflow
-# calls it after it publishes.
 on:
   workflow_dispatch:
     inputs:
@@ -34,41 +30,40 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: install.sh, by default and into RR_INSTALL
+      - name: install.sh, twice, then a project built and tested
         if: runner.os != 'Windows'
         shell: bash
         run: |
           sh install.sh < /dev/null
+          sh install.sh < /dev/null
           "$HOME/.local/bin/rr" --version
-          RR_INSTALL="$RUNNER_TEMP/rr" sh install.sh < /dev/null
-          # Again, over the installed one.
-          RR_INSTALL="$RUNNER_TEMP/rr" sh install.sh < /dev/null
           cd "$RUNNER_TEMP"
-          PATH="$RUNNER_TEMP/rr:$PATH" rr init demo
+          "$HOME/.local/bin/rr" init demo
           cd demo
-          PATH="$RUNNER_TEMP/rr:$PATH" make test
-          PATH="$HOME/.local/bin:$PATH" make
+          # rustup's rustc, which takes the project's rust-toolchain.toml.
+          PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH" make all test check
           ./demo
-      - name: install.ps1 by default, in Windows PowerShell, as from irm
+      - name: install.ps1, in Windows PowerShell, as from irm
         if: runner.os == 'Windows'
         shell: powershell
         run: |
           Get-Content -Raw install.ps1 | Invoke-Expression
           rr --version
           if ($LASTEXITCODE -ne 0) { exit 1 }
-          if (-not ([Environment]::GetEnvironmentVariable('Path', 'User') -split ';' -contains "$env:LOCALAPPDATA\Programs\rr")) { exit 1 }
-      - name: install.ps1 into RR_INSTALL, twice, in PowerShell
+      - name: install.ps1 again, in PowerShell, then a project built and tested
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $env:RR_INSTALL = "$env:RUNNER_TEMP\rr"
-          ./install.ps1
           ./install.ps1
           Set-Location $env:RUNNER_TEMP
-          & "$env:RUNNER_TEMP\rr\rr.exe" init demo
+          rr init demo
           if ($LASTEXITCODE -ne 0) { exit 1 }
           Set-Location demo
-          & "$env:RUNNER_TEMP\rr\rr.exe" src/main.rs -o demo.exe
+          rustc src/main.rs --edition 2024 --crate-name demo -C panic=abort -o demo.exe
           if ($LASTEXITCODE -ne 0) { exit 1 }
           ./demo.exe
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          rr test src/main.rs --crate-name demo
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          rr check src/main.rs --crate-name demo
           if ($LASTEXITCODE -ne 0) { exit 1 }

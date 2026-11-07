@@ -27,9 +27,16 @@ mod test;
 mod target;
 
 /// What rr add compares with the rr a component was checked with.
-pub const VERSION: &str = "0.4.3";
+pub const VERSION: &str = "0.5.0";
 
 pub fn main() -> ExitCode {
+    // rr builds on the official compiler, a stable one, and uses what only
+    // a nightly one takes: a tool attribute (rr::hot), the test harness of
+    // a no_std crate, a forced extern for its runtimes. RUSTC_BOOTSTRAP
+    // lets it, as the compiler's own build and the Linux kernel's do; the
+    // children rr starts, its runtimes' builds, inherit it.
+    // SAFETY: no other thread runs yet, so none reads the environment.
+    unsafe { env::set_var("RUSTC_BOOTSTRAP", "1") };
     match run() {
         Ok(code) => code,
         Err(error) => {
@@ -102,6 +109,18 @@ fn run() -> io::Result<ExitCode> {
     };
     let checking = command != "build";
     let profiling = args.iter().any(|arg| arg == "--prof");
+    // A program is built by rustc; rr builds only what its own commands
+    // run: a --prof build for rr prof, and what rr test, rr bench and rr
+    // fuz run, which they mark --rr-run.
+    let own_run = args.iter().any(|arg| arg == "--rr-run");
+    args.retain(|arg| arg != "--rr-run");
+    // --print asks the compiler and builds nothing.
+    let printing = args.iter().any(|arg| has_key(arg, "--print"));
+    if !checking && !profiling && !own_run && !printing {
+        return Err(io::Error::other(
+            "rr checks a crate (rr check, rr lint); build it with rustc, or with rr build --prof for rr prof",
+        ));
+    }
     args.retain(|arg| arg != "--prof");
     if profiling && args.iter().any(|arg| arg.contains("strip=")) {
         return Err(io::Error::other("a --prof build keeps its symbols: drop -C strip"));
@@ -146,25 +165,7 @@ fn run() -> io::Result<ExitCode> {
     if command != "lint" {
         compiler.push("-Aclippy::all".into());
     }
-    if !args.iter().any(|arg| has_key(arg, "--sysroot")) {
-        let bundle = executable()?
-            .parent()
-            .ok_or_else(|| io::Error::other("missing executable directory"))?
-            .to_owned();
-        if bundle.join("lib/rustlib").is_dir() {
-            // A distribution builds for its host only.
-            if let Some(t) = target::named(&args)
-                && !bundle.join("lib/rustlib").join(&t).is_dir()
-            {
-                return Err(io::Error::other(format!(
-                    "this rr builds for its host only and has no sysroot for {t}"
-                )));
-            }
-            compiler.extend(["--sysroot".into(), bundle.to_string_lossy().into_owned()]);
-        }
-    }
     let artifact = final_artifact(&args, &compiler);
-    compiler.extend(target::flags(&args, artifact));
     let scratch = if checking || profiling {
         Some(workspace::Scratch::new()?)
     } else {
@@ -178,7 +179,7 @@ fn run() -> io::Result<ExitCode> {
             &mut compiler,
             artifact && !checking,
             scratch.as_ref().map(|s| s.path.as_path()),
-            target::chosen(&args).as_deref(),
+            target::named(&args).as_deref(),
             target::sysroot(&args).as_deref(),
         )?;
     }
@@ -231,6 +232,6 @@ fn canonical(path: &Path) -> io::Result<PathBuf> {
 
 fn help() {
     println!(
-        "rr — Restricted Rust\n\nUsage:\n  rr FILE [RUSTC FLAGS]          Compile with restrictions\n  rr build FILE [RUSTC FLAGS]    Compile with restrictions\n  rr check FILE [RUSTC FLAGS]    Check without build artifacts\n  rr lint FILE [RUSTC FLAGS]     Check with Clippy lints too\n  rr fmt [--check] FILE...       Format a crate (--check: show what differs)\n  rr init [DIR] [--lib]          Create a project (or src/lib.rs alone)\n  rr add COMPONENT...            Copy a registry component into src/\n  rr test FILE [--check|--lint] [FLAGS] [-- FILTER]\n                                 Build and run the crate's #[test] items\n  rr bench FILE [FLAGS] [-- FILTER]\n                                 Measure the crate's #[bench] items\n  rr fuz FILE --target PATH [FLAGS] -- [ARGS]\n                                 Fuzz the crate's function at PATH\n  rr fuz FILE [FLAGS] -- [ARGS]  Build and run a libFuzzer harness\n  rr fuz init [DIR]             Create fuz.rs, corpus/ and artifacts/\n  rr build --prof FILE ...       Build to record allocations and copies by stack\n  rr prof -- COMMAND [ARGS]      Run COMMAND and report where it allocates and copies\n  rr time -- COMMAND [ARGS]      Run COMMAND a few times and report how long it took\n\nNo Cargo or project manifest. Edition 2024 and panic=abort by default.\nUse -O, -o, --crate-type, --target, --extern and -L like rustc.\nRequires no_std. Type/const generic definitions, impl Trait, dyn Trait,\ncomplex traits, async/await and macros (except no_std compiler builtins and core panic/assert) are forbidden.\nEscape hatches require an adjacent // rr: escape(kind): <reason> naming their kind.\nBundled sysroot is selected automatically; --sysroot can override it."
+        "rr — Restricted Rust: a checker on the official Rust release it is built on\n\nUsage:\n  rr check FILE [RUSTC FLAGS]    Check with rr's rules\n  rr lint FILE [RUSTC FLAGS]     Check with Clippy's lints too\n  rr fmt [--check] FILE...       Format a crate (--check: show what differs)\n  rr init [DIR] [--lib]          Create a project (or src/lib.rs alone)\n  rr add COMPONENT...            Copy a registry component into src/\n  rr test FILE [--check|--lint] [FLAGS] [-- FILTER]\n                                 Build and run the crate's #[test] items\n  rr bench FILE [FLAGS] [-- FILTER]\n                                 Measure the crate's #[bench] items\n  rr fuz FILE --target PATH [FLAGS] -- [ARGS]\n                                 Fuzz the crate's function at PATH\n  rr build --prof FILE ...       Build to record allocations and copies by stack\n  rr prof -- COMMAND [ARGS]      Run COMMAND and report where it allocates and copies\n  rr time -- COMMAND [ARGS]      Run COMMAND a few times and report how long it took\n\nrustc builds a program; rr checks it, and builds only what its own commands\nrun. No Cargo or project manifest. Edition 2024 and panic=abort by default.\nUse --target, --extern, -L, --crate-type and --cfg like rustc.\nRequires no_std. Type/const generic definitions, impl Trait, dyn Trait,\ncomplex traits, async/await and macros (except no_std compiler builtins and core panic/assert) are forbidden.\nEscape hatches require an adjacent // rr: escape(kind): <reason> naming their kind."
     );
 }

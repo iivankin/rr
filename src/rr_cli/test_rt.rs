@@ -7,8 +7,8 @@
 //! `#[should_panic]` is a child that ended so. On macOS and Linux the
 //! child is a fork; Windows has none, so there the executable runs again
 //! with `--rr-one=N` and runs the Nth test alone. Each system is reached
-//! as an rr program reaches it: macOS through its C library, Linux by
-//! system calls, Windows through kernel32.dll. A bench run measures each
+//! as an rr program reaches it: macOS and Linux through their C library,
+//! Windows through kernel32.dll. A bench run measures each
 //! `#[bench]` in this process, with the time, and under rr bench the
 //! allocations and bytes copied, of one iteration; a test run runs each
 //! bench once, as a test.
@@ -32,7 +32,7 @@ unsafe extern "C" {
     fn rr_prof_counts(allocations: *mut u64, copied: *mut u64);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 mod os {
     use core::ffi::c_int;
 
@@ -45,7 +45,10 @@ mod os {
         fn _exit(code: c_int) -> !;
     }
 
+    #[cfg(target_os = "macos")]
     const CLOCK_MONOTONIC: c_int = 6;
+    #[cfg(target_os = "linux")]
+    const CLOCK_MONOTONIC: c_int = 1;
 
     pub fn out(p: &[u8]) {
         // SAFETY: p is readable memory of its length.
@@ -76,80 +79,6 @@ mod os {
         let mut status = 0;
         // SAFETY: status is a valid out-parameter.
         unsafe { waitpid(pid, &raw mut status, 0) };
-        if pid > 0 { status as u32 } else { u32::MAX }
-    }
-
-    /// How a child ended, from its wait status.
-    pub fn ended(status: u32) {
-        super::wait_status(status);
-    }
-}
-
-#[cfg(target_os = "linux")]
-mod os {
-    #[cfg(target_arch = "x86_64")]
-    mod nr {
-        pub const WRITE: usize = 1;
-        pub const CLONE: usize = 56;
-        pub const WAIT4: usize = 61;
-        pub const CLOCK_GETTIME: usize = 228;
-        pub const EXIT_GROUP: usize = 231;
-    }
-    #[cfg(target_arch = "aarch64")]
-    mod nr {
-        pub const WRITE: usize = 64;
-        pub const CLONE: usize = 220;
-        pub const WAIT4: usize = 260;
-        pub const CLOCK_GETTIME: usize = 113;
-        pub const EXIT_GROUP: usize = 94;
-    }
-
-    /// System call n with four arguments; its result.
-    fn syscall(n: usize, a: usize, b: usize, c: usize, d: usize) -> isize {
-        let r: isize;
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: each call below passes what its system call takes.
-        unsafe {
-            core::arch::asm!("syscall", inlateout("rax") n as isize => r, in("rdi") a, in("rsi") b,
-                in("rdx") c, in("r10") d, lateout("rcx") _, lateout("r11") _, options(nostack));
-        }
-        #[cfg(target_arch = "aarch64")]
-        // SAFETY: each call below passes what its system call takes.
-        unsafe {
-            core::arch::asm!("svc #0", in("x8") n, inlateout("x0") a as isize => r, in("x1") b,
-                in("x2") c, in("x3") d, options(nostack));
-        }
-        r
-    }
-
-    const SIGCHLD: usize = 17;
-    const CLOCK_MONOTONIC: usize = 1;
-
-    pub fn out(p: &[u8]) {
-        syscall(nr::WRITE, 1, p.as_ptr() as usize, p.len(), 0);
-    }
-
-    pub fn now_ns() -> u64 {
-        let mut t = [0i64; 2];
-        syscall(nr::CLOCK_GETTIME, CLOCK_MONOTONIC, (&raw mut t) as usize, 0, 0);
-        (t[0] as u64).wrapping_mul(1_000_000_000).wrapping_add(t[1] as u64)
-    }
-
-    pub fn exit(code: i32) -> ! {
-        syscall(nr::EXIT_GROUP, code as usize, 0, 0, 0);
-        loop {}
-    }
-
-    /// Run test in a child, a fork; whether it returned.
-    pub fn in_child(_: usize, test: &dyn Fn()) -> u32 {
-        // clone with no new stack and SIGCHLD to the parent is fork.
-        let pid = syscall(nr::CLONE, SIGCHLD, 0, 0, 0);
-        if pid == 0 {
-            test();
-            exit(0);
-        }
-        let mut status: i32 = 0;
-        syscall(nr::WAIT4, pid as usize, (&raw mut status) as usize, 0, 0);
         if pid > 0 { status as u32 } else { u32::MAX }
     }
 

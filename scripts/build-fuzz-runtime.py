@@ -1,6 +1,8 @@
-"""Build pinned libFuzzer for the toolchain's host, and keep its matching
-AddressSanitizer runtime: macOS with Xcode's clang++, Linux with the
-system's c++, Windows with Visual Studio's cl."""
+"""Build pinned libFuzzer for the toolchain's host into what rr keeps in a
+toolchain's lib/rustlib/rr/: the library, rr fuz's coverage and ASan
+flags, and its license. macOS with Xcode's clang++, Linux with the
+system's c++, Windows with Visual Studio's cl. The AddressSanitizer
+runtime is the toolchain's own."""
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
@@ -30,7 +32,7 @@ def build(source, toolchain, destination):
     version = subprocess.check_output([toolchain / 'bin/rustc', '-vV'], text=True)
     host = next(line[len('host: '):] for line in version.splitlines() if line.startswith('host: '))
     if f'commit-hash: {RUST}' not in version:
-        raise SystemExit('Expected the pinned toolchain')
+        raise SystemExit('Expected the official Rust release rr is built on')
     if destination.exists():
         raise SystemExit(f'Destination already exists: {destination}')
     # The normal caller uses the exact LLVM submodule of the pinned Rust checkout.
@@ -42,11 +44,7 @@ def build(source, toolchain, destination):
         # On COFF, coverage's section bounds are defined by compiler-rt, not
         # by the linker: libFuzzer's archive carries them.
         sources.append(source.parent / 'sanitizer_common/sanitizer_coverage_win_sections.cpp')
-    toolchain_lib = toolchain / 'lib/rustlib' / host / 'lib'
-    asan_sources = sorted(toolchain_lib.glob('librustc-nightly_rt.asan.*'))
-    if not asan_sources and not host.endswith('-windows-msvc'):
-        raise SystemExit('Toolchain is missing ASan; enable build.sanitizers in bootstrap')
-    lib = destination / 'lib/rustlib' / host / 'lib'
+    lib = destination
     lib.mkdir(parents=True)
     windows = host.endswith('-windows-msvc')
     archive = lib / ('Fuzzer.lib' if windows else 'libFuzzer.a')
@@ -68,21 +66,6 @@ def build(source, toolchain, destination):
         else:
             subprocess.run(['ar', 'rcs', archive, *outputs], check=True)
     hashes = {'libfuzzer_sha256': hashlib.sha256(archive.read_bytes()).hexdigest()}
-    for asan_source in asan_sources:
-        asan = lib / asan_source.name
-        if host.endswith('-apple-darwin'):
-            architectures = subprocess.check_output(['xcrun', 'lipo', '-archs', asan_source], text=True).split()
-            if 'arm64' not in architectures:
-                raise SystemExit('Toolchain ASan runtime has no ARM64 architecture')
-            # lipo -thin accepts only universal files; native bootstrap may already be thin.
-            if architectures == ['arm64']:
-                shutil.copy2(asan_source, asan)
-            else:
-                subprocess.run(['xcrun', 'lipo', asan_source, '-thin', 'arm64', '-output', asan], check=True)
-            subprocess.run(['codesign', '--force', '--sign', '-', asan], check=True)
-        else:
-            shutil.copy2(asan_source, asan)
-        hashes['asan_sha256'] = hashlib.sha256(asan.read_bytes()).hexdigest()
     files = sorted(p for p in source.iterdir() if p.is_file())
     provenance = {'rust_commit': RUST, 'llvm_commit': LLVM, 'host': host,
                   'source_sha256': {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in files},
@@ -92,9 +75,18 @@ def build(source, toolchain, destination):
     if not license.is_file():
         license = source.parent.parent / 'LICENSE.TXT'
     (destination / 'LICENSE-libFuzzer.txt').write_bytes(license.read_bytes())
+    templates = Path(__file__).resolve().parent.parent / 'examples/fuzz'
+    system = 'macos' if host.endswith('-apple-darwin') else 'windows' if 'windows' in host else 'linux'
+    flags = (templates / f'fuzz-{system}.flags').read_text().splitlines()
+    if host == 'aarch64-pc-windows-msvc':
+        # There each function's counters are padded to an alignment, so a
+        # table of one PC per counter cannot match them: counters only.
+        flags.remove('-Cllvm-args=-sanitizer-coverage-pc-table')
+    (destination / 'fuzz.flags').write_text('\n'.join(flags) + '\n')
+    shutil.copy2(templates / 'asan.flags', destination / 'asan.flags')
 
 
 if __name__ == '__main__':
     if len(sys.argv) != 4:
-        raise SystemExit('Usage: build-fuzz-runtime.py LIBFUZZER_SOURCE TOOLCHAIN NEW_RUNTIME')
+        raise SystemExit('Usage: build-fuzz-runtime.py LIBFUZZER_SOURCE TOOLCHAIN NEW_DIRECTORY')
     build(*(Path(arg).resolve() for arg in sys.argv[1:]))

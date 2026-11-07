@@ -331,13 +331,20 @@ fn begin(first: *mut c_void) {
 
 #[cfg(target_os = "linux")]
 mod os {
-    use super::super::syscall;
     use super::Wait;
+    use core::ffi::{c_int, c_void};
+    use core::ptr::{null, null_mut};
 
-    #[cfg(target_arch = "x86_64")]
-    const PPOLL: usize = 271;
-    #[cfg(target_arch = "aarch64")]
-    const PPOLL: usize = 73;
+    #[link(name = "c")]
+    // rr: escape(unsafe): its signature is the C library's, from its headers.
+    unsafe extern "C" {
+        fn ppoll(
+            fds: *mut PollFd,
+            count: u64,
+            timeout: *const Timespec,
+            mask: *const c_void,
+        ) -> c_int;
+    }
 
     #[repr(C)]
     struct PollFd {
@@ -370,19 +377,18 @@ mod os {
             seconds: 0,
             nanoseconds: 0,
         };
-        let limit = match wait.timeout_ms {
+        let limit: *const Timespec = match wait.timeout_ms {
             Some(ms) => {
                 time.seconds = i64::try_from(ms / 1000).unwrap_or(i64::MAX);
                 time.nanoseconds = i64::try_from(ms % 1000).unwrap_or(0) * 1_000_000;
-                (&raw mut time).expose_provenance()
+                &raw const time
             }
-            None => 0,
+            None => null(),
         };
-        let count = wait.count.min(2);
-        let ask = [fds.as_mut_ptr().expose_provenance(), count, limit, 0, 8, 0];
+        let count = u64::try_from(wait.count.min(2)).unwrap_or(2);
         // rr: escape(unsafe): fds holds count entries and time is a local;
         // the signal mask is none.
-        let woke = unsafe { syscall(PPOLL, ask) };
+        let woke = unsafe { ppoll(fds.as_mut_ptr(), count, limit, null_mut()) };
         if woke <= 0 {
             return [0, 0];
         }

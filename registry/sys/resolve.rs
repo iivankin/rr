@@ -116,7 +116,6 @@ fn c_string(name: &[u8]) -> Option<Vec<u8>> {
 #[cfg(target_os = "linux")]
 mod os {
     use super::super::file::{self, Descriptor};
-    use super::super::syscall;
     use super::super::wait::{self, Fd, POLLERR, POLLHUP, POLLIN, POLLOUT};
     use super::{Address, Error, Wait};
     use crate::dns;
@@ -253,16 +252,10 @@ mod os {
         }
     }
 
-    /// System call n on plain numbers and memory the caller vouches for.
+    /// System call n on plain numbers and memory the caller vouches for:
+    /// its result, or the error number.
     fn call(n: usize, args: [usize; 6]) -> Result<usize, isize> {
-        // rr: escape(unsafe): each caller passes the call's own arguments,
-        // pointers to memory it holds for the call's length.
-        let r = unsafe { syscall(n, args) };
-        if r < 0 {
-            Err(-r)
-        } else {
-            Ok(r.cast_unsigned())
-        }
+        file::call(n, args).map_err(|error| isize::try_from(error).unwrap_or(isize::MAX))
     }
 
     /// The file at path, up to limit bytes; None when it cannot be

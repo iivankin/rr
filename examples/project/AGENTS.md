@@ -1,8 +1,9 @@
 # Instructions
 
-This project is restricted Rust: every compile goes through rr, no
-Cargo. rr's rules are part of the compiler. An rr error says what the
-design must change, never what to hide from it.
+This project is restricted Rust: rustc builds it and rr checks it, no
+Cargo; rr also builds what its own commands run (tests, benches, fuzz
+targets, profiles). rr's rules are part of the check. An rr error says
+what the design must change, never what to hide from it.
 
 When goals pull apart, safety comes first, then performance, then ease
 of work. Performance is first the time an event takes, then the memory
@@ -114,9 +115,9 @@ operation, and the simple design is rarely the first one.
   Assertions are not counted; one that restates the line above it says
   nothing.
 - A resource owns itself and is released on drop. unsafe and the
-  operating system stay in src/sys/: a file for each of macOS, Linux and
-  Windows, each with the same functions; a new one goes into all three.
-  macOS is reached through its C library, Linux by system calls,
+  operating system stay in src/sys/: unix.rs for macOS and Linux,
+  windows.rs for Windows, each with the same functions; a new one goes
+  into both. macOS and Linux are reached through their C library,
   Windows through kernel32.dll. A C function is declared as its
   header declares it, word for word; one that takes a variable number
   of arguments ends in `...`, or its arguments go where the callee does

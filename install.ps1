@@ -2,10 +2,12 @@
 #
 #     irm https://raw.githubusercontent.com/iivankin/rr/main/install.ps1 | iex
 #
-# By default the distribution goes to %LOCALAPPDATA%\Programs\rr, which is
-# added to the user's PATH. RR_INSTALL names another directory for the
-# distribution and changes no PATH: rr is then RR_INSTALL\rr.exe. RR_VERSION
-# picks a release tag instead of the latest.
+# rr is a Clippy-like tool on the official Rust release it is built on:
+# rustup installs that toolchain, rr goes into its bin\ beside rustc, as
+# clippy-driver does, with what is its own in lib\rustlib\rr\, and that
+# bin\ goes at the end of the user's PATH, after rustup's own tools, so
+# that rustc and cargo stay rustup's. RR_VERSION picks a release tag
+# instead of the latest.
 
 & {
     $ErrorActionPreference = 'Stop'
@@ -31,28 +33,17 @@
     } else {
         $url = "https://github.com/$repo/releases/latest/download"
     }
-    $custom = [bool]$env:RR_INSTALL
-    if ($custom) {
-        $dest = [IO.Path]::GetFullPath($env:RR_INSTALL)
-    } else {
-        $dest = Join-Path $env:LOCALAPPDATA 'Programs\rr'
-    }
-
-    # Replace only a directory that holds rr, never someone's other files.
-    if ((Test-Path -LiteralPath $dest) -and
-        -not ((Test-Path -LiteralPath (Join-Path $dest 'rr.exe') -PathType Leaf) -and
-            (Test-Path -LiteralPath (Join-Path $dest 'lib\rustlib') -PathType Container))) {
-        if ((Test-Path -LiteralPath $dest -PathType Leaf) -or
-            (Get-ChildItem -LiteralPath $dest -Force | Select-Object -First 1)) {
-            throw "rr install: $dest exists and is not an rr distribution"
+    # rustup, also where its installer leaves it when PATH does not have it yet.
+    $rustup = (Get-Command rustup -ErrorAction SilentlyContinue).Source
+    if (-not $rustup) {
+        $home_cargo = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
+        $rustup = Join-Path $home_cargo 'bin\rustup.exe'
+        if (-not (Test-Path -LiteralPath $rustup -PathType Leaf)) {
+            throw 'rr install: needs rustup, which installs Rust: https://rustup.rs'
         }
     }
 
-    # The new distribution is unpacked beside its destination, so that it
-    # replaces the old one by a rename on the same volume.
-    $parent = Split-Path -Parent $dest
-    New-Item -ItemType Directory -Force -Path $parent | Out-Null
-    $tmp = Join-Path $parent ('.rr-install.' + [IO.Path]::GetRandomFileName())
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) ('rr-install.' + [IO.Path]::GetRandomFileName())
     New-Item -ItemType Directory -Path $tmp | Out-Null
     try {
         Write-Host "Downloading $name from $url"
@@ -67,30 +58,38 @@
         if ((Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash -ne $want) {
             throw "rr install: $name.zip: checksum mismatch"
         }
+        $unpacked = Join-Path $tmp 'rr'
         Add-Type -AssemblyName System.IO.Compression.FileSystem
-        [IO.Compression.ZipFile]::ExtractToDirectory($zip, $tmp)
-        & (Join-Path $tmp "$name\rr.exe") --version | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw 'rr install: the downloaded rr does not run' }
+        [IO.Compression.ZipFile]::ExtractToDirectory($zip, $unpacked)
+        $release = (Get-Content -LiteralPath (Join-Path $unpacked 'lib\rustlib\rr\rust-version') -Raw).Trim()
+        if (-not $release) { throw 'rr install: the archive names no Rust release' }
 
-        if (Test-Path -LiteralPath $dest) {
-            Move-Item -LiteralPath $dest -Destination (Join-Path $tmp 'old')
+        Write-Host "Installing Rust $release with rustup"
+        & $rustup toolchain install $release --profile minimal --no-self-update
+        if ($LASTEXITCODE -ne 0) { throw "rr install: rustup could not install Rust $release" }
+        $toolchain = (& $rustup run $release rustc --print sysroot).Trim()
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $toolchain 'bin'))) {
+            throw "rr install: no toolchain for Rust $release"
         }
-        Move-Item -LiteralPath (Join-Path $tmp $name) -Destination $dest
+        # rr's own files are replaced whole; the toolchain's are not touched.
+        $own = Join-Path $toolchain 'lib\rustlib\rr'
+        if (Test-Path -LiteralPath $own) { Remove-Item -LiteralPath $own -Recurse -Force }
+        Copy-Item -Path (Join-Path $unpacked '*') -Destination $toolchain -Recurse -Force
     } finally {
         Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
     }
-    Write-Host "Installed $(& (Join-Path $dest 'rr.exe') --version) in $dest"
+    $bin = Join-Path $toolchain 'bin'
+    $rr = Join-Path $bin 'rr.exe'
+    & $rr --version | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'rr install: the installed rr does not run' }
+    Write-Host "Installed $(& $rr --version) in $toolchain"
 
-    if ($custom) {
-        Write-Host "Run it as $(Join-Path $dest 'rr.exe'), or add $dest to PATH."
-        return
-    }
     $path = [Environment]::GetEnvironmentVariable('Path', 'User')
-    if (-not (($path -split ';') -contains $dest)) {
-        [Environment]::SetEnvironmentVariable('Path', (@($dest) + ($path -split ';' | Where-Object { $_ }) -join ';'), 'User')
-        Write-Host "Added $dest to the user's PATH; new terminals find rr."
+    if (-not (($path -split ';') -contains $bin)) {
+        [Environment]::SetEnvironmentVariable('Path', ((@($path -split ';' | Where-Object { $_ }) + @($bin)) -join ';'), 'User')
+        Write-Host "Added $bin to the end of the user's PATH; new terminals find rr."
     }
-    if (-not (($env:Path -split ';') -contains $dest)) {
-        $env:Path = "$dest;$env:Path"
+    if (-not (($env:Path -split ';') -contains $bin)) {
+        $env:Path = "$env:Path;$bin"
     }
 }

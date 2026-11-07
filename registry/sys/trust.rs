@@ -436,15 +436,6 @@ mod os {
         pub const READLINKAT: usize = 78;
     }
 
-    // rr's start keeps the environment the kernel gave; a C library's
-    // start, as a fuzz build has, keeps it in environ.
-    #[cfg(target_vendor = "rr")]
-    // rr: escape(unsafe): rr_crt's own signature, in targets/crt_linux.rs.
-    unsafe extern "C" {
-        fn rr_crt_environ() -> *const *const c_char;
-    }
-
-    #[cfg(not(target_vendor = "rr"))]
     // rr: escape(unsafe): the C library's environ, from unistd.h.
     unsafe extern "C" {
         #[link_name = "environ"]
@@ -471,13 +462,6 @@ mod os {
         }
     }
 
-    #[cfg(target_vendor = "rr")]
-    fn environ() -> *const *const c_char {
-        // rr: escape(unsafe): rr_crt_environ takes nothing.
-        unsafe { rr_crt_environ() }
-    }
-
-    #[cfg(not(target_vendor = "rr"))]
     fn environ() -> *const *const c_char {
         // rr: escape(unsafe): the C library sets environ before main.
         unsafe { ENVIRON }

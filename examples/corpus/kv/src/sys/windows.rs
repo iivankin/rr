@@ -1,11 +1,26 @@
-//! What the program needs of Windows: the heap, files, output, arguments
-//! and an end on a bug, through kernel32.dll; there is no C runtime. The rest of
-//! the crate calls only this; unsafe stays here.
+//! What the program needs of Windows: the heap, output, arguments and an
+//! end on a bug, through kernel32.dll. The C runtime starts the program in
+//! main and gives what the compiler calls, such as memcpy. The rest of the
+//! crate calls only this; unsafe stays here.
 
 use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
 use core::ffi::{c_char, c_void};
-use core::ptr::null_mut;
+use core::ptr::{null, null_mut};
+
+// The C runtime: the DLL one, as Rust's own programs have it, or the
+// static one with -C target-feature=+crt-static. Each brings its parts
+// (vcruntime, ucrt) by itself.
+#[cfg_attr(target_feature = "crt-static", link(name = "libcmt"))]
+#[cfg_attr(not(target_feature = "crt-static"), link(name = "msvcrt"))]
+// rr: escape(unsafe): it declares nothing; it only links the C runtime.
+unsafe extern "C" {}
+
+#[link(name = "shell32", kind = "raw-dylib")]
+// rr: escape(unsafe): its signature is shell32's, from its documentation.
+unsafe extern "system" {
+    fn CommandLineToArgvW(line: *const u16, argc: *mut i32) -> *mut *const u16;
+}
 
 #[link(name = "kernel32", kind = "raw-dylib")]
 // rr: escape(unsafe): each signature is kernel32's, from its documentation.
@@ -15,6 +30,17 @@ unsafe extern "system" {
     fn HeapReAlloc(heap: *mut c_void, flags: u32, p: *mut c_void, size: usize) -> *mut c_void;
     fn HeapFree(heap: *mut c_void, flags: u32, p: *mut c_void) -> i32;
     fn GetStdHandle(which: u32) -> *mut c_void;
+    fn GetCommandLineW() -> *const u16;
+    fn WideCharToMultiByte(
+        page: u32,
+        flags: u32,
+        wide: *const u16,
+        n: i32,
+        out: *mut u8,
+        size: i32,
+        default: *const u8,
+        used: *mut i32,
+    ) -> i32;
     fn WriteFile(
         file: *mut c_void,
         p: *const u8,
@@ -182,20 +208,55 @@ pub fn stderr(p: &[u8]) {
     write_all(STD_ERROR_HANDLE, p);
 }
 
-/// main's arguments as byte strings, in UTF-8.
+/// The program's arguments as byte strings, in UTF-8. The C runtime
+/// gives main its argv in the system's code page, so Windows's own
+/// command line, in UTF-16, is split as the C runtime splits it and
+/// converted instead; argc and argv go unused.
 ///
 /// # Safety
-/// argv must hold argc NUL-terminated strings that live as long as the
-/// process, as main's own do.
-// rr: escape(unsafe): the caller vouches for argv, which only main can.
-pub unsafe fn args(argc: i32, argv: *const *const c_char) -> Vec<&'static [u8]> {
+/// None beyond main's: it takes main's arguments to be called as the
+/// other systems' args is.
+// rr: escape(unsafe): the same signature as the other systems' args.
+pub unsafe fn args(_argc: i32, _argv: *const *const c_char) -> Vec<&'static [u8]> {
+    let mut argc = 0;
+    // rr: escape(unsafe): the command line is the process's own and lives
+    // as long as it.
+    let line = unsafe { GetCommandLineW() };
+    // rr: escape(unsafe): line is NUL-terminated; argc is a local
+    // out-parameter.
+    let argv = unsafe { CommandLineToArgvW(line, &raw mut argc) };
+    if argv.is_null() {
+        return Vec::new();
+    }
     let argc = usize::try_from(argc).unwrap_or(0);
-    let mut out = Vec::with_capacity(argc);
-    // rr: escape(unsafe): argv holds argc of main's strings, per the contract.
-    let argv = unsafe { core::slice::from_raw_parts(argv, argc) };
-    for &s in argv {
-        // rr: escape(unsafe): s is NUL-terminated and lives as long as the process.
-        out.push(unsafe { core::ffi::CStr::from_ptr(s) }.to_bytes());
+    // rr: escape(unsafe): CommandLineToArgvW gave argc pointers, kept for
+    // the process.
+    let wide = unsafe { core::slice::from_raw_parts(argv, argc) };
+    // The UTF-8 of every argument, one after another, and where each is.
+    let mut text = Vec::new();
+    let mut spans = Vec::with_capacity(argc);
+    for &w in wide {
+        // A length of -1: up to the NUL, which is counted.
+        // rr: escape(unsafe): w is NUL-terminated.
+        let n =
+            unsafe { WideCharToMultiByte(CP_UTF8, 0, w, -1, null_mut(), 0, null(), null_mut()) };
+        let n = usize::try_from(n).unwrap_or(0);
+        let at = text.len();
+        text.resize(at + n, 0);
+        let Some(to) = text.get_mut(at..) else { break };
+        let size = i32::try_from(to.len()).unwrap_or(0);
+        // rr: escape(unsafe): w is NUL-terminated; to has size bytes.
+        unsafe {
+            WideCharToMultiByte(CP_UTF8, 0, w, -1, to.as_mut_ptr(), size, null(), null_mut())
+        };
+        spans.push((at, n.saturating_sub(1)));
+    }
+    // rr: escape(leak): the arguments live as long as the process, as
+    // main's own do on the other systems.
+    let text: &'static [u8] = text.leak();
+    let mut out = Vec::with_capacity(spans.len());
+    for (at, n) in spans {
+        out.push(text.get(at..at + n).unwrap_or_default());
     }
     out
 }

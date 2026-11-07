@@ -1,10 +1,14 @@
-# lz in restricted Rust: every compile goes through rr, no Cargo.
+# lz in restricted Rust: rustc builds it and rr checks it, no Cargo;
+# rr builds only what its own commands run.
 # The program is one crate, src/main.rs with its modules. Its tests and
 # benches sit beside the code they check; its fuzz targets are
 # functions under cfg(fuzzing), named in FUZZ.
 
+RUSTC = rustc
 RR = rr
 NAME = lz
+# What rr sets for every crate it checks, and the program needs built.
+BUILDFLAGS = --edition 2024 --crate-name $(NAME) -C panic=abort
 RRFLAGS = -C opt-level=3 -C codegen-units=1
 # Tests check arithmetic for overflow, as Rust's debug builds and rr
 # fuz's do; the program and its benches are built without, as it ships.
@@ -21,7 +25,7 @@ FUZZTIME = 60
 all: $(NAME)$(EXE)
 
 $(NAME)$(EXE): $(SRC)
-	$(RR) src/main.rs --crate-name $(NAME) $(RRFLAGS) $(LTOFLAGS) -C strip=symbols -o $@
+	$(RUSTC) src/main.rs $(BUILDFLAGS) $(RRFLAGS) $(LTOFLAGS) -C strip=symbols -o $@
 
 # The #[test] items, each in a child; FILTER=word runs those whose name
 # holds it.

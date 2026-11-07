@@ -1,18 +1,9 @@
 name: Build and release rr
 
-# Builds the static compiler and rr for each host, verifies each
-# distribution, and on a tag publishes them as a GitHub release. Full
-# compiler builds run on request or on a tag, not on every push.
-#
-# The compiler is built as official Rust builds are, with profile-guided
-# optimization on Linux and Windows: `profile` builds it twice, with its Rust
-# half and with its C++ half (LLVM) instrumented, and gathers a profile from
-# each at rr's kind of work; `toolchain` builds the release compiler with
-# both profiles, ThinLTO and one codegen unit per crate; `build` builds rr,
-# which BOLT lays out on Linux x86_64, and packages it. On macOS, as in
-# official builds, there is no PGO: Apple's clang cannot read the profiles
-# of the compiler's newer LLVM. Compilers and profiles are kept in the cache,
-# so a job whose result is there does nothing.
+# Builds rr for each host on the official Rust release it is built on,
+# which rustup installs, with libFuzzer from that release's LLVM; installs
+# each into its toolchain there and runs the smoke checks; and on a tag or
+# on request publishes them as a GitHub release.
 on:
   workflow_dispatch:
     inputs:
@@ -34,16 +25,12 @@ env:
   CARGO_INCREMENTAL: '0'
   CARGO_PROFILE_DEV_DEBUG: '0'
   CARGO_PROFILE_TEST_DEBUG: '0'
-  RUSTUP_TOOLCHAIN: nightly-2026-08-15
-  RUST_COMMIT: 58cf8f9c35b355199727627d07ae34a4e2846d67
 
 jobs:
   hosts:
     runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.pick.outputs.matrix }}
-      profiles: ${{ steps.pick.outputs.profiles }}
-      pgo: ${{ steps.pick.outputs.pgo }}
     steps:
       - name: The distributions this run builds
         id: pick
@@ -53,154 +40,26 @@ jobs:
           python3 - >> "$GITHUB_OUTPUT" <<'PY'
           import json, os
           all = [
-              {'name': 'rr-macos-arm64', 'runner': 'macos-15', 'pgo': False},
-              # BOLT, which lays out rr on Linux x86_64, needs more memory
-              # than the runner has: its build adds swap, which takes a
-              # privileged container and the runner's spare disk at /mnt.
-              {'name': 'rr-linux-x86_64', 'runner': 'ubuntu-24.04', 'container': 'ubuntu:20.04', 'pgo': True,
-               'build_container': {'image': 'ubuntu:20.04', 'options': '--privileged -v /mnt:/mnt'}},
-              {'name': 'rr-linux-aarch64', 'runner': 'ubuntu-24.04-arm', 'container': 'ubuntu:20.04', 'pgo': True},
-              {'name': 'rr-windows-x86_64', 'runner': 'windows-2025', 'pgo': True},
-              {'name': 'rr-windows-aarch64', 'runner': 'windows-11-arm', 'pgo': True},
+              {'name': 'rr-macos-arm64', 'runner': 'macos-15'},
+              {'name': 'rr-linux-x86_64', 'runner': 'ubuntu-24.04', 'container': 'ubuntu:20.04'},
+              {'name': 'rr-linux-aarch64', 'runner': 'ubuntu-24.04-arm', 'container': 'ubuntu:20.04'},
+              {'name': 'rr-windows-x86_64', 'runner': 'windows-2025'},
+              {'name': 'rr-windows-aarch64', 'runner': 'windows-11-arm'},
           ]
           wanted = [h.strip() for h in os.environ.get('HOSTS', '').split(',') if h.strip()]
           chosen = [h for h in all if not wanted or h['name'] in wanted]
           print('matrix=' + json.dumps({'include': chosen}))
-          profiles = [dict(h, kind=k) for h in chosen if h['pgo'] for k in ('rustc', 'llvm')]
-          print('profiles=' + json.dumps({'include': profiles}))
-          print('pgo=' + json.dumps(bool(profiles)))
           PY
 
-  profile:
-    needs: hosts
-    if: needs.hosts.outputs.pgo == 'true'
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.hosts.outputs.profiles) }}
-    name: profile (${{ matrix.name }}, ${{ matrix.kind }})
-    runs-on: ${{ matrix.runner }}
-    container: ${{ matrix.container }}
-    timeout-minutes: 360
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - name: Git, in the Linux container
-        if: matrix.container
-        run: apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -qy git ca-certificates
-      - name: Checkout rr
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: The compiler's cache key
-        id: key
-        uses: ./.github/actions/rr-key
-        with:
-          name: ${{ matrix.name }}
-      - name: Whether the release compiler is built
-        id: toolchain
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ env.RR_TEMP }}/rr-toolchain
-          key: ${{ steps.key.outputs.key }}
-          lookup-only: true
-      - name: Whether the profile is gathered
-        id: profile
-        if: steps.toolchain.outputs.cache-hit != 'true'
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ env.RR_TEMP }}/rr-pgo/${{ matrix.kind }}.profdata
-          key: rr-pgo-${{ matrix.kind }}-${{ steps.key.outputs.key }}
-          lookup-only: true
-      - name: Build tools and the compiler's source
-        if: steps.toolchain.outputs.cache-hit != 'true' && steps.profile.outputs.cache-hit != 'true'
-        uses: ./.github/actions/rr-setup
-        with:
-          name: ${{ matrix.name }}
-      - name: Build the instrumented compiler and gather its profile
-        if: steps.toolchain.outputs.cache-hit != 'true' && steps.profile.outputs.cache-hit != 'true'
-        # About an hour and a half at most; longer is a hang.
-        timeout-minutes: 180
-        run: scripts/pgo-profile.sh "${{ matrix.kind }}" "$RR_TEMP/rust" "$RR_TEMP/rr-scratch" "$RR_TEMP/rr-pgo"
-      - name: Keep the profile
-        if: steps.toolchain.outputs.cache-hit != 'true' && steps.profile.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ env.RR_TEMP }}/rr-pgo/${{ matrix.kind }}.profdata
-          key: rr-pgo-${{ matrix.kind }}-${{ steps.key.outputs.key }}
-
-  toolchain:
-    needs: [hosts, profile]
-    if: ${{ !cancelled() && needs.hosts.result == 'success' && (needs.profile.result == 'success' || needs.profile.result == 'skipped') }}
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.hosts.outputs.matrix) }}
-    runs-on: ${{ matrix.runner }}
-    container: ${{ matrix.container }}
-    timeout-minutes: 360
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - name: Git, in the Linux container
-        if: matrix.container
-        run: apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -qy git ca-certificates
-      - name: Checkout rr
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - name: The compiler's cache key
-        id: key
-        uses: ./.github/actions/rr-key
-        with:
-          name: ${{ matrix.name }}
-      - name: Whether the release compiler is built
-        id: toolchain
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ env.RR_TEMP }}/rr-toolchain
-          key: ${{ steps.key.outputs.key }}
-          lookup-only: true
-      - name: Build tools and the compiler's source
-        if: steps.toolchain.outputs.cache-hit != 'true'
-        uses: ./.github/actions/rr-setup
-        with:
-          name: ${{ matrix.name }}
-      - name: The Rust half's profile
-        if: steps.toolchain.outputs.cache-hit != 'true' && matrix.pgo
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ env.RR_TEMP }}/rr-pgo/rustc.profdata
-          key: rr-pgo-rustc-${{ steps.key.outputs.key }}
-          fail-on-cache-miss: true
-      - name: LLVM's profile
-        if: steps.toolchain.outputs.cache-hit != 'true' && matrix.pgo
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ env.RR_TEMP }}/rr-pgo/llvm.profdata
-          key: rr-pgo-llvm-${{ steps.key.outputs.key }}
-          fail-on-cache-miss: true
-      - name: Build LLVM and the matching static compiler, with both profiles where there are
-        if: steps.toolchain.outputs.cache-hit != 'true'
-        env:
-          RR_PGO: ${{ matrix.pgo && 'use' || '' }}
-        run: RR_PGO_DIR="$RR_TEMP/rr-pgo" scripts/build-toolchain.sh "$RR_TEMP/rust" "$RR_TEMP/rr-scratch" "$RR_TEMP/rr-toolchain"
-      - name: Keep the compiler
-        if: steps.toolchain.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ env.RR_TEMP }}/rr-toolchain
-          key: ${{ steps.key.outputs.key }}
-
   build:
-    needs: [hosts, toolchain]
-    if: ${{ !cancelled() && needs.toolchain.result == 'success' }}
+    needs: hosts
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.hosts.outputs.matrix) }}
+    name: build (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
-    container: ${{ matrix.build_container || matrix.container }}
-    timeout-minutes: 360
+    container: ${{ matrix.container }}
+    timeout-minutes: 120
     defaults:
       run:
         shell: bash
@@ -208,61 +67,22 @@ jobs:
       - name: Git, in the Linux container
         if: matrix.container
         run: apt-get update -q && DEBIAN_FRONTEND=noninteractive apt-get install -qy git ca-certificates
-      - name: Swap for BOLT
-        if: matrix.build_container
-        run: |
-          df -h /mnt
-          fallocate -l 24G /mnt/rr-bolt.swap
-          chmod 600 /mnt/rr-bolt.swap
-          mkswap /mnt/rr-bolt.swap
-          swapon /mnt/rr-bolt.swap
-          free -g
       - name: Checkout rr
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: The compiler's cache key
-        id: key
-        uses: ./.github/actions/rr-key
-        with:
-          name: ${{ matrix.name }}
-      - name: Build tools and the compiler's source
+      - name: Build tools
         uses: ./.github/actions/rr-setup
         with:
           name: ${{ matrix.name }}
-      - name: The release compiler
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ env.RR_TEMP }}/rr-toolchain
-          key: ${{ steps.key.outputs.key }}
-          fail-on-cache-miss: true
-      - name: LLVM's source, for libFuzzer
-        # A clone this large is sometimes cut off midway; it is tried again.
-        run: |
-          for attempt in 1 2 3; do
-            git -C "$RR_TEMP/rust" submodule update --init --depth 1 src/llvm-project && exit 0
-            sleep 30
-          done
-          exit 1
-      - name: The compiler on the environment, for rr's checks
-        run: |
-          {
-            echo "RR_TOOLCHAIN=$RR_TEMP/rr-toolchain"
-            echo "RUSTC=$RR_TEMP/rr-toolchain/bin/rustc"
-            echo "RUSTDOC=$RR_TEMP/rr-toolchain/bin/rustdoc"
-            echo "SYSROOT=$RR_TEMP/rr-toolchain"
-          } >> "$GITHUB_ENV"
       - name: rr's own checks
         if: runner.os != 'Windows'
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/rr-check
-          # LLVM's ThinLTO objects are bitcode: lld reads them, GNU ld does not.
-          RUSTFLAGS: ${{ matrix.container && '-Clink-arg=-fuse-ld=lld' || '' }}
-        run: |
-          cargo fmt --all --check
-          cargo test --locked --no-fail-fast -- --skip 5041_allow_dev_build
-      - name: Build, package and verify the distribution
-        run: scripts/release.sh "$RR_TEMP/rust" "$RR_TEMP/rr-toolchain" "$RR_TEMP/rr-release" "${{ matrix.name }}"
+          RUSTC_BOOTSTRAP: '1'
+        run: cargo test --locked --no-fail-fast -- --skip 5041_allow_dev_build
+      - name: Build, package, install and check rr
+        run: scripts/release.sh "$RUNNER_TEMP/rr-release" "${{ matrix.name }}"
       - name: Upload the distribution
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -295,7 +115,7 @@ jobs:
           cd dist
           sha256sum rr-*.tar.gz rr-*.zip > SHA256SUMS
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "rr $TAG" \
-            --notes "rr, Restricted Rust: the compiler and linter for macOS arm64, Linux x86_64 and aarch64, Windows x86_64 and aarch64. Each archive holds rr, its sysroots for the host and for the host's rr target where there is one, rust-lld and libFuzzer; see README.md inside." \
+            --notes "rr, Restricted Rust: the checker for macOS arm64, Linux x86_64 and aarch64, Windows x86_64 and aarch64. Each archive holds rr and libFuzzer for the official Rust release it is built on; install.sh and install.ps1 install that release with rustup and put rr into it. See README.md inside." \
             rr-*.tar.gz rr-*.zip SHA256SUMS ./*-verification.txt
 
   installers:

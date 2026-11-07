@@ -1,12 +1,20 @@
-//! Files on Linux by the kernel's own calls, for the components that
-//! read the system's configuration there (resolve, trust): open a path,
-//! read a file whole up to a limit, and a descriptor closed on drop.
-//! macOS and Windows read their configuration through the system's own
+//! Files on Linux, for the components that read the system's
+//! configuration there (resolve, trust): open a path, read a file whole up
+//! to a limit, and a descriptor closed on drop; and the kernel's calls by
+//! number, through the C library's syscall, for them and for this. macOS
+//! and Windows read their configuration through the system's own
 //! libraries, and have nothing here.
 #![cfg(target_os = "linux")]
 
-use super::syscall;
 use alloc::vec::Vec;
+use core::ffi::c_long;
+
+#[link(name = "c")]
+// rr: escape(unsafe): each signature is the C library's, from its headers.
+unsafe extern "C" {
+    fn syscall(number: c_long, ...) -> c_long;
+    fn __errno_location() -> *mut i32;
+}
 
 #[cfg(target_arch = "x86_64")]
 mod nr {
@@ -34,13 +42,22 @@ const CHUNK_BYTES: usize = 64 << 10;
 /// System call n on plain numbers and memory the caller vouches for;
 /// its result, or the error number.
 pub fn call(n: usize, args: [usize; 6]) -> Result<usize, i32> {
+    // The calls' numbers are small; a larger one is no call.
+    let Ok(n) = c_long::try_from(n) else {
+        return Err(EINVAL);
+    };
+    let [a, b, c, d, e, f] = args;
     // rr: escape(unsafe): each caller passes the call's own arguments,
     // pointers to memory it holds for the call's length.
-    let r = unsafe { syscall(n, args) };
-    match usize::try_from(r) {
-        Ok(r) => Ok(r),
-        Err(_) => Err(i32::try_from(r.saturating_neg()).unwrap_or(i32::MAX)),
+    let r = unsafe { syscall(n, a, b, c, d, e, f) };
+    if let Ok(r) = usize::try_from(r) {
+        return Ok(r);
     }
+    // rr: escape(unsafe): the C library gives each thread its errno.
+    let errno = unsafe { __errno_location() };
+    // rr: escape(unsafe): errno is the calling thread's, set by the call
+    // that failed.
+    Err(unsafe { *errno })
 }
 
 /// A descriptor, closed on drop.

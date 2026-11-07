@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Exercise a relocated bundle without Rust/Cargo tools or loader overrides."""
+"""Exercise rr as installed in a toolchain, with that toolchain's rustc
+and nothing else of Rust's on PATH: a project as rr init lays it out, the
+corpus programs and every registry component, through their Makefiles."""
 import os
 from pathlib import Path
 import platform
@@ -9,28 +11,29 @@ import sys
 import tempfile
 
 if len(sys.argv) != 2:
-    raise SystemExit("Usage: scripts/smoke-distribution.py DISTRIBUTION")
-source = Path(sys.argv[1]).resolve()
+    raise SystemExit("Usage: scripts/smoke-distribution.py RR")
+rr = Path(sys.argv[1]).resolve()
+toolchain = rr.parent.parent
 # An explicitly selected build volume must fail if unavailable, rather than
 # falling back to the system disk through tempfile's default directory search.
-with tempfile.TemporaryDirectory(prefix="rr-relocated-", dir=os.environ.get("TMPDIR")) as scratch:
+with tempfile.TemporaryDirectory(prefix="rr-smoke-", dir=os.environ.get("TMPDIR")) as scratch:
     root = Path(scratch)
-    bundle = root / "tool with spaces"
-    shutil.copytree(source, bundle)
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(("DYLD_", "RUST", "CARGO", "CLIPPY")) and key != "SYSROOT"}
     windows = platform.system() == "Windows"
+    # The toolchain's own tools (rustc for make's build), the system's, and
+    # on Windows make's: nothing else of Rust's.
     if windows:
-        # The system's own directories, and make's: nothing of Rust's.
-        env["PATH"] = os.pathsep.join(d for d in os.environ["PATH"].split(os.pathsep)
-                                      if not any(shutil.which(t, path=d) for t in ("rustc", "cargo")))
+        system = [d for d in os.environ["PATH"].split(os.pathsep)
+                  if not any(shutil.which(t, path=d) for t in ("rustc", "cargo"))]
     else:
-        env["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
-    for tool in ("rustc", "rustup", "cargo"):
-        if shutil.which(tool, path=env["PATH"]):
-            raise SystemExit(f"Smoke test PATH unexpectedly contains {tool}")
+        system = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+    env["PATH"] = os.pathsep.join([str(rr.parent), *system])
+    # The toolchain has cargo beside rustc; nothing here runs it, which the
+    # check below for its files confirms.
+    if shutil.which("rustup", path=env["PATH"]):
+        raise SystemExit("Smoke test PATH unexpectedly contains rustup")
     exe = ".exe" if windows else ""
-    rr = bundle / f"rr{exe}"
 
     def run(*args, good=True):
         result = subprocess.run([str(rr), *args], cwd=root, env=env,
@@ -41,24 +44,17 @@ with tempfile.TemporaryDirectory(prefix="rr-relocated-", dir=os.environ.get("TMP
 
     run("--version")
     sysroot = run("--print", "sysroot").stdout.strip()
-    assert Path(sysroot).resolve() == bundle.resolve(), sysroot
-    run("init", "native")
-    run("native/src/main.rs", "--crate-name", "native", "-O", "-o", f"native/app{exe}")
-    run("lint", "native/src/main.rs", "--crate-name", "native", "-Dwarnings")
-    subprocess.run([str(root / f"native/app{exe}")], env=env, check=True)
-    # A project as rr init lays it out: every check its Makefile offers.
+    assert Path(sysroot).resolve() == toolchain.resolve(), sysroot
     run("init", "project")
-    # make splits a variable at spaces: reach the bundle through a link,
-    # or on Windows, where a link takes privileges, a copy.
+    # make splits a variable at spaces: reach rr through a link, as
+    # install.sh does, or on Windows, where a link takes privileges, by its
+    # path, with forward slashes, which a recipe run through sh keeps.
     if windows:
-        shutil.copytree(bundle, root / "rr-copy")
-        # Forward slashes: a recipe that make runs through sh would take
-        # backslashes for escapes.
-        link = (root / "rr-copy" / f"rr{exe}").as_posix()
+        link = rr.as_posix()
     else:
         (root / "rr-link").symlink_to(rr)
         link = root / "rr-link"
-    fuzzing = (bundle / "fuzz/fuzz.flags").is_file()
+    fuzzing = (toolchain / "lib/rustlib/rr/fuzz.flags").is_file()
     def make(*targets):
         done = subprocess.run(["make", f"RR={link}", *targets], cwd=root / "project",
                               env=env, text=True, encoding="utf-8", errors="replace", capture_output=True)
@@ -96,7 +92,7 @@ with tempfile.TemporaryDirectory(prefix="rr-relocated-", dir=os.environ.get("TMP
                           text=True, encoding="utf-8", errors="replace", capture_output=True)
     assert over.returncode != 0 and "above the budget of 0 ms" in over.stdout, over.stdout
     # The programs in examples/corpus: every check their Makefiles offer,
-    # and a short run of each fuzz target, on this bundle.
+    # and a short run of each fuzz target.
     corpus = Path(__file__).resolve().parent.parent / "examples" / "corpus"
     for program in sorted(p for p in corpus.iterdir() if (p / "Makefile").is_file()):
         copy = root / f"corpus-{program.name}"
@@ -131,10 +127,10 @@ with tempfile.TemporaryDirectory(prefix="rr-relocated-", dir=os.environ.get("TMP
                     if p.parts[0] not in ("main.rs", "greet.rs", "sys")})
     text = main.read_text()
     main.write_text(text.replace("mod greet;\n", "mod greet;\n" + "".join(f"mod {m};\n" for m in roots), 1))
-    for system in ("macos", "linux", "windows"):
+    for system in ("unix", "windows"):
         own = components / "src" / "sys" / f"{system}.rs"
         added = sorted(p.stem for p in (components / "src" / "sys").glob("*.rs")
-                       if p.stem not in ("macos", "linux", "windows"))
+                       if p.stem not in ("unix", "windows"))
         own.write_text(own.read_text() + "".join(f"\npub mod {m};\n" for m in added))
     run("fmt", "components/src/main.rs")
     for f in (components / "src").rglob("*.rs"):
@@ -149,13 +145,14 @@ with tempfile.TemporaryDirectory(prefix="rr-relocated-", dir=os.environ.get("TMP
         if targets == ("bench",):
             # The numbers of this CPU, for the log.
             print("\n".join(l for l in done.stdout.splitlines() if l.startswith("bench ")))
+    # rustc builds a library, rr checks a crate against it, and builds none.
     run("init", "library", "--lib")
-    run("build", "library/src/lib.rs", "--crate-name", "dep", "-o", "libdep.rlib")
+    subprocess.run([str(rr.parent / f"rustc{exe}"), "--edition=2024", "library/src/lib.rs", "--crate-name", "dep",
+                    "--crate-type=rlib", "-Cpanic=abort", "-o", "libdep.rlib"], cwd=root, env=env, check=True)
     (root / "local.rs").write_text("pub fn offset() -> u32 { 1 }\n")
     (root / "lib.rs").write_text("#![no_std]\nmod local;\npub fn value() -> u32 { dep::answer() + local::offset() }\n")
-    run("lib.rs", "--extern", "dep=libdep.rlib", "-o", "libapp.rlib")
-    (root / "alloc.rs").write_text("#![no_std]\nextern crate alloc;\npub fn bytes() -> alloc::vec::Vec<u8> { alloc::vec::Vec::new() }\n")
-    run("alloc.rs", "--crate-type=rlib", "--crate-name", "alloc_fixture", "-o", "liballoc_fixture.rlib")
+    run("check", "lib.rs", "--extern", "dep=libdep.rlib")
+    assert "build it with rustc" in run("lib.rs", "--extern", "dep=libdep.rlib", "-o", "libapp.rlib", good=False).stderr
     (root / "lib.rs").write_text("#![no_std]\npub fn copy(v: u8) -> u8 { v.clone() }\n")
     assert "rr-unexplained-escape" in run("check", "lib.rs", good=False).stderr
     (root / "lib.rs").write_text("#![no_std]\npub fn copy(v: u8) -> u8 {\n// rr: escape(copy): this API deliberately exercises Clone on a scalar.\nv.clone()\n}\n")
@@ -164,5 +161,4 @@ with tempfile.TemporaryDirectory(prefix="rr-relocated-", dir=os.environ.get("TMP
     assert "rr-no-std" in run("check", "lib.rs", "--cap-lints=allow", "--force-warn=rr", good=False).stderr
     assert not list(root.rglob("Cargo.toml"))
     assert not list(root.rglob("Cargo.lock"))
-    assert not list((root / "native").glob("*.rmeta"))
-    print("PASS: relocated bundle; no Rust/Cargo PATH or DYLD/SYSROOT overrides; init project make/test/bench/format/check/lint/fuzz/prof, corpus programs make/test/bench/format/check/lint/fuzz, check/lint/build/native execution/extern/local modules/alloc/restrictions")
+    print("PASS: rr in its toolchain; only that toolchain on PATH, no DYLD/SYSROOT overrides; init project make/test/bench/format/check/lint/fuzz/prof/time, corpus programs make/test/bench/format/check/lint/fuzz/prof/time, registry components, check against a rustc-built dependency, restrictions")

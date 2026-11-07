@@ -50,9 +50,9 @@ fn init_lays_out_a_project_that_passes_lint() {
         "AGENTS.md",
         "Makefile",
         ".gitignore",
+        "rust-toolchain.toml",
         "src/main.rs",
-        "src/sys/macos.rs",
-        "src/sys/linux.rs",
+        "src/sys/unix.rs",
         "src/sys/windows.rs",
         "src/greet.rs",
     ] {
@@ -62,9 +62,8 @@ fn init_lays_out_a_project_that_passes_lint() {
     assert!(!root.join("src/lib.rs").exists());
     let main = fs::read_to_string(root.join("src/main.rs")).unwrap();
     assert!(main.contains("//! demo_app:"), "{main}");
-    // Building links alloc, which needs the bundle's panic=abort sysroot:
-    // scripts/smoke-distribution.py builds, tests and profiles it there.
-    // The entry rr fuz adds for several targets keeps rr's rules.
+    // scripts/smoke-distribution.py builds, tests and profiles it with the
+    // toolchain. The entry rr fuz adds for several targets keeps rr's rules.
     let greet = root.join("src/greet.rs");
     let mut source = fs::read_to_string(&greet).unwrap();
     source.push_str(
@@ -151,18 +150,36 @@ fn time_reports_the_fastest_run_and_fails_above_a_budget() {
 }
 
 #[test]
-fn explicit_prebuilt_dependencies_and_local_modules_work() {
+fn rustc_builds_and_rr_checks_against_a_prebuilt_dependency() {
     let project = Project::new();
     success(&project.rr(&["init", "dep", "--lib"]));
-    success(&project.rr(&["build", "dep/src/lib.rs", "--crate-name", "dep", "-o", "libdep.rlib"]));
+    // rustc of the same toolchain, which rustup picks for the test as it
+    // picked it for cargo.
+    let rustc = Command::new("rustc")
+        .current_dir(&project.0)
+        .args([
+            "--edition=2024",
+            "dep/src/lib.rs",
+            "--crate-name",
+            "dep",
+            "--crate-type=rlib",
+        ])
+        .args(["-Cpanic=abort", "-o", "libdep.rlib"])
+        .output()
+        .unwrap();
+    success(&rustc);
     fs::write(project.0.join("local.rs"), "pub fn local() -> u32 { 1 }").unwrap();
     fs::write(
         project.0.join("lib.rs"),
         "#![no_std]\nmod local;\npub fn value() -> u32 { dep::answer() + local::local() }",
     )
     .unwrap();
-    success(&project.rr(&["build", "lib.rs", "--extern", "dep=libdep.rlib", "-o", "libapp.rlib"]));
-    assert!(project.0.join("libapp.rlib").is_file());
+    success(&project.rr(&["check", "lib.rs", "--extern", "dep=libdep.rlib"]));
+    // rr checks; it builds no program.
+    let build = project.rr(&["build", "lib.rs", "--extern", "dep=libdep.rlib", "-o", "libapp.rlib"]);
+    assert!(!build.status.success());
+    assert!(String::from_utf8_lossy(&build.stderr).contains("build it with rustc"));
+    assert!(!project.0.join("libapp.rlib").exists());
 }
 
 #[test]
@@ -197,27 +214,31 @@ fn cargo_environment_cannot_disable_rr() {
 }
 
 #[test]
-fn fuz_initialization_preserves_the_harness_and_creates_no_manifest() {
-    let project = Project::new();
-    success(&project.rr(&["fuz", "init"]));
-    assert_eq!(project.files(), ["artifacts", "corpus", "fuz.rs"]);
-    let original = fs::read(project.0.join("fuz.rs")).unwrap();
-    success(&project.rr(&["check", "fuz.rs"]));
-    success(&project.rr(&["lint", "fuz.rs", "-Dwarnings"]));
-    assert!(!project.rr(&["fuz", "init"]).status.success());
-    assert_eq!(fs::read(project.0.join("fuz.rs")).unwrap(), original);
-    assert_eq!(project.files(), ["artifacts", "corpus", "fuz.rs"]);
-}
-
-#[test]
 fn fuz_cannot_override_native_output_through_an_argument_file() {
     let project = Project::new();
-    success(&project.rr(&["fuz", "init"]));
-    fs::write(project.0.join("flags"), "-o\nkeep-me\n").unwrap();
-    let output = project.rr(&["fuz", "fuz.rs", "@flags", "--", "-runs=1"]);
+    success(&project.rr(&["init", "demo"]));
+    let root = project.0.join("demo");
+    fs::write(root.join("flags"), "-o\nkeep-me\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rr"))
+        .current_dir(&root)
+        .args([
+            "fuz",
+            "src/main.rs",
+            "--target",
+            "greet::fuzz_greet",
+            "@flags",
+            "--",
+            "-runs=1",
+        ])
+        .output()
+        .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported flag: -o"));
-    assert!(!project.0.join("keep-me").exists());
+    assert!(!root.join("keep-me").exists());
+    // A file of its own is no fuzz target: rr fuzzes a crate's functions.
+    let file = project.rr(&["fuz", "fuz.rs", "--", "-runs=1"]);
+    assert!(!file.status.success());
+    assert!(String::from_utf8_lossy(&file.stderr).contains("--target PATH"));
 }
 
 #[test]

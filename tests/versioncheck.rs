@@ -99,6 +99,8 @@ fn check_host_compiler() {
         return;
     }
 
+    // rr is built on a Rust release, as its users' programs are, with the
+    // compiler's private crates through RUSTC_BOOTSTRAP.
     let version = rustc_tools_util::get_version_info!();
-    assert_eq!(version.host_compiler, Some("nightly".to_string()));
+    assert_eq!(version.host_compiler, Some("stable".to_string()));
 }

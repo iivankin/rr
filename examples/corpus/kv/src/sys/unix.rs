@@ -1,5 +1,5 @@
-//! What the program needs of macOS: the heap, files, output, arguments
-//! and an end on a bug, through the C library, as Apple requires. The
+//! What the program needs of macOS and Linux: the heap, files, output, arguments
+//! and an end on a bug, through the C library, which starts the program in main. The
 //! rest of the crate calls only this; unsafe stays here.
 
 use alloc::vec::Vec;
@@ -152,13 +152,26 @@ impl From<core::num::TryFromIntError> for Error {
     }
 }
 
-const O_RDWR: c_int = 0x0002;
+// The flags of open, which differ between the systems.
+const O_RDWR: c_int = 2;
+#[cfg(target_os = "macos")]
 const O_CREAT: c_int = 0x0200;
+#[cfg(target_os = "macos")]
 const O_TRUNC: c_int = 0x0400;
+#[cfg(target_os = "macos")]
 const O_CLOEXEC: c_int = 0x0100_0000;
+#[cfg(target_os = "linux")]
+const O_CREAT: c_int = 0o100;
+#[cfg(target_os = "linux")]
+const O_TRUNC: c_int = 0o1000;
+#[cfg(target_os = "linux")]
+const O_CLOEXEC: c_int = 0o2_000_000;
 const SEEK_END: c_int = 2;
 /// The longest path the program names.
+#[cfg(target_os = "macos")]
 pub const PATH_MAX: usize = 1024;
+#[cfg(target_os = "linux")]
+pub const PATH_MAX: usize = 4096;
 
 /// path with a NUL after it, on the stack; Error when it is too long or
 /// holds a NUL.

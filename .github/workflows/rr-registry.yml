@@ -53,9 +53,8 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $env:RR_INSTALL = "$env:RUNNER_TEMP\rr"
           ./install.ps1
-          Add-Content -Path $env:GITHUB_PATH -Value $env:RR_INSTALL
+          Add-Content -Path $env:GITHUB_PATH -Value (Split-Path (Get-Command rr).Source)
       - name: Every component, together
         shell: bash
         run: |

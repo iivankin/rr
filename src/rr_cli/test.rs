@@ -84,7 +84,7 @@ pub fn run(args: &[String], bench: bool) -> io::Result<ExitCode> {
         return Err(io::Error::other("rr test and rr bench own the executable; drop -o"));
     }
     let rr = executable()?;
-    let target = super::target::chosen(&flags);
+    let target = super::target::named(&flags);
     let sysroot = super::target::sysroot(&flags);
     let scratch = workspace::Scratch::new()?;
     let status = Command::new(&rr)
@@ -117,7 +117,7 @@ pub fn run(args: &[String], bench: bool) -> io::Result<ExitCode> {
     }
     compiler.args(&flags);
     if mode == "build" {
-        compiler.arg("-o").arg(&binary);
+        compiler.arg("--rr-run").arg("-o").arg(&binary);
     }
     if !compiler.status()?.success() {
         return Ok(ExitCode::FAILURE);

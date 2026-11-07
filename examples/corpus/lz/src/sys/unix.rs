@@ -1,6 +1,6 @@
-//! What the program needs of macOS: the heap, output, arguments and an
-//! end on a bug, through the C library, as Apple requires. The rest of
-//! the crate calls only this; unsafe stays here.
+//! What the program needs of macOS and Linux: the heap, input, output, arguments
+//! and an end on a bug, through the C library, which starts the program in main. The
+//! rest of the crate calls only this; unsafe stays here.
 
 use alloc::vec::Vec;
 use core::alloc::{GlobalAlloc, Layout};
@@ -16,6 +16,7 @@ unsafe extern "C" {
     fn free(p: *mut c_void);
     fn posix_memalign(p: *mut *mut c_void, align: usize, size: usize) -> c_int;
     fn write(fd: c_int, p: *const c_void, n: usize) -> isize;
+    fn read(fd: c_int, p: *mut c_void, n: usize) -> isize;
     fn strlen(s: *const c_char) -> usize;
     fn abort() -> !;
 }
@@ -96,6 +97,30 @@ fn write_all(fd: c_int, mut p: &[u8]) {
         // More than was asked: the system broke its contract; give up.
         let Some(rest) = p.get(n..) else { return };
         p = rest;
+    }
+}
+
+/// Standard input, all of it up to max bytes, onto out; false when it
+/// holds more or cannot be read.
+pub fn stdin(out: &mut Vec<u8>, max: usize) -> bool {
+    let mut buf = [0u8; 16384];
+    loop {
+        // rr: escape(unsafe): buf is writable memory of its length.
+        let n = unsafe { read(0, buf.as_mut_ptr().cast(), buf.len()) };
+        let Ok(n) = usize::try_from(n) else {
+            return false;
+        };
+        if n == 0 {
+            return true;
+        }
+        if out.len() + n > max {
+            return false;
+        }
+        // More than was asked: the system broke its contract.
+        let Some(read) = buf.get(..n) else {
+            return false;
+        };
+        out.extend_from_slice(read);
     }
 }
 
