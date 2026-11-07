@@ -499,9 +499,22 @@ mod os {
             (AF_INET6, _, Some(v6), Some(scope)) => {
                 // sin6_scope_id is in the host's order, little on every Mac.
                 let scope = u32::from_le_bytes(<[u8; 4]>::try_from(scope).ok()?);
+                let octets = <[u8; 16]>::try_from(v6).ok()?;
+                // Only an address of the link takes the interface it came
+                // on: a global one has no zone, and two answers of it from
+                // two interfaces are one address.
+                let linked = match octets {
+                    [0xfe, second, ..] => second & 0xc0 == 0x80,
+                    [0xff, second, ..] => second & 0x0f == 0x02,
+                    _ => false,
+                };
                 Some(Address {
-                    ip: IpAddr::from(<[u8; 16]>::try_from(v6).ok()?),
-                    scope: if scope == 0 { interface } else { scope },
+                    ip: IpAddr::from(octets),
+                    scope: if scope == 0 && linked {
+                        interface
+                    } else {
+                        scope
+                    },
                 })
             }
             _ => None,
@@ -699,9 +712,18 @@ mod os {
                 // rr: escape(unsafe): service is live and has a reply to read.
                 let code = unsafe { DNSServiceProcessResult(self.service) };
                 if code != NO_ERROR {
+                    // The connection to mDNSResponder failed: no reply comes
+                    // after, whatever the last one said was on its way.
                     // rr: escape(unsafe): answers is live while the lookup runs.
-                    unsafe { &mut *self.answers }.error = Some(error(code));
+                    let answers = unsafe { &mut *self.answers };
+                    answers.error = Some(error(code));
+                    answers.more = false;
                 }
+            }
+            // The last turn's reply may have ended it.
+            // rr: escape(unsafe): answers is live while the lookup runs.
+            if unsafe { &*self.answers }.over() {
+                self.over();
             }
         }
 
@@ -1189,9 +1211,15 @@ mod tests {
     /// lookup dropped while it runs is let go.
     #[test]
     fn bad_names_and_cancel() {
+        // Without a network, a resolver may say it could not ask (as glibc
+        // does with only a nameserver in resolv.conf), not that the name
+        // does not exist.
         for bad in [&b"a\0b"[..], b"bad..name", b"-x.invalid"] {
             assert!(
-                matches!(resolve(bad), Err(Error::NotFound | Error::Failed)),
+                matches!(
+                    resolve(bad),
+                    Err(Error::NotFound | Error::Failed | Error::Temporary | Error::Timeout)
+                ),
                 "{bad:?}"
             );
         }

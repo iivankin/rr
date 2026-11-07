@@ -606,9 +606,10 @@ impl<'a> Client<'a> {
     }
 
     /// Whether the handshake waits for verified: Verify::Caller, and the
-    /// server's Certificate is in.
+    /// server's Certificate is in. Not once the connection failed, as
+    /// verified(false) fails it: input then says why.
     pub fn awaiting(&self) -> bool {
-        matches!(self.state, State::Awaiting)
+        matches!(self.state, State::Awaiting) && self.failed.is_none()
     }
 
     /// The server's certificates, leaf first, into out while the client
@@ -743,6 +744,11 @@ impl<'a> Client<'a> {
         let tag = tag.first_chunk::<TAG>().ok_or(Error::Forged)?;
         let nonce = keys.nonce()?;
         keys.aead.open(&nonce, header, data, tag)?;
+        // TLSInnerPlaintext, padding and all, is 2^14 + 1 bytes at most
+        // (RFC 8446 5.4).
+        if data.len() > RECORD_MAX + 1 {
+            return Err(Error::Overflow);
+        }
         // The content type is the last byte that is not padding.
         let end = data
             .iter()
@@ -927,9 +933,13 @@ impl<'a> Client<'a> {
             }
             data.end()?;
         }
-        // A server below TLS 1.3 sends neither, nor a known version.
-        if version != 0x0303 || selected != Some(TLS13) {
-            return Err(Error::Version);
+        // A server below TLS 1.3 sends neither (protocol_version); one
+        // that selects a version the client did not offer is wrong
+        // (illegal_parameter, RFC 8446 4.2.1).
+        match (version, selected) {
+            (0x0303, Some(TLS13)) => {}
+            (0x0303, Some(_)) => return Err(Error::Parameter),
+            _ => return Err(Error::Version),
         }
         if stray {
             return Err(Error::Extension);
@@ -1013,8 +1023,13 @@ impl<'a> Client<'a> {
                 SERVER_NAME if self.literal => return Err(Error::Extension),
                 SERVER_NAME if !data.is_empty() => return Err(Error::Decode),
                 ALPN => self.choose(data)?,
-                SIGNATURE_ALGORITHMS | PRE_SHARED_KEY | EARLY_DATA | SUPPORTED_VERSIONS
-                | COOKIE | PSK_MODES | KEY_SHARE => return Err(Error::Extension),
+                // Offered in the ClientHello, but not for this message:
+                // illegal_parameter (RFC 8446 4.3.1); never offered:
+                // unsupported_extension (4.2).
+                SIGNATURE_ALGORITHMS | SUPPORTED_VERSIONS | COOKIE | KEY_SHARE => {
+                    return Err(Error::Parameter);
+                }
+                PRE_SHARED_KEY | EARLY_DATA | PSK_MODES => return Err(Error::Extension),
                 // Others, such as supported_groups, are information, as Go
                 // and OpenSSL take them.
                 _ => {}
@@ -1240,8 +1255,13 @@ impl<'a> Client<'a> {
     }
 
     /// A handshake message into the transcript and out in records.
+    /// A handshake message of the client's: in the transcript, and sent
+    /// unless close_notify went, after which nothing is.
     fn handshake_message(&mut self, message: &[u8], minor: u8) -> Result<(), Error> {
         self.transcript.update(message);
+        if self.close_sent {
+            return Ok(());
+        }
         self.records(HANDSHAKE, message, minor)
     }
 

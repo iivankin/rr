@@ -140,7 +140,8 @@ impl Signal {
 
     /// Says the work is done.
     pub fn set(&self) {
-        self.os.set();
+        // A pipe or pair whose buffer is full is readable already.
+        let _sent: bool = self.os.set();
     }
 
     /// What waits until set.
@@ -487,10 +488,11 @@ mod os {
             Some(signal)
         }
 
-        /// Says the work is done; the pipe is then readable.
-        pub fn set(&self) {
+        /// Says the work is done; the pipe is then readable. Whether the
+        /// byte went.
+        pub fn set(&self) -> bool {
             // rr: escape(unsafe): the pipe is open while self lives.
-            unsafe { write(self.pipe[1], b"!".as_ptr().cast(), 1) };
+            unsafe { write(self.pipe[1], b"!".as_ptr().cast(), 1) == 1 }
         }
 
         pub fn read_end(&self) -> c_int {
@@ -809,10 +811,10 @@ mod os {
             Some(Signal { reader, writer })
         }
 
-        /// Says the work is done.
-        pub fn set(&self) {
+        /// Says the work is done; whether the byte went.
+        pub fn set(&self) -> bool {
             // rr: escape(unsafe): the socket is open while self lives.
-            unsafe { send(self.writer.0, b"!".as_ptr(), 1, 0) };
+            unsafe { send(self.writer.0, b"!".as_ptr(), 1, 0) == 1 }
         }
 
         pub fn read_end(&self) -> usize {
@@ -1210,23 +1212,34 @@ mod poller {
         }
 
         /// Adds the filters the interest gained, deletes those it lost.
+        /// Adds the filters the interest gained, then deletes those it
+        /// lost, one change to a call: kevent stops at the first that
+        /// fails and keeps those before it. An addition refused undoes
+        /// those made, so that the kqueue holds the old interest, as the
+        /// Set does; a deletion refused finds its filter gone already.
         pub fn modify(&self, fd: c_int, key: u64, old: u8, interest: u8) -> bool {
             let ident = usize::try_from(fd).unwrap_or(usize::MAX);
-            let mut changes = [change(ident, 0, 0, key), change(ident, 0, 0, key)];
-            let mut count = 0;
-            for (bit, filter) in [(READ, EVFILT_READ), (WRITE, EVFILT_WRITE)] {
-                let flags = match (old & bit != 0, interest & bit != 0) {
-                    (false, true) => EV_ADD,
-                    (true, false) => EV_DELETE,
-                    (true, true) | (false, false) => continue,
-                };
-                if let Some(slot) = changes.get_mut(count) {
-                    slot.filter = filter;
-                    slot.flags = flags;
-                    count += 1;
+            let filters = [(READ, EVFILT_READ), (WRITE, EVFILT_WRITE)];
+            let mut added = 0;
+            for (bit, filter) in filters {
+                if old & bit == 0 && interest & bit != 0 {
+                    if !self.queue.apply(&[change(ident, filter, EV_ADD, key)]) {
+                        for (undo_bit, undo) in filters {
+                            if added & undo_bit != 0 {
+                                self.queue.apply(&[change(ident, undo, EV_DELETE, key)]);
+                            }
+                        }
+                        return false;
+                    }
+                    added |= bit;
                 }
             }
-            self.queue.apply(changes.get(..count).unwrap_or_default())
+            for (bit, filter) in filters {
+                if old & bit != 0 && interest & bit == 0 {
+                    self.queue.apply(&[change(ident, filter, EV_DELETE, key)]);
+                }
+            }
+            true
         }
 
         pub fn remove(&self, fd: c_int, key: u64, interest: u8) {
@@ -1428,16 +1441,22 @@ mod poller {
     impl Wake {
         pub fn wake(&self) {
             match self {
+                // A wake that could not be sent is not pending: the next
+                // one tries again.
                 Wake::Port(port) => {
                     if !port.pending.swap(true, Ordering::AcqRel) {
                         // rr: escape(unsafe): the port lives as long as
                         // self; key 0 names the waker.
-                        unsafe { PostQueuedCompletionStatus(port.handle, 0, 0, null_mut()) };
+                        let posted =
+                            unsafe { PostQueuedCompletionStatus(port.handle, 0, 0, null_mut()) };
+                        if posted == 0 {
+                            port.pending.store(false, Ordering::Release);
+                        }
                     }
                 }
                 Wake::Signal(signal, pending) => {
-                    if !pending.swap(true, Ordering::AcqRel) {
-                        signal.set();
+                    if !pending.swap(true, Ordering::AcqRel) && !signal.set() {
+                        pending.store(false, Ordering::Release);
                     }
                 }
             }
@@ -1820,11 +1839,14 @@ mod poller {
                 fd.revents = 0;
                 match (revents, key) {
                     (0, _) => {}
+                    // Drained first: a wake after the drain finds pending
+                    // cleared and sends its byte; one before it is this
+                    // wake.
                     (_, 0) => {
+                        os::drain(self.reader);
                         if let Wake::Signal(_, pending) = &*self.wake {
                             pending.store(false, Ordering::Release);
                         }
-                        os::drain(self.reader);
                         found.push((0, 0));
                     }
                     // Closed here before it was removed (WSAPoll's remarks):

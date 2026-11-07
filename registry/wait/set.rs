@@ -349,9 +349,36 @@ impl Set {
         {
             wanted = [Some((first, one | other)), None];
         }
+        // Entries go with their descriptor, wherever the Wait now names
+        // it; the ones it no longer names are removed before any is
+        // added, so that a descriptor never stands in the Set twice.
+        let mut kept: [Option<Token>; 2] = [None; 2];
+        for held in &mut watch.fds {
+            if let Some(token) = held.take() {
+                let fd = self.slot_mut(token).and_then(|slot| slot.fd);
+                let at = wanted
+                    .iter()
+                    .position(|want| want.is_some_and(|(named, _)| Some(named) == fd));
+                match at.and_then(|at| kept.get_mut(at)) {
+                    Some(place) => *place = Some(token),
+                    None => self.remove(token),
+                }
+            }
+        }
         let mut added = true;
-        for (place, want) in watch.fds.iter_mut().zip(wanted) {
-            added &= self.keep(place, want, key);
+        for ((place, want), held) in watch.fds.iter_mut().zip(wanted).zip(kept) {
+            *place = match (want, held) {
+                (Some((_, interest)), Some(token)) => {
+                    added &= self.modify(token, interest);
+                    Some(token)
+                }
+                (Some((fd, interest)), None) => {
+                    let token = self.add(fd, interest, key);
+                    added &= token.is_some();
+                    token
+                }
+                (None, _) => None,
+            };
         }
         if watch.timer.is_none() {
             watch.timer = self.timer(key);
@@ -372,28 +399,6 @@ impl Set {
         }
         if let Some(timer) = watch.timer.take() {
             self.remove(timer);
-        }
-    }
-
-    /// One of a watch's descriptors as wanted: added, changed, moved to
-    /// another descriptor or removed.
-    fn keep(&mut self, place: &mut Option<Token>, wanted: Option<(Raw, u8)>, key: u64) -> bool {
-        let current = place.and_then(|token| Some((token, self.slot_mut(token)?.fd?)));
-        match (current, wanted) {
-            (Some((token, fd)), Some((want, interest))) if fd == want => {
-                self.modify(token, interest)
-            }
-            (current, wanted) => {
-                if let Some((token, _)) = current {
-                    self.remove(token);
-                }
-                *place = None;
-                let Some((fd, interest)) = wanted else {
-                    return true;
-                };
-                *place = self.add(fd, interest, key);
-                place.is_some()
-            }
         }
     }
 
@@ -580,7 +585,7 @@ fn interest(fd: &Fd) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Signal, Wait};
+    use super::super::{Fd, Signal, Wait};
     use super::{EXPIRED, Instant, READ, Set, WOKEN, Watch};
     use alloc::vec::Vec;
 
@@ -718,6 +723,36 @@ mod tests {
             let woken = wait(&mut set, Instant::now().after_ms(1000));
             assert_eq!(woken, Vec::from([(9, WOKEN)]));
             quiet(&mut set, 9, u8::MAX, 30);
+        }
+    }
+
+    /// A descriptor that moves to the other place of the Wait keeps its
+    /// entry; the one the Wait no longer names goes, and wakes nothing.
+    #[test]
+    fn follows_a_descriptor_that_moves() {
+        for mut set in sets() {
+            let (first, second) = (Signal::new().unwrap(), Signal::new().unwrap());
+            let mut watch = Watch::NONE;
+            let [one, _] = first.wait().fds;
+            let [two, _] = second.wait().fds;
+            let both = Wait {
+                fds: [one, two],
+                count: 2,
+                timeout_ms: None,
+            };
+            assert!(set.follow(&mut watch, &both, 5));
+            let [moved, _] = second.wait().fds;
+            let alone = Wait {
+                fds: [moved, Fd::NONE],
+                count: 1,
+                timeout_ms: None,
+            };
+            assert!(set.follow(&mut watch, &alone, 5));
+            first.set();
+            quiet(&mut set, 5, u8::MAX, 30);
+            second.set();
+            until(&mut set, 5, READ);
+            set.unfollow(&mut watch);
         }
     }
 }

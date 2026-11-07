@@ -59,7 +59,10 @@ impl Trust {
     }
 
     /// Starts checking chain, DER certificates leaf first, for host at
-    /// now (Unix seconds). It never blocks: poll the check.
+    /// now (Unix seconds). It never blocks: poll the check. A host that is
+    /// empty or holds a NUL is Error::Input on every system: Windows reads
+    /// the name as a C string, which would end at the NUL, and checks
+    /// none for an empty one.
     pub fn check(&self, chain: &[&[u8]], host: &str, now: i64) -> Check {
         Check {
             os: os::check(&self.os, chain, host, now),
@@ -224,6 +227,11 @@ impl Found {
 
 fn der(bytes: &[u8], range: (usize, usize)) -> &[u8] {
     bytes.get(range.0..range.1).unwrap_or_default()
+}
+
+/// A host the system's verifiers can take: not empty, and no NUL.
+fn named(host: &str) -> bool {
+    !host.is_empty() && !host.contains('\0')
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -599,7 +607,7 @@ mod os {
 
     /// x509::verify, at once.
     pub fn check(trust: &Trust, chain: &[&[u8]], host: &str, now: i64) -> Check {
-        let result = if chain.is_empty() || chain.len() > x509::CHAIN_MAX {
+        let result = if chain.is_empty() || chain.len() > x509::CHAIN_MAX || !super::named(host) {
             Err(Error::Input)
         } else {
             match x509::verify(chain, &trust.store, host, now) {
@@ -932,6 +940,9 @@ mod os {
     pub struct Trust;
 
     pub fn check(_trust: &Trust, chain: &[&[u8]], host: &str, now: i64) -> Check {
+        if !super::named(host) {
+            return Check::start(Err(Error::Input));
+        }
         Check::start(evaluation(chain, host, now).map(|trust| Job { trust }))
     }
 
@@ -1313,7 +1324,7 @@ mod os {
     pub struct Trust;
 
     pub fn check(_trust: &Trust, chain: &[&[u8]], host: &str, now: i64) -> Check {
-        if chain.is_empty() || chain.len() > x509::CHAIN_MAX {
+        if chain.is_empty() || chain.len() > x509::CHAIN_MAX || !super::named(host) {
             return Check::start(Err(Error::Input));
         }
         Check::start(Ok(Job::new(chain, host, now)))
@@ -1885,6 +1896,12 @@ mod tests {
         #[cfg(target_os = "windows")]
         assert!(matches!(refused, Err(Error::Chain(_))));
         assert_eq!(trust.verify(&[], "x.test", TEST_NOW), Err(Error::Input));
+        // A NUL would end the name where Windows reads it.
+        assert_eq!(
+            trust.verify(&chain, "leaf.example.test\0.x", TEST_NOW),
+            Err(Error::Input)
+        );
+        assert_eq!(trust.verify(&chain, "", TEST_NOW), Err(Error::Input));
         assert_eq!(
             trust.verify(&[b"no"], "x.test", TEST_NOW),
             Err(Error::Input)

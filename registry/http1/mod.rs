@@ -22,18 +22,22 @@ pub enum Error {
     /// A request field holds a byte its grammar does not allow, CR, LF
     /// and NUL among them, or names a header the framing writes.
     Field,
-    /// The status line is not HTTP/1.0 or 1.1 with a code of 100 to 599.
+    /// The status line is not HTTP/1.x with a code of 100 to 599; a minor
+    /// version past 1 reads as 1.1.
     Status,
     /// A header line is malformed or holds a control byte such as NUL.
     Header,
-    /// A header line continues the one before it (obs-fold).
+    /// The first header line starts with whitespace: there is no field
+    /// before it for it to continue. A later folded line (obs-fold) goes
+    /// on its field, the fold a space.
     Fold,
     /// The heads passed HEAD_MAX bytes or HEADERS_MAX fields.
     TooLarge,
     /// Content-Length is not a number, or two of them differ.
     Length,
-    /// Transfer-Encoding does not end in chunked, names it twice, comes
-    /// with Content-Length or in an HTTP/1.0 response.
+    /// Transfer-Encoding names chunked other than last or twice, comes
+    /// with Content-Length or in an HTTP/1.0 response. One that ends in
+    /// another coding has a body that runs to the close, still coded.
     Coding,
     /// A chunk-size line or the line end after a chunk is malformed.
     Chunk,
@@ -263,6 +267,9 @@ pub struct Response {
     head: Vec<u8>,
     line: usize,
     fields: Vec<Field>,
+    /// The fields whose framing is noted: all but the last, which a
+    /// folded line may still go on.
+    settled: usize,
     /// Head and trailer bytes so far, interim heads among them.
     seen: usize,
     /// Bytes of the chunk-size line so far.
@@ -284,6 +291,7 @@ impl Response {
             head: Vec::new(),
             line: 0,
             fields: Vec::new(),
+            settled: 0,
             seen: 0,
             chunk_line: 0,
             status: 0,
@@ -304,6 +312,7 @@ impl Response {
         self.head.clear();
         self.line = 0;
         self.fields.clear();
+        self.settled = 0;
         self.seen = 0;
         self.chunk_line = 0;
         self.status = 0;
@@ -453,24 +462,72 @@ impl Response {
             (self.minor, self.status) = status_line(line)?;
             return Ok(false);
         }
-        if line.is_empty() {
+        let (empty, folded) = (line.is_empty(), matches!(line.first(), Some(b' ' | b'\t')));
+        if empty {
+            self.settle()?;
             return self.finish_head();
         }
+        if folded {
+            self.fold(start, end)?;
+            return Ok(false);
+        }
+        self.settle()?;
         if self.fields.len() >= HEADERS_MAX {
             return Err(Error::TooLarge);
         }
-        let parsed = field(line, start)?;
-        let name = self
-            .head
-            .get(parsed.name.0..parsed.name.1)
-            .unwrap_or_default();
-        let value = self
-            .head
-            .get(parsed.value.0..parsed.value.1)
-            .unwrap_or_default();
-        framing(&mut self.framing, name, value)?;
+        let text = self.head.get(start..end).unwrap_or_default();
+        let parsed = field(text, start)?;
         self.fields.push(parsed);
         Ok(false)
+    }
+
+    /// Notes the framing of the fields no fold can change any more.
+    fn settle(&mut self) -> Result<(), Error> {
+        while let Some(parsed) = self.fields.get(self.settled) {
+            let name = self
+                .head
+                .get(parsed.name.0..parsed.name.1)
+                .unwrap_or_default();
+            let value = self
+                .head
+                .get(parsed.value.0..parsed.value.1)
+                .unwrap_or_default();
+            framing(&mut self.framing, name, value)?;
+            self.settled += 1;
+        }
+        Ok(())
+    }
+
+    /// An obsolete line folding (obs-fold): the line from start to end
+    /// goes on the field before it, the fold replaced with spaces, as a
+    /// user agent must (RFC 9112 section 5.2). Whitespace before the first
+    /// field is no fold: such a head is refused (section 2.2).
+    fn fold(&mut self, start: usize, end: usize) -> Result<(), Error> {
+        let line = self.head.get(start..end).unwrap_or_default();
+        if !line.iter().all(|byte| field_byte(*byte)) {
+            return Err(Error::Header);
+        }
+        let first = line.iter().position(|byte| !matches!(byte, b' ' | b'\t'));
+        let last = line.iter().rposition(|byte| !matches!(byte, b' ' | b'\t'));
+        let Some(field) = self.fields.last_mut() else {
+            return Err(Error::Fold);
+        };
+        let (Some(first), Some(last)) = (first, last) else {
+            // Whitespace alone adds nothing.
+            return Ok(());
+        };
+        let (text, text_end) = (start + first, start + last + 1);
+        if field.value.0 == field.value.1 {
+            field.value = (text, text_end);
+            return Ok(());
+        }
+        // From the value's end to the folded text: its trailing space, the
+        // line's end and the fold's whitespace, each byte a space.
+        if let Some(gap) = self.head.get_mut(field.value.1..text) {
+            gap.fill(b' ');
+        }
+        field.value.1 = text_end;
+        Ok(())
     }
 
     /// Picks the body's framing once the head is whole; false after an
@@ -479,6 +536,7 @@ impl Response {
         if (100..200).contains(&self.status) && self.status != 101 {
             self.head.clear();
             self.fields.clear();
+            self.settled = 0;
             self.line = 0;
             self.framing = Framing {
                 length: None,
@@ -510,7 +568,16 @@ impl Response {
                 self.chunk_line = 0;
                 State::Chunk(Frame::Size(0))
             }
-            Coding::Other => return Err(Error::Coding),
+            // A coding that is not chunked last: the body runs to the end
+            // of the connection, still coded (RFC 9112 section 6.3), but
+            // only with no length beside it, and in HTTP/1.1.
+            Coding::Other => {
+                if self.framing.length.is_some() || self.minor == 0 {
+                    return Err(Error::Coding);
+                }
+                self.reusable = false;
+                State::Close
+            }
             Coding::None => match self.framing.length {
                 Some(0) => State::Done,
                 Some(length) => State::Length(length),
@@ -660,9 +727,10 @@ fn body(taken: usize, piece: &[u8]) -> (usize, Event<'_>) {
 /// absent, with or without the space before it.
 fn status_line(line: &[u8]) -> Result<(u8, u16), Error> {
     let (version, rest) = line.split_at_checked(8).ok_or(Error::Status)?;
+    // A later minor version of 1 is taken as 1.1 (RFC 9112 section 2.3).
     let minor = match version {
         b"HTTP/1.0" => 0,
-        b"HTTP/1.1" => 1,
+        [b'H', b'T', b'T', b'P', b'/', b'1', b'.', digit] if digit.is_ascii_digit() => 1,
         _ => return Err(Error::Status),
     };
     let [b' ', hundreds, tens, ones, reason @ ..] = rest else {
@@ -689,9 +757,6 @@ fn status_line(line: &[u8]) -> Result<(u8, u16), Error> {
 /// The name and trimmed value of a header line that starts at start in
 /// the head. No space may come before the colon, nor start the line.
 fn field(line: &[u8], start: usize) -> Result<Field, Error> {
-    if matches!(line.first(), Some(b' ' | b'\t')) {
-        return Err(Error::Fold);
-    }
     let colon = line
         .iter()
         .position(|byte| *byte == b':')
@@ -1172,12 +1237,15 @@ mod tests {
                 (b"HTTP/1.1 200 OK\r\nContent-Length: 18446744073709551616\r\n\r\n", Error::Length),
                 (b"HTTP/1.1 200 OK\r\nContent-Length: \r\n\r\n", Error::Length),
                 (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 1\r\n\r\n", Error::Coding),
-                (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n", Error::Coding),
+                (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nContent-Length: 3\r\n\r\n", Error::Coding),
+                (b"HTTP/1.0 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n", Error::Coding),
                 (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\n", Error::Coding),
                 (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n", Error::Coding),
                 (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: ,\r\n\r\n", Error::Coding),
                 (b"HTTP/1.0 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", Error::Coding),
-                (b"HTTP/1.1 200 OK\r\nA: 1\r\n folded\r\n\r\n", Error::Fold),
+                (b"HTTP/1.1 200 OK\r\n folded\r\nA: 1\r\n\r\n", Error::Fold),
+                (b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n 2\r\n\r\n", Error::Length),
+                (b"HTTP/1.1 200 OK\r\nA: 1\r\n x\0\r\n\r\n", Error::Header),
                 (b"HTTP/1.1 200 OK\r\nA: 1\0\r\n\r\n", Error::Header),
                 (b"HTTP/1.1 200 OK\r\nA: 1\r2\r\n\r\n", Error::Header),
                 (b"HTTP/1.1 200 OK\r\nA : 1\r\n\r\n", Error::Header),
@@ -1195,6 +1263,26 @@ mod tests {
             // The status line may end at the code.
             assert_eq!(ok(b"HTTP/1.1 200\r\n\r\n", false).status, 200);
             assert_eq!(ok(b"HTTP/1.1 200 \r\n\r\n", false).status, 200);
+        }
+
+        /// What RFC 9112 has a user agent take: a folded line goes on its
+        /// field, each fold a space (5.2); a coding not chunked last runs
+        /// to the close, still coded (6.3); HTTP/1.2 reads as 1.1 (2.3).
+        #[test]
+        fn lenient_heads() {
+            let mut parser = Response::new(false);
+            let message = b"HTTP/1.1 200 OK\r\nA: 1 \r\n \t folded\r\n\r\n";
+            assert!(matches!(parser.feed(message), Ok((_, Event::Head))));
+            assert_eq!(parser.header(b"a"), Some(&b"1      folded"[..]));
+            // chunked other than last stays refused, the framing two
+            // readers could take two ways (strict_heads).
+            let coded = ok(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\ncoded",
+                false,
+            );
+            assert_eq!((&coded.body[..], coded.reusable), (&b"coded"[..], false));
+            let later = ok(b"HTTP/1.2 200 OK\r\nContent-Length: 0\r\n\r\n", false);
+            assert_eq!((later.status, later.reusable), (200, true));
         }
 
         #[test]

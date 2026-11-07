@@ -694,3 +694,29 @@ fn one_of_a_thousand(b: &mut Bencher) {
         server.close(&mut set);
     }
 }
+
+/// descriptors says what the system holds, not what was asked: macOS
+/// cuts a limit to kern.maxfilesperproc, under its hard limit.
+#[cfg(unix)]
+#[test]
+fn descriptors_as_held() {
+    let raised = descriptors(1 << 40);
+    assert!(raised >= 256);
+    assert_eq!(descriptors(0), raised);
+}
+
+/// A socket removed from the Set and added again at once, under a new
+/// key: socket notifications hold a registration for a socket once.
+#[test]
+fn removed_and_added_again() {
+    for mut set in sets() {
+        let (client, server) = pair(&mut set, v4());
+        let first = set.add(server.raw(), READ, 1).unwrap();
+        set.remove(first);
+        let again = set.add(server.raw(), READ, 2).unwrap();
+        assert_eq!(client.write(b"x"), Ok(Io::Done(1)));
+        until(&mut set, 2, READ);
+        set.remove(again);
+        client.close(&mut set);
+    }
+}

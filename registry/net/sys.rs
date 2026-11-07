@@ -368,6 +368,12 @@ mod os {
         pub const EHOSTUNREACH: c_int = 113;
         pub const ENETUNREACH: c_int = 101;
         pub const EADDRINUSE: c_int = 98;
+        pub const ENETDOWN: c_int = 100;
+        pub const EPROTO: c_int = 71;
+        pub const ENOPROTOOPT: c_int = 92;
+        pub const EHOSTDOWN: c_int = 112;
+        pub const ENONET: c_int = 64;
+        pub const EOPNOTSUPP: c_int = 95;
     }
     #[cfg(target_os = "macos")]
     mod numbers {
@@ -561,12 +567,52 @@ mod os {
     #[cfg(target_os = "macos")]
     fn accept_one(fd: c_int, address: &mut [u8], size: &mut u32) -> c_int {
         // rr: escape(unsafe): address holds size bytes.
-        let accepted = unsafe { c::accept(fd, address.as_mut_ptr(), size) };
-        if accepted >= 0 && prepare_new(accepted).is_err() {
-            close(accepted);
-            return -1;
+        unsafe { c::accept(fd, address.as_mut_ptr(), size) }
+    }
+
+    /// What a failed accept says of the connection it took, not of the
+    /// listener: none waits, or the one that did is gone. Linux passes on
+    /// the new connection's network errors too, which accept(2) says to
+    /// take as EAGAIN.
+    #[cfg(target_os = "linux")]
+    fn passing(code: c_int) -> bool {
+        use numbers::{EHOSTDOWN, ENETDOWN, ENONET, ENOPROTOOPT, EOPNOTSUPP, EPROTO};
+        matches!(
+            code,
+            EAGAIN
+                | EINTR
+                | ECONNABORTED
+                | ENETDOWN
+                | EPROTO
+                | ENOPROTOOPT
+                | EHOSTDOWN
+                | ENONET
+                | EHOSTUNREACH
+                | EOPNOTSUPP
+                | ENETUNREACH
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn passing(code: c_int) -> bool {
+        matches!(code, EAGAIN | EINTR | ECONNABORTED)
+    }
+
+    /// A connection macOS took, made as every socket here is; one it
+    /// cannot be made (reset before, as setsockopt then says) is gone.
+    #[cfg(target_os = "macos")]
+    fn adopt(fd: c_int) -> bool {
+        if prepare_new(fd).is_ok() {
+            return true;
         }
-        accepted
+        close(fd);
+        false
+    }
+
+    /// accept4 made it whole.
+    #[cfg(target_os = "linux")]
+    fn adopt(_fd: c_int) -> bool {
+        true
     }
 
     /// The next connection waiting, and its peer; None when none waits,
@@ -576,10 +622,15 @@ mod os {
         let mut size = length(&address);
         let accepted = accept_one(fd, &mut address, &mut size);
         if accepted < 0 {
-            return match errno() {
-                EAGAIN | EINTR | ECONNABORTED => Ok(None),
-                code => Err(error(code)),
+            let code = errno();
+            return if passing(code) {
+                Ok(None)
+            } else {
+                Err(error(code))
             };
+        }
+        if !adopt(accepted) {
+            return Ok(None);
         }
         let filled = usize::try_from(size).unwrap_or(0);
         match address.get(..filled).and_then(decode) {
@@ -686,17 +737,28 @@ mod os {
             return 0;
         }
         let [current, most] = limit;
-        if current >= want {
+        // macOS refuses more than kern.maxfilesperproc, and Linux more
+        // than fs.nr_open, though either may be under the hard limit:
+        // asked again for half, as often as 32 times, down to what it has.
+        let mut asked = want.min(most);
+        for _ in 0..32 {
+            if asked <= current {
+                break;
+            }
+            let raised = [asked, most];
+            // rr: escape(unsafe): raised is a local struct rlimit.
+            if unsafe { c::setrlimit(RLIMIT_NOFILE, raised.as_ptr()) } == 0 {
+                break;
+            }
+            asked /= 2;
+        }
+        // What the system holds now, which it may have cut.
+        // rr: escape(unsafe): limit is a local struct rlimit.
+        if unsafe { c::getrlimit(RLIMIT_NOFILE, limit.as_mut_ptr()) } != 0 {
             return current;
         }
-        // macOS refuses more than kern.maxfilesperproc: then it stays.
-        let raised = [want.min(most), most];
-        // rr: escape(unsafe): raised is a local struct rlimit.
-        if unsafe { c::setrlimit(RLIMIT_NOFILE, raised.as_ptr()) } == 0 {
-            want.min(most)
-        } else {
-            current
-        }
+        let [now, _] = limit;
+        now
     }
 }
 
@@ -774,6 +836,7 @@ mod os {
     const TCP_NODELAY: i32 = 1;
     const SD_SEND: i32 = 1;
     const WSAEINTR: i32 = 10004;
+    const WSAEACCES: i32 = 10013;
     const WSAEWOULDBLOCK: i32 = 10035;
     const WSAEADDRINUSE: i32 = 10048;
     const WSAENETUNREACH: i32 = 10051;
@@ -863,9 +926,18 @@ mod os {
         option(socket, IPPROTO_TCP, TCP_NODELAY, 1)
     }
 
+    /// Binds; with SO_EXCLUSIVEADDRUSE, an address another socket holds
+    /// is refused as access denied (WSAEACCES), which is the address in
+    /// use.
     pub fn bind(socket: usize, address: &[u8]) -> Result<(), Error> {
         // rr: escape(unsafe): address is a sockaddr of its length.
-        check(unsafe { c::bind(socket, address.as_ptr(), length(address)) })
+        if unsafe { c::bind(socket, address.as_ptr(), length(address)) } == 0 {
+            return Ok(());
+        }
+        match last() {
+            WSAEACCES => Err(Error::InUse),
+            code => Err(error(code)),
+        }
     }
 
     pub fn listen(socket: usize, backlog: u32) -> Result<(), Error> {

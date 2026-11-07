@@ -5,7 +5,8 @@
 //! verify it themselves, as Go has them do: SecTrustEvaluateWithError
 //! with the SSL policy, and CertGetCertificateChain with the SSL chain
 //! policy, each on one of wait.rs's threads, as either may fetch a
-//! missing intermediate or a revocation status over the network; a poll
+//! missing intermediate over the network (neither is asked to check
+//! revocation, as Go does not); a poll
 //! loop waits on a pipe or a loopback socket, as for resolve. Linux
 //! has no verifier of its own: Trust loads the system's anchors once and
 //! x509::verify checks the chain at once.

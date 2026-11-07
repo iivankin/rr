@@ -182,7 +182,9 @@ fn wide(a: &Fe) -> [Wrapping<u128>; 5] {
 }
 
 /// Products whose limbs reach past 2^255 come back times 19, as
-/// 2^255 = 19 mod p. Inputs below 2^55 keep each column below 2^118.
+/// 2^255 = 19 mod p. Inputs below 2^54, as add and sub give them (below
+/// 2^53), keep the top column below 2^111, whose carry times 19 is below
+/// 2^64 in reduce: at 2^55 it would not be, and the result would be wrong.
 fn mul(f: &Fe, g: &Fe) -> Fe {
     let [f0, f1, f2, f3, f4] = wide(f);
     let [g0, g1, g2, g3, g4] = wide(g);

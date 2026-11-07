@@ -1474,9 +1474,11 @@ fn encrypted_extensions() {
     for (extensions, error) in [
         ("000a 0004 0002 001d  ff99 0000  0000 0000", None),
         ("0000 0001 00", Some(Error::Decode)),
-        ("002b 0002 0304", Some(Error::Extension)),
+        // Offered in the ClientHello, not for this message (4.3.1).
+        ("002b 0002 0304", Some(Error::Parameter)),
+        // Never offered (4.2).
         ("0029 0002 0000", Some(Error::Extension)),
-        ("0033 0000", Some(Error::Extension)),
+        ("0033 0000", Some(Error::Parameter)),
         ("0010", Some(Error::Decode)),
     ] {
         let mut script = Script::new(Kind::P256);
@@ -1696,16 +1698,28 @@ fn record_limits() {
         let mut client = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
         assert_eq!(client.input(bytes), result);
     }
-    // 2^14 bytes with padding to the limit pass; one more byte does not.
+    // 2^14 bytes and the content type pass: TLSInnerPlaintext is 2^14 + 1
+    // bytes at most (RFC 8446 5.4), so one byte of padding more does not,
+    // nor one more byte of data.
     let full = |server: &mut Server| {
         let mut inner = Vec::new();
         inner.resize(RECORD_MAX, b'a');
         inner.push(APPLICATION);
-        inner.resize(RECORD_MAX + 256 - 16, 0);
         server.raw(inner);
     };
     let (result, got, _) = after(full, 1000);
     assert_eq!((result, got.len()), (None, RECORD_MAX));
+    let padded = |server: &mut Server| {
+        let mut inner = Vec::new();
+        inner.resize(RECORD_MAX, b'a');
+        inner.push(APPLICATION);
+        inner.push(0);
+        server.raw(inner);
+    };
+    assert_eq!(
+        after(padded, 1000),
+        (Some(Error::Overflow), Vec::new(), Vec::from([22]))
+    );
     let large = |server: &mut Server| {
         let mut inner = Vec::new();
         inner.resize(RECORD_MAX + 1, b'a');
@@ -2079,6 +2093,9 @@ fn caller(script: Script, host: &str, piece: usize, judge: &Judge<'_>) -> Verdic
             // Nothing more is taken until the verdict.
             assert_eq!(client.input(&bytes[at..]), Ok(0));
             client.verified(trusted);
+            // A refusal ends the wait: a loop that asks awaiting before
+            // input sees it fail, not wait again.
+            assert!(!client.awaiting());
             let mut slots = [&[][..]; x509::CHAIN_MAX];
             assert!(client.chain(&mut slots).is_none());
             if let Err(error) = client.input(&[]) {
@@ -2139,6 +2156,27 @@ fn caller_trusts() {
         &Judge::Always(true),
     );
     assert!(elsewhere.connected);
+}
+
+/// close while the client awaits the verdict: close_notify is the last
+/// thing it sends, and the trusted verdict after it sends no Finished.
+#[test]
+fn close_while_awaiting() {
+    let mut server = Server::new(Script::new(Kind::P256));
+    let mut client = Client::new(HOST, &[], Verify::Caller, TEST_NOW, &RANDOM).unwrap();
+    server.receive(client.pending());
+    client.sent(client.pending().len());
+    let bytes = server.take();
+    let mut at = 0;
+    while !client.awaiting() {
+        at += client.input(&bytes[at..]).unwrap();
+    }
+    client.close();
+    let closing = client.pending().len();
+    assert!(closing > 0);
+    client.verified(true);
+    assert!(client.input(&bytes[at..]).is_ok());
+    assert_eq!(client.pending().len(), closing);
 }
 
 /// Refused: Untrusted, and unknown_ca reaches the server.
