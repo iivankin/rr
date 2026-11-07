@@ -27,16 +27,25 @@ python3() { "$rr_python" "$@"; }
 export CARGO_TARGET_DIR="$rr_scratch/target"
 # rr uses the compiler's private crates, as Clippy does.
 RUSTC_BOOTSTRAP=1 cargo build --locked --release --bin rr
-# libFuzzer's source alone, at the LLVM commit of the release.
+# libFuzzer's source alone, at the LLVM commit of the release: a sparse,
+# blobless checkout, set up by configuration, which Ubuntu 20.04's git
+# (2.25) reads as well as a new one; its paths in a file, which Git for
+# Windows's bash does not rewrite as it rewrites arguments.
 rr_llvm_source="$rr_scratch/llvm"
 if [ ! -d "$rr_llvm_source/compiler-rt/lib/fuzzer" ]; then
     rm -rf "$rr_llvm_source"
     git init -q "$rr_llvm_source"
-    git -C "$rr_llvm_source" remote add origin https://github.com/rust-lang/llvm-project.git
-    git -C "$rr_llvm_source" sparse-checkout set --no-cone /compiler-rt/lib/fuzzer/ \
-        /compiler-rt/lib/sanitizer_common/sanitizer_coverage_win_sections.cpp /compiler-rt/LICENSE.TXT
-    git -C "$rr_llvm_source" fetch -q --depth 1 --filter=blob:none origin "$rr_llvm"
-    git -C "$rr_llvm_source" checkout -q FETCH_HEAD
+    rr_git() { git -C "$rr_llvm_source" "$@"; }
+    rr_git remote add origin https://github.com/rust-lang/llvm-project.git
+    rr_git config core.repositoryformatversion 1
+    rr_git config extensions.partialClone origin
+    rr_git config remote.origin.promisor true
+    rr_git config core.sparseCheckout true
+    printf '%s\n' /compiler-rt/lib/fuzzer/ /compiler-rt/LICENSE.TXT \
+        /compiler-rt/lib/sanitizer_common/sanitizer_coverage_win_sections.cpp \
+        > "$rr_llvm_source/.git/info/sparse-checkout"
+    rr_git -c protocol.version=2 fetch -q --depth 1 --filter=blob:none origin "$rr_llvm"
+    rr_git checkout -q FETCH_HEAD
 fi
 rm -rf "$rr_scratch/fuzz"
 python3 scripts/build-fuzz-runtime.py "$rr_llvm_source/compiler-rt/lib/fuzzer" "$rr_toolchain" "$rr_scratch/fuzz"
