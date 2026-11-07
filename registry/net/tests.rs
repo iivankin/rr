@@ -691,3 +691,90 @@ fn one_of_a_thousand(b: &mut Bencher) {
         server.close(&mut set);
     }
 }
+
+/// Probe on the branch: pair's steps, up to stage, on set.
+#[cfg(target_os = "windows")]
+fn stage(set: &mut Set, stage: u32) {
+    let mut listener = Listener::bind(v4(), 16).unwrap();
+    let mut client = Stream::connect(listener.local().unwrap()).unwrap();
+    assert!(listener.watch(set, READ, LISTENER));
+    assert!(client.watch(set, WRITE, LISTENER + 1));
+    until(set, LISTENER + 1, WRITE | ERROR | HUP);
+    assert!(client.connected().unwrap());
+    if stage == 1 {
+        return;
+    }
+    let mut accepted = None;
+    for _ in 0..100 {
+        if let Some(found) = listener.accept().unwrap() {
+            accepted = Some(found);
+            break;
+        }
+        until(set, LISTENER, READ);
+    }
+    let (server, from) = accepted.unwrap();
+    if stage == 2 {
+        return;
+    }
+    assert!(from.ip().is_loopback());
+    if stage == 3 {
+        return;
+    }
+    assert_eq!(Some(from), client.local());
+    if stage == 4 {
+        return;
+    }
+    assert_eq!(client.peer(), listener.local());
+    if stage == 5 {
+        return;
+    }
+    listener.close(set);
+    assert!(client.watch(set, 0, LISTENER + 1));
+    if stage == 6 {
+        return;
+    }
+    assert!(client.watch(set, READ, 1));
+    drop(server);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn probe_stage_1() {
+    stage(&mut Set::new().unwrap(), 1);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn probe_stage_2() {
+    stage(&mut Set::new().unwrap(), 2);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn probe_stage_3() {
+    stage(&mut Set::new().unwrap(), 3);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn probe_stage_4() {
+    stage(&mut Set::new().unwrap(), 4);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn probe_stage_5() {
+    stage(&mut Set::new().unwrap(), 5);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn probe_stage_6() {
+    stage(&mut Set::new().unwrap(), 6);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn probe_stage_7() {
+    stage(&mut Set::new().unwrap(), 7);
+}
