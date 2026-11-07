@@ -520,8 +520,13 @@ fn pdb_frames(
         };
         if let Ok(Some(found)) = context.find_frames(probe) {
             for f in found.frames {
+                // A frame pdb-addr2line could not name, as one of an
+                // inlined call may be, says nothing of whose code it is.
+                let Some(function) = f.function.as_deref() else {
+                    continue;
+                };
                 out.push(Frame {
-                    function: f.function.as_deref().map(strip_hash).unwrap_or_default(),
+                    function: strip_hash(function),
                     file: f.file.map(std::borrow::Cow::into_owned).unwrap_or_default(),
                     line: f.line.unwrap_or(0),
                 });
