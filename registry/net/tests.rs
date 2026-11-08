@@ -2,7 +2,7 @@
 //! as a server and its clients use it, on every way the system has to
 //! wait (on Windows, socket notifications and WSAPoll both).
 
-use super::{Error, Io, Listener, Stream, descriptors};
+use super::{Error, Io, Listener, Stream, descriptors, descriptors_before};
 use crate::base::wait::{ERROR, EXPIRED, HUP, Instant, READ, Set, WRITE};
 use alloc::vec::Vec;
 use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -571,7 +571,8 @@ fn dropped_without_close() {
 
 /// An address another listens on is in use; once it closes, with a
 /// connection it closed first in TIME_WAIT, the address listens again, as
-/// a server that restarts needs.
+/// a server that restarts needs: on Windows with no option, which
+/// SO_EXCLUSIVEADDRUSE would refuse while that connection lingers.
 #[test]
 fn address_in_use_then_free() {
     let mut set = Set::new().unwrap();
@@ -704,6 +705,9 @@ fn descriptors_as_held() {
     let raised = descriptors(1 << 40);
     assert!(raised >= 256);
     assert_eq!(descriptors(0), raised);
+    if let Some(before) = descriptors_before() {
+        assert!(before < raised, "{before} before, {raised} now");
+    }
 }
 
 /// A socket removed from the Set and added again at once, under a new
@@ -783,5 +787,94 @@ fn closed_handles_taken_again() {
             client.abort(&mut set);
             server.close(&mut set);
         }
+    }
+}
+
+/// A client sends its request and finishes, as an HTTP/1.0 client or one
+/// that streams an upload does, then waits to write and read while the
+/// server answers: its own finish is no hangup, on any system (macOS's
+/// write filter says nothing more may be sent, which epoll does not
+/// report), and the answer comes whole, then the end.
+#[test]
+fn finished_writer() {
+    let mut buffer = [0u8; 64];
+    let mut answer = Vec::new();
+    for (at, mut set) in sets().into_iter().enumerate() {
+        // WSAPoll reports a hangup whatever it is asked (wait's sys.rs).
+        let polled = cfg!(target_os = "windows") && at == 1;
+        let (mut client, mut server) = pair(&mut set, v4());
+        assert_eq!(client.write(b"request"), Ok(Io::Done(7)));
+        client.finish().unwrap();
+        assert!(client.watch(&mut set, WRITE, 1));
+        let end = Instant::now().after_ms(50);
+        let mut writable = false;
+        while !end.reached_by(Instant::now()) {
+            for event in set.wait(Some(end)) {
+                if event.key == 1 {
+                    assert!(polled || event.ready & HUP == 0, "its own finish a hangup");
+                    assert_eq!(event.ready & ERROR, 0);
+                    writable |= event.ready & WRITE != 0;
+                }
+            }
+        }
+        // Linux and macOS say a socket that finished is writable: a write
+        // fails at once, and does not block.
+        assert!(writable || cfg!(target_os = "windows"));
+        assert!(server.watch(&mut set, READ, 2));
+        let mut got = 0;
+        while got < 7 {
+            until(&mut set, 2, READ);
+            if let Io::Done(count) = server.read(&mut buffer).unwrap() {
+                got += count;
+            }
+        }
+        assert_eq!(server.read(&mut buffer), Ok(Io::Done(0)));
+        assert_eq!(server.write(b"answer"), Ok(Io::Done(6)));
+        server.finish().unwrap();
+        assert!(server.watch(&mut set, 0, 2));
+        assert!(client.watch(&mut set, READ | WRITE, 1));
+        answer.clear();
+        loop {
+            let ready = until(&mut set, 1, READ | HUP);
+            assert_eq!(ready & ERROR, 0);
+            match client.read(&mut buffer).unwrap() {
+                Io::Done(0) => break,
+                Io::Done(count) => answer.extend_from_slice(&buffer[..count]),
+                Io::Blocked => {}
+            }
+        }
+        assert_eq!(answer, b"answer");
+        client.close(&mut set);
+        server.close(&mut set);
+    }
+}
+
+/// A socket added to a Set twice, open: the second is refused, and the
+/// first goes on as it was, with nothing of the second left to wake the
+/// Set; the same on every system but WSAPoll, which cannot tell it from
+/// a new socket that took a closed one's handle, and where the second
+/// takes the first's place (wait's set.rs).
+#[test]
+fn added_twice() {
+    for (at, mut set) in sets().into_iter().enumerate() {
+        let polled = cfg!(target_os = "windows") && at == 1;
+        let (client, server) = pair(&mut set, v4());
+        let first = set.add(server.raw(), READ, 1).unwrap();
+        let again = set.add(server.raw(), READ | WRITE, 2);
+        assert_eq!(again.is_some(), polled);
+        let (kept, gone) = if polled { (2, 1) } else { (1, 2) };
+        assert_eq!(client.write(b"x"), Ok(Io::Done(1)));
+        until(&mut set, kept, READ);
+        assert_eq!(server.read(&mut [0; 8]), Ok(Io::Done(1)));
+        if !polled {
+            quiet(&mut set, kept, READ, 50);
+            assert!(
+                wakeups(&mut set, 100) <= 3,
+                "the refused entry woke the Set"
+            );
+        }
+        quiet(&mut set, gone, u8::MAX, 30);
+        set.remove(again.unwrap_or(first));
+        client.close(&mut set);
     }
 }

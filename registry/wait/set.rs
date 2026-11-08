@@ -26,13 +26,18 @@
 //!
 //! A descriptor is in a Set once, and is removed before it is closed:
 //! close does both, so that nothing the system still holds of it is
-//! reported for the descriptor that takes its number next. One closed
-//! first is
-//! dropped by the system, and its entry stays, with its deadline, until
-//! it is removed or a new descriptor gets its number: that one is added
-//! as new, the old entry goes, and its token names nothing; what the
-//! system had queued for the old one may then be reported for it once,
-//! as a spurious report. On Linux that holds only when the closed
+//! reported for the descriptor that takes its number next. add refuses
+//! one the system still watches for its entry, as Linux's epoll refuses
+//! it, on every system: one added twice. One closed first is dropped by
+//! the system, and its entry stays, with its deadline, until it is
+//! removed or a new descriptor gets its number: that one is added as
+//! new, the old entry goes, and its token names nothing; what the system
+//! had queued for the old one may then be reported for it once, as a
+//! spurious report. The system watches an entry only while it has an
+//! interest, and WSAPoll watches a socket only by the handle the Set
+//! hands it: an entry with none, or any on WSAPoll, the system cannot
+//! tell from a closed one, and a descriptor added again takes its place
+//! as a new one does. On Linux that holds only when the closed
 //! descriptor was the last open on its socket: epoll watches the socket,
 //! not the number, so after dup or fork another descriptor keeps it
 //! watched, and its events come back on every wait for an entry the Set
@@ -222,11 +227,27 @@ impl Set {
     }
 
     /// Watches fd for interest (READ, WRITE, both or none), reported
-    /// with key. None when the system refuses it.
+    /// with key. None when the system refuses it, or when fd is in the
+    /// Set already: added before, open, and not removed.
     pub fn add(&mut self, fd: Raw, interest: u8, key: u64) -> Option<Token> {
+        // Whether the system still watches fd for the entry it has: then
+        // it is open, the one that entry was added with.
+        if let Some(&other) = self.owners.get(&fd)
+            && let Some(slot) = usize::try_from(other)
+                .ok()
+                .and_then(|at| self.slots.get(at))
+            && slot.attached
+        {
+            let held = token_key(Token {
+                index: other,
+                generation: slot.generation,
+            });
+            if self.poller.holds(fd, held, slot.interest) {
+                return None;
+            }
+        }
         let token = self.place(Some(fd), interest, key)?;
         if !self.poller.add(fd, token_key(token), interest) {
-            // On Linux also the descriptor already in the Set, open.
             self.release(token.index);
             return None;
         }

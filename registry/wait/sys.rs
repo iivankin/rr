@@ -6,15 +6,16 @@ use core::ffi::c_void;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
-/// fcntl.h's close-on-exec, for net's sockets as for the signal's pipe.
+/// fcntl.h's close-on-exec, for net's sockets as for the signal's pipe;
+/// errno, for net's and resolve's calls.
 #[cfg(unix)]
-pub use os::{F_SETFD, FD_CLOEXEC};
+pub use os::{F_SETFD, FD_CLOEXEC, errno};
 /// Winsock's, for net's sockets as for the signal's pair.
 #[cfg(target_os = "windows")]
 pub use os::{
     FIONBIO, HANDLE_FLAG_INHERIT, INVALID_SOCKET, IPPROTO_TCP, WSA_FLAG_NO_HANDLE_INHERIT,
 };
-/// Linux's close-on-exec flag, which epoll, eventfd and open take.
+/// Linux's close-on-exec flag, which epoll, eventfd, pipe2 and open take.
 #[cfg(target_os = "linux")]
 pub use poller::O_CLOEXEC;
 pub(super) use poller::{Poller, Wake, monotonic_ns};
@@ -53,6 +54,11 @@ pub const AF_INET6: u16 = 23;
 /// and net's sockets.
 #[cfg(unix)]
 pub const EINTR: i32 = 4;
+/// errno.h's timed out, for kqueue's wait and net's sockets.
+#[cfg(target_os = "linux")]
+pub const ETIMEDOUT: i32 = 110;
+#[cfg(target_os = "macos")]
+pub const ETIMEDOUT: i32 = 60;
 /// Stream sockets: 1 in Winsock and in the C libraries of Linux and
 /// macOS, for the signal's pair, resolve's lookups and the tests.
 pub const SOCK_STREAM: i32 = 1;
@@ -108,6 +114,16 @@ impl Wait {
         count: 0,
         timeout_ms: Some(0),
     };
+}
+
+/// A Set's wait failed for no passing reason: the system no longer takes
+/// the Set's own descriptor or memory, which is a bug in this program,
+/// and the loop could only spin on it. The process stops there, as Go's
+/// runtime throws and libuv aborts.
+fn broken() -> ! {
+    // rr: escape(panic): the Set's own descriptor or memory is no longer
+    // valid; nothing the loop does can wait again.
+    panic!("the system's wait failed");
 }
 
 /// Waits as wait says.
@@ -362,7 +378,15 @@ mod os {
         fn pthread_mutex_lock(mutex: *mut u64) -> c_int;
         fn pthread_mutex_unlock(mutex: *mut u64) -> c_int;
         fn abort() -> !;
+        #[cfg(target_os = "macos")]
         fn pipe(fds: *mut c_int) -> c_int;
+        #[cfg(target_os = "linux")]
+        fn pipe2(fds: *mut c_int, flags: c_int) -> c_int;
+        #[cfg(target_os = "macos")]
+        fn __error() -> *mut c_int;
+        #[cfg(target_os = "linux")]
+        fn __errno_location() -> *mut c_int;
+        #[cfg(any(target_os = "macos", test))]
         fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
         fn write(fd: c_int, buffer: *const c_void, size: usize) -> isize;
         fn close(fd: c_int) -> c_int;
@@ -374,6 +398,18 @@ mod os {
     #[cfg(test)]
     const F_GETFD: c_int = 1;
     pub const FD_CLOEXEC: c_int = 1;
+
+    /// The calling thread's errno, as the C library keeps it.
+    pub fn errno() -> c_int {
+        #[cfg(target_os = "macos")]
+        // rr: escape(unsafe): the C library's thread-local errno.
+        let place = unsafe { __error() };
+        #[cfg(target_os = "linux")]
+        // rr: escape(unsafe): the C library's thread-local errno.
+        let place = unsafe { __errno_location() };
+        // rr: escape(unsafe): the place is this thread's errno.
+        unsafe { place.read() }
+    }
 
     pub fn ready(wait: &Wait) -> [i16; 2] {
         let [one, two] = &wait.fds;
@@ -466,12 +502,25 @@ mod os {
     }
 
     /// A pipe a byte is written to when the work is done; both ends
-    /// close on exec, and with it.
+    /// close on exec, and with it. Linux makes them so with the pipe
+    /// (pipe2), as Go does; macOS has no pipe2, and a thread that forks
+    /// and execs between the pipe and fcntl hands its child the ends.
     pub struct Signal {
         pipe: [c_int; 2],
     }
 
     impl Signal {
+        #[cfg(target_os = "linux")]
+        pub fn new() -> Option<Signal> {
+            let mut pipe_fds: [c_int; 2] = [-1, -1];
+            // rr: escape(unsafe): pipe2 fills the two fds.
+            if unsafe { pipe2(pipe_fds.as_mut_ptr(), super::O_CLOEXEC) } != 0 {
+                return None;
+            }
+            Some(Signal { pipe: pipe_fds })
+        }
+
+        #[cfg(target_os = "macos")]
         pub fn new() -> Option<Signal> {
             let mut pipe_fds: [c_int; 2] = [-1, -1];
             // rr: escape(unsafe): pipe fills the two fds.
@@ -789,13 +838,15 @@ mod os {
     }
 
     /// WSAPoll on fds, up to timeout milliseconds (-1: no limit); how
-    /// many have events.
-    pub fn poll(fds: &mut [PollFd], timeout: i32) -> i32 {
+    /// many have events. It fails only for fds it cannot read, memory or
+    /// a network subsystem that failed: no wait that would pass.
+    pub fn poll(fds: &mut [PollFd], timeout: i32) -> usize {
         let Ok(count) = u32::try_from(fds.len()) else {
             return 0;
         };
         // rr: escape(unsafe): fds holds count entries.
-        unsafe { WSAPoll(fds.as_mut_ptr(), count, timeout) }
+        let got = unsafe { WSAPoll(fds.as_mut_ptr(), count, timeout) };
+        usize::try_from(got).unwrap_or_else(|_| super::broken())
     }
 
     /// A pair of loopback sockets: the thread sends a byte on one when
@@ -850,6 +901,8 @@ mod os {
 /// counts on too; the timeout is in milliseconds, rounded up.
 #[cfg(target_os = "linux")]
 mod poller {
+    use super::os::errno;
+    use super::{EINTR, broken};
     use crate::base::wait::{ERROR, HUP, READ, WRITE};
     use alloc::sync::Arc;
     use alloc::vec::Vec;
@@ -1006,6 +1059,14 @@ mod poller {
             self.modify(fd, key, interest, 0);
         }
 
+        /// Whether the epoll still watches fd for the entry under key: a
+        /// change to what it has already succeeds then, and fails when the
+        /// descriptor was closed, as epoll then dropped it, even once
+        /// another took its number. One with no interest it never held.
+        pub fn holds(&self, fd: c_int, key: u64, interest: u8) -> bool {
+            interest != 0 && self.control(EPOLL_CTL_MOD, fd, key, events(interest))
+        }
+
         /// Removes the descriptor, then closes it.
         pub fn close(&self, fd: c_int, key: u64, interest: u8) {
             self.remove(fd, key, interest);
@@ -1028,8 +1089,14 @@ mod poller {
             let room = c_int::try_from(BATCH).unwrap_or(0);
             // rr: escape(unsafe): events holds room entries.
             let got = unsafe { epoll_wait(self.epoll, self.events.as_mut_ptr(), room, ms) };
-            // -1 is an interrupted wait: nothing is ready.
-            let got = usize::try_from(got).unwrap_or(0);
+            // An interrupted wait: nothing is ready. epoll_wait's other
+            // errors are of the epoll or the events given it.
+            let Ok(got) = usize::try_from(got) else {
+                if errno() == EINTR {
+                    return;
+                }
+                broken();
+            };
             for event in self.events.iter().take(got) {
                 let (key, events) = (event.data, event.events);
                 if key == 0 {
@@ -1077,7 +1144,8 @@ mod poller {
 /// reads it on macOS; kevent's timeout is in nanoseconds.
 #[cfg(target_os = "macos")]
 mod poller {
-    use super::os::{F_SETFD, FD_CLOEXEC};
+    use super::os::{F_SETFD, FD_CLOEXEC, errno};
+    use super::{EINTR, ETIMEDOUT, broken};
     use crate::base::wait::{ERROR, HUP, READ, WRITE};
     use alloc::sync::Arc;
     use alloc::vec::Vec;
@@ -1127,11 +1195,16 @@ mod poller {
     const EVFILT_USER: i16 = -10;
     const EV_ADD: u16 = 0x1;
     const EV_DELETE: u16 = 0x2;
+    const EV_ENABLE: u16 = 0x4;
     const EV_CLEAR: u16 = 0x20;
     const EV_ERROR: u16 = 0x4000;
     const EV_EOF: u16 = 0x8000;
     const NOTE_TRIGGER: u32 = 0x0100_0000;
     const CLOCK_UPTIME_RAW: c_int = 8;
+    /// The longest kevent waits at once: it refuses a timeout of 2^31
+    /// seconds or more (EINVAL), and Go cuts it to 10^6 seconds; the
+    /// Set waits again when it returns.
+    const SECONDS_MAX: u64 = 1_000_000;
     /// The waker's identifier, in EVFILT_USER's own namespace.
     const WAKE: usize = 0;
     /// The events one wait takes; the rest, still ready, the next.
@@ -1261,6 +1334,21 @@ mod poller {
             self.modify(fd, key, interest, 0);
         }
 
+        /// Whether the kqueue still watches fd for the entry under key:
+        /// enabling a filter it has, as it is, succeeds then, and fails
+        /// (ENOENT) when the descriptor was closed, which took its filters
+        /// with it, even once another took its number. One with no
+        /// interest it never held.
+        pub fn holds(&self, fd: c_int, key: u64, interest: u8) -> bool {
+            let ident = usize::try_from(fd).unwrap_or(usize::MAX);
+            let filter = match (interest & READ, interest & WRITE) {
+                (0, 0) => return false,
+                (0, _) => EVFILT_WRITE,
+                (_, _) => EVFILT_READ,
+            };
+            self.queue.apply(&[change(ident, filter, EV_ENABLE, key)])
+        }
+
         /// Removes the descriptor, then closes it.
         pub fn close(&self, fd: c_int, key: u64, interest: u8) {
             self.remove(fd, key, interest);
@@ -1277,10 +1365,8 @@ mod poller {
         /// Waits up to timeout nanoseconds (None: no limit); what is
         /// ready goes to found by key, 0 for a wake.
         pub fn wait(&mut self, timeout: Option<u64>, found: &mut Vec<(u64, u8)>) {
-            // xnu converts tv_sec to 32 bits (tstoabstime): a longer wait
-            // is cut to what it holds.
             let time = timeout.map(|ns| Timespec {
-                seconds: i64::from(u32::try_from(ns / 1_000_000_000).unwrap_or(u32::MAX)),
+                seconds: i64::try_from((ns / 1_000_000_000).min(SECONDS_MAX)).unwrap_or(0),
                 nanoseconds: i64::try_from(ns % 1_000_000_000).unwrap_or(0),
             });
             let limit = time.as_ref().map_or(null(), core::ptr::from_ref);
@@ -1297,8 +1383,16 @@ mod poller {
                     limit,
                 )
             };
-            // -1 is an interrupted wait: nothing is ready.
-            let got = usize::try_from(got).unwrap_or(0);
+            // An interrupted wait: nothing is ready; so too ETIMEDOUT,
+            // which kevent is seen to return for a wait that timed out
+            // (go.dev/issue/59679). Its other errors are of the kqueue or
+            // the events given it.
+            let Ok(got) = usize::try_from(got) else {
+                if matches!(errno(), EINTR | ETIMEDOUT) {
+                    return;
+                }
+                broken();
+            };
             for event in self.events.iter().take(got) {
                 let (filter, flags, fflags) = (event.filter, event.flags, event.fflags);
                 let key = u64::try_from(event.udata.addr()).unwrap_or(0);
@@ -1311,15 +1405,22 @@ mod poller {
         }
     }
 
-    /// A filter's event: EV_EOF is the peer's hangup, with the socket's
-    /// error in fflags when there is one.
+    /// A filter's event, as mio reads it: EV_EOF on the read filter is
+    /// the peer's hangup; on the write filter it says only that nothing
+    /// more may be sent, which this socket's own shutdown says too, as
+    /// epoll does not, and is no hangup. On either it carries the
+    /// socket's error in fflags when there is one.
     fn ready(filter: i16, flags: u16, fflags: u32) -> u8 {
         let side = match filter {
             EVFILT_READ => READ,
             EVFILT_WRITE => WRITE,
             _ => 0,
         };
-        let hup = if flags & EV_EOF == 0 { 0 } else { HUP };
+        let hup = if filter == EVFILT_READ && flags & EV_EOF != 0 {
+            HUP
+        } else {
+            0
+        };
         let error = if flags & EV_ERROR != 0 || (flags & EV_EOF != 0 && fflags != 0) {
             ERROR
         } else {
@@ -1427,6 +1528,9 @@ mod poller {
     const POLLNVAL: i16 = 0x4;
     /// The notifications one wait takes; the rest, still ready, the next.
     const BATCH: usize = 256;
+    /// winerror.h's: a wait that timed out.
+    const WAIT_TIMEOUT: u32 = 258;
+    const ERROR_TIMEOUT: u32 = 1460;
 
     pub fn monotonic_ns() -> u64 {
         let (mut count, mut frequency) = (0i64, 0i64);
@@ -1546,6 +1650,17 @@ mod poller {
             match self {
                 Poller::Notified(notified) => notified.remove(socket, false),
                 Poller::Polled(polled) => polled.remove(key),
+            }
+        }
+
+        /// Whether the system still watches the socket for the entry: the
+        /// port can say; WSAPoll, which the Set hands each socket's handle
+        /// on every wait, cannot tell it from a new socket with a closed
+        /// one's handle.
+        pub fn holds(&mut self, socket: usize, _key: u64, _interest: u8) -> bool {
+            match self {
+                Poller::Notified(notified) => notified.holds(socket),
+                Poller::Polled(_) => false,
             }
         }
 
@@ -1726,6 +1841,7 @@ mod poller {
             match (registration, interest) {
                 (0, 0) => true,
                 (_, 0) => {
+                    // A removal refused finds the registration gone already.
                     self.unregister(socket, true);
                     true
                 }
@@ -1760,14 +1876,14 @@ mod poller {
 
         /// Asks the port to remove the socket's registration; with wait,
         /// the socket stays open and is registered again only after the
-        /// port's word.
-        fn unregister(&mut self, socket: usize, wait: bool) {
+        /// port's word. Whether the port removed one.
+        fn unregister(&mut self, socket: usize, wait: bool) -> bool {
             let Some(watched) = self.sockets.get_mut(&socket) else {
-                return;
+                return false;
             };
             let registration = core::mem::replace(&mut watched.registration, 0);
             if registration == 0 {
-                return;
+                return false;
             }
             self.registrations.remove(&registration);
             let removed = self.register(Registration {
@@ -1781,6 +1897,21 @@ mod poller {
             if removed && wait {
                 self.removing.insert(registration, socket);
             }
+            removed
+        }
+
+        /// Whether the port still holds the socket's registration: then
+        /// the socket is the one registered, open. The port has no way to
+        /// ask but to remove it, which it refuses for a new socket that
+        /// took a closed one's handle (closesocket ended that one's
+        /// registration); one it removes is the socket's again at the
+        /// port's word, as after any removal, with the interest it has.
+        fn holds(&mut self, socket: usize) -> bool {
+            let registered = self
+                .sockets
+                .get(&socket)
+                .is_some_and(|w| w.registration != 0);
+            registered && self.unregister(socket, true)
         }
 
         /// The port's word that a removal is done: its socket, if still
@@ -1814,9 +1945,14 @@ mod poller {
                     &raw mut received,
                 )
             };
-            if done != 0 {
-                // WAIT_TIMEOUT, or the wait failed: nothing taken.
-                return;
+            match done {
+                0 => {}
+                // Nothing in time: WAIT_TIMEOUT, as its result says, or
+                // ERROR_TIMEOUT, as its timeout's says.
+                WAIT_TIMEOUT | ERROR_TIMEOUT => return,
+                // An error of the port or the entries given it, as libuv
+                // and Go take a failed GetQueuedCompletionStatusEx.
+                _ => super::broken(),
             }
             let received = usize::try_from(received).unwrap_or(0);
             for at in 0..received.min(self.entries.len()) {
@@ -1987,7 +2123,7 @@ mod poller {
                 INFINITE => -1,
                 finite => i32::try_from(finite).unwrap_or(i32::MAX),
             };
-            if os::poll(&mut self.fds, ms) <= 0 {
+            if os::poll(&mut self.fds, ms) == 0 {
                 return;
             }
             for (fd, &key) in self.fds.iter_mut().zip(&self.keys) {

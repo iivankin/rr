@@ -13,8 +13,11 @@
 //!
 //! - macOS: mDNSResponder, through dns_sd.h's DNSServiceGetAddrInfo,
 //!   with VPN and split DNS as the system has them; a socket the
-//!   caller's poll waits on, no thread. Its answers come unsorted, so
-//!   resolve sorts them as getaddrinfo would (RFC 6724, sort.rs).
+//!   caller's poll waits on, no thread. It asks for IPv6 only where the
+//!   host has a routable IPv6 address, as getaddrinfo there does, and
+//!   waits for the second family 50 ms once the first gave an address
+//!   (RFC 8305). Its answers come unsorted, so resolve sorts them as
+//!   getaddrinfo would (RFC 6724, sort.rs).
 //! - Windows: GetAddrInfoExW, asynchronous, sorted by the system; its
 //!   callback sets a Signal that the caller's WSAPoll waits on.
 //! - Linux: the C library's getaddrinfo, with nsswitch.conf, files, DNS,
@@ -23,6 +26,13 @@
 //!   at most wait::THREADS_MAX at once, the rest in line, and one
 //!   cancelled once its thread took it runs on to the C library's
 //!   timeout (resolv.conf's timeout and attempts), its answer dropped.
+//!
+//! A process out of descriptors may be told a name is not found: macOS's
+//! getaddrinfo says EAI_NONAME then, as Go notes, and a C library on Linux
+//! that cannot open its files or sockets may not say why either. resolve
+//! keeps no answer, and takes what it can tell as for now (a system error
+//! of EMFILE or ENFILE on Linux; mDNSResponder, unreachable, fails); a
+//! caller that keeps NotFound keeps it no longer than such a moment.
 
 #[cfg(any(target_os = "macos", test))]
 mod sort;
