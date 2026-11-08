@@ -8,6 +8,15 @@
       "path": "mod.rs"
     },
     {
+      "path": "p256.rs"
+    },
+    {
+      "path": "p384.rs"
+    },
+    {
+      "path": "p521.rs"
+    },
+    {
       "path": "ecdsa-wycheproof.txt"
     }
   ]
