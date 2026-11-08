@@ -185,7 +185,7 @@ fn c_string(name: &[u8]) -> Option<Vec<u8>> {
 #[cfg(target_os = "linux")]
 mod os {
     use super::{Address, Error, Wait, c_string};
-    use crate::base::wait::{self, AF_INET, AF_INET6, SOCK_STREAM, Signal};
+    use crate::base::wait::{self, AF_INET, AF_INET6, SOCK_STREAM, Signal, errno};
     use alloc::boxed::Box;
     use alloc::vec::Vec;
     use core::cell::UnsafeCell;
@@ -224,11 +224,18 @@ mod os {
     const EAI_AGAIN: c_int = -3;
     const EAI_NODATA: c_int = -5;
     const EAI_NONAME: c_int = -2;
+    const EAI_SYSTEM: c_int = -11;
+    /// errno.h's: the process, or the system, has no descriptor to spare.
+    const ENFILE: c_int = 23;
+    const EMFILE: c_int = 24;
 
-    fn error(code: c_int) -> Error {
-        match code {
-            EAI_NONAME | EAI_NODATA => Error::NotFound,
-            EAI_AGAIN => Error::Temporary,
+    /// getaddrinfo's error; errno, read on its thread right after, says
+    /// why a system error was one: out of descriptors is for now, as
+    /// Go reads it (go.dev/issue/6232).
+    fn error(code: c_int, system: c_int) -> Error {
+        match (code, system) {
+            (EAI_NONAME | EAI_NODATA, _) => Error::NotFound,
+            (EAI_AGAIN, _) | (EAI_SYSTEM, EMFILE | ENFILE) => Error::Temporary,
             _ => Error::Failed,
         }
     }
@@ -256,7 +263,7 @@ mod os {
             )
         };
         if code != 0 {
-            return Err(error(code));
+            return Err(error(code, errno()));
         }
         let mut addresses = Vec::new();
         let mut next = list;
@@ -433,16 +440,23 @@ mod os {
 /// macOS: the system's own resolver, mDNSResponder, which getaddrinfo
 /// asks too and which knows VPN and split DNS, through dns_sd.h's
 /// DNSServiceGetAddrInfo: a socket to it that the caller's poll waits
-/// on, no thread, and a lookup dropped is cancelled there. Its answers
-/// come one at a time, unsorted: the lookup is over once IPv4 and IPv6
-/// each answered, with addresses or with none, and nothing more is on
-/// the way; then the addresses are sorted as getaddrinfo sorts them
-/// (RFC 6724), on the source the system would use for each.
+/// on, no thread, and a lookup dropped is cancelled there. It asks for
+/// the families as getaddrinfo asks (no protocol: mDNSResponder leaves
+/// out IPv6 where the host has no routable IPv6 address, and IPv4 where
+/// none of that, as AI_ADDRCONFIG does, and answers the family it left
+/// out with none at once). Its answers come one at a time, unsorted: the
+/// lookup is over once IPv4 and IPv6 each answered, with addresses or
+/// with none, and nothing more is on the way; or 50 ms after the first
+/// address came, without the other family, as RFC 8305's resolution
+/// delay waits for it, so that a DNS server that never answers AAAA (or
+/// A) does not hold the lookup to the system's timeout. Then the
+/// addresses are sorted as getaddrinfo sorts them (RFC 6724), on the
+/// source the system would use for each.
 #[cfg(target_os = "macos")]
 mod os {
     use super::super::sort::{ADDRESSES_MAX, sort};
     use super::{Address, Error, Wait, c_string, finish};
-    use crate::base::wait::{self, Fd, POLLIN};
+    use crate::base::wait::{self, F_SETFD, FD_CLOEXEC, Fd, Instant, POLLIN};
     use alloc::boxed::Box;
     use alloc::vec::Vec;
     use core::ffi::{c_char, c_int, c_void};
@@ -481,6 +495,7 @@ mod os {
         fn socket(domain: c_int, kind: c_int, protocol: c_int) -> c_int;
         fn connect(fd: c_int, address: *const u8, length: u32) -> c_int;
         fn getsockname(fd: c_int, address: *mut u8, length: *mut u32) -> c_int;
+        fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
         fn close(fd: c_int) -> c_int;
     }
 
@@ -489,8 +504,8 @@ mod os {
     const ADD: u32 = 0x2;
     const RETURN_INTERMEDIATES: u32 = 0x1000;
     const TIMEOUT: u32 = 0x10000;
-    const IPV4: u32 = 0x1;
-    const IPV6: u32 = 0x2;
+    /// No protocol: the families as the host can reach them.
+    const FAMILIES: u32 = 0;
     const NO_ERROR: i32 = 0;
     const NO_SUCH_NAME: i32 = -65538;
     const NO_SUCH_RECORD: i32 = -65554;
@@ -506,6 +521,9 @@ mod os {
     const SOCKADDR_BYTES: usize = 28;
     /// The replies read at one poll; more wait for the next.
     const REPLIES_MAX: usize = 64;
+    /// How long the other family is waited for once one gave an address:
+    /// RFC 8305's resolution delay.
+    const DELAY_MS: u64 = 50;
 
     /// What the replies said so far.
     struct Answers {
@@ -515,11 +533,21 @@ mod os {
         /// The last reply said more are on the way.
         more: bool,
         error: Option<Error>,
+        /// When the other family stops being waited for, once an
+        /// address came.
+        until: Option<Instant>,
     }
 
     impl Answers {
-        fn over(&self) -> bool {
-            !self.more && (self.error.is_some() || (self.v4 && self.v6))
+        fn over(&self, now: Instant) -> bool {
+            let waited = self.until.is_some_and(|until| until.reached_by(now));
+            !self.more && (self.error.is_some() || (self.v4 && self.v6) || waited)
+        }
+
+        /// The milliseconds left to wait for the other family; none
+        /// before an address came.
+        fn left_ms(&self, now: Instant) -> Option<u64> {
+            self.until.map(|until| until.since(now).div_ceil(1_000_000))
         }
 
         /// Marks the family a reply is about as answered; a reply about
@@ -627,7 +655,10 @@ mod os {
                     // An address taken back.
                     (false, _) => answers.found.retain(|other| *other != found),
                     (true, false) if answers.found.len() < ADDRESSES_MAX => {
-                        answers.found.push(found)
+                        answers.found.push(found);
+                        if answers.until.is_none() {
+                            answers.until = Some(Instant::now().after_ms(DELAY_MS));
+                        }
                     }
                     (true, _) => {}
                 }
@@ -695,11 +726,14 @@ mod os {
         if fd < 0 {
             return None;
         }
+        // Closed on exec, at once: macOS has no SOCK_CLOEXEC.
+        // rr: escape(unsafe): fd is this call's, open.
+        let kept = unsafe { fcntl(fd, F_SETFD, FD_CLOEXEC) } == 0;
         let mut local = [0u8; SOCKADDR_BYTES];
         let mut size = u32::try_from(SOCKADDR_BYTES).ok()?;
         let length = u32::try_from(length).ok()?;
         // rr: escape(unsafe): peer holds length bytes of a sockaddr.
-        let connected = unsafe { connect(fd, peer.as_ptr(), length) } == 0;
+        let connected = kept && unsafe { connect(fd, peer.as_ptr(), length) } == 0;
         // rr: escape(unsafe): local holds size bytes.
         let named = connected && unsafe { getsockname(fd, local.as_mut_ptr(), &raw mut size) } == 0;
         // rr: escape(unsafe): fd is this call's, closed once.
@@ -741,6 +775,7 @@ mod os {
                 v6: false,
                 more: false,
                 error: None,
+                until: None,
             }));
             // rr: escape(unsafe): text is NUL-terminated; answers lives until
             // the service is deallocated, in drop or once over.
@@ -749,7 +784,7 @@ mod os {
                     &raw mut state.service,
                     RETURN_INTERMEDIATES | TIMEOUT,
                     0,
-                    IPV4 | IPV6,
+                    FAMILIES,
                     text.as_ptr().cast(),
                     reply,
                     state.answers.cast(),
@@ -773,7 +808,7 @@ mod os {
         fn read(&mut self) {
             for _ in 0..REPLIES_MAX {
                 // rr: escape(unsafe): answers is live while the lookup runs.
-                if unsafe { &*self.answers }.over() {
+                if unsafe { &*self.answers }.over(Instant::now()) {
                     self.over();
                     return;
                 }
@@ -799,7 +834,7 @@ mod os {
             }
             // The last turn's reply may have ended it.
             // rr: escape(unsafe): answers is live while the lookup runs.
-            if unsafe { &*self.answers }.over() {
+            if unsafe { &*self.answers }.over(Instant::now()) {
                 self.over();
             }
         }
@@ -851,8 +886,10 @@ mod os {
                 events: POLLIN,
             };
             wait.count = 1;
-            // mDNSResponder ends the lookup itself (TIMEOUT), with a reply.
-            wait.timeout_ms = None;
+            // mDNSResponder ends the lookup itself (TIMEOUT), with a reply;
+            // the other family is waited for only so long.
+            // rr: escape(unsafe): answers is live while the lookup runs.
+            wait.timeout_ms = unsafe { &*self.answers }.left_ms(Instant::now());
             wait
         }
     }
@@ -875,6 +912,83 @@ mod os {
     /// The lookup, waited on.
     pub fn resolve(name: &[u8]) -> Result<Vec<Address>, Error> {
         finish(super::Lookup::start(name))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{
+            ADD, AF_INET, AF_INET6, Answers, DELAY_MS, NO_ERROR, NO_SUCH_RECORD, SOCKADDR_BYTES,
+            reply,
+        };
+        use crate::base::wait::Instant;
+        use alloc::vec::Vec;
+        use core::ptr::{null, null_mut};
+
+        fn answers() -> Answers {
+            Answers {
+                found: Vec::new(),
+                v4: false,
+                v6: false,
+                more: false,
+                error: None,
+                until: None,
+            }
+        }
+
+        /// A reply as mDNSResponder gives it: an address of the family,
+        /// added, or none of it.
+        fn send(answers: &mut Answers, family: u8, code: i32) {
+            let mut address = [0u8; SOCKADDR_BYTES];
+            address[1] = family;
+            if family == AF_INET {
+                address[0] = 16;
+                address[4..8].copy_from_slice(&[192, 0, 2, 1]);
+            } else {
+                address[0] = 28;
+                address[8..10].copy_from_slice(&[0x20, 0x01]);
+            }
+            let flags = if code == NO_ERROR { ADD } else { 0 };
+            let context = core::ptr::from_mut(answers).cast();
+            reply(
+                null_mut(),
+                flags,
+                0,
+                code,
+                null(),
+                address.as_ptr(),
+                0,
+                context,
+            );
+        }
+
+        /// An address of one family, and the other never answered, as a
+        /// DNS server that swallows AAAA: over once the delay passed,
+        /// not at the system's timeout.
+        #[test]
+        fn other_family_waited_for_briefly() {
+            let mut one = answers();
+            send(&mut one, AF_INET, NO_ERROR);
+            let now = Instant::now();
+            assert!(!one.over(now));
+            assert!(one.left_ms(now).is_some_and(|ms| ms <= DELAY_MS));
+            assert!(one.over(Instant::now().after_ms(DELAY_MS)));
+            assert_eq!(one.found.len(), 1);
+        }
+
+        /// Both families answered, either with none: over at once.
+        #[test]
+        fn both_families_answered() {
+            let mut none_first = answers();
+            send(&mut none_first, AF_INET6, NO_SUCH_RECORD);
+            assert!(!none_first.over(Instant::now()));
+            send(&mut none_first, AF_INET, NO_ERROR);
+            assert!(none_first.over(Instant::now()));
+            let mut both = answers();
+            send(&mut both, AF_INET, NO_ERROR);
+            send(&mut both, AF_INET6, NO_ERROR);
+            assert!(both.over(Instant::now()));
+            assert_eq!(both.found.len(), 2);
+        }
     }
 }
 

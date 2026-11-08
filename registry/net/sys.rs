@@ -9,12 +9,12 @@ use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 pub enum Error {
     /// Nobody listens there.
     Refused,
-    /// The peer reset or aborted the connection, or is gone and a write
-    /// found out.
+    /// The peer reset or aborted the connection, or is gone and a write,
+    /// or the system's keep-alive (ENETRESET, WSAENETRESET), found out.
     Reset,
     /// The connection timed out.
     TimedOut,
-    /// No route to the host or its network.
+    /// No route to the host or its network, or either is down.
     Unreachable,
     /// The address is taken.
     InUse,
@@ -231,8 +231,20 @@ impl Listener {
 /// the system lets it, and says how many it has: a server of many
 /// connections needs more than the 256 (macOS) or 1024 (Linux) a process
 /// starts with, as Go raises them itself. Windows sets no such limit.
+///
+/// The limit raised is the soft one (RLIMIT_NOFILE), which a child the
+/// process starts inherits, and a program that uses select may need low
+/// (FD_SETSIZE, 1024): Go gives the children it starts the limit back.
+/// descriptors_before says what it was, for a caller that starts one to
+/// set in the child before exec.
 pub fn descriptors(want: u64) -> u64 {
     os::descriptors(want)
+}
+
+/// The soft limit of descriptors before descriptors first raised it;
+/// None while it has not, and on Windows.
+pub fn descriptors_before() -> Option<u64> {
+    os::descriptors_before()
 }
 
 /// address as the system's sockaddr_in or sockaddr_in6, and its length.
@@ -293,6 +305,7 @@ mod os {
     use crate::base::wait::SOCK_STREAM;
     use core::ffi::c_int;
     use core::net::SocketAddr;
+    use core::sync::atomic::{AtomicU64, Ordering};
 
     /// The system's calls, apart from the functions named after them.
     mod c {
@@ -356,18 +369,14 @@ mod os {
             pub(super) fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
             pub(super) fn getrlimit(resource: c_int, limit: *mut u64) -> c_int;
             pub(super) fn setrlimit(resource: c_int, limit: *const u64) -> c_int;
-            #[cfg(target_os = "macos")]
-            pub(super) fn __error() -> *mut c_int;
-            #[cfg(target_os = "linux")]
-            pub(super) fn __errno_location() -> *mut c_int;
         }
     }
 
     // sys/socket.h's, netinet/in.h's, netinet/tcp.h's and errno.h's: Linux's
     // from asm-generic, as x86_64 and aarch64 have them, macOS's from its
     // SDK.
-    use crate::base::wait::EINTR;
     pub use crate::base::wait::{AF_INET, AF_INET6};
+    use crate::base::wait::{EINTR, ETIMEDOUT, errno};
     const IPPROTO_TCP: c_int = 6;
     const IPPROTO_IPV6: c_int = 41;
     const TCP_NODELAY: c_int = 1;
@@ -389,11 +398,11 @@ mod os {
         pub const ECONNREFUSED: c_int = 111;
         pub const ECONNRESET: c_int = 104;
         pub const ECONNABORTED: c_int = 103;
-        pub const ETIMEDOUT: c_int = 110;
         pub const EHOSTUNREACH: c_int = 113;
         pub const ENETUNREACH: c_int = 101;
         pub const EADDRINUSE: c_int = 98;
         pub const ENETDOWN: c_int = 100;
+        pub const ENETRESET: c_int = 102;
         pub const EPROTO: c_int = 71;
         pub const ENOPROTOOPT: c_int = 92;
         pub const EHOSTDOWN: c_int = 112;
@@ -419,41 +428,25 @@ mod os {
         pub const ECONNREFUSED: c_int = 61;
         pub const ECONNRESET: c_int = 54;
         pub const ECONNABORTED: c_int = 53;
-        pub const ETIMEDOUT: c_int = 60;
         pub const EHOSTUNREACH: c_int = 65;
         pub const ENETUNREACH: c_int = 51;
         pub const EADDRINUSE: c_int = 48;
+        pub const ENETDOWN: c_int = 50;
+        pub const ENETRESET: c_int = 52;
+        pub const EHOSTDOWN: c_int = 64;
     }
     use numbers::{
-        EADDRINUSE, EAGAIN, ECONNABORTED, ECONNREFUSED, ECONNRESET, EHOSTUNREACH, EINPROGRESS,
-        ENETUNREACH, ETIMEDOUT, IPV6_V6ONLY, SEND_FLAGS, SO_ERROR, SO_LINGER, SO_REUSEADDR,
-        SOL_SOCKET,
+        EADDRINUSE, EAGAIN, ECONNABORTED, ECONNREFUSED, ECONNRESET, EHOSTDOWN, EHOSTUNREACH,
+        EINPROGRESS, ENETDOWN, ENETRESET, ENETUNREACH, IPV6_V6ONLY, SEND_FLAGS, SO_ERROR,
+        SO_LINGER, SO_REUSEADDR, SOL_SOCKET,
     };
-
-    #[cfg(target_os = "macos")]
-    fn errno_place() -> *mut c_int {
-        // rr: escape(unsafe): the C library's thread-local errno.
-        unsafe { c::__error() }
-    }
-
-    #[cfg(target_os = "linux")]
-    fn errno_place() -> *mut c_int {
-        // rr: escape(unsafe): the C library's thread-local errno.
-        unsafe { c::__errno_location() }
-    }
-
-    fn errno() -> c_int {
-        let place = errno_place();
-        // rr: escape(unsafe): the place is this thread's errno.
-        unsafe { place.read() }
-    }
 
     pub fn error(code: c_int) -> Error {
         match code {
             ECONNREFUSED => Error::Refused,
-            ECONNRESET | EPIPE | ECONNABORTED => Error::Reset,
+            ECONNRESET | EPIPE | ECONNABORTED | ENETRESET => Error::Reset,
             ETIMEDOUT => Error::TimedOut,
-            EHOSTUNREACH | ENETUNREACH => Error::Unreachable,
+            EHOSTUNREACH | ENETUNREACH | EHOSTDOWN | ENETDOWN => Error::Unreachable,
             EADDRINUSE => Error::InUse,
             other => Error::Other(other),
         }
@@ -601,7 +594,7 @@ mod os {
     /// take as EAGAIN.
     #[cfg(target_os = "linux")]
     fn passing(code: c_int) -> bool {
-        use numbers::{EHOSTDOWN, ENETDOWN, ENONET, ENOPROTOOPT, EOPNOTSUPP, EPROTO};
+        use numbers::{ENONET, ENOPROTOOPT, EOPNOTSUPP, EPROTO};
         matches!(
             code,
             EAGAIN
@@ -784,6 +777,17 @@ mod os {
         u64::MAX
     }
 
+    /// The soft limit before the first raise; 0 until then. A soft limit
+    /// of 0 is never raised from: no descriptor could have opened the
+    /// sockets that ask.
+    // rr: escape(shared): one limit for the process, which any thread may
+    // raise.
+    static BEFORE: AtomicU64 = AtomicU64::new(0);
+
+    pub fn descriptors_before() -> Option<u64> {
+        Some(BEFORE.load(Ordering::Acquire)).filter(|&before| before != 0)
+    }
+
     pub fn descriptors(want: u64) -> u64 {
         let mut limit = [0u64; 2];
         // rr: escape(unsafe): limit is a local struct rlimit.
@@ -797,6 +801,9 @@ mod os {
         let asked = want.min(most).min(per_process());
         if asked > current {
             let raised = [asked, most];
+            // rr: escape(discard): the first raise keeps what it raised
+            // from; a later one finds it kept.
+            let _first = BEFORE.compare_exchange(0, current, Ordering::AcqRel, Ordering::Acquire);
             // rr: escape(unsafe): raised is a local struct rlimit. Refused,
             // the limit stays as it was.
             unsafe { c::setrlimit(RLIMIT_NOFILE, raised.as_ptr()) };
@@ -878,8 +885,6 @@ mod os {
     const SOL_SOCKET: i32 = 0xffff;
     const SO_ERROR: i32 = 0x1007;
     const SO_LINGER: i32 = 0x80;
-    /// ~SO_REUSEADDR: nobody else may bind the address while it is ours.
-    const SO_EXCLUSIVEADDRUSE: i32 = !0x4;
     const IPPROTO_IPV6: i32 = 41;
     const IPV6_V6ONLY: i32 = 27;
     const TCP_NODELAY: i32 = 1;
@@ -888,12 +893,15 @@ mod os {
     const WSAEACCES: i32 = 10013;
     const WSAEWOULDBLOCK: i32 = 10035;
     const WSAEADDRINUSE: i32 = 10048;
+    const WSAENETDOWN: i32 = 10050;
     const WSAENETUNREACH: i32 = 10051;
+    const WSAENETRESET: i32 = 10052;
     const WSAECONNABORTED: i32 = 10053;
     const WSAECONNRESET: i32 = 10054;
     const WSAESHUTDOWN: i32 = 10058;
     const WSAETIMEDOUT: i32 = 10060;
     const WSAECONNREFUSED: i32 = 10061;
+    const WSAEHOSTDOWN: i32 = 10064;
     const WSAEHOSTUNREACH: i32 = 10065;
 
     fn last() -> i32 {
@@ -904,9 +912,9 @@ mod os {
     pub fn error(code: i32) -> Error {
         match code {
             WSAECONNREFUSED => Error::Refused,
-            WSAECONNRESET | WSAECONNABORTED | WSAESHUTDOWN => Error::Reset,
+            WSAECONNRESET | WSAECONNABORTED | WSAESHUTDOWN | WSAENETRESET => Error::Reset,
             WSAETIMEDOUT => Error::TimedOut,
-            WSAEHOSTUNREACH | WSAENETUNREACH => Error::Unreachable,
+            WSAEHOSTUNREACH | WSAENETUNREACH | WSAEHOSTDOWN | WSAENETDOWN => Error::Unreachable,
             WSAEADDRINUSE => Error::InUse,
             other => Error::Other(other),
         }
@@ -961,10 +969,18 @@ mod os {
         check(unsafe { c::setsockopt(socket, level, name, bytes.as_ptr(), length(&bytes)) })
     }
 
-    /// A listener's options: nobody else binds its address while it
-    /// listens; IPv6 alone on an IPv6 socket.
+    /// A listener's options: IPv6 alone on an IPv6 socket, and nothing
+    /// for its address, as in Go, libuv and Rust's std. Windows takes an
+    /// address again while connections to it linger in TIME_WAIT without
+    /// SO_REUSEADDR, which would let another socket take it while it
+    /// listens; and SO_EXCLUSIVEADDRUSE refuses it until those
+    /// connections are gone (Microsoft's "Using SO_REUSEADDR and
+    /// SO_EXCLUSIVEADDRUSE", libuv's issue 1360), which a server that
+    /// restarts cannot wait for. Without either, a second listener on the
+    /// address is refused, as on Linux and macOS; only the same user may
+    /// still take a specific address under a listener on the wildcard
+    /// one, which SO_EXCLUSIVEADDRUSE alone would refuse.
     pub fn prepare(socket: usize, v6: bool) -> Result<(), Error> {
-        option(socket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, 1)?;
         if v6 {
             option(socket, IPPROTO_IPV6, IPV6_V6ONLY, 1)?;
         }
@@ -975,9 +991,10 @@ mod os {
         option(socket, IPPROTO_TCP, TCP_NODELAY, i32::from(on))
     }
 
-    /// Binds; with SO_EXCLUSIVEADDRUSE, an address another socket holds
-    /// is refused as access denied (WSAEACCES), which is the address in
-    /// use.
+    /// Binds; an address another user's socket holds, or one that set
+    /// SO_EXCLUSIVEADDRUSE, or one the system keeps for itself (an
+    /// excluded port range), is refused as access denied (WSAEACCES),
+    /// which is the address in use.
     pub fn bind(socket: usize, address: &[u8]) -> Result<(), Error> {
         // rr: escape(unsafe): address is a sockaddr of its length.
         if unsafe { c::bind(socket, address.as_ptr(), length(address)) } == 0 {
@@ -1120,5 +1137,9 @@ mod os {
     /// Windows has no limit to raise: as many as asked.
     pub fn descriptors(want: u64) -> u64 {
         want
+    }
+
+    pub fn descriptors_before() -> Option<u64> {
+        None
     }
 }
