@@ -1,5 +1,6 @@
-//! AES-128-GCM (FIPS 197, NIST SP 800-38D) as TLS 1.3 uses it: a 16-byte
-//! key, a 12-byte nonce and a 16-byte tag, sealed and opened in place.
+//! AES-128-GCM and AES-256-GCM (FIPS 197, NIST SP 800-38D) as TLS 1.3
+//! uses them: a 16- or 32-byte key, a 12-byte nonce and a 16-byte tag,
+//! sealed and opened in place.
 //!
 //! CTR and GHASH run on the CPU's instructions through sys::aes where it
 //! has them. The portable code is constant-time: AES is bitsliced, four
@@ -13,6 +14,8 @@ mod sys;
 use sys as hw;
 
 pub const KEY_LEN: usize = 16;
+/// AES-256's key.
+pub const KEY256_LEN: usize = 32;
 pub const NONCE_LEN: usize = 12;
 pub const TAG_LEN: usize = 16;
 /// What one nonce may cover: the 32-bit counter starts at 2, so 2^32 - 2
@@ -22,6 +25,8 @@ const DATA_MAX: u64 = ((1 << 32) - 2) * 16;
 const AAD_MAX: u64 = u64::MAX / 8;
 /// Every fourth bit: the bitsliced key's lanes and bmul64's slices.
 const M0: u64 = 0x1111_1111_1111_1111;
+/// AES-256's round keys; AES-128's 11 are the last of as many places.
+const ROUND_KEYS: usize = 15;
 
 #[cfg_attr(any(test, fuzzing), derive(Debug))]
 pub enum Error {
@@ -33,10 +38,13 @@ pub enum Error {
 
 /// One key, expanded once: round keys and the hash key H in both forms.
 pub struct AesGcm {
-    /// The round keys as bytes, aligned for the instructions.
+    /// The round keys as bytes, aligned for the instructions, from
+    /// rk.first on.
     rk: hw::RoundKeys,
-    /// The same, bitsliced for four blocks of the portable code.
-    sk: [[u64; 8]; 11],
+    /// The same, bitsliced and compressed: one bit of each nibble, which
+    /// the portable code spreads to the nibble (spread_key) for its four
+    /// blocks, a quarter of the size.
+    sk: [[u64; 2]; ROUND_KEYS],
     /// H as two big-endian words, for the portable GHASH.
     h: [u64; 2],
     /// H to H^8 as the instructions' GHASH takes them.
@@ -46,20 +54,37 @@ pub struct AesGcm {
 }
 
 impl AesGcm {
+    /// AES-128-GCM.
     pub fn new(key: &[u8; KEY_LEN]) -> AesGcm {
         AesGcm::with(key, hw::available())
     }
 
-    fn with(key: &[u8; KEY_LEN], hw: bool) -> AesGcm {
-        let w = expand(key);
+    /// AES-256-GCM.
+    pub fn new256(key: &[u8; KEY256_LEN]) -> AesGcm {
+        AesGcm::with(key, hw::available())
+    }
+
+    /// A key of 16 or 32 bytes: AES-128's 11 round keys go in the last 11
+    /// places, so the last rounds take theirs from the same place for both.
+    fn with(key: &[u8], hw: bool) -> AesGcm {
+        let first = if key.len() == KEY256_LEN {
+            0
+        } else {
+            hw::AES128_FIRST
+        };
+        let mut w = [[0; 4]; ROUND_KEYS];
+        expand(key, w.get_mut(first..).unwrap_or_default());
         let mut g = AesGcm {
-            rk: hw::RoundKeys([[0; 16]; 11]),
-            sk: [[0; 8]; 11],
+            rk: hw::RoundKeys {
+                keys: [[0; 16]; ROUND_KEYS],
+                first,
+            },
+            sk: [[0; 2]; ROUND_KEYS],
             h: [0; 2],
             htbl: [[0; 16]; 16],
             hw,
         };
-        for ((rk, sk), k) in g.rk.0.iter_mut().zip(&mut g.sk).zip(w) {
+        for ((rk, sk), k) in g.rk.keys.iter_mut().zip(&mut g.sk).zip(w) {
             *rk = block_bytes(k);
             *sk = bitslice_key(k);
         }
@@ -207,26 +232,31 @@ impl AesGcm {
         if self.hw && hw::ctr(&self.rk, block, ctr, data) {
             return;
         }
+        let mut sk = [[0; 8]; ROUND_KEYS];
+        for (d, k) in sk.iter_mut().zip(&self.sk).skip(self.rk.first) {
+            *d = spread_key(*k);
+        }
         let [n0, n1, n2, _] = block_words(block);
         let (quads, tail) = data.as_chunks_mut::<64>();
         let mut c = ctr;
         for q in quads {
-            let ks = self.keystream([n0, n1, n2], c);
+            let ks = self.keystream(&sk, [n0, n1, n2], c);
             c = c.wrapping_add(4);
             for (d, k) in q.iter_mut().zip(ks) {
                 *d ^= k;
             }
         }
         if !tail.is_empty() {
-            let ks = self.keystream([n0, n1, n2], c);
+            let ks = self.keystream(&sk, [n0, n1, n2], c);
             for (d, k) in tail.iter_mut().zip(ks) {
                 *d ^= k;
             }
         }
     }
 
-    /// Four blocks of key stream, counters c to c + 3.
-    fn keystream(&self, n: [u32; 3], c: u32) -> [u8; 64] {
+    /// Four blocks of key stream, counters c to c + 3, under the round
+    /// keys sk spread out.
+    fn keystream(&self, sk: &[[u64; 8]; ROUND_KEYS], n: [u32; 3], c: u32) -> [u8; 64] {
         let [n0, n1, n2] = n;
         let mut q = [0; 8];
         let (lo, hi) = q.split_at_mut(4);
@@ -235,7 +265,7 @@ impl AesGcm {
             (*a, *b) = interleave_in([n0, n1, n2, w3]);
         }
         ortho(&mut q);
-        encrypt(&self.sk, &mut q);
+        encrypt(sk, self.rk.first, &mut q);
         ortho(&mut q);
         let mut out = [0; 64];
         let (q03, q47) = q.split_at(4);
@@ -334,24 +364,37 @@ fn bmul64(x: u64, y: u64) -> u64 {
     (z0 & M0) | (z1 & M1) | (z2 & M2) | (z3 & M3)
 }
 
-/// The AES-128 key schedule (FIPS 197 5.2) as eleven round keys of
-/// little-endian words; SubWord goes through the circuit, not a table.
-fn expand(key: &[u8; KEY_LEN]) -> [[u32; 4]; 11] {
-    let mut rk = [[0; 4]; 11];
-    let mut k = block_words(key);
-    let mut rcon = 1;
-    for r in &mut rk {
-        *r = k;
-        let [_, _, _, last] = k;
-        let t = sub_word(last.rotate_right(8)) ^ rcon;
-        let [k0, k1, k2, k3] = k;
-        let k0 = k0 ^ t;
-        let k1 = k1 ^ k0;
-        let k2 = k2 ^ k1;
-        k = [k0, k1, k2, k3 ^ k2];
-        rcon = (rcon << 1) ^ ((rcon >> 7) * 0x11b);
+/// The key schedule (FIPS 197 5.2) of a 16- or 32-byte key into rk, 11
+/// or 15 round keys of little-endian words: Nk words of the key, then
+/// each word the one Nk before XORed with the one before, transformed
+/// at each multiple of Nk and, for AES-256, halfway too. SubWord goes
+/// through the circuit, not a table.
+fn expand(key: &[u8], rk: &mut [[u32; 4]]) {
+    let w = rk.as_flattened_mut();
+    let (words, _) = key.as_chunks::<4>();
+    let nk = words.len();
+    for (d, c) in w.iter_mut().zip(words) {
+        *d = u32::from_le_bytes(*c);
     }
-    rk
+    let mut rcon = 1;
+    for i in nk..w.len() {
+        let Some((done, [next, ..])) = w.split_at_mut_checked(i) else {
+            break;
+        };
+        let (Some(&back), Some(&prev)) = (done.get(i - nk), done.last()) else {
+            break;
+        };
+        let t = if i % nk == 0 {
+            let t = sub_word(prev.rotate_right(8)) ^ rcon;
+            rcon = (rcon << 1) ^ ((rcon >> 7) * 0x11b);
+            t
+        } else if nk > 6 && i % nk == 4 {
+            sub_word(prev)
+        } else {
+            prev
+        };
+        *next = back ^ t;
+    }
 }
 
 /// S applied to each byte of x.
@@ -364,14 +407,21 @@ fn sub_word(x: u32) -> u32 {
     low32(q[0])
 }
 
-/// A round key in the bitsliced form, the same in all four blocks.
-fn bitslice_key(k: [u32; 4]) -> [u64; 8] {
+/// A round key in the bitsliced form, the same in all four blocks, and
+/// so one bit of each nibble: those bits, which spread_key spreads.
+fn bitslice_key(k: [u32; 4]) -> [u64; 2] {
     let (a, b) = interleave_in(k);
     let mut q = [a, a, a, a, b, b, b, b];
     ortho(&mut q);
     let [q0, q1, q2, q3, q4, q5, q6, q7] = q;
     let c0 = (q0 & M0) | (q1 & (M0 << 1)) | (q2 & (M0 << 2)) | (q3 & (M0 << 3));
     let c1 = (q4 & M0) | (q5 & (M0 << 1)) | (q6 & (M0 << 2)) | (q7 & (M0 << 3));
+    [c0, c1]
+}
+
+/// The round key for four blocks from bitslice_key's bits.
+fn spread_key(c: [u64; 2]) -> [u64; 8] {
+    let [c0, c1] = c;
     // Each bit fills its nibble: x * 15 with one bit in four set.
     [
         (c0 & M0) * 15,
@@ -430,11 +480,15 @@ fn ortho(q: &mut [u64; 8]) {
     *q = [q0, q1, q2, q3, q4, q5, q6, q7];
 }
 
-/// Ten rounds on four bitsliced blocks.
-fn encrypt(sk: &[[u64; 8]; 11], q: &mut [u64; 8]) {
-    let [first, middle @ .., last] = sk;
-    add_round_key(q, first);
-    for k in middle {
+/// Ten or fourteen rounds on four bitsliced blocks, the round keys from
+/// sk[first] on.
+fn encrypt(sk: &[[u64; 8]; ROUND_KEYS], first: usize, q: &mut [u64; 8]) {
+    let [keys @ .., last] = sk;
+    let mut keys = keys.iter().skip(first);
+    if let Some(k) = keys.next() {
+        add_round_key(q, k);
+    }
+    for k in keys {
         sbox(q);
         shift_rows(q);
         mix_columns(q);
@@ -657,13 +711,15 @@ mod tests {
         v
     }
 
-    fn key(s: &str) -> [u8; 16] {
-        unhex(s).try_into().unwrap()
-    }
-
-    /// The instructions where the CPU has them, and the portable code.
+    /// The instructions where the CPU has them, and the portable code,
+    /// for a key of 16 or 32 bytes.
     fn both(k: &str) -> [AesGcm; 2] {
-        [AesGcm::new(&key(k)), AesGcm::with(&key(k), false)]
+        let key = unhex(k);
+        assert!(matches!(key.len(), 16 | 32));
+        [
+            AesGcm::with(&key, hw::available()),
+            AesGcm::with(&key, false),
+        ]
     }
 
     /// Seals pt, checks ct and tag, then opens it back.
@@ -683,26 +739,48 @@ mod tests {
     fn apple_silicon_has_the_instructions() {
         assert!(hw::available());
         assert!(AesGcm::new(&[0; 16]).hw);
+        assert!(AesGcm::new256(&[0; 32]).hw);
     }
 
-    /// FIPS 197 appendix C.1, through the counter: E(K, P) is the key
-    /// stream of the counter block P.
+    /// FIPS 197 appendices C.1 and C.3, through the counter: E(K, P) is
+    /// the key stream of the counter block P.
     #[test]
     fn fips197() {
-        for g in both("000102030405060708090a0b0c0d0e0f") {
-            let p: [u8; 16] = unhex("00112233445566778899aabbccddeeff")
-                .try_into()
-                .unwrap();
-            let c = u32::from_be_bytes(p[12..].try_into().unwrap());
-            let mut block = p;
-            block[12..].fill(0);
-            let mut out = [0; 16];
-            g.ctr(&block, c, &mut out);
-            assert_eq!(out[..], unhex("69c4e0d86a7b0430d8cdb78070b4c55a")[..]);
+        let key128 = "000102030405060708090a0b0c0d0e0f";
+        let key256 = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        for (k, c) in [
+            (key128, "69c4e0d86a7b0430d8cdb78070b4c55a"),
+            (key256, "8ea2b7ca516745bfeafc49904b496089"),
+        ] {
+            for g in both(k) {
+                let p: [u8; 16] = unhex("00112233445566778899aabbccddeeff")
+                    .try_into()
+                    .unwrap();
+                let counter = u32::from_be_bytes(p[12..].try_into().unwrap());
+                let mut block = p;
+                block[12..].fill(0);
+                let mut out = [0; 16];
+                g.ctr(&block, counter, &mut out);
+                assert_eq!(out[..], unhex(c)[..]);
+            }
         }
     }
 
-    /// McGrew and Viega's test cases 1 to 4.
+    /// FIPS 197 A.3's AES-256 key expansion: the last round key.
+    #[test]
+    fn key_expansion_256() {
+        let key = unhex("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4");
+        let g = AesGcm::with(&key, false);
+        assert_eq!(g.rk.first, 0);
+        assert_eq!(
+            g.rk.keys[14][..],
+            unhex("fe4890d1e6188d0b046df344706c631e")[..]
+        );
+        let short = AesGcm::with(&key[..16], false);
+        assert_eq!(short.rk.first, hw::AES128_FIRST);
+    }
+
+    /// McGrew and Viega's test cases 1 to 4, and 13 to 16 of AES-256.
     #[test]
     fn gcm_spec() {
         let z = "00000000000000000000000000000000";
@@ -726,11 +804,33 @@ mod tests {
             vector(&g, nonce, "", pt, ct, "4d5c2af327cd64a62cf35abd2ba6fab4");
             vector(&g, nonce, aad, pt4, ct4, "5bc94fbc3221a5db94fae95ae7121a47");
         }
+        let z256 = "0000000000000000000000000000000000000000000000000000000000000000";
+        for g in both(z256) {
+            vector(&g, n, "", "", "", "530f8afbc74536b9a963b4f1c4cb738b");
+            let zeros = "cea7403d4d606b6e074ec5d3baf39d18";
+            vector(&g, n, "", z, zeros, "d0d1c8a799996bf0265b98b5d48ab919");
+        }
+        let ct15 = "522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa\
+                    8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f662898015ad";
+        let ct16 = "522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa\
+                    8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f662";
+        for g in both("feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308") {
+            vector(&g, nonce, "", pt, ct15, "b094dac5d93471bdec1a502270e3cc6c");
+            vector(
+                &g,
+                nonce,
+                aad,
+                pt4,
+                ct16,
+                "76fc6ece0f4e1768cddf8853bb2d551b",
+            );
+        }
     }
 
     /// A 12-byte nonce with AAD and a partial block: NIST's GCM validation
-    /// vectors (gcmEncryptExtIV128, IVlen 96, PTlen 408, AADlen 160,
-    /// Count 0), and one with AAD alone (PTlen 0, AADlen 128, Count 0).
+    /// vectors (gcmEncryptExtIV128 and 256, IVlen 96, PTlen 408, AADlen
+    /// 160, Count 0), and one with AAD alone (PTlen 0, AADlen 128, Count
+    /// 0).
     #[test]
     fn nist_cavp() {
         for g in both("fe47fcce5fc32665d2ae399e4eec72ba") {
@@ -755,6 +855,28 @@ mod tests {
                 "209fcc8d3675ed938e9c7166709dd946",
             );
         }
+        for g in both("24501ad384e473963d476edcfe08205237acfd49b5b8f33857f8114e863fec7f") {
+            vector(
+                &g,
+                "9ff18563b978ec281b3f2794",
+                "adb5ec720ccf9898500028bf34afccbcaca126ef",
+                "27f348f9cdc0c5bd5e66b1ccb63ad920ff2219d14e8d631b3872265cf117ee86\
+                 757accb158bd9abb3868fdc0d0b074b5f01b2c",
+                "eb7cb754c824e8d96f7c6d9b76c7d26fb874ffbf1d65c6f64a698d839b0b0614\
+                 5dae82057ad55994cf59ad7f67c0fa5e85fab8",
+                "bc95c532fecc594c36d1550286a7a3f0",
+            );
+        }
+        for g in both("78dc4e0aaf52d935c3c01eea57428f00ca1fd475f5da86a49c8dd73d68c8e223") {
+            vector(
+                &g,
+                "d79cf22d504cc793c3fb6c8a",
+                "b96baa8c1c75a671bfb2d08d06be5f36",
+                "",
+                "",
+                "3e5d486aa2e30b22e040b85723a06e76",
+            );
+        }
     }
 
     /// The 8 fields of a case's line, split at spaces.
@@ -768,8 +890,8 @@ mod tests {
         out
     }
 
-    /// Wycheproof's aes_gcm_test, the cases of a 128-bit key, a 96-bit
-    /// nonce and a 128-bit tag (aesgcm-wycheproof.py), on both paths: a
+    /// Wycheproof's aes_gcm_test, the cases of a 128- or 256-bit key, a
+    /// 96-bit nonce and a 128-bit tag (aesgcm-wycheproof.py), on both paths: a
     /// valid one seals to its ciphertext and tag and opens back; an
     /// invalid one is refused and leaves the ciphertext.
     #[test]
@@ -798,7 +920,7 @@ mod tests {
             }
             cases += 1;
         }
-        assert_eq!(cases, 67);
+        assert_eq!(cases, 133);
     }
 
     /// A changed tag, ciphertext, AAD or nonce is refused, and the data is
@@ -837,8 +959,12 @@ mod tests {
     /// length to past two blocks.
     #[test]
     fn paths_agree() {
-        let k = [0x5a; 16];
-        let [fast, slow] = [AesGcm::new(&k), AesGcm::with(&k, false)];
+        paths_agree_key(&[0x5a; 16]);
+        paths_agree_key(&[0x5a; 32]);
+    }
+
+    fn paths_agree_key(k: &[u8]) {
+        let [fast, slow] = [AesGcm::with(k, hw::available()), AesGcm::with(k, false)];
         let mut aad = [0; 41];
         for (i, a) in aad.iter_mut().enumerate() {
             *a = u8::try_from(i).unwrap();
@@ -871,35 +997,37 @@ mod tests {
     /// counter: block 6 of a run from 2^32 - 6 is counter 0.
     #[test]
     fn counter_wraps() {
-        let k = [0x11; 16];
-        let [fast, slow] = [AesGcm::new(&k), AesGcm::with(&k, false)];
-        let mut block = [0x33; 16];
-        block[12..].fill(0);
-        let mut a = [0; 200];
-        let mut b = [0; 200];
-        fast.ctr(&block, u32::MAX - 5, &mut a);
-        slow.ctr(&block, u32::MAX - 5, &mut b);
-        assert_eq!(a, b);
-        let mut c = [0; 16];
-        slow.ctr(&block, 0, &mut c);
-        assert_eq!(a[96..112], c);
+        for k in [&[0x11; 16][..], &[0x11; 32]] {
+            let [fast, slow] = [AesGcm::with(k, hw::available()), AesGcm::with(k, false)];
+            let mut block = [0x33; 16];
+            block[12..].fill(0);
+            let mut a = [0; 200];
+            let mut b = [0; 200];
+            fast.ctr(&block, u32::MAX - 5, &mut a);
+            slow.ctr(&block, u32::MAX - 5, &mut b);
+            assert_eq!(a, b);
+            let mut c = [0; 16];
+            slow.ctr(&block, 0, &mut c);
+            assert_eq!(a[96..112], c);
+        }
     }
 
     /// CTR alone, as tag masks and a refused open use it, agrees on every
     /// length: whole groups of four blocks, the blocks after, a part.
     #[test]
     fn ctr_paths_agree() {
-        let k = [0x77; 16];
-        let [fast, slow] = [AesGcm::new(&k), AesGcm::with(&k, false)];
-        let block = [
-            0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0, 0, 0, 0,
-        ];
-        for n in 0..200 {
-            let mut a = [0; 200];
-            let mut b = [0; 200];
-            fast.ctr(&block, 2, &mut a[..n]);
-            slow.ctr(&block, 2, &mut b[..n]);
-            assert_eq!(a, b, "length {n}");
+        for k in [&[0x77; 16][..], &[0x77; 32]] {
+            let [fast, slow] = [AesGcm::with(k, hw::available()), AesGcm::with(k, false)];
+            let block = [
+                0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0, 0, 0, 0,
+            ];
+            for n in 0..200 {
+                let mut a = [0; 200];
+                let mut b = [0; 200];
+                fast.ctr(&block, 2, &mut a[..n]);
+                slow.ctr(&block, 2, &mut b[..n]);
+                assert_eq!(a, b, "length {n}");
+            }
         }
     }
 
@@ -911,8 +1039,13 @@ mod tests {
         if !hw::available() {
             return;
         }
-        let k = [0x11; 16];
-        let [fast, slow] = [AesGcm::new(&k), AesGcm::with(&k, false)];
+        for k in [&[0x11; 16][..], &[0x11; 32]] {
+            stitched_counter_wraps_key(k);
+        }
+    }
+
+    fn stitched_counter_wraps_key(k: &[u8]) {
+        let [fast, slow] = [AesGcm::with(k, true), AesGcm::with(k, false)];
         let mut block = [0x33; 16];
         block[12..].fill(0);
         let start = u32::MAX - 9;
@@ -936,8 +1069,12 @@ mod tests {
     /// A whole TLS record, past the strides many times, agrees as well.
     #[test]
     fn long_records() {
-        let k = [0x42; 16];
-        let [fast, slow] = [AesGcm::new(&k), AesGcm::with(&k, false)];
+        long_record(&[0x42; 16]);
+        long_record(&[0x42; 32]);
+    }
+
+    fn long_record(k: &[u8]) {
+        let [fast, slow] = [AesGcm::with(k, hw::available()), AesGcm::with(k, false)];
         let mut a = Vec::new();
         a.resize(16384 + 5, 0x91);
         // rr: escape(copy): the same record, sealed by the other path.
@@ -950,12 +1087,26 @@ mod tests {
     }
 
     /// One TLS record of 16 KiB with its 5-byte header as AAD.
-    #[bench]
-    fn seal_16k(b: &mut Bencher) {
-        let g = AesGcm::new(&[7; 16]);
+    fn seal_record(b: &mut Bencher, g: &AesGcm) {
         let mut record = Vec::new();
         record.resize(16384, 0x17);
         let aad = [0x17, 3, 3, 0x40, 0x11];
         b.iter(|| g.seal(&[9; 12], &aad, &mut record).unwrap());
+    }
+
+    #[bench]
+    fn seal_16k(b: &mut Bencher) {
+        seal_record(b, &AesGcm::new(&[7; 16]));
+    }
+
+    #[bench]
+    fn seal_16k_256(b: &mut Bencher) {
+        seal_record(b, &AesGcm::new256(&[7; 32]));
+    }
+
+    /// The portable code, which a CPU without the instructions takes.
+    #[bench]
+    fn seal_16k_portable(b: &mut Bencher) {
+        seal_record(b, &AesGcm::with(&[7; 16], false));
     }
 }

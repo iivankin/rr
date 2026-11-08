@@ -16,7 +16,7 @@ add declares it in src/base/mod.rs; the crate root declares `mod base;`.
 |---|---|---|
 | sha256 | cpu | SHA-256, HMAC, HKDF; SHA instructions where the CPU has them |
 | sha384 | cpu | SHA-384 and SHA-512, HMAC, HKDF-SHA384; SHA512 instructions where the CPU has them |
-| aesgcm | cpu | AES-128-GCM in place; AES and carry-less multiply instructions, on 256-bit vectors where x86-64 has VAES, constant-time portable code elsewhere |
+| aesgcm | cpu | AES-128-GCM and AES-256-GCM in place; AES and carry-less multiply instructions, on 256-bit vectors where x86-64 has VAES, constant-time portable code elsewhere |
 | x25519 | | X25519 key agreement, constant time |
 | mlkem | | ML-KEM-768 key encapsulation (FIPS 203), constant time, for TLS's X25519MLKEM768; its own SHA-3 and SHAKE |
 | ecdh | | P-256 Diffie-Hellman for TLS key shares, constant time |
@@ -24,7 +24,7 @@ add declares it in src/base/mod.rs; the crate root declares `mod base;`.
 | rsa | sha256, sha384 | RSA PKCS#1 v1.5 and PSS verification, SHA-256, SHA-384 or SHA-512 |
 | x509 | sha256, sha384, ecdsa, rsa | certificates, a store of anchors, chain verification for a host |
 | roots | x509 | Mozilla's trust anchors and OneCRL, with Chrome's announced distrusts |
-| tls | sha256, aesgcm, x25519, mlkem, ecdh, x509; asks for trust or roots | TLS 1.3 client with post-quantum X25519MLKEM768, bytes in any split; the chain verified by x509 or by the caller (the system, through trust) |
+| tls | sha256, sha384, aesgcm, x25519, mlkem, ecdh, x509; asks for trust or roots | TLS 1.3 client, AES-128-GCM and AES-256-GCM, with post-quantum X25519MLKEM768, bytes in any split; the chain verified by x509 or by the caller (the system, through trust) |
 | http1 | | HTTP/1.1 requests and an incremental response parser |
 | net | wait | TCP for a loop of many connections: a Listener and Streams that own their socket and their entry in a wait Set; non-blocking, not inherited, no SIGPIPE; errors by kind |
 | resolve | wait | host lookup that never blocks the loop, by the system: DNSServiceGetAddrInfo on macOS and GetAddrInfoExW on Windows, asynchronous and cancellable; getaddrinfo on a thread on Linux |

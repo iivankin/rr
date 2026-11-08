@@ -1,4 +1,4 @@
-//! AES-128-GCM's CTR and GHASH on the CPU's instructions: AES and PMULL
+//! AES-GCM's CTR and GHASH on the CPU's instructions: AES and PMULL
 //! on aarch64, AES-NI, PCLMULQDQ and SSSE3 on x86_64, and VAES with
 //! VPCLMULQDQ where x86_64 has them. Each function
 //! returns false, having done nothing, where the CPU lacks them;
@@ -19,8 +19,13 @@
 //! only the bytes; its module says how that works.
 //!
 //! Where the CPU has more (FASTER), seal and open take a faster
-//! loop: on aarch64 one in asm on SHA3's EOR3, on x86-64 one on VAES
-//! and VPCLMULQDQ, two blocks to each instruction.
+//! loop: on aarch64 one in asm on SHA3's EOR3, for AES-128, on x86-64
+//! one on VAES and VPCLMULQDQ, two blocks to each instruction.
+//!
+//! AES-128 and AES-256 differ only in their round keys: 11 or 15, kept
+//! so that the last ones are in the same place for both. A key's rounds
+//! run from RoundKeys.first on, so the round count is where a loop
+//! starts, and the last rounds keep their fixed keys.
 
 use crate::base::cpu;
 
@@ -28,10 +33,19 @@ use crate::base::cpu;
 /// Karatsuba's middle product takes.
 pub type Table = [[u8; 16]; 16];
 
-/// AES-128's 11 round keys, aligned as a vector register is: the
-/// instructions read them where the key keeps them, with no copy.
+/// AES's round keys, aligned as a vector register is: the instructions
+/// read them where the key keeps them, with no copy.
 #[repr(C, align(16))]
-pub struct RoundKeys(pub [[u8; 16]; 11]);
+pub struct RoundKeys {
+    /// AES-256's 15, or AES-128's 11 in the last 11 places.
+    pub keys: [[u8; 16]; 15],
+    /// Where the first round key is: 0 for AES-256, AES128_FIRST for
+    /// AES-128.
+    pub first: usize,
+}
+
+/// Where AES-128's first round key is in RoundKeys.
+pub const AES128_FIRST: usize = 4;
 
 /// What the faster loop of seal and open runs on besides: SHA3's EOR3
 /// on aarch64, VAES and VPCLMULQDQ on x86_64.
@@ -138,15 +152,16 @@ mod arch {
 
     #[target_feature(enable = "aes")]
     /// The round keys as vectors, where rk keeps them: loaded into
-    /// stack slots instead, x86-64 copies all 176 bytes with memcpy.
-    fn round_keys(rk: &RoundKeys) -> &[V; 11] {
-        // rr: escape(unsafe): RoundKeys is 11 blocks of 16 bytes aligned
-        // to 16, as [V; 11] is, and every bit pattern is a vector.
-        unsafe { &*core::ptr::from_ref(rk).cast::<[V; 11]>() }
+    /// stack slots instead, x86-64 copies all of them with memcpy.
+    fn round_keys(rk: &RoundKeys) -> &[V; 15] {
+        // rr: escape(unsafe): RoundKeys starts with 15 blocks of 16 bytes
+        // (repr(C)) and is aligned to 16, as [V; 15] is, and every bit
+        // pattern is a vector.
+        unsafe { &*core::ptr::from_ref(rk).cast::<[V; 15]>() }
     }
 
-    const _: () = assert!(size_of::<RoundKeys>() == size_of::<[V; 11]>());
-    const _: () = assert!(align_of::<RoundKeys>() == align_of::<[V; 11]>());
+    const _: () = assert!(size_of::<RoundKeys>() >= size_of::<[V; 15]>());
+    const _: () = assert!(align_of::<RoundKeys>() == align_of::<[V; 15]>());
 
     /// Counter blocks from ctr on, one for each of s.
     #[target_feature(enable = "aes")]
@@ -168,15 +183,17 @@ mod arch {
     /// The last round. AESE adds the round key before it substitutes, so
     /// the last key is a plain XOR.
     #[target_feature(enable = "aes")]
-    fn last(s: &mut [V], k: &[V; 11]) {
+    fn last(s: &mut [V], k: &[V; 15]) {
         for x in s.iter_mut() {
-            *x = veorq_u8(vaeseq_u8(*x, k[9]), k[10]);
+            *x = veorq_u8(vaeseq_u8(*x, k[13]), k[14]);
         }
     }
 
+    /// The rounds of the key from k[first] on: AESE and AESMC with each
+    /// key before the last two.
     #[target_feature(enable = "aes")]
-    fn aes(k: &[V; 11], s: &mut [V]) {
-        for rk in k.iter().take(9) {
+    fn aes(k: &[V; 15], first: usize, s: &mut [V]) {
+        for rk in k.iter().take(13).skip(first) {
             round(s, *rk);
         }
         last(s, k);
@@ -203,7 +220,7 @@ mod arch {
         for four in fours {
             counters(base, c, &mut s);
             c = c.wrapping_add(4);
-            aes(k, &mut s);
+            aes(k, rk.first, &mut s);
             xor_into(four, &mut s);
         }
         if rest.is_empty() && tail.is_empty() {
@@ -211,7 +228,7 @@ mod arch {
         }
         // Under four blocks and a part: one more batch of key stream.
         counters(base, c, &mut s);
-        aes(k, &mut s);
+        aes(k, rk.first, &mut s);
         xor_into(rest, &mut s);
         if let Some(ks) = s.get(rest.len()) {
             let mut t = [0; 16];
@@ -303,16 +320,26 @@ mod arch {
         fold(acc)
     }
 
-    /// Eight AES chains with ghash8 of x woven between their rounds.
+    /// Eight AES chains, from k[first] on, with ghash8 of x woven between
+    /// their first eight rounds.
     #[target_feature(enable = "aes")]
-    fn aes8_ghash8(k: &[V; 11], s: &mut [V; 8], x: &[V; 8], h: &[V; 8], hk: &[V; 8]) -> V {
+    fn aes8_ghash8(
+        k: &[V; 15],
+        first: usize,
+        s: &mut [V; 8],
+        x: &[V; 8],
+        h: &[V; 8],
+        hk: &[V; 8],
+    ) -> V {
         let mut acc = [vdupq_n_u8(0); 3];
-        let turns = k.iter().zip(x).zip(h.iter().rev()).zip(hk.iter().rev());
-        for (((rk, xb), hp), kp) in turns {
+        let turns = x.iter().zip(k.iter().skip(first));
+        for ((xb, rk), (hp, kp)) in turns.zip(h.iter().rev().zip(hk.iter().rev())) {
             round(s, *rk);
             kmul(&mut acc, *xb, *hp, *kp);
         }
-        round(s, k[8]);
+        for rk in k.iter().take(13).skip(first + 8) {
+            round(s, *rk);
+        }
         last(s, k);
         fold(acc)
     }
@@ -370,11 +397,33 @@ mod arch {
         y: &mut [u8; 16],
         eor3: bool,
     ) {
-        if eor3 {
+        if eor3 && rk.first == super::AES128_FIRST {
             // rr: escape(unsafe): the caller found SHA3's EOR3 beside AES.
             unsafe { seal_eor3(rk, tbl, block, ctr, blocks, y) };
             return;
         }
+        // The first round key's place a constant in each copy, as the
+        // round count is: a loop of it, the keys then in registers, ran
+        // a fifth slower.
+        if rk.first == super::AES128_FIRST {
+            seal_from(rk, super::AES128_FIRST, tbl, block, ctr, blocks, y);
+        } else {
+            seal_from(rk, 0, tbl, block, ctr, blocks, y);
+        }
+    }
+
+    /// seal() with the keys from k[first] on.
+    #[inline]
+    #[target_feature(enable = "aes")]
+    fn seal_from(
+        rk: &RoundKeys,
+        first: usize,
+        tbl: &Table,
+        block: &[u8; 16],
+        ctr: u32,
+        blocks: &mut [[u8; 16]],
+        y: &mut [u8; 16],
+    ) {
         let k = round_keys(rk);
         let (h, hk) = powers(tbl);
         let base = vreinterpretq_u32_u8(load(block));
@@ -389,9 +438,9 @@ mod arch {
             match prev {
                 Some(mut x) => {
                     x[0] = veorq_u8(x[0], yp);
-                    yp = aes8_ghash8(k, &mut s, &x, &h, &hk);
+                    yp = aes8_ghash8(k, first, &mut s, &x, &h, &hk);
                 }
-                None => aes(k, &mut s),
+                None => aes(k, first, &mut s),
             }
             xor_into(eight, &mut s);
             prev = Some(s.map(|v| vrbitq_u8(v)));
@@ -417,11 +466,33 @@ mod arch {
         y: &mut [u8; 16],
         eor3: bool,
     ) {
-        if eor3 {
+        if eor3 && rk.first == super::AES128_FIRST {
             // rr: escape(unsafe): the caller found SHA3's EOR3 beside AES.
             unsafe { open_eor3(rk, tbl, block, ctr, blocks, y) };
             return;
         }
+        // The first round key's place a constant in each copy, as the
+        // round count is: a loop of it, the keys then in registers, ran
+        // a fifth slower.
+        if rk.first == super::AES128_FIRST {
+            open_from(rk, super::AES128_FIRST, tbl, block, ctr, blocks, y);
+        } else {
+            open_from(rk, 0, tbl, block, ctr, blocks, y);
+        }
+    }
+
+    /// open() with the keys from k[first] on.
+    #[inline]
+    #[target_feature(enable = "aes")]
+    fn open_from(
+        rk: &RoundKeys,
+        first: usize,
+        tbl: &Table,
+        block: &[u8; 16],
+        ctr: u32,
+        blocks: &mut [[u8; 16]],
+        y: &mut [u8; 16],
+    ) {
         let k = round_keys(rk);
         let (h, hk) = powers(tbl);
         let base = vreinterpretq_u32_u8(load(block));
@@ -437,7 +508,7 @@ mod arch {
                 *v = vrbitq_u8(load(b));
             }
             x[0] = veorq_u8(x[0], yp);
-            yp = aes8_ghash8(k, &mut s, &x, &h, &hk);
+            yp = aes8_ghash8(k, first, &mut s, &x, &h, &hk);
             xor_into(eight, &mut s);
         }
         yp = ghash_rev(&h, &hk, yp, rest);
@@ -445,7 +516,8 @@ mod arch {
         store(y, vrbitq_u8(yp));
     }
 
-    /// seal() in one asm loop after the first turn, on EOR3 too.
+    /// seal() of AES-128 in one asm loop after the first turn, on EOR3
+    /// too.
     #[target_feature(enable = "aes,sha3")]
     fn seal_eor3(
         rk: &RoundKeys,
@@ -466,7 +538,7 @@ mod arch {
             let mut s = [vdupq_n_u8(0); 8];
             counters(vreinterpretq_u32_u8(base), c, &mut s);
             c = c.wrapping_add(8);
-            aes(k, &mut s);
+            aes(k, rk.first, &mut s);
             xor_into(first, &mut s);
         }
         yp = turns(rk, tbl, base, &mut c, eights, true, yp);
@@ -478,7 +550,7 @@ mod arch {
         store(y, vrbitq_u8(yp));
     }
 
-    /// open() in one asm loop, on EOR3 too.
+    /// open() of AES-128 in one asm loop, on EOR3 too.
     #[target_feature(enable = "aes,sha3")]
     fn open_eor3(
         rk: &RoundKeys,
@@ -501,7 +573,9 @@ mod arch {
     /// The eight-block turns, in asm: for seal every turn but the first,
     /// hashing the turn before; for open every turn, hashing its own
     /// ciphertext before it is decrypted. c is the counter of the first
-    /// turn run, and after them the next.
+    /// turn run, and after them the next. The key is AES-128's: its 11
+    /// round keys fill v0-v10, and AES-256's 15 would not fit beside the
+    /// rest, so it takes the intrinsics.
     ///
     /// The intrinsics did the same work in about 197 vector instructions
     /// a turn: with 11 round keys, H^8..H and their halves, eight states
@@ -848,7 +922,7 @@ mod arch {
                 "add {c:w}, {c:w}, #8",
                 "subs {n}, {n}, #1",
                 "b.ne 2b",
-                rk = inout(reg) rk.0.as_ptr() => _,
+                rk = inout(reg) rk.keys.as_ptr().wrapping_add(super::AES128_FIRST) => _,
                 tbl = in(reg) tbl.as_ptr(),
                 p = inout(reg) p => _,
                 g = inout(reg) at => _,
@@ -919,15 +993,23 @@ mod arch {
 
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
     /// The round keys as vectors, where rk keeps them: loaded into
-    /// stack slots instead, x86-64 copies all 176 bytes with memcpy.
-    fn round_keys(rk: &RoundKeys) -> &[V; 11] {
-        // rr: escape(unsafe): RoundKeys is 11 blocks of 16 bytes aligned
-        // to 16, as [V; 11] is, and every bit pattern is a vector.
-        unsafe { &*core::ptr::from_ref(rk).cast::<[V; 11]>() }
+    /// stack slots instead, x86-64 copies all of them with memcpy.
+    fn round_keys(rk: &RoundKeys) -> &[V; 15] {
+        // rr: escape(unsafe): RoundKeys starts with 15 blocks of 16 bytes
+        // (repr(C)) and is aligned to 16, as [V; 15] is, and every bit
+        // pattern is a vector.
+        unsafe { &*core::ptr::from_ref(rk).cast::<[V; 15]>() }
     }
 
-    const _: () = assert!(size_of::<RoundKeys>() == size_of::<[V; 11]>());
-    const _: () = assert!(align_of::<RoundKeys>() == align_of::<[V; 11]>());
+    const _: () = assert!(size_of::<RoundKeys>() >= size_of::<[V; 15]>());
+    const _: () = assert!(align_of::<RoundKeys>() == align_of::<[V; 15]>());
+
+    /// The key added before the rounds: k[first], which RoundKeys keeps
+    /// in range.
+    #[target_feature(enable = "aes,pclmulqdq,ssse3")]
+    fn first_key(k: &[V; 15], first: usize) -> V {
+        k.get(first).copied().unwrap_or(k[0])
+    }
 
     /// The 16 bytes of v in the other order.
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
@@ -951,9 +1033,9 @@ mod arch {
 
     /// The first key, added before the rounds.
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
-    fn first(s: &mut [V], k: &[V; 11]) {
+    fn first(s: &mut [V], k: V) {
         for x in s.iter_mut() {
-            *x = _mm_xor_si128(*x, k[0]);
+            *x = _mm_xor_si128(*x, k);
         }
     }
 
@@ -965,16 +1047,17 @@ mod arch {
     }
 
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
-    fn last(s: &mut [V], k: &[V; 11]) {
+    fn last(s: &mut [V], k: &[V; 15]) {
         for x in s.iter_mut() {
-            *x = _mm_aesenclast_si128(*x, k[10]);
+            *x = _mm_aesenclast_si128(*x, k[14]);
         }
     }
 
+    /// The rounds of the key from k[first] on.
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
-    fn aes(k: &[V; 11], s: &mut [V]) {
-        first(s, k);
-        for rk in k.iter().skip(1).take(9) {
+    fn aes(k: &[V; 15], first_at: usize, s: &mut [V]) {
+        first(s, first_key(k, first_at));
+        for rk in k.iter().take(14).skip(first_at + 1) {
             round(s, *rk);
         }
         last(s, k);
@@ -1001,7 +1084,7 @@ mod arch {
         for four in fours {
             counters(base, c, &mut s);
             c = c.wrapping_add(4);
-            aes(k, &mut s);
+            aes(k, rk.first, &mut s);
             xor_into(four, &mut s);
         }
         if rest.is_empty() && tail.is_empty() {
@@ -1009,7 +1092,7 @@ mod arch {
         }
         // Under four blocks and a part: one more batch of key stream.
         counters(base, c, &mut s);
-        aes(k, &mut s);
+        aes(k, rk.first, &mut s);
         xor_into(rest, &mut s);
         if let Some(ks) = s.get(rest.len()) {
             let mut t = [0; 16];
@@ -1106,22 +1189,27 @@ mod arch {
         fold(acc)
     }
 
-    /// Eight AES chains with ghash8 of x woven between their rounds.
+    /// Eight AES chains, from k[first] on, with ghash8 of x woven between
+    /// their first eight rounds.
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
-    fn aes8_ghash8(k: &[V; 11], s: &mut [V; 8], x: &[V; 8], h: &[V; 8], hk: &[V; 8]) -> V {
+    fn aes8_ghash8(
+        k: &[V; 15],
+        first_at: usize,
+        s: &mut [V; 8],
+        x: &[V; 8],
+        h: &[V; 8],
+        hk: &[V; 8],
+    ) -> V {
         let mut acc = [_mm_setzero_si128(); 3];
-        first(s, k);
-        let turns = k
-            .iter()
-            .skip(1)
-            .zip(x)
-            .zip(h.iter().rev())
-            .zip(hk.iter().rev());
-        for (((rk, xb), hp), kp) in turns {
+        first(s, first_key(k, first_at));
+        let turns = x.iter().zip(k.iter().skip(first_at + 1));
+        for ((xb, rk), (hp, kp)) in turns.zip(h.iter().rev().zip(hk.iter().rev())) {
             round(s, *rk);
             kmul(&mut acc, *xb, *hp, *kp);
         }
-        round(s, k[9]);
+        for rk in k.iter().take(14).skip(first_at + 9) {
+            round(s, *rk);
+        }
         last(s, k);
         fold(acc)
     }
@@ -1181,11 +1269,34 @@ mod arch {
         y: &mut [u8; 16],
         wide: bool,
     ) {
-        if wide {
+        // The first round key's place a constant in each copy, as the
+        // round count is, so the keys stay in registers.
+        match (wide, rk.first == super::AES128_FIRST) {
             // rr: escape(unsafe): the caller found VAES, VPCLMULQDQ and AVX2.
-            unsafe { seal_wide(rk, tbl, block, ctr, blocks, y) };
-            return;
+            (true, true) => unsafe {
+                seal_wide(rk, super::AES128_FIRST, tbl, block, ctr, blocks, y);
+            },
+            // rr: escape(unsafe): the caller found VAES, VPCLMULQDQ and AVX2.
+            (true, false) => unsafe { seal_wide(rk, 0, tbl, block, ctr, blocks, y) },
+            (false, true) => {
+                seal_from(rk, super::AES128_FIRST, tbl, block, ctr, blocks, y);
+            }
+            (false, false) => seal_from(rk, 0, tbl, block, ctr, blocks, y),
         }
+    }
+
+    /// seal() with the keys from k[first] on.
+    #[inline]
+    #[target_feature(enable = "aes,pclmulqdq,ssse3")]
+    fn seal_from(
+        rk: &RoundKeys,
+        first: usize,
+        tbl: &Table,
+        block: &[u8; 16],
+        ctr: u32,
+        blocks: &mut [[u8; 16]],
+        y: &mut [u8; 16],
+    ) {
         let k = round_keys(rk);
         let (h, hk) = powers(tbl);
         let base = reflect(load(block));
@@ -1200,9 +1311,9 @@ mod arch {
             match prev {
                 Some(mut x) => {
                     x[0] = _mm_xor_si128(x[0], yr);
-                    yr = aes8_ghash8(k, &mut s, &x, &h, &hk);
+                    yr = aes8_ghash8(k, first, &mut s, &x, &h, &hk);
                 }
-                None => aes(k, &mut s),
+                None => aes(k, first, &mut s),
             }
             xor_into(eight, &mut s);
             prev = Some(s.map(|v| reflect(v)));
@@ -1229,11 +1340,34 @@ mod arch {
         y: &mut [u8; 16],
         wide: bool,
     ) {
-        if wide {
+        // The first round key's place a constant in each copy, as the
+        // round count is, so the keys stay in registers.
+        match (wide, rk.first == super::AES128_FIRST) {
             // rr: escape(unsafe): the caller found VAES, VPCLMULQDQ and AVX2.
-            unsafe { open_wide(rk, tbl, block, ctr, blocks, y) };
-            return;
+            (true, true) => unsafe {
+                open_wide(rk, super::AES128_FIRST, tbl, block, ctr, blocks, y);
+            },
+            // rr: escape(unsafe): the caller found VAES, VPCLMULQDQ and AVX2.
+            (true, false) => unsafe { open_wide(rk, 0, tbl, block, ctr, blocks, y) },
+            (false, true) => {
+                open_from(rk, super::AES128_FIRST, tbl, block, ctr, blocks, y);
+            }
+            (false, false) => open_from(rk, 0, tbl, block, ctr, blocks, y),
         }
+    }
+
+    /// open() with the keys from k[first] on.
+    #[inline]
+    #[target_feature(enable = "aes,pclmulqdq,ssse3")]
+    fn open_from(
+        rk: &RoundKeys,
+        first: usize,
+        tbl: &Table,
+        block: &[u8; 16],
+        ctr: u32,
+        blocks: &mut [[u8; 16]],
+        y: &mut [u8; 16],
+    ) {
         let k = round_keys(rk);
         let (h, hk) = powers(tbl);
         let base = reflect(load(block));
@@ -1249,7 +1383,7 @@ mod arch {
                 *v = reflect(load(b));
             }
             x[0] = _mm_xor_si128(x[0], yr);
-            yr = aes8_ghash8(k, &mut s, &x, &h, &hk);
+            yr = aes8_ghash8(k, first, &mut s, &x, &h, &hk);
             xor_into(eight, &mut s);
         }
         yr = ghash_reflected(&h, &hk, yr, rest);
@@ -1303,25 +1437,25 @@ mod arch {
     }
 
     #[target_feature(enable = "aes,pclmulqdq,ssse3,avx,avx2,vaes,vpclmulqdq")]
-    fn wfirst(s: &mut [W; 4], k: &[V; 11]) {
-        let key = _mm256_broadcastsi128_si256(k[0]);
+    fn wfirst(s: &mut [W; 4], k: V) {
+        let key = _mm256_broadcastsi128_si256(k);
         for x in s.iter_mut() {
             *x = _mm256_xor_si256(*x, key);
         }
     }
 
     #[target_feature(enable = "aes,pclmulqdq,ssse3,avx,avx2,vaes,vpclmulqdq")]
-    fn wlast(s: &mut [W; 4], k: &[V; 11]) {
-        let key = _mm256_broadcastsi128_si256(k[10]);
+    fn wlast(s: &mut [W; 4], k: &[V; 15]) {
+        let key = _mm256_broadcastsi128_si256(k[14]);
         for x in s.iter_mut() {
             *x = _mm256_aesenclast_epi128(*x, key);
         }
     }
 
     #[target_feature(enable = "aes,pclmulqdq,ssse3,avx,avx2,vaes,vpclmulqdq")]
-    fn waes(k: &[V; 11], s: &mut [W; 4]) {
-        wfirst(s, k);
-        for key in k.iter().skip(1).take(9) {
+    fn waes(k: &[V; 15], first_at: usize, s: &mut [W; 4]) {
+        wfirst(s, first_key(k, first_at));
+        for key in k.iter().take(14).skip(first_at + 1) {
             wround(s, *key);
         }
         wlast(s, k);
@@ -1377,16 +1511,24 @@ mod arch {
         wfold(acc)
     }
 
-    /// Four vectors of AES chains with wghash of x between their rounds.
+    /// Four vectors of AES chains, from k[first] on, with wghash of x
+    /// between their first four rounds.
     #[target_feature(enable = "aes,pclmulqdq,ssse3,avx,avx2,vaes,vpclmulqdq")]
-    fn waes_wghash(k: &[V; 11], s: &mut [W; 4], x: &[W; 4], hw: &[W; 4], hkw: &[W; 4]) -> V {
+    fn waes_wghash(
+        k: &[V; 15],
+        first_at: usize,
+        s: &mut [W; 4],
+        x: &[W; 4],
+        hw: &[W; 4],
+        hkw: &[W; 4],
+    ) -> V {
         let mut acc = [_mm256_setzero_si256(); 3];
-        wfirst(s, k);
-        for (key, ((xb, hp), kp)) in k.iter().skip(1).zip(x.iter().zip(hw).zip(hkw)) {
+        wfirst(s, first_key(k, first_at));
+        for (((xb, hp), kp), key) in x.iter().zip(hw).zip(hkw).zip(k.iter().skip(first_at + 1)) {
             wround(s, *key);
             wkmul(&mut acc, *xb, *hp, *kp);
         }
-        for key in k.iter().skip(5).take(5) {
+        for key in k.iter().take(14).skip(first_at + 5) {
             wround(s, *key);
         }
         wlast(s, k);
@@ -1405,9 +1547,11 @@ mod arch {
 
     /// seal() with each turn on 256-bit vectors; the blocks after the
     /// last whole turn take the 128-bit code.
+    #[inline]
     #[target_feature(enable = "aes,pclmulqdq,ssse3,avx,avx2,vaes,vpclmulqdq")]
     fn seal_wide(
         rk: &RoundKeys,
+        first: usize,
         tbl: &Table,
         block: &[u8; 16],
         ctr: u32,
@@ -1431,9 +1575,9 @@ mod arch {
             match prev {
                 Some(mut x) => {
                     x[0] = _mm256_xor_si256(x[0], _mm256_zextsi128_si256(yr));
-                    yr = waes_wghash(k, &mut s, &x, &hw, &hkw);
+                    yr = waes_wghash(k, first, &mut s, &x, &hw, &hkw);
                 }
-                None => waes(k, &mut s),
+                None => waes(k, first, &mut s),
             }
             wxor_into(eight, &mut s);
             prev = Some(s.map(|v| wreflect(v)));
@@ -1448,9 +1592,11 @@ mod arch {
     }
 
     /// open() with each turn on 256-bit vectors.
+    #[inline]
     #[target_feature(enable = "aes,pclmulqdq,ssse3,avx,avx2,vaes,vpclmulqdq")]
     fn open_wide(
         rk: &RoundKeys,
+        first: usize,
         tbl: &Table,
         block: &[u8; 16],
         ctr: u32,
@@ -1475,7 +1621,7 @@ mod arch {
                 *v = wreflect(wload(pair));
             }
             x[0] = _mm256_xor_si256(x[0], _mm256_zextsi128_si256(yr));
-            yr = waes_wghash(k, &mut s, &x, &hw, &hkw);
+            yr = waes_wghash(k, first, &mut s, &x, &hw, &hkw);
             wxor_into(eight, &mut s);
         }
         yr = ghash_reflected(&h, &hk, yr, rest);
@@ -1527,14 +1673,17 @@ mod arch {
 #[cfg(test)]
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 mod tests {
-    use super::{FASTER, RoundKeys, Table, available, cpu};
+    use super::{AES128_FIRST, FASTER, RoundKeys, Table, available, cpu};
     use test::Bencher;
 
     /// A key schedule and GHASH table of no key in particular.
     fn keys() -> (RoundKeys, Table) {
-        let rk = RoundKeys(core::array::from_fn(|r| {
-            core::array::from_fn(|j| u8::try_from(((16 * r + j) * 13 + 5) % 256).unwrap())
-        }));
+        let rk = RoundKeys {
+            keys: core::array::from_fn(|r| {
+                core::array::from_fn(|j| u8::try_from(((16 * r + j) * 13 + 5) % 256).unwrap())
+            }),
+            first: AES128_FIRST,
+        };
         let mut tbl: Table = [[0; 16]; 16];
         // rr: escape(unsafe): the callers looked for the instructions.
         unsafe { super::arch::ghash_key(&[0x66; 16], &mut tbl) };

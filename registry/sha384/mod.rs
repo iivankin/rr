@@ -199,7 +199,8 @@ impl Hash {
     }
 }
 
-/// A SHA-384 hash in progress.
+/// A SHA-384 hash in progress; a clone goes on from the same message.
+#[derive(Clone)]
 pub struct Sha384(Hash);
 
 impl Sha384 {
