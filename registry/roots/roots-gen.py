@@ -19,6 +19,23 @@ those dates out and so trusts such roots fully.
 certdata.txt rather than CCADB's CSV report: it is what Firefox ships,
 it is versioned by NSS's release tags, so --check reproduces the file
 from a fixed input, and its trust records are the ones NSS applies.
+
+revoked.txt is Mozilla's OneCRL, the certificates Firefox refuses
+wherever they are on a path: intermediates revoked, cross-certificates
+withdrawn, and since NSS 3.116 the roots certdata.txt used to mark
+CKT_NSS_NOT_TRUSTED (DigiNotar and the like). Firefox applies every
+record of the collection, enabled or not, by issuer and serial number or
+by subject and the SHA-256 of the key; each becomes one line, the hex
+SHA-256 of
+
+    01 || issuer DER || serial INTEGER contents
+    02 || subject DER || SHA-256(SubjectPublicKeyInfo)
+
+which x509::Store::add_revoked reads. OneCRL is not versioned: the
+header names the collection's timestamp and the SHA-256 of what came,
+and --check tells whether the file is today's.
+
+    python3 roots-gen.py --onecrl FILE      # from a saved records JSON
 """
 
 import argparse
@@ -30,6 +47,7 @@ import urllib.request
 
 TAG = "NSS_3_133_RTM"
 URL = "https://hg.mozilla.org/projects/nss/raw-file/{tag}/lib/ckfw/builtins/certdata.txt"
+ONECRL = "https://firefox.settings.services.mozilla.com/v1/buckets/security-state/collections/onecrl/records"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -112,6 +130,40 @@ def build(text, tag):
     return "\n".join(out), count
 
 
+def revoked(text):
+    """revoked.txt's text from OneCRL's records JSON, and its count."""
+    import json
+
+    records = json.loads(text)["data"]
+    digests = set()
+    for record in records:
+        if record.get("issuerName") and record.get("serialNumber"):
+            name = base64.b64decode(record["issuerName"])
+            other = base64.b64decode(record["serialNumber"])
+            kind = b"\x01"
+        elif record.get("subject") and record.get("pubKeyHash"):
+            name = base64.b64decode(record["subject"])
+            other = base64.b64decode(record["pubKeyHash"])
+            kind = b"\x02"
+        else:
+            sys.exit("roots-gen: a OneCRL record of no kind: %r" % record.get("id"))
+        if name[:1] != b"\x30" or (kind == b"\x02" and len(other) != 32):
+            sys.exit("roots-gen: an odd OneCRL record: %r" % record.get("id"))
+        digests.add(hashlib.sha256(kind + name + other).hexdigest())
+    stamp = max((record["last_modified"] for record in records), default=0)
+    out = [
+        "# Mozilla's OneCRL, made by roots-gen.py from",
+        "# " + ONECRL,
+        "# at timestamp %d, SHA-256 %s." % (stamp, hashlib.sha256(text.encode("utf-8")).hexdigest()),
+        "#",
+        "# One certificate a line: the SHA-256 of 01, its issuer's DER and its",
+        "# serial number's INTEGER contents, or of 02, its subject's DER and",
+        "# the SHA-256 of its SubjectPublicKeyInfo.",
+    ]
+    out.extend(sorted(digests))
+    return "\n".join(out) + "\n", len(digests)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--tag", default=TAG, help="NSS release tag (%(default)s)")
@@ -122,6 +174,7 @@ def main():
     default = beside if os.path.exists(beside) else os.path.join(HERE, "..", "src", "base", "roots", "roots.pem")
     parser.add_argument("--out", default=default)
     parser.add_argument("--check", action="store_true", help="compare, do not write")
+    parser.add_argument("--onecrl", help="a saved OneCRL records JSON")
     args = parser.parse_args()
     if args.certdata:
         with open(args.certdata, encoding="utf-8") as f:
@@ -130,15 +183,28 @@ def main():
         with urllib.request.urlopen(URL.format(tag=args.tag)) as response:
             text = response.read().decode("utf-8")
     pem, count = build(text, args.tag)
+    if args.onecrl:
+        with open(args.onecrl, encoding="utf-8") as f:
+            records = f.read()
+    else:
+        with urllib.request.urlopen(ONECRL) as response:
+            records = response.read().decode("utf-8")
+    listed, revocations = revoked(records)
+    out_revoked = os.path.join(os.path.dirname(args.out), "revoked.txt")
     if args.check:
         with open(args.out, encoding="utf-8") as f:
             if f.read() != pem:
                 sys.exit("roots-gen: %s differs from %s" % (args.out, args.tag))
-        print("roots-gen: %s is %s's %d roots" % (args.out, args.tag, count))
+        with open(out_revoked, encoding="utf-8") as f:
+            if f.read() != listed:
+                sys.exit("roots-gen: %s differs from OneCRL now" % out_revoked)
+        print("roots-gen: %s is %s's %d roots, %s OneCRL's %d" % (args.out, args.tag, count, out_revoked, revocations))
         return
     with open(args.out, "w", encoding="utf-8") as f:
         f.write(pem)
-    print("roots-gen: wrote %d roots to %s" % (count, args.out))
+    with open(out_revoked, "w", encoding="utf-8") as f:
+        f.write(listed)
+    print("roots-gen: wrote %d roots to %s, %d revocations to %s" % (count, args.out, revocations, out_revoked))
 
 
 if __name__ == "__main__":

@@ -198,6 +198,9 @@ pub enum Error {
     Name,
     /// No path leads to a trusted anchor (unknown_ca).
     Untrusted,
+    /// A certificate the store holds revoked, with no path around it
+    /// (certificate_revoked).
+    Revoked,
     /// The chain is refused for another reason (bad_certificate).
     Certificate,
     /// CertificateVerify does not verify (decrypt_error).
@@ -225,6 +228,7 @@ impl Error {
             Error::Expired => Some(45),
             Error::Parameter | Error::Group => Some(47),
             Error::Untrusted => Some(48),
+            Error::Revoked => Some(44),
             Error::Decode | Error::TooLarge => Some(50),
             Error::Signature | Error::Finished => Some(51),
             Error::Version => Some(70),
@@ -251,6 +255,7 @@ impl From<x509::Error> for Error {
             x509::Error::Expired => Error::Expired,
             x509::Error::Host => Error::Name,
             x509::Error::Untrusted | x509::Error::Distrusted => Error::Untrusted,
+            x509::Error::Revoked => Error::Revoked,
             x509::Error::Malformed
             | x509::Error::Unsupported
             | x509::Error::Critical

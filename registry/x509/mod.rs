@@ -59,6 +59,9 @@ pub enum Error {
     Untrusted,
     /// The path's anchor is distrusted for leaves issued when this was.
     Distrusted,
+    /// A certificate the store holds revoked (Mozilla's OneCRL), and no
+    /// path around it.
+    Revoked,
     /// More certificates, signatures or name comparisons than allowed.
     TooMany,
 }
@@ -87,6 +90,8 @@ pub struct Certificate<'a> {
     /// Name DER with its header.
     pub issuer: &'a [u8],
     pub subject: &'a [u8],
+    /// The serial number's INTEGER contents, a leading zero and all.
+    serial: &'a [u8],
     /// Unix seconds, both inclusive.
     pub not_before: i64,
     pub not_after: i64,
@@ -111,6 +116,9 @@ pub struct Store {
     // bounds.
     anchors: Vec<Anchor>,
     skipped: usize,
+    /// The revoked certificates' digests (revocation_digest), sorted;
+    /// add_revoked holds them to REVOKED_MAX.
+    revoked: Vec<[u8; 32]>,
 }
 
 /// Where an anchor's DER and subject are in a store.
@@ -205,6 +213,8 @@ const SIGNATURES_MAX: usize = 100;
 const COMPARISONS_MAX: usize = 100_000;
 const EXTENSIONS_MAX: usize = 32;
 const STORE_BYTES_MAX: usize = 16 << 20;
+/// The most revocations a store holds: OneCRL lists about 2,000.
+const REVOKED_MAX: usize = 1 << 16;
 
 const BOOLEAN: u8 = 0x01;
 const INTEGER: u8 = 0x02;
@@ -442,7 +452,8 @@ pub fn parse(der: &[u8]) -> Result<Certificate<'_>, Error> {
         }
     };
     // At most 20 bytes (RFC 5280 4.1.2.2), and not negative.
-    if unsigned(fields.take(INTEGER)?)?.len() > 20 {
+    let serial = fields.take(INTEGER)?;
+    if unsigned(serial)?.len() > 20 {
         return Err(Error::Malformed);
     }
     if fields.expect(SEQUENCE)?.whole != algorithm_id.whole {
@@ -472,6 +483,7 @@ pub fn parse(der: &[u8]) -> Result<Certificate<'_>, Error> {
         signature,
         issuer,
         subject,
+        serial,
         not_before,
         not_after,
         spki: spki.whole,
@@ -885,7 +897,56 @@ impl Store {
             bytes: Vec::new(),
             anchors: Vec::new(),
             skipped: 0,
+            revoked: Vec::new(),
         }
+    }
+
+    /// The revocations held.
+    pub fn revocations(&self) -> usize {
+        self.revoked.len()
+    }
+
+    /// Revokes the certificates of revoked's digests, one per line in
+    /// hex, as roots-gen.py writes them from Mozilla's OneCRL; text from
+    /// '#' to the line's end is a comment. A certificate revoked is used
+    /// nowhere on a path, leaf, intermediate or anchor, as Firefox does
+    /// with OneCRL; a path around it may still verify. Returns how many
+    /// it added; a line that is not 64 hex digits is skipped.
+    pub fn add_revoked(&mut self, text: &[u8]) -> usize {
+        let mut added = 0;
+        for line in text.split(|byte| *byte == b'\n') {
+            let line = line
+                .split(|byte| *byte == b'#')
+                .next()
+                .unwrap_or_default()
+                .trim_ascii();
+            if line.is_empty() {
+                continue;
+            }
+            match hex_digest(line) {
+                Some(digest) if self.revoked.len() < REVOKED_MAX => {
+                    self.revoked.push(digest);
+                    added += 1;
+                }
+                Some(_) | None => self.skipped += 1,
+            }
+        }
+        self.revoked.sort_unstable();
+        self.revoked.dedup();
+        added
+    }
+
+    /// Whether certificate is revoked here: by its issuer and serial
+    /// number, or by its subject and key.
+    fn revokes(&self, certificate: &Certificate<'_>) -> bool {
+        if self.revoked.is_empty() {
+            return false;
+        }
+        let by_serial = revocation_digest(ISSUER_SERIAL, certificate.issuer, certificate.serial);
+        let key = sha256::digest(certificate.spki);
+        let by_key = revocation_digest(SUBJECT_KEY, certificate.subject, &key);
+        self.revoked.binary_search(&by_serial).is_ok()
+            || self.revoked.binary_search(&by_key).is_ok()
     }
 
     /// The anchors loaded.
@@ -1011,6 +1072,36 @@ impl Store {
         let anchor = self.anchors.get(index)?;
         parse(self.bytes.get(anchor.der.0..anchor.der.1)?).ok()
     }
+}
+
+/// The kinds of a revocation: by issuer and serial number, or by
+/// subject and the SHA-256 of the key's SubjectPublicKeyInfo, as OneCRL
+/// names a certificate.
+const ISSUER_SERIAL: u8 = 1;
+const SUBJECT_KEY: u8 = 2;
+
+/// A revocation's digest: SHA-256 of its kind, the name's DER (which
+/// says its own length) and the other field.
+fn revocation_digest(kind: u8, name: &[u8], other: &[u8]) -> [u8; 32] {
+    let mut hash = sha256::Sha256::new();
+    hash.update(&[kind]);
+    hash.update(name);
+    hash.update(other);
+    hash.finish()
+}
+
+/// 64 hex digits, as 32 bytes.
+fn hex_digest(text: &[u8]) -> Option<[u8; 32]> {
+    let mut digest = [0u8; 32];
+    if text.len() != 64 {
+        return None;
+    }
+    for (byte, &[high, low]) in digest.iter_mut().zip(text.as_chunks::<2>().0) {
+        let high = char::from(high).to_digit(16)?;
+        let low = char::from(low).to_digit(16)?;
+        *byte = u8::try_from(high * 16 + low).ok()?;
+    }
+    Some(digest)
 }
 
 /// The text before the next BEGIN CERTIFICATE line, the base64 between
@@ -1188,6 +1279,9 @@ pub fn verify<'a>(
     if !covers(leaf.ext.names, host) {
         return Err(Error::Host);
     }
+    if store.revokes(&leaf) {
+        return Err(Error::Revoked);
+    }
     let found = Leaf {
         der: leaf.der,
         key: leaf.key,
@@ -1234,6 +1328,7 @@ fn path(pool: &[Certificate<'_>], store: &Store, now: i64) -> Result<(), Error> 
         let outcome = match candidate {
             Candidate::Anchor(index) if distrusted(store, index, leaf) => Err(Error::Distrusted),
             Candidate::Anchor(index) => match store.certificate(index) {
+                Some(anchor) if store.revokes(&anchor) => Err(Error::Revoked),
                 Some(anchor) => issues(&anchor, child, pool, &frames, now, &mut budget),
                 None => Err(Error::Untrusted),
             },
@@ -1242,7 +1337,11 @@ fn path(pool: &[Certificate<'_>], store: &Store, now: i64) -> Result<(), Error> 
                 if on_path(peer, pool, &frames) {
                     continue;
                 }
-                issues(peer, child, pool, &frames, now, &mut budget)
+                if store.revokes(peer) {
+                    Err(Error::Revoked)
+                } else {
+                    issues(peer, child, pool, &frames, now, &mut budget)
+                }
             }
         };
         match (outcome, candidate) {
@@ -1685,9 +1784,11 @@ pub fn test_certificate(name: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Error, PEM_END, Reader, Store, TEST_NOW as NOW, TESTS, address_within, domain_within,
-        extensions, find, host_matches, key_usage, parse, test_certificate, time, unsigned, verify,
+        Error, ISSUER_SERIAL, PEM_END, Reader, SUBJECT_KEY, Store, TEST_NOW as NOW, TESTS,
+        address_within, domain_within, extensions, find, host_matches, key_usage, parse,
+        revocation_digest, test_certificate, time, unsigned, verify,
     };
+    use crate::base::sha256;
     use alloc::vec::Vec;
     use test::Bencher;
 
@@ -2151,6 +2252,58 @@ mod tests {
             assert_eq!(refused.add_pem(&odd), 0);
             assert_eq!(refused.skipped(), 1);
         }
+    }
+
+    /// A line of revoked.txt for certificate: by its issuer and serial,
+    /// or by its subject and key.
+    fn revocation_line(certificate: &[u8], by_key: bool, out: &mut Vec<u8>) {
+        let parsed = parse(certificate).unwrap();
+        let key = sha256::digest(parsed.spki);
+        let digest = if by_key {
+            revocation_digest(SUBJECT_KEY, parsed.subject, &key)
+        } else {
+            revocation_digest(ISSUER_SERIAL, parsed.issuer, parsed.serial)
+        };
+        for byte in digest {
+            for nibble in [byte >> 4, byte & 15] {
+                out.push(char::from_digit(u32::from(nibble), 16).unwrap() as u8);
+            }
+        }
+        out.push(b'\n');
+    }
+
+    /// A certificate revoked is used nowhere on a path: as the leaf, an
+    /// intermediate or the anchor, by issuer and serial or by subject and
+    /// key; one revoked off the path changes nothing. Comments and blank
+    /// lines are skipped, a malformed line is counted.
+    #[test]
+    fn revoked() {
+        let (root, inter, leaf) = (der("test.root"), der("test.inter"), der("test.leaf"));
+        let chain = [&leaf[..], &inter];
+        let mut lines = Vec::new();
+        for (revoked, by_key) in [
+            (&leaf, false),
+            (&inter, true),
+            (&inter, false),
+            (&root, true),
+        ] {
+            lines.clear();
+            lines.extend_from_slice(b"# OneCRL\n\n");
+            revocation_line(revoked, by_key, &mut lines);
+            let mut store = Store::new();
+            assert!(store.add_der(&root));
+            assert_eq!(store.add_revoked(&lines), 1);
+            let refused = verify(&chain, &store, "api.example.test", NOW);
+            assert_eq!(refused.map(|_| ()), Err(Error::Revoked));
+        }
+        lines.clear();
+        revocation_line(&der("github.leaf"), false, &mut lines);
+        lines.extend_from_slice(b"not hex\n");
+        let mut store = Store::new();
+        assert!(store.add_der(&root));
+        assert_eq!(store.add_revoked(&lines), 1);
+        assert_eq!((store.revocations(), store.skipped()), (1, 1));
+        assert!(verify(&chain, &store, "api.example.test", NOW).is_ok());
     }
 
     /// The store loads the CAs of a bundle and counts the rest.

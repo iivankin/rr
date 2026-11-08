@@ -7,10 +7,16 @@
 //! curl's cacert.pem drops those dates. The data is Mozilla's, under
 //! the Mozilla Public License 2.0.
 //!
-//! To refresh it, run `python3 registry/roots/roots-gen.py --tag
+//! revoked.txt is Mozilla's OneCRL: the certificates Firefox refuses
+//! wherever they stand on a path, intermediates revoked and roots
+//! distrusted (DigiNotar's among them, which certdata.txt no longer
+//! carries), as digests that x509::Store::add_revoked reads. A bundle
+//! from the system carries none of it.
+//!
+//! To refresh both, run `python3 registry/roots/roots-gen.py --tag
 //! NSS_3_xxx_RTM` there, or scripts/roots-gen.py in a project, and update the
 //! counts in the test below; `--check` says whether
-//! roots.pem is what its tag gives. A root outside x509's profile, such
+//! roots.pem is what its tag gives and revoked.txt what OneCRL holds now. A root outside x509's profile, such
 //! as one with a P-521 key, is skipped and counted.
 //!
 //! A program may trust the system's bundle instead, or as well: the
@@ -25,12 +31,15 @@
 use crate::base::x509;
 
 const MOZILLA: &[u8] = include_bytes!("roots.pem");
+const REVOKED: &[u8] = include_bytes!("revoked.txt");
 
-/// A store of Mozilla's anchors, decoded and checked: about 200 KB of
-/// PEM, once per program.
+/// A store of Mozilla's anchors, decoded and checked, and OneCRL's
+/// revocations: about 200 KB of PEM and 125 KB of digests, once per
+/// program.
 pub fn mozilla() -> x509::Store {
     let mut store = x509::Store::new();
     store.add_pem(MOZILLA);
+    store.add_revoked(REVOKED);
     store
 }
 
@@ -48,6 +57,8 @@ mod tests {
     fn anchors() {
         let store = mozilla();
         assert_eq!((store.len(), store.skipped()), (117, 1));
+        // OneCRL at timestamp 1793748796854: 1,920 records, 1,916 distinct.
+        assert_eq!(store.revocations(), 1916);
         let dates = MOZILLA
             .split(|byte| *byte == b'\n')
             .filter(|line| line.starts_with(b"# distrust-after: "))
