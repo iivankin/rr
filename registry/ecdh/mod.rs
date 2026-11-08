@@ -1,5 +1,5 @@
-//! P-256 (secp256r1) Diffie-Hellman, as TLS 1.3 uses it (RFC 8446
-//! 4.2.8.2, 7.4.2): a secret scalar, its public point uncompressed, and
+//! P-256 (secp256r1) Diffie-Hellman, as TLS 1.3 uses it (RFC 9846
+//! 4.3.8.2, 7.4.2): a secret scalar, its public point uncompressed, and
 //! the x-coordinate shared with a peer's point.
 //!
 //! Constant time over the secret: the scalar is read four bits at a
@@ -113,7 +113,7 @@ pub fn public_key(secret: &[u8; SECRET_BYTES]) -> Option<[u8; PUBLIC_BYTES]> {
 /// x-coordinate of secret times peer. None when secret is not one
 /// public_key takes, and when peer is not an uncompressed point of the
 /// curve (65 bytes, coordinates below p, on the curve), which TLS 1.3
-/// must abort on (RFC 8446 4.2.8.2): compressed points are refused.
+/// must abort on (RFC 9846 4.3.8.2): compressed points are refused.
 #[cfg_attr(rr, rr::hot)]
 pub fn shared(secret: &[u8; SECRET_BYTES], peer: &[u8]) -> Option<[u8; SHARED_BYTES]> {
     let k = scalar(secret)?;

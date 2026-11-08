@@ -1,6 +1,6 @@
 //! RSA signature verification (RFC 8017): RSASSA-PKCS1-v1_5, which
 //! certificates use, and RSASSA-PSS with MGF1 and a salt as long as the
-//! hash, which TLS 1.3's CertificateVerify uses (RFC 8446 4.2.3); with
+//! hash, which TLS 1.3's CertificateVerify uses (RFC 9846 4.3.3); with
 //! SHA-256, SHA-384 or SHA-512, as the Web PKI allows.
 //!
 //! The key, the digest and the signature are public, so the arithmetic

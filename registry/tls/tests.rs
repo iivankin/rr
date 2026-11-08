@@ -1214,8 +1214,9 @@ fn key_of(secret: &[u8; 32]) -> Vec<u8> {
 
 /// The trace's key schedule and records through the client. Its
 /// ClientHello is not this client's, so the trace's takes our own's
-/// place in the transcript; its certificate is 1024-bit RSA, outside
-/// x509's profile, so Certificate and CertificateVerify go into the
+/// place in the transcript, and its EncryptedExtensions, an answer to
+/// that ClientHello, goes in as it is; its certificate is 1024-bit RSA,
+/// outside x509's profile, so Certificate and CertificateVerify go into the
 /// transcript unchecked. The rest is the client's own: the secrets from
 /// ServerHello, the opening of the flight, the check of the server's
 /// Finished, and the exact bytes of the client's Finished and of its
@@ -1255,9 +1256,15 @@ fn rfc8448_simple_1rtt() {
         let length = usize::from(rest[2]) * 256 + usize::from(rest[3]);
         let (message, next) = rest.split_at(4 + length);
         match message[0] {
+            // Its EncryptedExtensions answers the trace's ClientHello,
+            // which offered record_size_limit; this client never does,
+            // so it refuses the extension (RFC 9846 4.3), and the message
+            // goes into the transcript as the trace has it.
             8 => {
-                assert_eq!(client.message(8, message), Ok(false));
-                assert!(matches!(client.state, State::Certificate));
+                assert_eq!(client.message(8, message), Err(Error::Extension));
+                assert!(matches!(client.state, State::Extensions));
+                client.transcript.update(message);
+                client.state = State::Certificate;
             }
             11 => client.transcript.update(message),
             15 => {
@@ -1659,16 +1666,23 @@ fn alpn() {
 #[test]
 fn encrypted_extensions() {
     for (extensions, error) in [
-        ("000a 0004 0002 001d  ff99 0000  0000 0000", None),
+        ("000a 0004 0002 001d  0000 0000", None),
         ("0000 0001 00", Some(Error::Decode)),
-        // Offered in the ClientHello, not for this message (4.3.1).
+        // Offered in the ClientHello, not for this message (RFC 9846 4.3).
         ("002b 0002 0304", Some(Error::Parameter)),
-        // Never offered (4.2).
-        ("0029 0002 0000", Some(Error::Extension)),
         ("0033 0000", Some(Error::Parameter)),
+        // Never offered, known or not (4.3): pre_shared_key, early_data,
+        // ALPN without protocols offered, and a type of no meaning.
+        ("0029 0002 0000", Some(Error::Extension)),
+        ("002a 0000", Some(Error::Extension)),
+        ("0010 0005 0003 0268 32", Some(Error::Extension)),
+        ("ff99 0000", Some(Error::Extension)),
         ("0010", Some(Error::Decode)),
-        // Each extension once (4.2).
-        ("ff99 0000  ff99 0000", Some(Error::Decode)),
+        // Each extension once (4.3).
+        (
+            "000a 0004 0002 001d  000a 0004 0002 001d",
+            Some(Error::Decode),
+        ),
     ] {
         let mut script = Script::new(Kind::P256);
         script.extensions = hex(extensions);
@@ -1681,12 +1695,12 @@ fn encrypted_extensions() {
     assert_eq!(result, Some(Error::Extension));
 }
 
-/// RFC 8446 4.4.2: without a certificate the client answers a request
+/// RFC 9846 4.5.1: without a certificate the client answers a request
 /// with an empty Certificate, and the handshake goes on.
 #[test]
 fn certificate_request() {
     let mut script = Script::new(Kind::P384);
-    // An empty context and signature_algorithms, as RFC 8446 4.3.2 asks.
+    // An empty context and signature_algorithms, as RFC 9846 4.4.2 asks.
     script.request = Some(hex("00 0008 000d 0004 0002 0403"));
     let store = script.identity.store();
     let mut server = Server::new(script);
@@ -1908,7 +1922,7 @@ fn record_limits() {
         assert_eq!(client.input(bytes), result);
     }
     // 2^14 bytes and the content type pass: TLSInnerPlaintext is 2^14 + 1
-    // bytes at most (RFC 8446 5.4), so one byte of padding more does not,
+    // bytes at most (RFC 9846 5.4), so one byte of padding more does not,
     // nor one more byte of data.
     let full = |server: &mut Server| {
         let mut inner = Vec::new();

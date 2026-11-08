@@ -23,7 +23,7 @@ pub fn public_key(secret: &[u8; KEY_BYTES]) -> [u8; KEY_BYTES] {
 }
 
 /// The secret shared with peer. None when it is all zero: peer is a point
-/// of small order, and TLS (RFC 8446 7.4.2) must abort then.
+/// of small order, and TLS (RFC 9846 7.4.2) must abort then.
 #[cfg_attr(rr, rr::hot)]
 pub fn shared(secret: &[u8; KEY_BYTES], peer: &[u8; KEY_BYTES]) -> Option<[u8; KEY_BYTES]> {
     let out = ladder(secret, peer);

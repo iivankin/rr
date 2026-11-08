@@ -1,17 +1,17 @@
-//! A TLS 1.3 client (RFC 8446) without I/O: the caller moves bytes
+//! A TLS 1.3 client (RFC 9846) without I/O: the caller moves bytes
 //! between the socket and the client, which serves a blocking loop, a
 //! poll loop or a thread alike.
 //!
 //! The profile: TLS_AES_128_GCM_SHA256; key shares for X25519MLKEM768,
 //! post-quantum, and X25519 on one X25519 key, as Go and browsers send
-//! them, and P-256, which RFC 8446 9.1 requires, for a server that asks
+//! them, and P-256, which RFC 9846 9.1 requires, for a server that asks
 //! in a HelloRetryRequest; server signatures ECDSA P-256, P-384 and
 //! P-521 and RSA-PSS with SHA-256, SHA-384 or SHA-512; SNI and ALPN; middlebox compatibility
-//! (a random session ID and one change_cipher_spec, RFC 8446 D.4). A
+//! (a random session ID and one change_cipher_spec, RFC 9846 E.4). A
 //! HelloRetryRequest with a cookie, a group or both is answered. Records
 //! that carry nothing, 32 in a row, end the connection. No resumption, no 0-RTT and no client certificate: tickets are
 //! ignored, and a CertificateRequest is answered with an empty
-//! Certificate, as RFC 8446 4.4.2 says a client without one must; the
+//! Certificate, as RFC 9846 4.5.1 says a client without one must; the
 //! server then decides. A KeyUpdate is honoured and answered when asked,
 //! and the client updates its own keys every 2^24 records it seals.
 //!
@@ -95,11 +95,11 @@ const IDLE_MAX: u8 = 32;
 const HEADER: usize = 5;
 const TAG: usize = aesgcm::TAG_LEN;
 /// A protected record: the plaintext, its type byte and up to 255 of
-/// padding, and the tag (RFC 8446 5.2).
+/// padding, and the tag (RFC 9846 5.2).
 const CIPHERTEXT_MAX: usize = RECORD_MAX + 256;
 /// A full record as this client seals it, without padding.
 const SEALED_MAX: usize = HEADER + RECORD_MAX + 1 + TAG;
-/// Records under one key before the client updates its own: RFC 8446
+/// Records under one key before the client updates its own: RFC 9846
 /// 5.5 allows AES-GCM 2^24.5 full records.
 const KEY_RECORDS_MAX: u64 = 1 << 24;
 const HASH: usize = sha256::DIGEST_BYTES;
@@ -156,13 +156,11 @@ const MESSAGE_HASH: u8 = 254;
 
 // Extensions.
 const SERVER_NAME: u16 = 0;
+const SUPPORTED_GROUPS: u16 = 10;
 const SIGNATURE_ALGORITHMS: u16 = 13;
 const ALPN: u16 = 16;
-const PRE_SHARED_KEY: u16 = 41;
-const EARLY_DATA: u16 = 42;
 const SUPPORTED_VERSIONS: u16 = 43;
 const COOKIE: u16 = 44;
-const PSK_MODES: u16 = 45;
 const KEY_SHARE: u16 = 51;
 
 const TLS13: u16 = 0x0304;
@@ -182,7 +180,7 @@ const P256_ORDER: [u8; 32] = [
 ];
 
 /// ServerHello's random when it is a HelloRetryRequest: SHA-256 of
-/// "HelloRetryRequest" (RFC 8446 4.1.3).
+/// "HelloRetryRequest" (RFC 9846 4.2.3).
 const HELLO_RETRY: [u8; 32] = [
     0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
     0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
@@ -356,7 +354,7 @@ impl Keys {
         }
     }
 
-    /// The keys after a KeyUpdate (RFC 8446 7.2).
+    /// The keys after a KeyUpdate (RFC 9846 7.2).
     fn next(&self) -> Keys {
         let mut secret = [0; HASH];
         expand(&self.secret, b"traffic upd", &[], &mut secret);
@@ -364,7 +362,7 @@ impl Keys {
     }
 
     /// The next record's nonce: the sequence number XORed into the IV's
-    /// last eight bytes (RFC 8446 5.3).
+    /// last eight bytes (RFC 9846 5.3).
     fn nonce(&mut self) -> Result<[u8; aesgcm::NONCE_LEN], Error> {
         let mut nonce = self.iv;
         for (byte, number) in nonce.iter_mut().skip(4).zip(self.seq.to_be_bytes()) {
@@ -440,8 +438,8 @@ pub struct Client<'a> {
     /// The protocol the server chose, where it is in offer.
     chosen: Option<(usize, usize)>,
     random: [u8; 32],
-    /// legacy_session_id: random, for middlebox compatibility (RFC 8446
-    /// D.4), and echoed by the server; none without it, as RFC 8448's
+    /// legacy_session_id: random, for middlebox compatibility (RFC 9846
+    /// E.4), and echoed by the server; none without it, as RFC 8448's
     /// client.
     session: Option<[u8; 32]>,
     secret: [u8; x25519::KEY_BYTES],
@@ -582,7 +580,7 @@ impl<'a> Client<'a> {
         };
         let hello = client.hello(&[]);
         // The first ClientHello's record says TLS 1.0, as most clients'
-        // do, for middleboxes that look (RFC 8446 5.1).
+        // do, for middleboxes that look (RFC 9846 5.1).
         client.handshake_message(&hello, 1)?;
         Ok(client)
     }
@@ -713,7 +711,7 @@ impl<'a> Client<'a> {
 
     /// The caller's verdict on chain. False fails the connection with
     /// Untrusted, whose alert is unknown_ca: the chain did not lead to an
-    /// anchor the caller trusts (RFC 8446 6.2). True goes on with the
+    /// anchor the caller trusts (RFC 9846 6.2). True goes on with the
     /// messages already in, CertificateVerify first, which the client
     /// checks with the leaf's key. A call while nothing is awaited does
     /// nothing.
@@ -787,7 +785,7 @@ impl<'a> Client<'a> {
         let Some(&[kind, _, _, high, low]) = self.rx.first_chunk::<HEADER>() else {
             return Ok(HEADER);
         };
-        // legacy_record_version is ignored, as RFC 8446 5.1 says.
+        // legacy_record_version is ignored, as RFC 9846 5.1 says.
         let length = usize::from(u16::from_be_bytes([high, low]));
         let limit = match kind {
             APPLICATION => CIPHERTEXT_MAX,
@@ -819,7 +817,7 @@ impl<'a> Client<'a> {
         Ok(())
     }
 
-    /// Opens the protected record in rx in place (RFC 8446 5.2).
+    /// Opens the protected record in rx in place (RFC 9846 5.2).
     fn protected(&mut self) -> Result<(), Error> {
         let Some(keys) = &mut self.input_keys else {
             return Err(Error::Unexpected);
@@ -831,7 +829,7 @@ impl<'a> Client<'a> {
         let nonce = keys.nonce()?;
         keys.aead.open(&nonce, header, data, tag)?;
         // TLSInnerPlaintext, padding and all, is 2^14 + 1 bytes at most
-        // (RFC 8446 5.4).
+        // (RFC 9846 5.4).
         if data.len() > RECORD_MAX + 1 {
             return Err(Error::Overflow);
         }
@@ -868,7 +866,7 @@ impl<'a> Client<'a> {
     }
 
     /// The middlebox compatibility record, dropped before the server's
-    /// Finished (RFC 8446 5).
+    /// Finished (RFC 9846 5).
     fn change_cipher_spec(&mut self) -> Result<(), Error> {
         let late = matches!(self.state, State::Connected | State::Closed);
         if late || !self.hs.is_empty() || self.rx.get(HEADER..) != Some(&[1][..]) {
@@ -900,7 +898,7 @@ impl<'a> Client<'a> {
         match description {
             // close_notify ends what the server sends.
             0 if matches!(self.state, State::Connected) => self.state = State::Closed,
-            // user_canceled is followed by close_notify (RFC 8446 6.1).
+            // user_canceled is followed by close_notify (RFC 9846 6.1).
             90 => self.idle()?,
             // Every other alert is an error, whatever its level (6.2).
             _ => return Err(Error::Alert(description)),
@@ -911,7 +909,7 @@ impl<'a> Client<'a> {
     /// The handshake bytes at rx[start..stop], after any part message
     /// that came before them.
     fn handshake(&mut self, start: usize, stop: usize) -> Result<(), Error> {
-        // A handshake record is never empty (RFC 8446 5.1).
+        // A handshake record is never empty (RFC 9846 5.1).
         if start == stop {
             return Err(Error::Unexpected);
         }
@@ -1030,7 +1028,7 @@ impl<'a> Client<'a> {
         }
         // A server below TLS 1.3 sends neither (protocol_version); one
         // that selects a version the client did not offer is wrong
-        // (illegal_parameter, RFC 8446 4.2.1).
+        // (illegal_parameter, RFC 9846 4.3.1).
         match (version, selected) {
             (0x0303, Some(TLS13)) => {}
             (0x0303, Some(_)) => return Err(Error::Parameter),
@@ -1111,7 +1109,7 @@ impl<'a> Client<'a> {
         }
     }
 
-    /// A HelloRetryRequest (RFC 8446 4.1.4): the second ClientHello
+    /// A HelloRetryRequest (RFC 9846 4.2.4): the second ClientHello
     /// shares a key for the group it asks for, P-256, the one offered
     /// without a share; and adds the cookie, if any. One that would change
     /// nothing is illegal_parameter.
@@ -1149,7 +1147,7 @@ impl<'a> Client<'a> {
         self.transcript.update(message);
         self.state = State::Retried;
         let hello = self.hello(cookie);
-        // Middlebox compatibility: change_cipher_spec before it (D.4).
+        // Middlebox compatibility: change_cipher_spec before it (E.4).
         self.compatible();
         self.handshake_message(&hello, 3)?;
         Ok(true)
@@ -1209,16 +1207,17 @@ impl<'a> Client<'a> {
                 SERVER_NAME if self.literal => return Err(Error::Extension),
                 SERVER_NAME if !data.is_empty() => return Err(Error::Decode),
                 ALPN => self.choose(data)?,
+                // The name used, and the server's groups, information for
+                // a later handshake.
+                SERVER_NAME | SUPPORTED_GROUPS => {}
                 // Offered in the ClientHello, but not for this message:
-                // illegal_parameter (RFC 8446 4.3.1); never offered:
-                // unsupported_extension (4.2).
+                // illegal_parameter (RFC 9846 4.3).
                 SIGNATURE_ALGORITHMS | SUPPORTED_VERSIONS | COOKIE | KEY_SHARE => {
                     return Err(Error::Parameter);
                 }
-                PRE_SHARED_KEY | EARLY_DATA | PSK_MODES => return Err(Error::Extension),
-                // Others, such as supported_groups, are information, as Go
-                // and OpenSSL take them.
-                _ => {}
+                // Never offered, known or not: unsupported_extension (RFC
+                // 9846 4.3), as BoringSSL and rustls answer it.
+                _ => return Err(Error::Extension),
             }
         }
         self.transcript.update(message);
@@ -1258,7 +1257,7 @@ impl<'a> Client<'a> {
 
     /// A CertificateRequest during the handshake: its context is empty
     /// and signature_algorithms is among its extensions, each once (RFC
-    /// 8446 4.3.2). The empty Certificate answers it.
+    /// 9846 4.4.2). The empty Certificate answers it.
     fn request(&mut self, message: &[u8], body: &[u8]) -> Result<bool, Error> {
         let mut fields = Reader { rest: body };
         let context = fields.vector(1)?;
@@ -1328,7 +1327,7 @@ impl<'a> Client<'a> {
         if !matches!(scheme, 0x0403 | 0x0503 | 0x0603 | 0x0804 | 0x0805 | 0x0806) {
             return Err(Error::Parameter);
         }
-        // RFC 8446 4.4.3: 64 spaces, the context string and the hash.
+        // RFC 9846 4.5.2: 64 spaces, the context string and the hash.
         let mut content = [0x20; 64 + VERIFY_CONTEXT.len() + HASH];
         let hash = self.hash();
         for (byte, value) in content
@@ -1498,14 +1497,14 @@ impl<'a> Client<'a> {
         self.transcript.clone().finish()
     }
 
-    /// A ClientHello with the cookie, if any (RFC 8446 4.1.2). The
+    /// A ClientHello with the cookie, if any (RFC 9846 4.2.2). The
     /// limits on host, ALPN and cookie keep every length in its field.
     fn hello(&self, cookie: &[u8]) -> Vec<u8> {
         let mut m = Vec::with_capacity(256 + self.host.len() + self.offer.len() + cookie.len());
         m.extend_from_slice(&[CLIENT_HELLO, 0, 0, 0, 3, 3]);
         m.extend_from_slice(&self.random);
         // A session ID of 32 random bytes, for middlebox compatibility
-        // (RFC 8446 D.4); one suite and no compression.
+        // (RFC 9846 E.4); one suite and no compression.
         let session = self.session.as_ref().map_or(&[][..], |id| &id[..]);
         m.push(u8::try_from(session.len()).unwrap_or(0));
         m.extend_from_slice(session);
@@ -1523,7 +1522,7 @@ impl<'a> Client<'a> {
         // them.
         m.extend_from_slice(&[0, 10, 0, 8, 0, 6, 0x11, 0xec, 0, 0x1d, 0, 0x17]);
         // signature_algorithms: what CertificateVerify may use, then
-        // PKCS #1, which only certificates may (RFC 8446 4.2.3).
+        // PKCS #1, which only certificates may (RFC 9846 4.3.3).
         m.extend_from_slice(&[
             0, 13, 0, 20, 0, 18, 4, 3, 5, 3, 6, 3, 8, 4, 8, 5, 8, 6, 4, 1, 5, 1, 6, 1,
         ]);
@@ -1572,8 +1571,8 @@ impl<'a> Client<'a> {
     }
 }
 
-/// The extension types of one block, which may each come once (RFC 8446
-/// 4.2): a block of more than SEEN_MAX is refused, as no server sends
+/// The extension types of one block, which may each come once (RFC 9846
+/// 4.3): a block of more than SEEN_MAX is refused, as no server sends
 /// one.
 struct Seen {
     kinds: [u16; SEEN_MAX],
@@ -1605,7 +1604,7 @@ impl Seen {
 
 /// The certificates of a Certificate message's body into out, leaf
 /// first; how many. More than out holds is refused, and so is none
-/// (RFC 8446 4.4.2.4).
+/// (RFC 9846 4.5.1.3).
 fn certificates<'m>(body: &'m [u8], out: &mut [&'m [u8]]) -> Result<usize, Error> {
     let mut fields = Reader { rest: body };
     if !fields.vector(1)?.is_empty() {
@@ -1644,7 +1643,7 @@ fn message_header(kind: u8, length: usize) -> [u8; 4] {
     [kind, a, b, c]
 }
 
-/// Seals data as one record of kind at the end of tx (RFC 8446 5.2):
+/// Seals data as one record of kind at the end of tx (RFC 9846 5.2):
 /// the header, the data, its type and the tag, sealed in place.
 fn seal(keys: &mut Keys, tx: &mut Vec<u8>, kind: u8, data: &[u8]) -> Result<(), Error> {
     let Ok(length) = u16::try_from(data.len() + 1 + TAG) else {
@@ -1670,7 +1669,7 @@ fn seal(keys: &mut Keys, tx: &mut Vec<u8>, kind: u8, data: &[u8]) -> Result<(), 
     Ok(())
 }
 
-/// The secrets ServerHello's key share leads to (RFC 8446 7.1).
+/// The secrets ServerHello's key share leads to (RFC 9846 7.1).
 struct Secrets {
     client: [u8; HASH],
     server: [u8; HASH],
@@ -1698,7 +1697,7 @@ fn derive(secret: &[u8; HASH], label: &[u8], hash: &[u8; HASH]) -> [u8; HASH] {
     out
 }
 
-/// HKDF-Expand-Label (RFC 8446 7.1). The labels are this file's, at most
+/// HKDF-Expand-Label (RFC 9846 7.1). The labels are this file's, at most
 /// 12 bytes, and a context is a hash at most: info fits 64 bytes.
 fn expand(secret: &[u8; HASH], label: &[u8], context: &[u8], out: &mut [u8]) {
     let mut info = [0; 64];
@@ -1727,7 +1726,7 @@ fn expand(secret: &[u8; HASH], label: &[u8], context: &[u8], out: &mut [u8]) {
 }
 
 /// HMAC-SHA256 of data under key, which HKDF-Extract is with key as
-/// the salt: a Finished's verify_data (RFC 8446 4.4.4).
+/// the salt: a Finished's verify_data (RFC 9846 4.5.3).
 fn mac(key: &[u8; HASH], data: &[u8; HASH]) -> [u8; HASH] {
     sha256::hkdf_extract(key, data)
 }

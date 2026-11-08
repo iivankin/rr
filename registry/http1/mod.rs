@@ -368,7 +368,7 @@ impl Response {
     /// a body without a length. Over TLS the connection closed only with
     /// the server's close_notify (tls's Client::closed): a TCP close
     /// without it may be an attacker's, which cuts such a body short
-    /// (RFC 8446 6.1), so it is Truncated, not eof.
+    /// (RFC 9846 6.1), so it is Truncated, not eof.
     pub fn eof(&mut self) -> Result<(), Error> {
         match self.state {
             State::Close | State::Done => {

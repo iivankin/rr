@@ -921,7 +921,7 @@ fn signed(
 
 impl Leaf<'_> {
     /// Whether signature is the server's CertificateVerify of message,
-    /// the TLS 1.3 content it signs (RFC 8446 4.4.3), under scheme:
+    /// the TLS 1.3 content it signs (RFC 9846 4.5.2), under scheme:
     /// ecdsa_secp256r1_sha256, _secp384r1_sha384 or _secp521r1_sha512, or
     /// rsa_pss_rsae_sha256, _sha384 or _sha512. The scheme's curve must be
     /// the key's.
