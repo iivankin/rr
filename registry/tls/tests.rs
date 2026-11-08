@@ -2449,3 +2449,15 @@ fn caller_with_x509() {
     let refused = caller(Script::new(Kind::P256), HOST, 9, &other);
     assert_eq!(refused.error, Some(Error::Untrusted));
 }
+
+/// A chain the caller trusts still needs a leaf whose key may sign the
+/// handshake: keyUsage keyEncipherment alone is refused before the
+/// server's CertificateVerify.
+#[test]
+fn caller_needs_a_signing_key() {
+    let mut script = Script::new(Kind::P256);
+    script.identity.chain = Vec::from([test_certificate("test.kencleaf").unwrap()]);
+    let verdict = caller(script, HOST, WHOLE, &Judge::Always(true));
+    assert_eq!(verdict.error, Some(Error::Certificate));
+    assert!(!verdict.connected);
+}

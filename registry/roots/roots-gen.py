@@ -23,6 +23,17 @@ leaf's notBefore stands for it, as for Mozilla's dates. Chrome's root
 store also sunsets old roots for its newest versions; those are its
 own policy for its own store, and are left out.
 
+A root on which Firefox imposes name constraints of its own (NSS's
+lib/certdb/genname.c, builtInNameConstraints, which
+NSSCertDBTrustDomain::FindIssuer applies to every issuer of that subject)
+carries a line
+
+    # name-constraints: 3009a007300582032e7472
+
+before its PEM block: the NameConstraints DER in hex, which
+x509::Store::add_pem imposes on every CA of the block's subject, as if
+it were the CA's own extension. IMPOSED below is genname.c's table.
+
 certdata.txt rather than CCADB's CSV report: it is what Firefox ships,
 it is versioned by NSS's release tags, so --check reproduces the file
 from a fixed input, and its trust records are the ones NSS applies.
@@ -61,6 +72,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # date, by the SHA-256 of their DER: Chrome 139 and later, announced
 # 2025-05-30 at
 # https://blog.google/security/sustaining-digital-certificate-security-chrome-root-store-changes/
+# Chrome's root store has since removed all three (its version 45 lists
+# none of them), so Chrome trusts no certificate under them at all; the
+# cutoff is kept as it is: a leaf issued before 2025-08-01 is valid for
+# at most 398 days, so by now (late 2026) none remains current, and the
+# date refuses all that Chrome refuses.
 CHROME = {
     # OU=ePKI Root Certification Authority, O=Chunghwa Telecom Co., Ltd.
     "c0a6f4dc63a24bfdcf54ef2a6a082a0a72de35803e2ff5ff527ae5d87206dfd5": "2025-07-31T23:59:59Z",
@@ -68,6 +84,40 @@ CHROME = {
     "f015ce3cc239bfef064be9f1d2c417e1a0264a0a94be1f0c8d121864eb6949cc": "2025-07-31T23:59:59Z",
     # CN=NetLock Arany (Class Gold) Főtanúsítvány, O=NetLock Kft.
     "6c61dac3a2def031506be036d2a6fe401994fbd13df9c8d466599274c446ec98": "2025-07-31T23:59:59Z",
+}
+
+
+# Name constraints NSS imposes on a root by its subject, copied from
+# lib/certdb/genname.c (NSS_3_133_RTM), ANSSI's and TUBITAK's: the subject
+# DER and the NameConstraints DER. ANSSI's IGC/A is no longer in
+# certdata.txt, so only TUBITAK's applies; both are kept as NSS keeps
+# them.
+IMPOSED = {
+    # ANSSI_SUBJECT_DN: C=FR, ST=France, L=Paris, O=PM/SGDN, OU=DCSSI,
+    # CN=IGC/A, emailAddress=igca@sgdn.pm.gouv.fr
+    b"\x30\x81\x85"
+    b"\x31\x0b\x30\x09\x06\x03\x55\x04\x06\x13\x02" b"FR"
+    b"\x31\x0f\x30\x0d\x06\x03\x55\x04\x08\x13\x06" b"France"
+    b"\x31\x0e\x30\x0c\x06\x03\x55\x04\x07\x13\x05" b"Paris"
+    b"\x31\x10\x30\x0e\x06\x03\x55\x04\x0a\x13\x07" b"PM/SGDN"
+    b"\x31\x0e\x30\x0c\x06\x03\x55\x04\x0b\x13\x05" b"DCSSI"
+    b"\x31\x0e\x30\x0c\x06\x03\x55\x04\x03\x13\x05" b"IGC/A"
+    b"\x31\x23\x30\x21\x06\x09\x2a\x86\x48\x86\xf7\x0d\x01\x09\x01"
+    b"\x16\x14" b"igca@sgdn.pm.gouv.fr":
+    b"\x30\x5d\xa0\x5b"
+    + b"".join(b"\x30\x05\x82\x03" + domain for domain in
+               [b".fr", b".gp", b".gf", b".mq", b".re", b".yt", b".pm", b".bl", b".mf", b".wf", b".pf", b".nc", b".tf"]),
+    # TUBITAK1_SUBJECT_DN: C=TR, L=Gebze - Kocaeli, O=Turkiye Bilimsel ve
+    # Teknolojik Arastirma Kurumu - TUBITAK, OU=Kamu Sertifikasyon Merkezi
+    # - Kamu SM, CN=TUBITAK Kamu SM SSL Kok Sertifikasi - Surum 1
+    b"\x30\x81\xd2"
+    b"\x31\x0b\x30\x09\x06\x03\x55\x04\x06\x13\x02" b"TR"
+    b"\x31\x18\x30\x16\x06\x03\x55\x04\x07\x13\x0f" b"Gebze - Kocaeli"
+    b"\x31\x42\x30\x40\x06\x03\x55\x04\x0a\x13\x39"
+    b"Turkiye Bilimsel ve Teknolojik Arastirma Kurumu - TUBITAK"
+    b"\x31\x2d\x30\x2b\x06\x03\x55\x04\x0b\x13\x24" b"Kamu Sertifikasyon Merkezi - Kamu SM"
+    b"\x31\x36\x30\x34\x06\x03\x55\x04\x03\x13\x2d" b"TUBITAK Kamu SM SSL Kok Sertifikasi - Surum 1":
+    b"\x30\x09\xa0\x07" b"\x30\x05\x82\x03" b".tr",
 }
 
 
@@ -127,7 +177,9 @@ def build(text, tag):
         "(http://mozilla.org/MPL/2.0/). Kept: the roots NSS trusts to issue",
         "TLS server certificates; a distrust-after line gives the time after",
         "which a leaf's notBefore makes a path to that root fail, Mozilla's",
-        "or Chrome's, whichever is earlier.",
+        "or Chrome's, whichever is earlier; a name-constraints line, the",
+        "NameConstraints Firefox imposes on CAs of that subject (NSS's",
+        "lib/certdb/genname.c), in hex DER.",
         "",
     ]
     count = 0
@@ -147,6 +199,9 @@ def build(text, tag):
         if dates:
             # RFC 3339 times of one form sort as they come.
             out.append("# distrust-after: " + min(dates))
+        imposed = IMPOSED.get(item["CKA_SUBJECT"][1])
+        if imposed:
+            out.append("# name-constraints: " + imposed.hex())
         encoded = base64.b64encode(item["CKA_VALUE"][1]).decode("ascii")
         out.append("-----BEGIN CERTIFICATE-----")
         out.extend(encoded[i : i + 64] for i in range(0, len(encoded), 64))

@@ -48,14 +48,14 @@
     },
     {
       "name": "roots",
-      "description": "Mozilla's trust anchors for TLS servers from NSS's certdata.txt at a release tag (MPL 2.0), with Mozilla's distrust-after dates and Chrome's announced distrusts of roots Mozilla still trusts, embedded as PEM and loaded into an x509::Store, with Mozilla's OneCRL revocations (intermediates and roots refused anywhere on a path); scripts/roots-gen.py rebuilds the file from a newer tag.",
+      "description": "Mozilla's trust anchors for TLS servers from NSS's certdata.txt at a release tag (MPL 2.0), with Mozilla's distrust-after dates and Chrome's announced distrusts of roots Mozilla still trusts, embedded as PEM and loaded into an x509::Store, with the name constraints Firefox imposes on TUBITAK's root, with Mozilla's OneCRL revocations (intermediates and roots refused anywhere on a path), and policy(): that distrust alone, to lay over the system's anchors or screen a path the system verified; scripts/roots-gen.py rebuilds the file from a newer tag.",
       "dependencies": [
         "x509"
       ]
     },
     {
       "name": "rsa",
-      "description": "RSA signature verification (RFC 8017): RSASSA-PKCS1-v1_5 and RSASSA-PSS with MGF1 and a salt of the hash's length, SHA-256, SHA-384 or SHA-512, for moduli of 2048 to 4096 bits and exponents of at most 33 bits.",
+      "description": "RSA signature verification (RFC 8017): RSASSA-PKCS1-v1_5 and RSASSA-PSS with MGF1 and a salt of the hash's length, SHA-256, SHA-384 or SHA-512, for moduli of 2048 to 8192 bits and exponents of at most 33 bits.",
       "dependencies": [
         "sha256",
         "sha384"
@@ -101,7 +101,7 @@
     },
     {
       "name": "trust",
-      "description": "TLS server authentication by the operating system's trust, as Go's crypto/x509 does it: macOS's SecTrustEvaluateWithError and Windows's CertGetCertificateChain with the SSL policy, on a thread a poll loop waits on, and on Linux x509::verify against the system's anchors (its bundle and certificate directories, or SSL_CERT_FILE and SSL_CERT_DIR, read through the C library). system() also loads the anchors themselves on all three: macOS's trust domains with their SSL trust settings, Windows's ROOT store less what is disabled for server authentication or Disallowed.",
+      "description": "TLS server authentication by the operating system's trust, as Go's crypto/x509 does it: macOS's SecTrustEvaluateWithError and Windows's CertGetCertificateChain with the SSL policy, on a thread a poll loop waits on, and on Linux x509::verify against the system's anchors (its bundle and certificate directories, or SSL_CERT_FILE and SSL_CERT_DIR, read through the C library); SSL_CERT_FILE and SSL_CERT_DIR replace the system's verifier on macOS and Windows too, as in Go 1.27; a policy such as roots::policy (OneCRL, distrust dates) screens the path whichever verifies. system() also loads the anchors themselves on all three: macOS's trust domains with their SSL trust settings, Windows's ROOT store less what is disabled for server authentication or Disallowed.",
       "dependencies": [
         "x509",
         "wait"
@@ -119,7 +119,7 @@
     },
     {
       "name": "x509",
-      "description": "X.509 (RFC 5280) for TLS server authentication without I/O: a strict DER parser that borrows the certificate, a store of trust anchors from PEM or DER, and chain verification for a host at a given time, with paths built through intermediates in any order, name constraints as Go enforces them, bounded depth and signature checks (ECDSA P-256, P-384, P-521; RSA PKCS #1 and PSS; SHA-256, SHA-384, SHA-512), anyExtendedKeyUsage honoured on a leaf only, and the leaf's key for TLS 1.3's CertificateVerify.",
+      "description": "X.509 (RFC 5280) for TLS server authentication without I/O: a strict DER parser that borrows the certificate, a store of trust anchors from PEM or DER, and chain verification for a host at a given time, with paths built through intermediates in any order, name constraints as Go enforces them, bounded depth and signature checks (ECDSA P-256, P-384, P-521; RSA of 2048 to 8192 bits, PKCS #1 and PSS; SHA-256, SHA-384, SHA-512), serverAuth required where ExtKeyUsage is present (anyExtendedKeyUsage counts nowhere, as in Firefox and webpki), a CA refused as a leaf, directoryName constraints as Chrome compares them and other forms failing closed, Mozilla's name constraints imposed on a CA's name, v1 and self-signed anchors as Go and Firefox take them, a policy of revocations and distrust dates to lay over other anchors or screen a path another verifier built, and the leaf's key for TLS 1.3's CertificateVerify.",
       "dependencies": [
         "sha256",
         "sha384",
