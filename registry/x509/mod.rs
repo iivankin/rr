@@ -1607,8 +1607,22 @@ fn address_within(address: &[u8], constraint: &[u8]) -> bool {
             .all(|(a, (n, m))| a & m == n & m)
 }
 
+/// Whether the certificate (DER) names host, as verify checks its leaf:
+/// for a verifier that built the path itself, such as the system's, so
+/// that a host means the same on every system.
+pub fn names(der: &[u8], host: &str) -> Result<(), Error> {
+    if covers(parse(der)?.ext.names, host) {
+        Ok(())
+    } else {
+        Err(Error::Host)
+    }
+}
+
 /// Whether subjectAltName names host: an IP literal (IPv6 maybe in
-/// brackets) by iPAddress, a DNS name by dNSName.
+/// brackets) by iPAddress, a DNS name by dNSName, with a dot after it or
+/// not. The subject's common name never counts (RFC 9525), and a name
+/// that ends in a number is no DNS name, as the WHATWG URL standard
+/// reads one as an address: 192.0.2.1. is the address.
 fn covers(names: Option<&[u8]>, host: &str) -> bool {
     let Some(names) = names else {
         return false;
@@ -1620,11 +1634,17 @@ fn covers(names: Option<&[u8]>, host: &str) -> bool {
         Some(inner) => inner
             .parse::<core::net::Ipv6Addr>()
             .map(core::net::IpAddr::V6),
-        None => host.parse::<core::net::IpAddr>(),
+        // An IPv4 address may end with a dot, as a DNS name may.
+        None => host.parse::<core::net::IpAddr>().or_else(|error| {
+            host.strip_suffix('.')
+                .ok_or(error)?
+                .parse::<core::net::Ipv4Addr>()
+                .map(core::net::IpAddr::V4)
+        }),
     };
     let host = host.as_bytes();
     let host = host.strip_suffix(b".").unwrap_or(host);
-    if address.is_err() && !valid_host(host) {
+    if address.is_err() && (!valid_host(host) || numeric_end(host)) {
         return false;
     }
     let mut list = Reader::new(names);
@@ -1652,6 +1672,16 @@ fn valid_host(host: &[u8]) -> bool {
                     .iter()
                     .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-' || *byte == b'_')
         })
+}
+
+/// Whether a name's last label is a number, decimal or 0x hex.
+fn numeric_end(host: &[u8]) -> bool {
+    let last = host.rsplit(|byte| *byte == b'.').next().unwrap_or(host);
+    let hex = last
+        .strip_prefix(b"0x")
+        .or_else(|| last.strip_prefix(b"0X"))
+        .is_some_and(|digits| digits.iter().all(u8::is_ascii_hexdigit));
+    hex || last.iter().all(u8::is_ascii_digit)
 }
 
 /// RFC 6125 6.4: the names equal without case, or a pattern's whole
@@ -2011,12 +2041,23 @@ mod tests {
             ("2001:0db8:0:0:0:0:0:1", true),
             ("2001:db8::2", false),
             ("[192.0.2.1]", false),
+            // The address, with a dot after it: no DNS name.
+            ("192.0.2.1.", true),
+            ("192.0.2.2.", false),
+            ("2001:db8::1.", false),
+            ("3221225985", false),
+            ("192.0.0x2.1", false),
         ] {
             let expected = if valid { Ok(()) } else { Err(Error::Host) };
             assert_eq!(check(&test, host, NOW), expected, "{host}");
         }
         // A dNSName that spells an IP address is no iPAddress.
         assert_eq!(check(&["test.ncgood", "test.nc"], "192.0.2.5", NOW), Ok(()));
+        // The leaf's names alone, as a system that verified the path asks.
+        let leaf = der("openai.leaf");
+        assert_eq!(super::names(&leaf, "api.openai.com."), Ok(()));
+        assert_eq!(super::names(&leaf, "openai.com"), Err(Error::Host));
+        assert_eq!(super::names(b"\x30\x00", "a.test"), Err(Error::Malformed));
     }
 
     /// RFC 6125's rules, as the leaf's names are matched.

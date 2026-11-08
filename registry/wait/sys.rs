@@ -1832,7 +1832,7 @@ mod poller {
         /// The sockets handed over to close whose removal the port has yet
         /// to confirm are closed with it.
         fn drop(&mut self) {
-            while let Some((socket, removing)) = self.removing.pop_first() {
+            for (&socket, removing) in &self.removing {
                 if removing.close {
                     os::close(socket);
                 }

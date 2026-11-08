@@ -2,6 +2,13 @@
 //! the caller's loop, the same on all three: start a lookup, poll it
 //! until it is done, take the addresses; drop it to cancel.
 //!
+//! Some names are answered before any system sees them, the same on all
+//! three: no name (empty, ".", not ASCII: an internationalized name comes
+//! as its A-labels), .onion (RFC 7686) and a name that ends in a number
+//! but is no dotted-decimal address (127.1) are not found; localhost and
+//! the names under it are the loopback addresses (RFC 6761); an IPv4
+//! address is itself.
+//!
 //! The system answers, as it answers every program there:
 //!
 //! - macOS: mDNSResponder, through dns_sd.h's DNSServiceGetAddrInfo,

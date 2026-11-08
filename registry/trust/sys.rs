@@ -13,7 +13,9 @@ pub enum Error {
     /// A system call failed: an errno on Linux, an OSStatus on macOS, a
     /// GetLastError code on Windows.
     System(i32),
-    /// Linux: why x509::verify refused the chain.
+    /// Why x509 refused: on Linux the chain, x509::verify's error; on
+    /// every system a leaf that does not name the host, x509::Error::Host,
+    /// before the system is asked.
     Untrusted(x509::Error),
     /// macOS: the OSStatus SecTrustEvaluateWithError refused it with,
     /// such as errSecNotTrusted or errSecHostNameMismatch.
@@ -232,6 +234,31 @@ fn der(bytes: &[u8], range: (usize, usize)) -> &[u8] {
 /// A host the system's verifiers can take: not empty, and no NUL.
 fn named(host: &str) -> bool {
     !host.is_empty() && !host.contains('\0')
+}
+
+/// The host as the system's verifier is given it, once x509 found it
+/// among the leaf's names, as Go checks the name itself before it asks
+/// the system: so that a host means the same on every system, and
+/// neither falls back to the subject's common name. An IPv6 address
+/// without its brackets, a name without the dot after it.
+#[cfg(not(target_os = "linux"))]
+fn platform_host<'h>(chain: &[&[u8]], host: &'h str) -> Result<&'h str, Error> {
+    let Some(leaf) = chain.first() else {
+        return Err(Error::Input);
+    };
+    if chain.len() > x509::CHAIN_MAX || !named(host) {
+        return Err(Error::Input);
+    }
+    match x509::names(leaf, host) {
+        Ok(()) => {}
+        Err(x509::Error::Host) => return Err(Error::Untrusted(x509::Error::Host)),
+        Err(_) => return Err(Error::Input),
+    }
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host);
+    Ok(bare.strip_suffix('.').unwrap_or(bare))
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -940,10 +967,10 @@ mod os {
     pub struct Trust;
 
     pub fn check(_trust: &Trust, chain: &[&[u8]], host: &str, now: i64) -> Check {
-        if !super::named(host) {
-            return Check::start(Err(Error::Input));
-        }
-        Check::start(evaluation(chain, host, now).map(|trust| Job { trust }))
+        let job = super::platform_host(chain, host)
+            .and_then(|host| evaluation(chain, host, now))
+            .map(|trust| Job { trust });
+        Check::start(job)
     }
 
     /// What the thread evaluates: a SecTrust of ours.
@@ -1324,10 +1351,7 @@ mod os {
     pub struct Trust;
 
     pub fn check(_trust: &Trust, chain: &[&[u8]], host: &str, now: i64) -> Check {
-        if chain.is_empty() || chain.len() > x509::CHAIN_MAX || !super::named(host) {
-            return Check::start(Err(Error::Input));
-        }
-        Check::start(Ok(Job::new(chain, host, now)))
+        Check::start(super::platform_host(chain, host).map(|host| Job::new(chain, host, now)))
     }
 
     /// What the thread checks: the chain's DER, where each certificate
@@ -1350,9 +1374,8 @@ mod os {
                 bytes.extend_from_slice(der);
                 ranges.push((start, bytes.len()));
             }
-            let name = host.strip_suffix('.').unwrap_or(host);
             // rr: escape(copy): the host in UTF-16, as Windows takes it.
-            let mut wide: Vec<u16> = name.encode_utf16().collect();
+            let mut wide: Vec<u16> = host.encode_utf16().collect();
             wide.push(0);
             Job {
                 bytes,
@@ -1861,6 +1884,7 @@ mod tests {
     #[test]
     fn platform() {
         let trust = super::Trust::new().unwrap();
+        let mut dotted = alloc::string::String::new();
         for (names, host) in CHAINS {
             let certificates = certificates(names);
             // rr: escape(copy): the chain check takes, borrowed from them.
@@ -1878,23 +1902,30 @@ mod tests {
                 .unwrap();
             assert_eq!(result, Ok(()), "{host}");
             assert_eq!(check.poll(), Some(Err(Error::Polled)));
-            let wrong = trust.verify(&chain, "example.com", TEST_NOW);
-            // errSecHostNameMismatch, CERT_E_CN_NO_MATCH.
-            #[cfg(target_os = "macos")]
-            assert_eq!(wrong, Err(Error::Refused(-67602)));
-            #[cfg(target_os = "windows")]
-            assert_eq!(wrong, Err(Error::Policy(0x800B_010F)));
+            // x509 says so before the system is asked, as on Linux.
+            assert_eq!(
+                trust.verify(&chain, "example.com", TEST_NOW),
+                Err(Error::Untrusted(crate::base::x509::Error::Host))
+            );
+            // The dot after a name is no other name.
+            dotted.clear();
+            dotted.push_str(host);
+            dotted.push('.');
+            assert_eq!(trust.verify(&chain, &dotted, TEST_NOW), Ok(()), "{dotted}");
             // A check dropped while it runs is let go.
             drop(trust.check(&chain, host, TEST_NOW));
         }
         let certificates = certificates(&["test.leaf", "test.inter", "test.root"]);
         // rr: escape(copy): the chain check takes, borrowed from them.
         let chain: Vec<&[u8]> = certificates.iter().map(Vec::as_slice).collect();
-        let refused = trust.verify(&chain, "leaf.example.test", TEST_NOW);
-        #[cfg(target_os = "macos")]
-        assert!(matches!(refused, Err(Error::Refused(_))));
-        #[cfg(target_os = "windows")]
-        assert!(matches!(refused, Err(Error::Chain(_))));
+        // Named, an address in brackets as well, but not trusted.
+        for host in ["b.wild.example.test", "192.0.2.1", "[2001:db8::1]"] {
+            let refused = trust.verify(&chain, host, TEST_NOW);
+            #[cfg(target_os = "macos")]
+            assert!(matches!(refused, Err(Error::Refused(_))), "{host}");
+            #[cfg(target_os = "windows")]
+            assert!(matches!(refused, Err(Error::Chain(_))), "{host}");
+        }
         assert_eq!(trust.verify(&[], "x.test", TEST_NOW), Err(Error::Input));
         // A NUL would end the name where Windows reads it.
         assert_eq!(

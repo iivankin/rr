@@ -31,26 +31,36 @@ pub enum Error {
 
 /// One name's lookup. Dropping it cancels it.
 pub struct Lookup {
-    os: os::State,
+    /// What answered sees without asking the system, or the system's
+    /// lookup.
+    found: Result<Result<Vec<Address>, Error>, os::State>,
 }
 
 impl Lookup {
-    /// Starts looking up name, a host name or a literal address.
+    /// Starts looking up name, a host name in ASCII (an
+    /// internationalized one as its A-labels, xn--) or a literal address.
     pub fn start(name: &[u8]) -> Lookup {
         Lookup {
-            os: os::State::start(name),
+            found: answered(name).ok_or_else(|| os::State::start(name)),
         }
     }
 
     /// Does what is ready, without waiting: None while the lookup runs,
     /// then the addresses, best first, or why there are none.
     pub fn poll(&mut self) -> Option<Result<&[Address], Error>> {
-        self.os.poll()
+        match &mut self.found {
+            Ok(Ok(addresses)) => Some(Ok(addresses)),
+            Ok(Err(error)) => Some(Err(*error)),
+            Err(state) => state.poll(),
+        }
     }
 
     /// What to wait on before polling again.
     pub fn wait(&self) -> Wait {
-        self.os.wait()
+        match &self.found {
+            Ok(_) => Wait::READY,
+            Err(state) => state.wait(),
+        }
     }
 
     /// Stops the lookup; what it had is released.
@@ -61,7 +71,74 @@ impl Lookup {
 
 /// Looks up name and waits for the answer.
 pub fn resolve(name: &[u8]) -> Result<Vec<Address>, Error> {
-    os::resolve(name)
+    answered(name).unwrap_or_else(|| os::resolve(name))
+}
+
+/// What a name gets without asking the system, the same on every one:
+/// - no name: the empty one, ".", one with a NUL, or one not in ASCII,
+///   which each system would read its own way (Windows answers the empty
+///   one with the machine's own addresses; it and glibc may encode an
+///   internationalized name, mDNSResponder sends it as it is);
+/// - a .onion name, which DNS must never see (RFC 7686), as Go has it;
+/// - localhost and every name under it: the loopback addresses, never
+///   an answer from DNS (RFC 6761 6.3, as browsers and systemd-resolved
+///   answer);
+/// - an IPv4 address in dotted decimal, with a dot after it or not;
+/// - a name that ends in a number and is no such address, as 127.1 or
+///   0x7f.1, which getaddrinfo would read as an address and the WHATWG
+///   URL standard refuses: not found.
+fn answered(name: &[u8]) -> Option<Result<Vec<Address>, Error>> {
+    let Ok(text) = core::str::from_utf8(name) else {
+        return Some(Err(Error::NotFound));
+    };
+    if !text.is_ascii() || text.contains('\0') {
+        return Some(Err(Error::NotFound));
+    }
+    let bare = text.strip_suffix('.').unwrap_or(text);
+    if bare.is_empty() || bare.ends_with('.') {
+        return Some(Err(Error::NotFound));
+    }
+    if under(bare, "onion") {
+        return Some(Err(Error::NotFound));
+    }
+    if under(bare, "localhost") {
+        return Some(Ok(Vec::from([
+            Address {
+                ip: IpAddr::V6(core::net::Ipv6Addr::LOCALHOST),
+                scope: 0,
+            },
+            Address {
+                ip: IpAddr::V4(core::net::Ipv4Addr::LOCALHOST),
+                scope: 0,
+            },
+        ])));
+    }
+    if let Ok(v4) = bare.parse::<core::net::Ipv4Addr>() {
+        return Some(Ok(Vec::from([Address {
+            ip: IpAddr::V4(v4),
+            scope: 0,
+        }])));
+    }
+    let last = bare.rsplit('.').next().unwrap_or(bare);
+    let hex = last
+        .strip_prefix("0x")
+        .or_else(|| last.strip_prefix("0X"))
+        .is_some_and(|digits| digits.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    let decimal = last.bytes().all(|byte| byte.is_ascii_digit());
+    if (hex || decimal) && bare.parse::<core::net::Ipv6Addr>().is_err() {
+        return Some(Err(Error::NotFound));
+    }
+    None
+}
+
+/// Whether name is domain or a name under it, in any case.
+fn under(name: &str, domain: &str) -> bool {
+    let Some(start) = name.len().checked_sub(domain.len()) else {
+        return false;
+    };
+    let tail = name.get(start..).unwrap_or_default();
+    let before = name.get(..start).unwrap_or_default();
+    tail.eq_ignore_ascii_case(domain) && (before.is_empty() || before.ends_with('.'))
 }
 
 /// The addresses of a lookup that is over, for the caller to keep.
@@ -1201,10 +1278,43 @@ mod tests {
     /// Literal addresses are themselves.
     #[test]
     fn literals() {
-        let found = resolve(b"192.0.2.1").unwrap();
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].ip, core::net::IpAddr::from([192, 0, 2, 1]));
+        for name in [&b"192.0.2.1"[..], b"192.0.2.1."] {
+            let found = resolve(name).unwrap();
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].ip, core::net::IpAddr::from([192, 0, 2, 1]));
+        }
         assert!(resolve(b"::1").unwrap()[0].ip.is_loopback());
+        assert!(resolve(b"::ffff:192.0.2.1").is_ok());
+    }
+
+    /// Names each system would read its own way are not found, without
+    /// asking it; localhost's are loopback, never DNS's.
+    #[test]
+    fn names_answered_here() {
+        for bad in [
+            &b""[..],
+            b".",
+            b"a..",
+            b"127.1",
+            b"0x7f.0.0.1",
+            b"2130706433",
+            b"1.2.3.04",
+            b"host.0x1F",
+            b"exa\xc3\xa9mple.com",
+            b"\xff",
+            b"duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion",
+            b"x.ONION.",
+        ] {
+            assert_eq!(resolve(bad), Err(Error::NotFound), "{bad:?}");
+            let mut lookup = Lookup::start(bad);
+            assert!(matches!(lookup.poll(), Some(Err(Error::NotFound))));
+        }
+        for name in [&b"localhost."[..], b"LocalHost", b"a.b.localhost"] {
+            assert!(loopback(&resolve(name).unwrap()), "{name:?}");
+        }
+        assert!(super::answered(b"notlocalhost").is_none());
+        assert!(super::answered(b"onion.example").is_none());
+        assert!(super::answered(b"v4.123x").is_none());
     }
 
     /// A name that is not one is not found, without asking anyone; a
