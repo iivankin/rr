@@ -199,13 +199,21 @@ impl Hash {
     }
 }
 
-/// A SHA-384 hash in progress; a clone goes on from the same message.
-#[derive(Clone)]
+/// A SHA-384 hash in progress.
 pub struct Sha384(Hash);
 
 impl Sha384 {
     pub const fn new() -> Self {
         Self(Hash::new(INITIAL))
+    }
+
+    /// A hash in progress that goes on from the same message, as a
+    /// transcript's hash so far is taken while the transcript goes on.
+    /// A method, not a derived Clone: a derive nothing in the program
+    /// uses is refused, and only some programs take one.
+    pub fn fork(&self) -> Self {
+        // rr: escape(copy): the state goes on in both.
+        Self(self.0.clone())
     }
 
     /// Adds data to the message; any split of it gives the same digest.
