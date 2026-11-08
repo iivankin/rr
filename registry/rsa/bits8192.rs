@@ -1,0 +1,281 @@
+//! The arithmetic of moduli of up to 8192 bits, in numbers of 128
+//! limbs.
+//!
+//! registry/rsa/rsa-gen.py in rr's repository writes this file
+//! from modulus.rs.in beside it, which is where to change it.
+
+use super::{
+    Column, Encoding, Key, MODULUS_BITS_MIN, below, load, low, negative_inverse, shift_left,
+    shift_right, subtract,
+};
+
+/// The limbs of the widest modulus.
+pub(super) const LIMBS: usize = 128;
+
+/// A modulus of at most LIMBS limbs with the key's exponent, and what
+/// Montgomery multiplication by it needs.
+struct Modulus {
+    m: [u64; LIMBS],
+    /// The limbs m has, from 32, as a modulus has 2048 bits at least, to
+    /// LIMBS: R = 2^(64 limbs).
+    limbs: usize,
+    /// The modulus's bytes, which a signature has too.
+    bytes: usize,
+    /// -m^-1 mod 2^64.
+    m0inv: u64,
+    e: u64,
+}
+
+/// Whether signature^e mod m under the key, whose modulus has at most
+/// LIMBS limbs, is the encoded message the encoding wants.
+pub(super) fn verify(key: &Key<'_>, signature: &[u8], encoding: &Encoding<'_>) -> bool {
+    let Some(modulus) = Modulus::new(key) else {
+        return false;
+    };
+    let mut buffer = [0; 8 * LIMBS];
+    let Some(em) = modulus.public(signature, &mut buffer) else {
+        return false;
+    };
+    encoding.matches(em, key.bits)
+}
+
+impl Modulus {
+    /// The key's modulus as limbs; None if it has more than LIMBS.
+    fn new(key: &Key<'_>) -> Option<Modulus> {
+        let bytes = key.modulus.len();
+        let limbs = bytes.div_ceil(8);
+        if limbs > LIMBS {
+            return None;
+        }
+        let mut m = [0; LIMBS];
+        load(key.modulus, &mut m);
+        Some(Modulus {
+            m,
+            limbs,
+            bytes,
+            m0inv: negative_inverse(m[0]),
+            e: key.e,
+        })
+    }
+
+    /// The limbs m has: a constant where the narrowest modulus has
+    /// LIMBS, as in bits2048.rs, which the compiler then unrolls loops
+    /// over and checks against.
+    fn limbs(&self) -> usize {
+        if MODULUS_BITS_MIN / 64 == LIMBS {
+            LIMBS
+        } else {
+            self.limbs
+        }
+    }
+
+    fn modulus(&self) -> &[u64] {
+        // rr: escape(panic): new bounds limbs by LIMBS.
+        &self.m[..self.limbs()]
+    }
+
+    /// signature^e mod m as the modulus's bytes, in the first of them in
+    /// out; None unless the signature has that length and is below m.
+    fn public<'out>(
+        &self,
+        signature: &[u8],
+        out: &'out mut [u8; 8 * LIMBS],
+    ) -> Option<&'out mut [u8]> {
+        let bytes = self.bytes;
+        if signature.len() != bytes {
+            return None;
+        }
+        let n = self.limbs();
+        let mut s = [0; LIMBS];
+        load(signature, &mut s);
+        // rr: escape(panic): n is at most LIMBS.
+        let s = &s[..n];
+        if !below(s, self.modulus()) {
+            return None;
+        }
+        let mut x = [0; LIMBS];
+        // rr: escape(panic): as above.
+        let x = &mut x[..n];
+        self.to_montgomery(s, x);
+        let mut acc = [0; LIMBS];
+        // rr: escape(panic): as above.
+        let mut acc = &mut acc[..n];
+        acc.copy_from_slice(x);
+        let mut scratch = [0; LIMBS];
+        // rr: escape(panic): as above.
+        let mut scratch = &mut scratch[..n];
+        // Left to right below the top bit, which acc holds already. e is
+        // odd, so the last step multiplies, by s and not s R: that brings
+        // s^(e - 1) R to s^e, out of the domain.
+        let top = u64::BITS - 1 - self.e.leading_zeros();
+        for bit in (0..top).rev() {
+            self.square(acc, scratch);
+            if bit == 0 {
+                self.multiply(scratch, s, acc);
+            } else if (self.e >> bit) & 1 == 1 {
+                self.multiply(scratch, x, acc);
+            } else {
+                core::mem::swap(&mut acc, &mut scratch);
+            }
+        }
+        // rr: escape(panic): bytes is at most 8 LIMBS.
+        let out = &mut out[..bytes];
+        for (place, byte) in out.iter_mut().rev().enumerate() {
+            // rr: escape(panic, cast): place / 8 < n, as bytes <= 8n; the
+            // shift picks one byte of the limb.
+            *byte = (acc[place / 8] >> (8 * (place % 8))) as u8;
+        }
+        Some(out)
+    }
+
+    /// out = s R mod m, for s below m: n steps that each take a number
+    /// v below m to v 2^64 mod m, by a quotient word estimated from the
+    /// top words (Knuth's algorithm D, TAOCP 4.3.1), with m and v shifted
+    /// so that m's top bit is set: the estimate is then at most 2 above
+    /// the quotient. Cheaper than R^2 mod m and a multiplication by it.
+    fn to_montgomery(&self, s: &[u64], out: &mut [u64]) {
+        let m = self.modulus();
+        let n = m.len();
+        let mut d = [0; LIMBS];
+        let mut v = [0; LIMBS];
+        // rr: escape(panic): new keeps limbs in 32..=LIMBS, as a modulus
+        // has at least 2048 bits.
+        let (d, v, shift) = (&mut d[..n], &mut v[..n], m[n - 1].leading_zeros());
+        shift_left(m, shift, d);
+        shift_left(s, shift, v);
+        // rr: escape(panic): as above.
+        let divisor = d[n - 1];
+        for _ in 0..n {
+            // rr: escape(panic): as above.
+            let (high, next) = (v[n - 1], v[n - 2]);
+            let quotient = if high >= divisor {
+                u64::MAX
+            } else {
+                low(((u128::from(high) << 64) | u128::from(next)) / u128::from(divisor))
+            };
+            // v 2^64 - quotient d: v's words move up one.
+            let (mut carry, mut borrow, mut below_word) = (0, false, 0_u64);
+            for (word, y) in v.iter_mut().zip(&*d) {
+                let product = u128::from(quotient)
+                    .wrapping_mul(u128::from(*y))
+                    .wrapping_add(u128::from(carry));
+                carry = low(product >> 64);
+                let (r, b1) = below_word.overflowing_sub(low(product));
+                let (r, b2) = r.overflowing_sub(u64::from(borrow));
+                below_word = *word;
+                *word = r;
+                borrow = b1 | b2;
+            }
+            let (extra, b1) = below_word.overflowing_sub(carry);
+            let (mut extra, b2) = extra.overflowing_sub(u64::from(borrow));
+            // Too large an estimate leaves the difference negative.
+            let mut negative = b1 | b2;
+            for _ in 0..2 {
+                if !negative {
+                    break;
+                }
+                let mut carried = false;
+                for (word, y) in v.iter_mut().zip(&*d) {
+                    let (r, c1) = word.overflowing_add(*y);
+                    let (r, c2) = r.overflowing_add(u64::from(carried));
+                    *word = r;
+                    carried = c1 | c2;
+                }
+                let (sum, over) = extra.overflowing_add(u64::from(carried));
+                extra = sum;
+                negative = !over;
+            }
+        }
+        shift_right(v, shift, out);
+    }
+
+    /// out = a b / R mod m, for a and b below m, all of n limbs.
+    fn multiply(&self, a: &[u64], b: &[u64], out: &mut [u64]) {
+        self.montgomery(&Operand::Product(a, b), out);
+    }
+
+    /// out = a^2 / R mod m.
+    fn square(&self, a: &[u64], out: &mut [u64]) {
+        self.montgomery(&Operand::Square(a), out);
+    }
+
+    /// out = t / R mod m, column by column (Montgomery product scanning):
+    /// the low n columns of t each with the multiple u_i m that clears
+    /// it, the high n the result. That is below 2m, so one subtraction
+    /// brings it below m.
+    fn montgomery(&self, t: &Operand<'_>, out: &mut [u64]) {
+        let m = self.modulus();
+        let n = m.len();
+        let mut u = [0; LIMBS];
+        let mut sum = Column::new();
+        for i in 0..2 * n {
+            t.column(i, &u, m, &mut sum);
+            if let Some(slot) = u.get_mut(i).filter(|_| i < n) {
+                *slot = sum.word().wrapping_mul(self.m0inv);
+                // rr: escape(panic): new keeps n at least 32.
+                sum.add(*slot, m[0]);
+            } else if let Some(word) = out.get_mut(i - n) {
+                *word = sum.word();
+            } else {
+                return;
+            }
+            sum.shift();
+        }
+        if sum.word() != 0 || !below(out, m) {
+            subtract(out, m);
+        }
+    }
+}
+
+/// What montgomery reduces, by its columns.
+enum Operand<'a> {
+    Product(&'a [u64], &'a [u64]),
+    Square(&'a [u64]),
+}
+
+impl Operand<'_> {
+    /// Adds column i of the number and of the reduction so far, u m, to
+    /// sum: the products whose indices add up to i, of the n limbs of m.
+    /// Pairs of the two go to two sums in one loop, whose additions do
+    /// not wait for each other.
+    #[inline(always)]
+    fn column(&self, i: usize, u: &[u64; LIMBS], m: &[u64], sum: &mut Column) {
+        let n = m.len();
+        // u_j m_(i - j) for j in from..to: u_i is not known yet.
+        let (from, to) = ((i + 1).saturating_sub(n), i.min(n));
+        let mut part = Column::new();
+        match self {
+            Operand::Product(a, b) => {
+                if let (Some(x), Some(y)) = (a.get(i), b.first()) {
+                    part.add(*x, *y);
+                }
+                // rr: escape(panic): from <= to <= n and i - from < n.
+                let these = (&a[from..to], &b[i + 1 - to..=i - from]);
+                // rr: escape(panic): as above.
+                let reduction = (&u[from..to], &m[i + 1 - to..=i - from]);
+                part.add_both(these, sum, reduction);
+                sum.add_column(&part);
+            }
+            Operand::Square(a) => {
+                // Each pair below the diagonal twice, and the square on it:
+                // j in from..half, with half <= to.
+                let half = i.div_ceil(2).max(from);
+                // rr: escape(panic): as above.
+                let these = (&a[from..half], &a[i + 1 - half..=i - from]);
+                // rr: escape(panic): as above.
+                let reduction = (&u[from..half], &m[i + 1 - half..=i - from]);
+                part.add_both(these, sum, reduction);
+                // rr: escape(panic): as above.
+                let (rest, partners) = (&u[half..to], &m[i + 1 - to..=i - half]);
+                for (x, y) in rest.iter().zip(partners.iter().rev()) {
+                    sum.add(*x, *y);
+                }
+                sum.add_column(&part);
+                sum.add_column(&part);
+                if let Some(x) = a.get(i / 2).filter(|_| i.is_multiple_of(2)) {
+                    sum.add(*x, *x);
+                }
+            }
+        }
+    }
+}

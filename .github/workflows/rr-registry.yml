@@ -57,7 +57,9 @@ jobs:
           Add-Content -Path $env:GITHUB_PATH -Value (Split-Path (Get-Command rr).Source)
       - name: Files a script writes, as it writes them
         if: matrix.runner == 'ubuntu-24.04'
-        run: python3 registry/ecdsa/ecdsa-gen.py --check
+        run: |
+          python3 registry/ecdsa/ecdsa-gen.py --check
+          python3 registry/rsa/rsa-gen.py --check
       - name: Every component, together
         shell: bash
         run: |
