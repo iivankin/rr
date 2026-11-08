@@ -491,8 +491,8 @@ impl Transcript {
         match self {
             // rr: escape(copy): the transcript goes on past this hash.
             Transcript::Both(a, _) | Transcript::Sha256(a) => Digest::Sha256(a.clone().finish()),
-            // rr: escape(copy): the transcript goes on past this hash.
-            Transcript::Sha384(b) => Digest::Sha384(Sha384::clone(b).finish()),
+            // fork copies: the transcript goes on past this hash.
+            Transcript::Sha384(b) => Digest::Sha384(b.fork().finish()),
         }
     }
 
