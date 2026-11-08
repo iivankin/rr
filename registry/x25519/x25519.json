@@ -6,6 +6,9 @@
   "files": [
     {
       "path": "mod.rs"
+    },
+    {
+      "path": "x25519-wycheproof.txt"
     }
   ]
 }

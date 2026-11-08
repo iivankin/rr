@@ -1,6 +1,6 @@
 {
   "name": "roots",
-  "description": "Mozilla's trust anchors for TLS servers from NSS's certdata.txt at a release tag (MPL 2.0), with Mozilla's distrust-after dates, embedded as PEM and loaded into an x509::Store, with Mozilla's OneCRL revocations (intermediates and roots refused anywhere on a path); scripts/roots-gen.py rebuilds the file from a newer tag.",
+  "description": "Mozilla's trust anchors for TLS servers from NSS's certdata.txt at a release tag (MPL 2.0), with Mozilla's distrust-after dates and Chrome's announced distrusts of roots Mozilla still trusts, embedded as PEM and loaded into an x509::Store, with Mozilla's OneCRL revocations (intermediates and roots refused anywhere on a path); scripts/roots-gen.py rebuilds the file from a newer tag.",
   "rr": "0.5.2",
   "dependencies": [
     "x509"

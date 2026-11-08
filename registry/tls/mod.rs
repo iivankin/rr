@@ -2,11 +2,14 @@
 //! between the socket and the client, which serves a blocking loop, a
 //! poll loop or a thread alike.
 //!
-//! The profile: TLS_AES_128_GCM_SHA256, an X25519 key share, server
-//! signatures ECDSA P-256 and P-384 and RSA-PSS with SHA-256 or SHA-384,
-//! SNI and ALPN. A HelloRetryRequest with a cookie is answered; one that
-//! asks for another group fails, since X25519 is the only group offered.
-//! No resumption, no 0-RTT and no client certificate: tickets are
+//! The profile: TLS_AES_128_GCM_SHA256; key shares for X25519MLKEM768,
+//! post-quantum, and X25519 on one X25519 key, as Go and browsers send
+//! them, and P-256, which RFC 8446 9.1 requires, for a server that asks
+//! in a HelloRetryRequest; server signatures ECDSA P-256, P-384 and
+//! P-521 and RSA-PSS with SHA-256, SHA-384 or SHA-512; SNI and ALPN; middlebox compatibility
+//! (a random session ID and one change_cipher_spec, RFC 8446 D.4). A
+//! HelloRetryRequest with a cookie, a group or both is answered. Records
+//! that carry nothing, 32 in a row, end the connection. No resumption, no 0-RTT and no client certificate: tickets are
 //! ignored, and a CertificateRequest is answered with an empty
 //! Certificate, as RFC 8446 4.4.2 says a client without one must; the
 //! server then decides. A KeyUpdate is honoured and answered when asked,
@@ -55,9 +58,12 @@
 //! the kept bytes and the socket as before.
 
 use crate::base::aesgcm::{self, AesGcm};
+use crate::base::ecdh;
+use crate::base::mlkem;
 use crate::base::sha256::{self, Sha256};
 use crate::base::x509;
 use crate::base::x25519;
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -76,6 +82,15 @@ pub const PENDING_MAX: usize = SEALED_MAX;
 pub const COOKIE_MAX: usize = 4096;
 /// The most bytes of the ALPN list, each protocol with its length byte.
 pub const ALPN_MAX: usize = 1024;
+/// The system's randomness a client takes: the ClientHello's random and
+/// legacy_session_id, the X25519 secret, ML-KEM-768's seed and a P-256
+/// secret, in that order.
+pub const RANDOM_BYTES: usize =
+    32 + 32 + x25519::KEY_BYTES + mlkem::SEED_BYTES + ecdh::SECRET_BYTES;
+/// Records in a row that carry nothing, before the client gives up on
+/// the server: empty application data, change_cipher_spec, user_canceled,
+/// KeyUpdate and NewSessionTicket, as BoringSSL bounds them.
+const IDLE_MAX: u8 = 32;
 
 const HEADER: usize = 5;
 const TAG: usize = aesgcm::TAG_LEN;
@@ -91,15 +106,21 @@ const HASH: usize = sha256::DIGEST_BYTES;
 /// A KeyUpdate and an alert, sealed.
 const KEY_UPDATE_SEALED: usize = HEADER + 4 + 1 + 1 + TAG;
 const ALERT_SEALED: usize = HEADER + 2 + 1 + TAG;
-/// The longest ClientHello: header and fixed fields, SNI of 253 bytes,
-/// groups, signatures, versions, the key share, the whole ALPN list and
-/// the largest cookie, as hello writes them.
-const HELLO_MAX: usize = 4 + 43 + (9 + 253) + 8 + 18 + 7 + 42 + (6 + ALPN_MAX) + (6 + COOKIE_MAX);
+/// The first ClientHello's key shares: X25519MLKEM768's and X25519's.
+const SHARES_BYTES: usize = 6 + (4 + HYBRID_SHARE) + (4 + x25519::KEY_BYTES);
+/// The longest ClientHello: header and fixed fields with the session ID,
+/// SNI of 253 bytes, groups, signatures, versions, the key shares, the
+/// whole ALPN list and the largest cookie, as hello writes them.
+const HELLO_MAX: usize =
+    4 + 43 + 32 + (9 + 253) + 12 + 24 + 7 + SHARES_BYTES + (6 + ALPN_MAX) + (6 + COOKIE_MAX);
+/// The middlebox compatibility record: change_cipher_spec.
+const CCS_RECORD: [u8; 6] = [CHANGE_CIPHER_SPEC, 3, 3, 0, 1, 1];
 /// What the handshake may leave pending when the caller sends none of
-/// it: both ClientHellos, the empty Certificate with the longest context,
+/// it: both ClientHellos, change_cipher_spec, the empty Certificate,
 /// Finished, and an alert.
 const HANDSHAKE_PENDING_MAX: usize = 2 * (HEADER + HELLO_MAX)
-    + (HEADER + 4 + 1 + 255 + 3 + 1 + TAG)
+    + CCS_RECORD.len()
+    + (HEADER + 4 + 1 + 3 + 1 + TAG)
     + (HEADER + 4 + HASH + 1 + TAG)
     + ALERT_SEALED;
 /// What pending holds at most once connected. write adds a record only
@@ -146,7 +167,19 @@ const KEY_SHARE: u16 = 51;
 
 const TLS13: u16 = 0x0304;
 const AES_128_GCM_SHA256: u16 = 0x1301;
+// Named groups.
+const SECP256R1: u16 = 0x0017;
 const X25519: u16 = 0x001d;
+const X25519MLKEM768: u16 = 0x11ec;
+/// X25519MLKEM768's shares: ML-KEM-768's encapsulation key or ciphertext,
+/// then X25519's key (draft-ietf-tls-ecdhe-mlkem 3).
+const HYBRID_SHARE: usize = mlkem::ENCAPSULATION_KEY_BYTES + x25519::KEY_BYTES;
+const HYBRID_REPLY: usize = mlkem::CIPHERTEXT_BYTES + x25519::KEY_BYTES;
+/// The order of P-256's base point, big-endian: a secret is below it.
+const P256_ORDER: [u8; 32] = [
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63, 0x25, 0x51,
+];
 
 /// ServerHello's random when it is a HelloRetryRequest: SHA-256 of
 /// "HelloRetryRequest" (RFC 8446 4.1.3).
@@ -180,9 +213,9 @@ pub enum Error {
     Extension,
     /// The server does not speak TLS 1.3 (protocol_version).
     Version,
-    /// A HelloRetryRequest for a key share group other than X25519,
-    /// which is all this offers (illegal_parameter).
-    Group,
+    /// A required extension is not there: a CertificateRequest without
+    /// signature_algorithms (missing_extension).
+    Missing,
     /// A record over its limit, before or after decryption
     /// (record_overflow).
     Overflow,
@@ -226,7 +259,8 @@ impl Error {
             Error::Overflow => Some(22),
             Error::Name | Error::Certificate => Some(42),
             Error::Expired => Some(45),
-            Error::Parameter | Error::Group => Some(47),
+            Error::Parameter => Some(47),
+            Error::Missing => Some(109),
             Error::Untrusted => Some(48),
             Error::Revoked => Some(44),
             Error::Decode | Error::TooLarge => Some(50),
@@ -268,6 +302,13 @@ impl From<x509::Error> for Error {
             | x509::Error::TooMany => Error::Certificate,
         }
     }
+}
+
+/// Middlebox compatibility's change_cipher_spec.
+#[derive(Clone, Copy)]
+enum Ccs {
+    Due,
+    Sent,
 }
 
 /// Where the handshake is: the message expected next.
@@ -399,8 +440,26 @@ pub struct Client<'a> {
     /// The protocol the server chose, where it is in offer.
     chosen: Option<(usize, usize)>,
     random: [u8; 32],
+    /// legacy_session_id: random, for middlebox compatibility (RFC 8446
+    /// D.4), and echoed by the server; none without it, as RFC 8448's
+    /// client.
+    session: Option<[u8; 32]>,
     secret: [u8; x25519::KEY_BYTES],
     public: [u8; x25519::KEY_BYTES],
+    /// ML-KEM-768's half of the X25519MLKEM768 share, until ServerHello.
+    kem: Option<Box<mlkem::DecapsulationKey>>,
+    /// A P-256 secret, for a server that asks for that group, and its
+    /// public key once one did.
+    p256: [u8; ecdh::SECRET_BYTES],
+    p256_public: Option<[u8; ecdh::PUBLIC_BYTES]>,
+    /// The group a HelloRetryRequest asked for: the second ClientHello
+    /// shares a key for it alone, and ServerHello must choose it.
+    group: Option<u16>,
+    /// The change_cipher_spec of middlebox compatibility: sent once,
+    /// before the second ClientHello or the client's encrypted flight.
+    ccs: Ccs,
+    /// Records in a row that carried nothing.
+    idle: u8,
     state: State,
     transcript: Sha256,
     /// The key that checks the server's Finished.
@@ -412,8 +471,9 @@ pub struct Client<'a> {
     // rr: escape(bound): x509 refuses a certificate over
     // CERTIFICATE_BYTES_MAX, and this is cleared before it takes one.
     leaf: Vec<u8>,
-    /// A CertificateRequest's context, echoed in the empty Certificate.
-    context: Option<Vec<u8>>,
+    /// The server asked for a certificate: the client answers with an
+    /// empty Certificate.
+    requested: bool,
     input_keys: Option<Keys>,
     output_keys: Option<Keys>,
     /// One record as it comes; an application record is opened here.
@@ -439,14 +499,15 @@ impl<'a> Client<'a> {
     /// A client for host (a DNS name, or an IP literal, which SNI does
     /// not carry), offering the ALPN protocols given, if any, and
     /// verifying the server's chain as verify says, at now (Unix seconds).
-    /// random is 64 bytes of the system's randomness: the ClientHello's
-    /// random, then the X25519 secret. The ClientHello is pending.
+    /// random is RANDOM_BYTES of the system's randomness. The ClientHello
+    /// is pending: it offers X25519MLKEM768 and X25519, sharing a key for
+    /// both, and P-256 for a server that asks for it in a retry.
     pub fn new(
         host: &str,
         alpn: &[&[u8]],
         verify: Verify<'a>,
         now: i64,
-        random: &[u8; 64],
+        random: &[u8; RANDOM_BYTES],
     ) -> Result<Client<'a>, Error> {
         let host = host.strip_suffix('.').unwrap_or(host);
         let literal = ip_literal(host);
@@ -464,11 +525,24 @@ impl<'a> Client<'a> {
             offer.push(length);
             offer.extend_from_slice(name);
         }
-        let (head, tail) = random.split_at(32);
+        let mut parts = Reader { rest: random };
         let mut client_random = [0; 32];
-        client_random.copy_from_slice(head);
+        let mut session = [0; 32];
         let mut secret = [0; x25519::KEY_BYTES];
-        secret.copy_from_slice(tail);
+        let mut seed = [0; mlkem::SEED_BYTES];
+        let mut p256 = [0; ecdh::SECRET_BYTES];
+        for part in [
+            &mut client_random[..],
+            &mut session,
+            &mut secret,
+            &mut seed,
+            &mut p256,
+        ] {
+            part.copy_from_slice(parts.take(part.len())?);
+        }
+        // rr: escape(move): once a connection, as it starts; boxed, so
+        // that the client stays small after the handshake drops it.
+        let kem = Box::new(mlkem::generate(&seed));
         let mut client = Client {
             verify,
             now,
@@ -479,14 +553,21 @@ impl<'a> Client<'a> {
             offer,
             chosen: None,
             random: client_random,
+            session: Some(session),
             public: x25519::public_key(&secret),
             secret,
+            kem: Some(kem),
+            p256,
+            p256_public: None,
+            group: None,
+            ccs: Ccs::Due,
+            idle: 0,
             state: State::Hello,
             transcript: Sha256::new(),
             server_finished: [0; HASH],
             master: [0; HASH],
             leaf: Vec::new(),
-            context: None,
+            requested: false,
             input_keys: None,
             output_keys: None,
             rx: Vec::with_capacity(HEADER + CIPHERTEXT_MAX),
@@ -769,7 +850,10 @@ impl<'a> Client<'a> {
                 if !matches!(self.state, State::Connected) || !self.hs.is_empty() {
                     return Err(Error::Unexpected);
                 }
-                if end > 0 {
+                if end == 0 {
+                    self.idle()?;
+                } else {
+                    self.idle = 0;
                     self.app_at = start;
                     self.app_end = stop;
                 }
@@ -785,12 +869,12 @@ impl<'a> Client<'a> {
 
     /// The middlebox compatibility record, dropped before the server's
     /// Finished (RFC 8446 5).
-    fn change_cipher_spec(&self) -> Result<(), Error> {
+    fn change_cipher_spec(&mut self) -> Result<(), Error> {
         let late = matches!(self.state, State::Connected | State::Closed);
         if late || !self.hs.is_empty() || self.rx.get(HEADER..) != Some(&[1][..]) {
             return Err(Error::Unexpected);
         }
-        Ok(())
+        self.idle()
     }
 
     /// An alert or handshake record in the clear, before ServerHello.
@@ -817,7 +901,7 @@ impl<'a> Client<'a> {
             // close_notify ends what the server sends.
             0 if matches!(self.state, State::Connected) => self.state = State::Closed,
             // user_canceled is followed by close_notify (RFC 8446 6.1).
-            90 => {}
+            90 => self.idle()?,
             // Every other alert is an error, whatever its level (6.2).
             _ => return Err(Error::Alert(description)),
         }
@@ -886,15 +970,21 @@ impl<'a> Client<'a> {
         match (self.state, kind) {
             (State::Hello | State::Retried, SERVER_HELLO) => self.server_hello(message, body),
             (State::Extensions, ENCRYPTED_EXTENSIONS) => self.extensions(message, body),
-            (State::Certificate, CERTIFICATE_REQUEST) if self.context.is_none() => {
+            (State::Certificate, CERTIFICATE_REQUEST) if !self.requested => {
                 self.request(message, body)
             }
             (State::Certificate | State::Trusted, CERTIFICATE) => self.certificate(message, body),
             (State::Verify, CERTIFICATE_VERIFY) => self.verify(message, body),
             (State::Finished, FINISHED) => self.finished(message, body),
             // No resumption: a ticket is of no use.
-            (State::Connected, NEW_SESSION_TICKET) => Ok(false),
-            (State::Connected, KEY_UPDATE) => self.key_update(body),
+            (State::Connected, NEW_SESSION_TICKET) => {
+                self.idle()?;
+                Ok(false)
+            }
+            (State::Connected, KEY_UPDATE) => {
+                self.idle()?;
+                self.key_update(body)
+            }
             _ => Err(Error::Unexpected),
         }
     }
@@ -949,23 +1039,23 @@ impl<'a> Client<'a> {
         if stray {
             return Err(Error::Extension);
         }
-        if !session.is_empty() || suite != AES_128_GCM_SHA256 || compression != 0 {
+        let ours = self.session.as_ref().map_or(&[][..], |id| &id[..]);
+        if session != ours || suite != AES_128_GCM_SHA256 || compression != 0 {
             return Err(Error::Parameter);
         }
         if retry {
             return self.retry(message, share, cookie);
         }
-        let Some((X25519, key)) = share else {
+        let Some((group, key)) = share else {
             return Err(Error::Parameter);
         };
-        let peer = key.first_chunk::<32>().ok_or(Error::Parameter)?;
-        if key.len() != 32 {
-            return Err(Error::Parameter);
-        }
-        let shared = x25519::shared(&self.secret, peer).ok_or(Error::Parameter)?;
+        let mut shared = [0; 2 * 32];
+        let length = self.agree(group, key, &mut shared)?;
         self.secret = [0; x25519::KEY_BYTES];
+        self.p256 = [0; ecdh::SECRET_BYTES];
+        self.kem = None;
         self.transcript.update(message);
-        let secrets = handshake_secrets(&shared, &self.hash());
+        let secrets = handshake_secrets(shared.get(..length).unwrap_or_default(), &self.hash());
         let mut finished = [0; HASH];
         expand(&secrets.server, b"finished", &[], &mut finished);
         self.server_finished = finished;
@@ -976,9 +1066,55 @@ impl<'a> Client<'a> {
         Ok(true)
     }
 
-    /// A HelloRetryRequest: the second ClientHello adds the cookie
-    /// (RFC 8446 4.1.4). Its key share would be X25519's again, so a
-    /// retry that names a group changes nothing that could help.
+    /// The shared secret of the server's key share for group, into
+    /// shared; its length. The group is one this ClientHello shared a
+    /// key for: after a HelloRetryRequest, the one it asked for.
+    fn agree(&self, group: u16, key: &[u8], shared: &mut [u8; 64]) -> Result<usize, Error> {
+        let offered = match self.group {
+            Some(asked) => group == asked,
+            None => matches!(group, X25519MLKEM768 | X25519),
+        };
+        if !offered {
+            return Err(Error::Parameter);
+        }
+        let (first, second) = shared.split_at_mut(32);
+        match group {
+            X25519 => {
+                let peer = key.first_chunk::<32>().ok_or(Error::Parameter)?;
+                if key.len() != 32 {
+                    return Err(Error::Parameter);
+                }
+                first.copy_from_slice(&x25519::shared(&self.secret, peer).ok_or(Error::Parameter)?);
+                Ok(32)
+            }
+            X25519MLKEM768 => {
+                // ML-KEM's secret, then X25519's (draft-ietf-tls-ecdhe-mlkem
+                // 3); a ciphertext of the wrong length is illegal_parameter.
+                let kem = self.kem.as_ref().ok_or(Error::Parameter)?;
+                let (ciphertext, peer) = key
+                    .split_first_chunk::<{ mlkem::CIPHERTEXT_BYTES }>()
+                    .ok_or(Error::Parameter)?;
+                let peer = peer.first_chunk::<32>().ok_or(Error::Parameter)?;
+                if key.len() != HYBRID_REPLY {
+                    return Err(Error::Parameter);
+                }
+                first.copy_from_slice(&kem.decapsulate(ciphertext));
+                second
+                    .copy_from_slice(&x25519::shared(&self.secret, peer).ok_or(Error::Parameter)?);
+                Ok(64)
+            }
+            _ => {
+                // SECP256R1, the only group a retry may ask for.
+                first.copy_from_slice(&ecdh::shared(&self.p256, key).ok_or(Error::Parameter)?);
+                Ok(32)
+            }
+        }
+    }
+
+    /// A HelloRetryRequest (RFC 8446 4.1.4): the second ClientHello
+    /// shares a key for the group it asks for, P-256, the one offered
+    /// without a share; and adds the cookie, if any. One that would change
+    /// nothing is illegal_parameter.
     fn retry(
         &mut self,
         message: &[u8],
@@ -989,16 +1125,19 @@ impl<'a> Client<'a> {
             return Err(Error::Unexpected);
         }
         match share {
-            Some((X25519, _)) => return Err(Error::Parameter),
-            Some(_) => return Err(Error::Group),
+            Some((SECP256R1, _)) => {
+                self.p256_public = Some(self.p256_public()?);
+                self.kem = None;
+            }
+            Some(_) => return Err(Error::Parameter),
+            None if cookie.is_none() => return Err(Error::Parameter),
             None => {}
         }
-        let Some(cookie) = cookie else {
-            return Err(Error::Parameter);
-        };
-        if cookie.is_empty() {
+        self.group = share.map(|(group, _)| group);
+        if cookie.is_some_and(<[u8]>::is_empty) {
             return Err(Error::Decode);
         }
+        let cookie = cookie.unwrap_or_default();
         if cookie.len() > COOKIE_MAX {
             return Err(Error::TooLarge);
         }
@@ -1010,8 +1149,48 @@ impl<'a> Client<'a> {
         self.transcript.update(message);
         self.state = State::Retried;
         let hello = self.hello(cookie);
+        // Middlebox compatibility: change_cipher_spec before it (D.4).
+        self.compatible();
         self.handshake_message(&hello, 3)?;
         Ok(true)
+    }
+
+    /// The P-256 public key of the secret, or of a hash of it while it is
+    /// 0 or not below the order, as a new secret would be drawn: once in
+    /// 2^32.
+    fn p256_public(&mut self) -> Result<[u8; ecdh::PUBLIC_BYTES], Error> {
+        for _ in 0..4 {
+            if self.p256 != [0; ecdh::SECRET_BYTES]
+                && self.p256 < P256_ORDER
+                && let Some(public) = ecdh::public_key(&self.p256)
+            {
+                return Ok(public);
+            }
+            self.p256 = sha256::digest(&self.p256);
+        }
+        // Four hashes in a row at or above the order: never.
+        Err(Error::Parameter)
+    }
+
+    /// Sends middlebox compatibility's change_cipher_spec once, in the
+    /// clear, before the client's next record.
+    fn compatible(&mut self) {
+        if matches!(self.ccs, Ccs::Sent) || self.close_sent || self.session.is_none() {
+            return;
+        }
+        self.ccs = Ccs::Sent;
+        self.drained();
+        self.tx.extend_from_slice(&CCS_RECORD);
+    }
+
+    /// A record that carried nothing: too many in a row end the
+    /// connection.
+    fn idle(&mut self) -> Result<(), Error> {
+        self.idle = self.idle.saturating_add(1);
+        if self.idle > IDLE_MAX {
+            return Err(Error::Unexpected);
+        }
+        Ok(())
     }
 
     fn extensions(&mut self, message: &[u8], body: &[u8]) -> Result<bool, Error> {
@@ -1020,9 +1199,11 @@ impl<'a> Client<'a> {
             rest: fields.vector(2)?,
         };
         fields.end()?;
+        let mut seen = Seen::new();
         while !list.rest.is_empty() {
             let kind = list.u16()?;
             let data = list.vector(2)?;
+            seen.add(kind)?;
             match kind {
                 // The server used the name; nothing comes with it.
                 SERVER_NAME if self.literal => return Err(Error::Extension),
@@ -1075,14 +1256,40 @@ impl<'a> Client<'a> {
         Err(Error::Parameter)
     }
 
+    /// A CertificateRequest during the handshake: its context is empty
+    /// and signature_algorithms is among its extensions, each once (RFC
+    /// 8446 4.3.2). The empty Certificate answers it.
     fn request(&mut self, message: &[u8], body: &[u8]) -> Result<bool, Error> {
         let mut fields = Reader { rest: body };
         let context = fields.vector(1)?;
-        fields.vector(2)?;
+        let mut list = Reader {
+            rest: fields.vector(2)?,
+        };
         fields.end()?;
-        // rr: escape(copy): the empty Certificate echoes the context after
-        // this message's buffer has moved on.
-        self.context = Some(context.to_vec());
+        if !context.is_empty() {
+            return Err(Error::Parameter);
+        }
+        let mut seen = Seen::new();
+        let mut signatures = false;
+        while !list.rest.is_empty() {
+            let kind = list.u16()?;
+            let mut data = Reader {
+                rest: list.vector(2)?,
+            };
+            seen.add(kind)?;
+            if kind == SIGNATURE_ALGORITHMS {
+                let schemes = data.vector(2)?;
+                data.end()?;
+                if schemes.is_empty() || schemes.len() % 2 != 0 {
+                    return Err(Error::Decode);
+                }
+                signatures = true;
+            }
+        }
+        if !signatures {
+            return Err(Error::Missing);
+        }
+        self.requested = true;
         self.transcript.update(message);
         Ok(false)
     }
@@ -1118,7 +1325,7 @@ impl<'a> Client<'a> {
         let scheme = fields.u16()?;
         let signature = fields.vector(2)?;
         fields.end()?;
-        if !matches!(scheme, 0x0403 | 0x0503 | 0x0804 | 0x0805) {
+        if !matches!(scheme, 0x0403 | 0x0503 | 0x0603 | 0x0804 | 0x0805 | 0x0806) {
             return Err(Error::Parameter);
         }
         // RFC 8446 4.4.3: 64 spaces, the context string and the hash.
@@ -1159,15 +1366,13 @@ impl<'a> Client<'a> {
         let client = derive(&self.master, b"c ap traffic", &hash);
         let server = derive(&self.master, b"s ap traffic", &hash);
         self.input_keys = Some(Keys::new(&server));
-        if let Some(context) = self.context.take() {
-            // An empty Certificate: the context, and no certificates.
-            let mut empty = Vec::with_capacity(8 + context.len());
-            empty.extend_from_slice(&message_header(CERTIFICATE, context.len() + 4));
-            // The context came in a vector of one length byte.
-            empty.push(u8::try_from(context.len()).unwrap_or(u8::MAX));
-            empty.extend_from_slice(&context);
-            empty.extend_from_slice(&[0, 0, 0]);
-            self.handshake_message(&empty, 3)?;
+        // Middlebox compatibility: change_cipher_spec before the client's
+        // encrypted flight, unless it went before a second ClientHello.
+        self.compatible();
+        if self.requested {
+            // An empty Certificate: an empty context, and no certificates.
+            let [kind, high, middle, low] = message_header(CERTIFICATE, 4);
+            self.handshake_message(&[kind, high, middle, low, 0, 0, 0, 0], 3)?;
         }
         let Some(keys) = &self.output_keys else {
             return Err(Error::Unexpected);
@@ -1299,9 +1504,12 @@ impl<'a> Client<'a> {
         let mut m = Vec::with_capacity(256 + self.host.len() + self.offer.len() + cookie.len());
         m.extend_from_slice(&[CLIENT_HELLO, 0, 0, 0, 3, 3]);
         m.extend_from_slice(&self.random);
-        // No session ID: no middlebox compatibility mode. One suite and
-        // no compression.
-        m.extend_from_slice(&[0, 0, 2, 0x13, 0x01, 1, 0]);
+        // A session ID of 32 random bytes, for middlebox compatibility
+        // (RFC 8446 D.4); one suite and no compression.
+        let session = self.session.as_ref().map_or(&[][..], |id| &id[..]);
+        m.push(u8::try_from(session.len()).unwrap_or(0));
+        m.extend_from_slice(session);
+        m.extend_from_slice(&[0, 2, 0x13, 0x01, 1, 0]);
         let extensions = m.len();
         m.extend_from_slice(&[0, 0]);
         if !self.literal {
@@ -1311,16 +1519,37 @@ impl<'a> Client<'a> {
             put(&mut m, &[0], host.len());
             m.extend_from_slice(host);
         }
-        // supported_groups: X25519.
-        m.extend_from_slice(&[0, 10, 0, 4, 0, 2, 0, 0x1d]);
+        // supported_groups: X25519MLKEM768, X25519, P-256, as Go offers
+        // them.
+        m.extend_from_slice(&[0, 10, 0, 8, 0, 6, 0x11, 0xec, 0, 0x1d, 0, 0x17]);
         // signature_algorithms: what CertificateVerify may use, then
         // PKCS #1, which only certificates may (RFC 8446 4.2.3).
-        m.extend_from_slice(&[0, 13, 0, 14, 0, 12, 4, 3, 5, 3, 8, 4, 8, 5, 4, 1, 5, 1]);
+        m.extend_from_slice(&[
+            0, 13, 0, 20, 0, 18, 4, 3, 5, 3, 6, 3, 8, 4, 8, 5, 8, 6, 4, 1, 5, 1, 6, 1,
+        ]);
         // supported_versions: TLS 1.3.
         m.extend_from_slice(&[0, 43, 0, 3, 2, 3, 4]);
-        // key_share: X25519's.
-        m.extend_from_slice(&[0, 51, 0, 38, 0, 36, 0, 0x1d, 0, 32]);
-        m.extend_from_slice(&self.public);
+        // key_share: P-256's alone after a retry that asked for it;
+        // else X25519MLKEM768's and X25519's, one X25519 key for both.
+        match (self.p256_public, &self.kem) {
+            (Some(public), _) if self.group == Some(SECP256R1) => {
+                put(&mut m, &[0, 51], public.len() + 6);
+                put(&mut m, &[], public.len() + 4);
+                put(&mut m, &[0x00, 0x17], public.len());
+                m.extend_from_slice(&public);
+            }
+            (_, Some(kem)) => {
+                put(&mut m, &[0, 51], SHARES_BYTES - 4);
+                put(&mut m, &[], SHARES_BYTES - 6);
+                put(&mut m, &[0x11, 0xec], HYBRID_SHARE);
+                m.extend_from_slice(&kem.encapsulation_key());
+                m.extend_from_slice(&self.public);
+                put(&mut m, &[0, 0x1d], x25519::KEY_BYTES);
+                m.extend_from_slice(&self.public);
+            }
+            // The shares are sent before ServerHello drops them.
+            _ => {}
+        }
         if !self.offer.is_empty() {
             put(&mut m, &[0, 16], self.offer.len() + 2);
             put(&mut m, &[], self.offer.len());
@@ -1340,6 +1569,37 @@ impl<'a> Client<'a> {
             slot.copy_from_slice(&header);
         }
         m
+    }
+}
+
+/// The extension types of one block, which may each come once (RFC 8446
+/// 4.2): a block of more than SEEN_MAX is refused, as no server sends
+/// one.
+struct Seen {
+    kinds: [u16; SEEN_MAX],
+    count: usize,
+}
+
+const SEEN_MAX: usize = 32;
+
+impl Seen {
+    const fn new() -> Seen {
+        Seen {
+            kinds: [0; SEEN_MAX],
+            count: 0,
+        }
+    }
+
+    /// Notes kind; a second of a kind does not decode.
+    fn add(&mut self, kind: u16) -> Result<(), Error> {
+        let seen = self.kinds.get(..self.count).unwrap_or_default();
+        if seen.contains(&kind) {
+            return Err(Error::Decode);
+        }
+        let slot = self.kinds.get_mut(self.count).ok_or(Error::Decode)?;
+        *slot = kind;
+        self.count += 1;
+        Ok(())
     }
 }
 
@@ -1417,10 +1677,10 @@ struct Secrets {
     master: [u8; HASH],
 }
 
-/// The handshake traffic secrets and the master secret, from the X25519
-/// shared secret and the hash of ClientHello..ServerHello. Without a
+/// The handshake traffic secrets and the master secret, from the key
+/// exchange's shared secret and the hash of ClientHello..ServerHello. Without a
 /// PSK the early secret is HKDF-Extract of zeros.
-fn handshake_secrets(shared: &[u8; 32], hash: &[u8; HASH]) -> Secrets {
+fn handshake_secrets(shared: &[u8], hash: &[u8; HASH]) -> Secrets {
     let empty = sha256::digest(&[]);
     let early = sha256::hkdf_extract(&[0; HASH], &[0; HASH]);
     let handshake = sha256::hkdf_extract(&derive(&early, b"derived", &empty), shared);
@@ -1520,7 +1780,7 @@ pub fn fuzz_server(input: &[u8]) {
         &[b"h2"],
         Verify::Store(&store),
         x509::TEST_NOW,
-        &[0x5c; 64],
+        &[0x5c; RANDOM_BYTES],
     );
     fuzz_feed(client.as_mut().unwrap(), rest, usize::from(seed % 64) + 1);
 }
@@ -1547,7 +1807,7 @@ pub fn fuzz_flight(input: &[u8]) {
         &[b"h2"],
         verify,
         x509::TEST_NOW,
-        &[0x5c; 64],
+        &[0x5c; RANDOM_BYTES],
     )
     .unwrap();
     client.sent(client.pending().len());

@@ -1,13 +1,16 @@
-//! SHA-384 (FIPS 180-4: SHA-512's rounds from other initial values, cut
-//! to 48 bytes), HMAC-SHA384 (RFC 2104) and HKDF-SHA384 (RFC 5869).
+//! SHA-384 and SHA-512 (FIPS 180-4: one compression, from other initial
+//! values, SHA-384's digest cut to 48 bytes), HMAC-SHA384 and
+//! HMAC-SHA512 (RFC 2104) and HKDF-SHA384 (RFC 5869).
 //! Whole blocks are compressed straight from the caller's input; only a
 //! part block waits in the state. The rounds run on SHA512 instructions
 //! where sys finds them, as portable code elsewhere.
 
 mod sys;
 
-/// The bytes of a digest.
+/// The bytes of a SHA-384 digest.
 pub const DIGEST_BYTES: usize = 48;
+/// The bytes of a SHA-512 digest.
+pub const SHA512_BYTES: usize = 64;
 /// The bytes of one block the compression takes.
 pub const BLOCK_BYTES: usize = 128;
 /// The most bytes hkdf_expand writes: its counter is one byte.
@@ -110,10 +113,23 @@ pub const ROUND: [u64; 80] = [
     0x6c44198c4a475817,
 ];
 
-/// A hash in progress: the chaining state and the part block not yet
-/// compressed.
+/// SHA-512's initial values.
+const INITIAL512: [u64; 8] = [
+    0x6a09e667f3bcc908,
+    0xbb67ae8584caa73b,
+    0x3c6ef372fe94f82b,
+    0xa54ff53a5f1d36f1,
+    0x510e527fade682d1,
+    0x9b05688c2b3e6c1f,
+    0x1f83d9abfb41bd6b,
+    0x5be0cd19137e2179,
+];
+
+/// SHA-512 or SHA-384 in progress, which differ only in their initial
+/// values and in how much of the state the digest keeps: the chaining
+/// state and the part block not yet compressed.
 #[derive(Clone)]
-pub struct Sha384 {
+struct Hash {
     state: [u64; 8],
     block: [u8; BLOCK_BYTES],
     /// The bytes of block that hold message; always under BLOCK_BYTES.
@@ -122,19 +138,18 @@ pub struct Sha384 {
     length: u64,
 }
 
-impl Sha384 {
-    pub fn new() -> Self {
+impl Hash {
+    const fn new(initial: [u64; 8]) -> Self {
         Self {
-            state: INITIAL,
+            state: initial,
             block: [0; BLOCK_BYTES],
             buffered: 0,
             length: 0,
         }
     }
 
-    /// Adds data to the message; any split of it gives the same digest.
     #[cfg_attr(rr, rr::hot)]
-    pub fn update(&mut self, data: &[u8]) {
+    fn update(&mut self, data: &[u8]) {
         // 2^64 bytes take centuries to hash; the count wraps there.
         self.length = self.length.wrapping_add(data.len() as u64);
         let mut rest = data;
@@ -160,8 +175,8 @@ impl Sha384 {
         self.buffered = tail.len();
     }
 
-    /// The digest of the message. It takes the hash, which padding ends.
-    pub fn finish(mut self) -> [u8; DIGEST_BYTES] {
+    /// The whole final state, of which SHA-384 keeps the first 48 bytes.
+    fn finish(mut self) -> [u8; SHA512_BYTES] {
         assert!(self.buffered < BLOCK_BYTES);
         // rr: escape(panic): buffered is under BLOCK_BYTES after update.
         self.block[self.buffered] = 0x80;
@@ -176,7 +191,7 @@ impl Sha384 {
             *byte = *length;
         }
         compress(&mut self.state, core::slice::from_ref(&self.block));
-        let mut digest = [0; DIGEST_BYTES];
+        let mut digest = [0; SHA512_BYTES];
         for (bytes, word) in digest.as_chunks_mut::<8>().0.iter_mut().zip(self.state) {
             *bytes = word.to_be_bytes();
         }
@@ -184,28 +199,82 @@ impl Sha384 {
     }
 }
 
-/// The digest of data in one call.
+/// A SHA-384 hash in progress.
+pub struct Sha384(Hash);
+
+impl Sha384 {
+    pub const fn new() -> Self {
+        Self(Hash::new(INITIAL))
+    }
+
+    /// Adds data to the message; any split of it gives the same digest.
+    pub fn update(&mut self, data: &[u8]) {
+        self.0.update(data);
+    }
+
+    /// The digest of the message. It takes the hash, which padding ends.
+    pub fn finish(self) -> [u8; DIGEST_BYTES] {
+        let mut digest = [0; DIGEST_BYTES];
+        for (byte, word) in digest.iter_mut().zip(self.0.finish()) {
+            *byte = word;
+        }
+        digest
+    }
+}
+
+/// A SHA-512 hash in progress.
+pub struct Sha512(Hash);
+
+impl Sha512 {
+    pub const fn new() -> Self {
+        Self(Hash::new(INITIAL512))
+    }
+
+    /// Adds data to the message; any split of it gives the same digest.
+    pub fn update(&mut self, data: &[u8]) {
+        self.0.update(data);
+    }
+
+    /// The digest of the message. It takes the hash, which padding ends.
+    pub fn finish(self) -> [u8; SHA512_BYTES] {
+        self.0.finish()
+    }
+}
+
+/// The SHA-384 digest of data in one call.
 pub fn digest(data: &[u8]) -> [u8; DIGEST_BYTES] {
     let mut hash = Sha384::new();
     hash.update(data);
     hash.finish()
 }
 
-/// HMAC-SHA384 in progress: both hashes keyed, so that one keyed value
-/// can be cloned for each message under the same key.
-#[derive(Clone)]
-pub struct Hmac384 {
-    inner: Sha384,
-    outer: Sha384,
+/// The SHA-512 digest of data in one call.
+pub fn digest512(data: &[u8]) -> [u8; SHA512_BYTES] {
+    let mut hash = Sha512::new();
+    hash.update(data);
+    hash.finish()
 }
 
-impl Hmac384 {
-    pub fn new(key: &[u8]) -> Self {
+/// HMAC in progress over SHA-512 or SHA-384: both hashes keyed, so that
+/// one keyed value can be cloned for each message under the same key.
+#[derive(Clone)]
+struct Keyed {
+    inner: Hash,
+    outer: Hash,
+    /// The digest's bytes: 48 or 64.
+    bytes: usize,
+}
+
+impl Keyed {
+    fn new(initial: [u64; 8], bytes: usize, key: &[u8]) -> Self {
         // A key longer than a block is hashed first, as RFC 2104 says.
         let hashed;
         let key = if key.len() > BLOCK_BYTES {
-            hashed = digest(key);
-            &hashed[..]
+            let mut hash = Hash::new(initial);
+            hash.update(key);
+            hashed = hash.finish();
+            // rr: escape(panic): bytes is 48 or 64, within the digest.
+            &hashed[..bytes]
         } else {
             key
         };
@@ -213,24 +282,65 @@ impl Hmac384 {
         for (byte, secret) in pad.iter_mut().zip(key) {
             *byte ^= secret;
         }
-        let mut inner = Sha384::new();
+        let mut inner = Hash::new(initial);
         inner.update(&pad);
         for byte in &mut pad {
             *byte ^= 0x36 ^ 0x5c;
         }
-        let mut outer = Sha384::new();
+        let mut outer = Hash::new(initial);
         outer.update(&pad);
-        Self { inner, outer }
+        Self {
+            inner,
+            outer,
+            bytes,
+        }
+    }
+
+    /// The tag in the first bytes of the result.
+    fn finish(mut self) -> [u8; SHA512_BYTES] {
+        let inner = self.inner.finish();
+        // rr: escape(panic): bytes is 48 or 64, within the digest.
+        self.outer.update(&inner[..self.bytes]);
+        self.outer.finish()
+    }
+}
+
+/// HMAC-SHA384 in progress.
+#[derive(Clone)]
+pub struct Hmac384(Keyed);
+
+impl Hmac384 {
+    pub fn new(key: &[u8]) -> Self {
+        Self(Keyed::new(INITIAL, DIGEST_BYTES, key))
     }
 
     pub fn update(&mut self, data: &[u8]) {
-        self.inner.update(data);
+        self.0.inner.update(data);
     }
 
-    pub fn finish(mut self) -> [u8; DIGEST_BYTES] {
-        let inner = self.inner.finish();
-        self.outer.update(&inner);
-        self.outer.finish()
+    pub fn finish(self) -> [u8; DIGEST_BYTES] {
+        let mut tag = [0; DIGEST_BYTES];
+        for (byte, word) in tag.iter_mut().zip(self.0.finish()) {
+            *byte = word;
+        }
+        tag
+    }
+}
+
+/// HMAC-SHA512 in progress.
+pub struct Hmac512(Keyed);
+
+impl Hmac512 {
+    pub fn new(key: &[u8]) -> Self {
+        Self(Keyed::new(INITIAL512, SHA512_BYTES, key))
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        self.0.inner.update(data);
+    }
+
+    pub fn finish(self) -> [u8; SHA512_BYTES] {
+        self.0.finish()
     }
 }
 
@@ -318,8 +428,8 @@ fn compress(state: &mut [u64; 8], blocks: &[[u8; BLOCK_BYTES]]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        BLOCK_BYTES, DIGEST_BYTES, EXPAND_BYTES_MAX, Hmac384, Sha384, digest, hkdf_expand,
-        hkdf_extract,
+        BLOCK_BYTES, DIGEST_BYTES, EXPAND_BYTES_MAX, Hmac384, Hmac512, Sha384, Sha512, digest,
+        digest512, hkdf_expand, hkdf_extract,
     };
     use alloc::vec::Vec;
     use test::Bencher;
@@ -379,6 +489,45 @@ mod tests {
             let expected = hex(expected);
             assert_eq!(digest(data)[..], expected[..]);
             let mut hash = Sha384::new();
+            for piece in data.chunks(997) {
+                hash.update(piece);
+            }
+            assert_eq!(hash.finish()[..], expected[..]);
+        }
+    }
+
+    /// FIPS 180-4's SHA-512 examples and the million a's, whole and in
+    /// pieces.
+    #[test]
+    fn sha512_vectors() {
+        let mut million = Vec::new();
+        million.resize(1_000_000, b'a');
+        for (data, expected) in [
+            (
+                &b""[..],
+                "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce\
+                 47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e",
+            ),
+            (
+                b"abc",
+                "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a\
+                 2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",
+            ),
+            (
+                b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmn\
+                  hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu",
+                "8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018\
+                 501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909",
+            ),
+            (
+                &million[..],
+                "e718483d0ce769644e2e42c7bc15b4638e1f98b13b2044285632a803afa973eb\
+                 de0ff244877ea60a4cb0432ce577c31beb009c5c2c49aa2e4eadb217ad8cc09b",
+            ),
+        ] {
+            let expected = hex(expected);
+            assert_eq!(digest512(data)[..], expected[..]);
+            let mut hash = Sha512::new();
             for piece in data.chunks(997) {
                 hash.update(piece);
             }
@@ -467,6 +616,107 @@ mod tests {
         }
     }
 
+    /// Keys one byte short of a block, a block and a block and a byte:
+    /// padded, padded exactly, and hashed first. Python's hmac gave the
+    /// tags.
+    #[test]
+    fn block_size_keys() {
+        let mut key = [0; BLOCK_BYTES + 1];
+        for (byte, value) in key.iter_mut().zip(0..) {
+            *byte = value;
+        }
+        for (length, tag384, tag512) in [
+            (
+                BLOCK_BYTES - 1,
+                "dbebb7841ea8e2cb6180cc85d28f99f2247bb2666e9949b129a0f73e8ce33132\
+                 2c148cf5ad7c00d03cff7234dac5fb43",
+                "b165030069f5631883a89fb0bb02a9b41c71bf6334b6fd9c70dcd3f89a8e1bb9\
+                 d9c19363c8f6a242ee545884553242204756035bc2aa8c32d6b22bc21d3a10e0",
+            ),
+            (
+                BLOCK_BYTES,
+                "0534177b30cf3f731c5e94f988d86dba6ca5e2496ac14e278e5bc62a7cb08b8c\
+                 fe47b7e5884ab04bb5ceb3e6fde1dc08",
+                "695dc10b6e2b7f95bf21d58d04e30fb4f75b54f4701452b10e13694adcda2240\
+                 f63c91a3915c90203ae5f29596b4fc3f8d9b67455a2eb2719658f2b85aace95c",
+            ),
+            (
+                BLOCK_BYTES + 1,
+                "41b716fdc05cdbf749230caf91f627050721a28e40b90425a4df345942d10aac\
+                 ee2c122099f1ecd3be945871b8ae6a0e",
+                "935db917a886dc2d99263737db8f72ab7f71ec96bcad62cee9486d41cd7b4732\
+                 9c529c5514705ba6a2d88ca3f2f219d446bd74102869794c01e70a98ef2681bf",
+            ),
+        ] {
+            let mut short = Hmac384::new(&key[..length]);
+            short.update(b"block-size key");
+            assert_eq!(short.finish()[..], hex(tag384)[..]);
+            let mut long = Hmac512::new(&key[..length]);
+            long.update(b"block-size key");
+            assert_eq!(long.finish()[..], hex(tag512)[..]);
+        }
+    }
+
+    /// A line's eight fields, or seven and an empty one.
+    fn fields(line: &str) -> [&str; 8] {
+        let mut out = [""; 8];
+        let mut words = line.split(' ');
+        for (slot, word) in out.iter_mut().zip(&mut words) {
+            *slot = word;
+        }
+        assert!(words.next().is_none(), "{line}");
+        out
+    }
+
+    /// Wycheproof's hmac_sha384_test, hmac_sha512_test and
+    /// hkdf_sha384_test, every case (sha384-wycheproof.py): a MAC whose
+    /// first tag bytes match exactly when the case is valid, and HKDF's
+    /// output, or a refusal past 255 blocks.
+    #[test]
+    fn wycheproof() {
+        let field = |text: &str| if text == "-" { Vec::new() } else { hex(text) };
+        let (mut macs, mut keys) = (0, 0);
+        let mut out = Vec::new();
+        for line in include_str!("sha384-wycheproof.txt").lines() {
+            if line.starts_with('#') {
+                continue;
+            }
+            match fields(line) {
+                ["hmac", bits, id, valid, size, key, message, tag] => {
+                    let size: usize = size.parse().unwrap();
+                    let (key, message) = (field(key), field(message));
+                    let mut mac = [0; 64];
+                    if bits == "384" {
+                        let mut hmac = Hmac384::new(&key);
+                        hmac.update(&message);
+                        mac[..DIGEST_BYTES].copy_from_slice(&hmac.finish());
+                    } else {
+                        let mut hmac = Hmac512::new(&key);
+                        hmac.update(&message);
+                        mac = hmac.finish();
+                    }
+                    let matches = mac[..size] == field(tag)[..];
+                    assert_eq!(matches, valid == "1", "hmac {bits} tcId {id}");
+                    macs += 1;
+                }
+                ["hkdf", id, input, salt, info, size, okm, ""] => {
+                    let key = hkdf_extract(&field(salt), &field(input));
+                    out.clear();
+                    out.resize(size.parse().unwrap(), 0);
+                    let expected = field(okm);
+                    let done = hkdf_expand(&key, &field(info), &mut out);
+                    assert_eq!(done, !expected.is_empty(), "hkdf tcId {id}");
+                    if done {
+                        assert_eq!(out, expected, "hkdf tcId {id}");
+                    }
+                    keys += 1;
+                }
+                _ => panic!("{line}"),
+            }
+        }
+        assert_eq!((macs, keys), (348, 83));
+    }
+
     /// RFC 5869's three inputs under SHA-384, whose results Python's
     /// hmac and hashlib gave: one and two output blocks, a long salt and
     /// info, and none at all.
@@ -534,5 +784,12 @@ mod tests {
     fn digest_16k(b: &mut Bencher) {
         let data = [0x5a; 16 * 1024];
         b.iter(|| digest(&data));
+    }
+
+    /// The same under SHA-512: the same rounds, a wider digest.
+    #[bench]
+    fn digest512_16k(b: &mut Bencher) {
+        let data = [0x5a; 16 * 1024];
+        b.iter(|| digest512(&data));
     }
 }

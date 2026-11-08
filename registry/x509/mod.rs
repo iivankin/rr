@@ -3,9 +3,9 @@
 //! certificate's bytes, a store of trust anchors, and verification of
 //! a server's chain for a host name at a given time.
 //!
-//! The profile: keys P-256, P-384 (uncompressed) and RSA of 2048 to
-//! 4096 bits; signatures ECDSA with SHA-256 or SHA-384, RSA PKCS #1
-//! v1.5 with SHA-256 or SHA-384, and RSA-PSS with MGF1 of the same hash
+//! The profile: keys P-256, P-384, P-521 (uncompressed) and RSA of 2048
+//! to 4096 bits; signatures ECDSA, RSA PKCS #1 v1.5 and RSA-PSS, each
+//! with SHA-256, SHA-384 or SHA-512, RSA-PSS with MGF1 of the same hash
 //! and a salt of its length (RFC 4055's parameters in DER, as Go and
 //! OpenSSL write them). An anchor's own signature is never checked, so
 //! one of any algorithm loads. DER is required everywhere but in three
@@ -72,6 +72,7 @@ pub enum Key<'a> {
     /// The uncompressed point 04 || X || Y.
     P256(&'a [u8]),
     P384(&'a [u8]),
+    P521(&'a [u8]),
     /// Big-endian integers without a sign byte.
     Rsa {
         modulus: &'a [u8],
@@ -133,10 +134,13 @@ struct Anchor {
 enum Algorithm {
     EcdsaSha256,
     EcdsaSha384,
+    EcdsaSha512,
     Pkcs1Sha256,
     Pkcs1Sha384,
+    Pkcs1Sha512,
     PssSha256,
     PssSha384,
+    PssSha512,
     Other,
 }
 
@@ -152,8 +156,8 @@ struct Extensions<'a> {
     path_length: Option<usize>,
     /// KeyUsage's first sixteen bits, digitalSignature the highest.
     key_usage: Option<u16>,
-    /// Whether ExtKeyUsage, when present, allows serverAuth.
-    server_auth: Option<bool>,
+    /// What ExtKeyUsage, when present, allows of serverAuth.
+    server_auth: Option<Purpose>,
     /// SubjectAltName's GeneralNames, without the SEQUENCE header.
     names: Option<&'a [u8]>,
     /// NameConstraints' GeneralSubtrees, without their headers.
@@ -245,12 +249,15 @@ const KEY_CERT_SIGN: u16 = 0x0400;
 const EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
 const P256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
 const P384: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x22];
+const P521: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x23];
 const RSA_ENCRYPTION: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
 const RSA_PSS: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a];
 const RSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b];
 const RSA_SHA384: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0c];
+const RSA_SHA512: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0d];
 const ECDSA_SHA256: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02];
 const ECDSA_SHA384: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03];
+const ECDSA_SHA512: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x04];
 /// RSASSA-PSS-params: the hash, MGF1 with the same hash, a salt of the
 /// hash's length and the default trailer.
 const PSS_SHA256: &[u8] = &[
@@ -264,6 +271,12 @@ const PSS_SHA384: &[u8] = &[
     0x02, 0x05, 0x00, 0xa1, 0x1c, 0x30, 0x1a, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01,
     0x01, 0x08, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02, 0x05,
     0x00, 0xa2, 0x03, 0x02, 0x01, 0x30,
+];
+const PSS_SHA512: &[u8] = &[
+    0x30, 0x34, 0xa0, 0x0f, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+    0x03, 0x05, 0x00, 0xa1, 0x1c, 0x30, 0x1a, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01,
+    0x01, 0x08, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05,
+    0x00, 0xa2, 0x03, 0x02, 0x01, 0x40,
 ];
 const SUBJECT_KEY_ID: &[u8] = &[0x55, 0x1d, 0x0e];
 const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
@@ -500,12 +513,17 @@ fn algorithm(body: &[u8]) -> Result<Algorithm, Error> {
     match (oid, parameters) {
         (ECDSA_SHA256, []) => Ok(Algorithm::EcdsaSha256),
         (ECDSA_SHA384, []) => Ok(Algorithm::EcdsaSha384),
+        (ECDSA_SHA512, []) => Ok(Algorithm::EcdsaSha512),
         // NULL, or absent as some encoders write it (RFC 4055 5).
         (RSA_SHA256, [] | [NULL, 0]) => Ok(Algorithm::Pkcs1Sha256),
         (RSA_SHA384, [] | [NULL, 0]) => Ok(Algorithm::Pkcs1Sha384),
+        (RSA_SHA512, [] | [NULL, 0]) => Ok(Algorithm::Pkcs1Sha512),
         (RSA_PSS, PSS_SHA256) => Ok(Algorithm::PssSha256),
         (RSA_PSS, PSS_SHA384) => Ok(Algorithm::PssSha384),
-        (ECDSA_SHA256 | ECDSA_SHA384 | RSA_SHA256 | RSA_SHA384, _) => Err(Error::Malformed),
+        (RSA_PSS, PSS_SHA512) => Ok(Algorithm::PssSha512),
+        (ECDSA_SHA256 | ECDSA_SHA384 | ECDSA_SHA512 | RSA_SHA256 | RSA_SHA384 | RSA_SHA512, _) => {
+            Err(Error::Malformed)
+        }
         _ => Ok(Algorithm::Other),
     }
 }
@@ -515,10 +533,13 @@ impl Algorithm {
         match self {
             Algorithm::EcdsaSha256 => Some((Scheme::Ecdsa, rsa::Hash::Sha256)),
             Algorithm::EcdsaSha384 => Some((Scheme::Ecdsa, rsa::Hash::Sha384)),
+            Algorithm::EcdsaSha512 => Some((Scheme::Ecdsa, rsa::Hash::Sha512)),
             Algorithm::Pkcs1Sha256 => Some((Scheme::Pkcs1, rsa::Hash::Sha256)),
             Algorithm::Pkcs1Sha384 => Some((Scheme::Pkcs1, rsa::Hash::Sha384)),
+            Algorithm::Pkcs1Sha512 => Some((Scheme::Pkcs1, rsa::Hash::Sha512)),
             Algorithm::PssSha256 => Some((Scheme::Pss, rsa::Hash::Sha256)),
             Algorithm::PssSha384 => Some((Scheme::Pss, rsa::Hash::Sha384)),
+            Algorithm::PssSha512 => Some((Scheme::Pss, rsa::Hash::Sha512)),
             Algorithm::Other => None,
         }
     }
@@ -614,6 +635,7 @@ fn public_key(body: &[u8]) -> Result<Key<'_>, Error> {
             match (curve, key.len(), key.first()) {
                 (P256, 65, Some(4)) => Ok(Key::P256(key)),
                 (P384, 97, Some(4)) => Ok(Key::P384(key)),
+                (P521, 133, Some(4)) => Ok(Key::P521(key)),
                 _ => Err(Error::Unsupported),
             }
         }
@@ -738,16 +760,35 @@ fn key_usage(body: &[u8]) -> Result<u16, Error> {
     Ok(bits)
 }
 
-/// ExtKeyUsageSyntax: whether it allows serverAuth.
-fn server_auth(body: &[u8]) -> Result<bool, Error> {
+/// What ExtKeyUsage says of serverAuth.
+#[derive(Clone, Copy, PartialEq)]
+enum Purpose {
+    /// It names serverAuth.
+    Server,
+    /// It names anyExtendedKeyUsage, not serverAuth: a leaf's serves, as
+    /// RFC 5280 and Go have it; a CA's does not, as Firefox (mozilla::
+    /// pkix) and the CA/Browser Forum's baseline requirements have it.
+    Any,
+    /// Neither.
+    Other,
+}
+
+/// ExtKeyUsageSyntax: what it allows of serverAuth.
+fn server_auth(body: &[u8]) -> Result<Purpose, Error> {
     let mut purposes = Reader::new(body);
     if purposes.is_empty() {
         return Err(Error::Malformed);
     }
-    let mut allows = false;
+    let mut allows = Purpose::Other;
     while !purposes.is_empty() {
         let purpose = purposes.oid()?;
-        allows |= purpose == SERVER_AUTH || purpose == ANY_USAGE;
+        if purpose == SERVER_AUTH {
+            allows = Purpose::Server;
+        } else if purpose == ANY_USAGE && allows == Purpose::Other {
+            allows = Purpose::Any;
+        } else {
+            // Another purpose adds nothing for a TLS server.
+        }
     }
     Ok(allows)
 }
@@ -859,6 +900,9 @@ fn signed(
         (Scheme::Ecdsa, Key::P384(point)) => {
             ecdsa::verify(&ecdsa::Curve::P384, point, digest, signature)
         }
+        (Scheme::Ecdsa, Key::P521(point)) => {
+            ecdsa::verify(&ecdsa::Curve::P521, point, digest, signature)
+        }
         (Scheme::Pkcs1, Key::Rsa { modulus, exponent }) => {
             rsa::verify_pkcs1(modulus, exponent, hash, digest, signature)
         }
@@ -866,25 +910,29 @@ fn signed(
             rsa::verify_pss(modulus, exponent, hash, digest, signature)
         }
         (Scheme::Ecdsa, Key::Rsa { .. })
-        | (Scheme::Pkcs1 | Scheme::Pss, Key::P256(_) | Key::P384(_)) => false,
+        | (Scheme::Pkcs1 | Scheme::Pss, Key::P256(_) | Key::P384(_) | Key::P521(_)) => false,
     };
     match hash {
         rsa::Hash::Sha256 => check(&sha256::digest(message)),
         rsa::Hash::Sha384 => check(&sha384::digest(message)),
+        rsa::Hash::Sha512 => check(&sha384::digest512(message)),
     }
 }
 
 impl Leaf<'_> {
     /// Whether signature is the server's CertificateVerify of message,
     /// the TLS 1.3 content it signs (RFC 8446 4.4.3), under scheme:
-    /// ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384, or
-    /// rsa_pss_rsae_sha256 or _sha384. The scheme's curve must be the key's.
+    /// ecdsa_secp256r1_sha256, _secp384r1_sha384 or _secp521r1_sha512, or
+    /// rsa_pss_rsae_sha256, _sha384 or _sha512. The scheme's curve must be
+    /// the key's.
     pub fn verify_tls13(&self, scheme: u16, message: &[u8], signature: &[u8]) -> bool {
         let (method, hash) = match (scheme, &self.key) {
             (0x0403, Key::P256(_)) => (Scheme::Ecdsa, rsa::Hash::Sha256),
             (0x0503, Key::P384(_)) => (Scheme::Ecdsa, rsa::Hash::Sha384),
+            (0x0603, Key::P521(_)) => (Scheme::Ecdsa, rsa::Hash::Sha512),
             (0x0804, Key::Rsa { .. }) => (Scheme::Pss, rsa::Hash::Sha256),
             (0x0805, Key::Rsa { .. }) => (Scheme::Pss, rsa::Hash::Sha384),
+            (0x0806, Key::Rsa { .. }) => (Scheme::Pss, rsa::Hash::Sha512),
             _ => return false,
         };
         signed(&self.key, &method, &hash, message, signature)
@@ -1272,7 +1320,7 @@ pub fn verify<'a>(
         .ext
         .key_usage
         .is_some_and(|bits| bits & DIGITAL_SIGNATURE == 0)
-        || leaf.ext.server_auth == Some(false)
+        || leaf.ext.server_auth == Some(Purpose::Other)
     {
         return Err(Error::Usage);
     }
@@ -1449,7 +1497,7 @@ fn issues(
         .ext
         .key_usage
         .is_some_and(|bits| bits & KEY_CERT_SIGN == 0)
-        || parent.ext.server_auth == Some(false)
+        || matches!(parent.ext.server_auth, Some(Purpose::Other | Purpose::Any))
     {
         return Err(Error::Usage);
     }
@@ -1840,6 +1888,9 @@ mod tests {
             "anchor.amazon-1",
             "test.root",
             "test.rsaroot",
+            "test.anyroot",
+            "test.p521root",
+            "test.rsa512root",
         ] {
             assert!(store.add_der(&der(name)));
         }
@@ -2176,6 +2227,15 @@ mod tests {
             check(&["test.crit", "test.inter"], "api.example.test", NOW),
             Err(Error::Critical)
         );
+        // anyExtendedKeyUsage serves a leaf, not a CA.
+        assert_eq!(
+            check(&["test.anyleaf", "test.anyroot"], "api.example.test", NOW),
+            Ok(())
+        );
+        assert_eq!(
+            check(&["test.underany", "test.anyca"], "api.example.test", NOW),
+            Err(Error::Usage)
+        );
     }
 
     /// PSS and PKCS #1 certificate signatures, and the four TLS 1.3
@@ -2221,6 +2281,23 @@ mod tests {
              1c437310258b36915dedf71e381a5b1a64b4af29bca15250c51791abcd2ba141\
              7a29e8b2c1c548f3b9236a8a66c4ccd925f2d92ec7b057521ab6c0e06b2ede8e",
         );
+        let p521 = bytes(
+            "3081860241633adf157108257310f6737c0e399810cab369d3c9fe907912d703\
+             39a18ed67b9b2ddd2e3c61f6a5d88e7250f3fc8b65b8fe209a70730419bb7730\
+             c8042d6e19d002412c6c753fdd888af9c6a558dbdefc33b4a9761b5ef722a67f\
+             71331ac8f1b90f7fd2d311a37f1137b23d2f5c97fef4a5dcf862cc769dbf5015\
+             41f033bfea33e9641b",
+        );
+        let pss512 = bytes(
+            "3f44b06d73d297d92fe1a5ae967978fc38da70b1abd9f8e61fdfc6736dfe13a1\
+             d0bb265f529924031e16b4ca871c0d12b3cd5503490b0e8c40b1f2079a6158dc\
+             c09d4c02ab2c3d96460cefaa4814c2427457ebbe65862134c70cd0ee8802e11e\
+             3d530baa250aac764b7bdd84e56d45dad7583ec2ad6911faed8e6f7653070b0e\
+             9a23b693d96de930e65c927bd55a1f64ae5e462848784b8154546a7f314110c8\
+             7baf6561882ef9d205b7b4d25813cb0a6cb2bd4ff265c1eeb3d884b0f1fde726\
+             90458306b495859c93643ba2c365f90d4bba5848eb1bc215d5115a0171a3fcfc\
+             3b61df8a0fe6103c1dfe119f3eb3dcbaf91805b5e960ff1ad770953ac6799d71",
+        );
         let store = anchors();
         // rr: escape(copy): the message stays as it was signed, beside it.
         let mut changed = message.clone();
@@ -2230,6 +2307,22 @@ mod tests {
             ("test.leaf384", "test.inter", 0x0503, &p384, 0x0403),
             ("test.rsaleaf", "test.rsaroot", 0x0804, &pss256, 0x0805),
             ("test.rsaleaf", "test.rsaroot", 0x0805, &pss384, 0x0804),
+            // P-521 and SHA-512 certificates, and their TLS 1.3 schemes.
+            ("test.p521leaf", "test.p521root", 0x0603, &p521, 0x0503),
+            (
+                "test.rsa512leaf",
+                "test.rsa512root",
+                0x0806,
+                &pss512,
+                0x0805,
+            ),
+            (
+                "test.rsa512pkcs",
+                "test.rsa512root",
+                0x0806,
+                &pss512,
+                0x0804,
+            ),
         ] {
             let (leaf, issuer) = (der(leaf), der(issuer));
             let verified = verify(&[&leaf, &issuer], &store, "api.example.test", NOW).unwrap();
@@ -2351,15 +2444,15 @@ mod tests {
     #[test]
     fn store() {
         let mut store = Store::new();
-        assert_eq!(store.add_pem(TESTS.as_bytes()), 26);
-        assert_eq!((store.len(), store.skipped()), (26, 22));
+        assert_eq!(store.add_pem(TESTS.as_bytes()), 30);
+        assert_eq!((store.len(), store.skipped()), (30, 27));
         let bad = b"x\n-----BEGIN CERTIFICATE-----\nMII!\n-----END CERTIFICATE-----\n\
                     -----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n\
                     -----BEGIN CERTIFICATE-----\nAAAA";
         assert_eq!(store.add_pem(bad), 0);
-        assert_eq!((store.len(), store.skipped()), (26, 24));
+        assert_eq!((store.len(), store.skipped()), (30, 29));
         assert!(!store.add_der(&der("test.leaf")));
-        assert_eq!((store.len(), store.skipped()), (26, 25));
+        assert_eq!((store.len(), store.skipped()), (30, 30));
         // A list of DER loads as the same blocks do, and verifies alike.
         let (root, inter, leaf) = (der("test.root"), der("test.inter"), der("test.leaf"));
         let mut list = Store::new();

@@ -722,9 +722,9 @@ fn removed_and_added_again() {
     }
 }
 
-/// The peer finished while the writer waits for room: writing still
-/// works, and the hangup, which ends reading, does not wake a Set that
-/// waits for writing alone.
+/// The peer finished while the writer waits for room: the hangup, which
+/// ends reading, is not reported to a Set that waits for writing alone,
+/// and wakes it no more than writing does.
 #[test]
 fn half_closed_writer() {
     let chunk = [7u8; 16 * 1024];
@@ -737,10 +737,24 @@ fn half_closed_writer() {
         }
         server.finish().unwrap();
         assert!(client.watch(&mut set, WRITE, 1));
-        assert!(
-            wakeups(&mut set, 100) <= 3,
-            "a hangup woke a Set waiting to write"
-        );
+        let end = Instant::now().after_ms(100);
+        let mut idle = 0;
+        while !end.reached_by(Instant::now()) {
+            let mut writable = false;
+            for event in set.wait(Some(end)) {
+                if event.key == 1 {
+                    assert_eq!(event.ready & HUP, 0, "a writer told of a hangup");
+                    writable |= event.ready & WRITE != 0;
+                }
+            }
+            if writable {
+                // The system grew its buffer: writing goes on.
+                while let Io::Done(_) = client.write(&chunk).unwrap() {}
+            } else {
+                idle += 1;
+            }
+        }
+        assert!(idle <= 3, "woken {idle} times with nothing to write");
         client.close(&mut set);
         server.close(&mut set);
     }

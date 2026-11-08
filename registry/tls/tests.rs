@@ -3,10 +3,13 @@
 //! and retries, splits, tampers and misbehaves as each test asks.
 
 use super::{
-    ALERT, APPLICATION, CHANGE_CIPHER_SPEC, Client, Error, HANDSHAKE, HELLO_RETRY, KEY_RECORDS_MAX,
-    Keys, MESSAGE_MAX, PENDING_MAX, RECORD_MAX, RECORDS_PER_INPUT, Reader, State, VERIFY_CONTEXT,
-    Verify, derive, expand, handshake_secrets, mac,
+    ALERT, APPLICATION, CHANGE_CIPHER_SPEC, Client, Error, HANDSHAKE, HELLO_RETRY, IDLE_MAX,
+    KEY_RECORDS_MAX, Keys, MESSAGE_MAX, PENDING_MAX, RANDOM_BYTES, RECORD_MAX, RECORDS_PER_INPUT,
+    Reader, SECP256R1, State, VERIFY_CONTEXT, Verify, X25519, X25519MLKEM768, derive, expand,
+    handshake_secrets, mac,
 };
+use crate::base::ecdh;
+use crate::base::mlkem;
 use crate::base::sha256::{self, Sha256};
 use crate::base::sha384;
 use crate::base::x509::{self, Store, TEST_NOW, test_certificate};
@@ -14,8 +17,10 @@ use crate::base::x25519;
 use alloc::vec::Vec;
 use test::Bencher;
 
-/// The client's random and X25519 secret in every test.
-const RANDOM: [u8; 64] = [0x5c; 64];
+/// The client's randomness in every test.
+const RANDOM: [u8; RANDOM_BYTES] = [0x5c; RANDOM_BYTES];
+/// The session ID the client sends, from RANDOM.
+const SESSION: [u8; 32] = [0x5c; 32];
 const HOST: &str = "api.example.test";
 /// A split that brings everything at once.
 const WHOLE: usize = 1 << 24;
@@ -495,13 +500,17 @@ impl Identity {
 /// What the server does besides a plain handshake.
 struct Script {
     identity: Identity,
-    /// A HelloRetryRequest first, with this cookie.
+    /// A HelloRetryRequest first, with this cookie, this group or both.
     cookie: Option<&'static [u8]>,
+    retry_group: Option<u16>,
+    /// The group ServerHello chooses without a retry that names one.
+    group: u16,
     /// The protocol EncryptedExtensions chooses, if any.
     alpn: Option<&'static [u8]>,
     /// Extensions added to EncryptedExtensions, as on the wire.
     extensions: Vec<u8>,
-    request: bool,
+    /// A CertificateRequest's body, before the Certificate.
+    request: Option<Vec<u8>>,
     /// A change_cipher_spec after ServerHello.
     compatible: bool,
     /// Whether the flight after ServerHello is sent.
@@ -515,9 +524,11 @@ impl Script {
         Script {
             identity: Identity::new(kind),
             cookie: None,
+            retry_group: None,
+            group: X25519MLKEM768,
             alpn: None,
             extensions: Vec::new(),
-            request: false,
+            request: None,
             compatible: false,
             flight: true,
             piece: RECORD_MAX,
@@ -531,7 +542,10 @@ struct Hello {
     // rr: escape(bound): one ClientHello's.
     alpn: Vec<Vec<u8>>,
     cookie: Option<Vec<u8>>,
-    share: Vec<u8>,
+    session: Vec<u8>,
+    /// The key shares, by group.
+    // rr: escape(bound): one ClientHello's.
+    shares: Vec<(u16, Vec<u8>)>,
     // rr: escape(bound): one ClientHello's.
     suites: Vec<u16>,
     // rr: escape(bound): one ClientHello's.
@@ -562,6 +576,8 @@ struct Server {
     certificate: Option<Vec<u8>>,
     /// KeyUpdates the client sent.
     updates: usize,
+    /// change_cipher_spec records the client sent.
+    ccs: usize,
     finished: bool,
 }
 
@@ -583,12 +599,14 @@ impl Server {
                 name: None,
                 alpn: Vec::new(),
                 cookie: None,
-                share: Vec::new(),
+                session: Vec::new(),
+                shares: Vec::new(),
                 suites: Vec::new(),
                 signatures: Vec::new(),
             },
             certificate: None,
             updates: 0,
+            ccs: 0,
             finished: false,
         }
     }
@@ -608,6 +626,12 @@ impl Server {
             }
             let rest = self.input.split_off(5 + length);
             let mut record = core::mem::replace(&mut self.input, rest);
+            if record[0] == CHANGE_CIPHER_SPEC {
+                // Middlebox compatibility's, in the clear.
+                assert_eq!(record[5..], [1]);
+                self.ccs += 1;
+                continue;
+            }
             let kind = match &mut self.read {
                 Some(keys) => opened(keys, &mut record),
                 None => {
@@ -663,7 +687,8 @@ impl Server {
         };
         assert_eq!(fields.u16().unwrap(), 0x0303);
         fields.take(32).unwrap();
-        assert!(fields.vector(1).unwrap().is_empty());
+        // rr: escape(copy): ServerHello echoes it.
+        hello.session = fields.vector(1).unwrap().to_vec();
         let mut suites = Reader {
             rest: fields.vector(2).unwrap(),
         };
@@ -690,7 +715,7 @@ impl Server {
                     // rr: escape(copy): the test looks at it later.
                     hello.name = Some(list.vector(2).unwrap().to_vec());
                 }
-                10 => assert_eq!(list.rest, [0, 0x1d]),
+                10 => assert_eq!(list.rest, [0x11, 0xec, 0, 0x1d, 0, 0x17]),
                 13 => {
                     hello.signatures.clear();
                     while let Ok(scheme) = list.u16() {
@@ -707,31 +732,45 @@ impl Server {
                 // rr: escape(copy): the test looks at it later.
                 44 => hello.cookie = Some(list.rest.to_vec()),
                 51 => {
-                    assert_eq!(list.u16().unwrap(), 0x1d);
-                    // rr: escape(copy): the server's key share needs it.
-                    hello.share = list.vector(2).unwrap().to_vec();
+                    hello.shares.clear();
+                    while let Ok(group) = list.u16() {
+                        // rr: escape(copy): the server's key share needs it.
+                        hello.shares.push((group, list.vector(2).unwrap().to_vec()));
+                    }
                 }
                 other => panic!("extension {other}"),
             }
             data.end().unwrap();
         }
         self.transcript.update(message);
-        if self.script.cookie.is_some() && !self.retried {
+        let asks = self.script.cookie.is_some() || self.script.retry_group.is_some();
+        if asks && !self.retried {
             self.retried = true;
             return self.retry();
         }
         if self.retried {
             assert_eq!(self.hello.cookie.as_deref(), self.script.cookie);
+            if let Some(group) = self.script.retry_group {
+                // A key for the group asked for, alone.
+                assert_eq!(self.hello.shares.len(), 1);
+                assert_eq!(self.hello.shares[0].0, group);
+            }
         }
         self.server_hello();
     }
 
     fn retry(&mut self) {
-        let mut extensions = Vec::from([0, 43, 0, 2, 3, 4, 0, 44]);
-        let cookie = self.script.cookie.unwrap();
-        prefixed(&mut extensions, 2 + cookie.len(), &[]);
-        prefixed(&mut extensions, cookie.len(), cookie);
-        let retry = hello_message(&HELLO_RETRY, &extensions);
+        let mut extensions = Vec::from([0, 43, 0, 2, 3, 4]);
+        if let Some(group) = self.script.retry_group {
+            extensions.extend_from_slice(&[0, 51, 0, 2]);
+            extensions.extend_from_slice(&group.to_be_bytes());
+        }
+        if let Some(cookie) = self.script.cookie {
+            extensions.extend_from_slice(&[0, 44]);
+            prefixed(&mut extensions, 2 + cookie.len(), &[]);
+            prefixed(&mut extensions, cookie.len(), cookie);
+        }
+        let retry = hello_message(&HELLO_RETRY, &self.hello.session, &extensions);
         let first = self.hash();
         self.transcript = Sha256::new();
         self.transcript.update(&[254, 0, 0, 32]);
@@ -740,19 +779,54 @@ impl Server {
         self.plain(HANDSHAKE, &retry);
     }
 
-    fn server_hello(&mut self) {
+    /// The server's key share for group, from the client's, and the
+    /// shared secret.
+    fn agree(&self, group: u16) -> (Vec<u8>, Vec<u8>) {
+        let (_, share) = self
+            .hello
+            .shares
+            .iter()
+            .find(|(offered, _)| *offered == group)
+            .expect("no key share for the group");
         let secret = [0x3a; 32];
-        let mut extensions = Vec::from([0, 43, 0, 2, 3, 4, 0, 51, 0, 36, 0, 0x1d, 0, 32]);
-        extensions.extend_from_slice(&x25519::public_key(&secret));
-        let hello = hello_message(&[0x7e; 32], &extensions);
+        let (mut key, mut shared) = (Vec::new(), Vec::new());
+        match group {
+            X25519 => {
+                key.extend_from_slice(&x25519::public_key(&secret));
+                let peer: [u8; 32] = share[..].try_into().unwrap();
+                shared.extend_from_slice(&x25519::shared(&secret, &peer).unwrap());
+            }
+            X25519MLKEM768 => {
+                let (encapsulation, peer) = share.split_at(mlkem::ENCAPSULATION_KEY_BYTES);
+                let encapsulation = encapsulation.try_into().unwrap();
+                let (ciphertext, kem) = mlkem::encapsulate(encapsulation, &[0x4d; 32]).unwrap();
+                key.extend_from_slice(&ciphertext);
+                key.extend_from_slice(&x25519::public_key(&secret));
+                shared.extend_from_slice(&kem);
+                let peer: [u8; 32] = peer.try_into().unwrap();
+                shared.extend_from_slice(&x25519::shared(&secret, &peer).unwrap());
+            }
+            _ => {
+                key.extend_from_slice(&ecdh::public_key(&secret).unwrap());
+                shared.extend_from_slice(&ecdh::shared(&secret, share).unwrap());
+            }
+        }
+        (key, shared)
+    }
+
+    fn server_hello(&mut self) {
+        let group = self.script.retry_group.unwrap_or(self.script.group);
+        let (share, shared) = self.agree(group);
+        let mut extensions = Vec::from([0, 43, 0, 2, 3, 4, 0, 51]);
+        prefixed(&mut extensions, share.len() + 4, &group.to_be_bytes());
+        prefixed(&mut extensions, share.len(), &share);
+        let hello = hello_message(&[0x7e; 32], &self.hello.session, &extensions);
         self.transcript.update(&hello);
         self.plain(HANDSHAKE, &hello);
         if self.script.compatible {
             self.output
                 .extend_from_slice(&[CHANGE_CIPHER_SPEC, 3, 3, 0, 1, 1]);
         }
-        let share: [u8; 32] = self.hello.share[..].try_into().unwrap();
-        let shared = x25519::shared(&secret, &share).unwrap();
         let secrets = handshake_secrets(&shared, &self.hash());
         self.read = Some(Keys::new(&secrets.client));
         self.write = Some(Keys::new(&secrets.server));
@@ -776,9 +850,8 @@ impl Server {
         let mut body = Vec::new();
         prefixed(&mut body, encrypted.len(), &encrypted);
         self.add(&mut flight, 8, &body);
-        if self.script.request {
-            // A context, and signature_algorithms, which RFC 8446 requires.
-            self.add(&mut flight, 13, &hex("02 c0de 0008 000d 0004 0002 0403"));
+        if let Some(request) = self.script.request.take() {
+            self.add(&mut flight, 13, &request);
         }
         let mut list = Vec::new();
         for der in &self.script.identity.chain {
@@ -861,11 +934,14 @@ impl Server {
     }
 }
 
-/// A ServerHello, or a HelloRetryRequest by its random.
-fn hello_message(random: &[u8; 32], extensions: &[u8]) -> Vec<u8> {
+/// A ServerHello, or a HelloRetryRequest by its random, echoing the
+/// client's session ID.
+fn hello_message(random: &[u8; 32], session: &[u8], extensions: &[u8]) -> Vec<u8> {
     let mut m = Vec::from([2, 0, 0, 0, 3, 3]);
     m.extend_from_slice(random);
-    m.extend_from_slice(&[0, 0x13, 0x01, 0]);
+    m.push(u8::try_from(session.len()).unwrap());
+    m.extend_from_slice(session);
+    m.extend_from_slice(&[0x13, 0x01, 0]);
     prefixed(&mut m, extensions.len(), extensions);
     let length = u24(m.len() - 4);
     m[1..4].copy_from_slice(&length);
@@ -1147,9 +1223,13 @@ fn key_of(secret: &[u8; 32]) -> Vec<u8> {
 #[test]
 fn rfc8448_simple_1rtt() {
     let store = Store::new();
-    let mut random = [0; 64];
-    random[32..].copy_from_slice(&hex(CLIENT_PRIVATE));
+    let mut random = [0; RANDOM_BYTES];
+    random[64..96].copy_from_slice(&hex(CLIENT_PRIVATE));
     let mut client = Client::new("server", &[], Verify::Store(&store), 0, &random).unwrap();
+    // RFC 8448's client offers X25519 alone, without middlebox
+    // compatibility.
+    client.session = None;
+    client.kem = None;
     client.sent(client.pending().len());
     client.transcript = Sha256::new();
     client.transcript.update(&hex(CLIENT_HELLO));
@@ -1226,7 +1306,9 @@ fn client_hello() {
     assert_eq!(hello.suites, [0x1301]);
     assert_eq!(
         hello.signatures,
-        [0x0403, 0x0503, 0x0804, 0x0805, 0x0401, 0x0501]
+        [
+            0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601
+        ]
     );
     assert_eq!(hello.cookie, None);
     let mut other = Server::new(Script::new(Kind::P256));
@@ -1368,6 +1450,113 @@ fn fragmented_messages() {
     }
 }
 
+/// Each group the client shares a key for, and P-256 in a retry that
+/// asks for it, with a cookie or not; the client sends one
+/// change_cipher_spec, before its second flight.
+#[test]
+fn groups() {
+    for (group, retry, cookie) in [
+        (X25519MLKEM768, None, None),
+        (X25519, None, None),
+        (X25519, Some(SECP256R1), None),
+        (X25519, Some(SECP256R1), Some(&b"\x01"[..])),
+    ] {
+        let mut script = Script::new(Kind::P256);
+        script.group = group;
+        script.retry_group = retry;
+        script.cookie = cookie;
+        let store = script.identity.store();
+        let mut server = Server::new(script);
+        let mut client = connect(&store, &mut server, HOST, &[], &mut whole()).unwrap();
+        assert!(client.connected() && server.finished);
+        assert_eq!(server.ccs, 1);
+        assert_eq!(server.hello.session, SESSION);
+        assert!(client.kem.is_none() && client.p256 == [0; 32]);
+        assert_eq!(client.write(b"x"), Ok(1));
+        assert_eq!(
+            exchange(&mut client, &mut server, &mut whole()),
+            Ok(Vec::new())
+        );
+        assert_eq!(server.received, b"x");
+    }
+    // The first ClientHello shares X25519MLKEM768's key and X25519's.
+    let store = Store::new();
+    let mut server = Server::new(Script::new(Kind::P256));
+    let client = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
+    server.receive(client.pending());
+    let shares = &server.hello.shares;
+    assert_eq!(shares.len(), 2);
+    assert_eq!(
+        (shares[0].0, shares[0].1.len()),
+        (X25519MLKEM768, 1184 + 32)
+    );
+    assert_eq!((shares[1].0, shares[1].1.len()), (X25519, 32));
+}
+
+/// A ServerHello whose key share is for a group without one, or after
+/// a retry for another than it asked, or of the wrong length, or a
+/// session ID that is not the client's.
+#[test]
+fn server_hello_refused() {
+    for (share, asked, session) in [
+        ("0017 0041", None, true),
+        ("001d 0020", Some("0017"), true),
+        ("11ec 0441", None, true),
+        ("001d 001f", None, true),
+        ("001d 0020", None, false),
+    ] {
+        let store = Store::new();
+        let mut client = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
+        client.sent(client.pending().len());
+        if let Some(group) = asked {
+            let mut all = hex("002b 0002 0304  0033 0002");
+            all.extend(hex(group));
+            let retry = hello_message(&HELLO_RETRY, &SESSION, &all);
+            let mut record = Vec::from([22, 3, 3]);
+            prefixed(&mut record, retry.len(), &retry);
+            assert_eq!(client.input(&record), Ok(record.len()));
+        }
+        let mut all = hex("002b 0002 0304  0033");
+        let mut entry = hex(share);
+        let length = usize::from(entry[2]) * 256 + usize::from(entry[3]);
+        entry.resize(4 + length, 9);
+        prefixed(&mut all, entry.len(), &entry);
+        let echo = if session { &SESSION[..] } else { &[][..] };
+        let hello = hello_message(&[0x7e; 32], echo, &all);
+        let mut record = Vec::from([22, 3, 3]);
+        prefixed(&mut record, hello.len(), &hello);
+        assert_eq!(client.input(&record), Err(Error::Parameter), "{share}");
+    }
+}
+
+/// Records that carry nothing, IDLE_MAX in a row, are taken; one more
+/// ends the connection. Data in between starts the count again.
+#[test]
+fn idle_records() {
+    let (result, got, _) = after(
+        |server| {
+            for round in 0..2 * IDLE_MAX {
+                server.send(APPLICATION, b"");
+                if round == IDLE_MAX - 1 {
+                    server.send(APPLICATION, b"!");
+                }
+            }
+        },
+        WHOLE,
+    );
+    assert_eq!((result, got), (None, Vec::from(*b"!")));
+    let (flooded, _, alerts) = after(
+        |server| {
+            for _ in 0..=IDLE_MAX {
+                server.send(HANDSHAKE, &[4, 0, 0, 0]);
+            }
+        },
+        WHOLE,
+    );
+    assert_eq!(flooded, Some(Error::Unexpected));
+    assert_eq!(alerts, [10]);
+}
+
 #[test]
 fn hello_retry() {
     let mut script = Script::new(Kind::P256);
@@ -1393,7 +1582,7 @@ fn retried(extensions: Vec<u8>, twice: bool) -> Option<Error> {
     let store = Store::new();
     let mut all = hex("002b 0002 0304");
     all.extend(extensions);
-    let retry = hello_message(&HELLO_RETRY, &all);
+    let retry = hello_message(&HELLO_RETRY, &SESSION, &all);
     let mut record = Vec::from([22, 3, 3]);
     prefixed(&mut record, retry.len(), &retry);
     let mut client = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
@@ -1409,17 +1598,15 @@ fn retried(extensions: Vec<u8>, twice: bool) -> Option<Error> {
     client.input(&record).err()
 }
 
-/// A group not offered, X25519's own, nothing to change, a cookie too
-/// long, and a second retry.
+/// P-256, with a cookie or not; a group not offered, one already shared,
+/// nothing to change, a cookie too long, and a second retry.
 #[test]
 fn hello_retry_refused() {
     for (extensions, twice, error) in [
-        (
-            "0033 0002 0017  002c 0003 0001 01",
-            false,
-            Some(Error::Group),
-        ),
-        ("0033 0002 0017", false, Some(Error::Group)),
+        ("0033 0002 0017  002c 0003 0001 01", false, None),
+        ("0033 0002 0017", false, None),
+        ("0033 0002 0018", false, Some(Error::Parameter)),
+        ("0033 0002 11ec", false, Some(Error::Parameter)),
         (
             "0033 0002 001d  002c 0003 0001 01",
             false,
@@ -1480,6 +1667,8 @@ fn encrypted_extensions() {
         ("0029 0002 0000", Some(Error::Extension)),
         ("0033 0000", Some(Error::Parameter)),
         ("0010", Some(Error::Decode)),
+        // Each extension once (4.2).
+        ("ff99 0000  ff99 0000", Some(Error::Decode)),
     ] {
         let mut script = Script::new(Kind::P256);
         script.extensions = hex(extensions);
@@ -1497,12 +1686,32 @@ fn encrypted_extensions() {
 #[test]
 fn certificate_request() {
     let mut script = Script::new(Kind::P384);
-    script.request = true;
+    // An empty context and signature_algorithms, as RFC 8446 4.3.2 asks.
+    script.request = Some(hex("00 0008 000d 0004 0002 0403"));
     let store = script.identity.store();
     let mut server = Server::new(script);
     let client = connect(&store, &mut server, HOST, &[], &mut whole()).unwrap();
     assert!(client.connected() && server.finished);
-    assert_eq!(server.certificate, Some(hex("0b000006 02c0de 000000")));
+    assert_eq!(server.certificate, Some(hex("0b000004 00 000000")));
+    for (request, error) in [
+        // A context, which only a request after the handshake has.
+        ("02 c0de 0008 000d 0004 0002 0403", Error::Parameter),
+        // No signature_algorithms.
+        ("00 0004 002f 0000", Error::Missing),
+        ("00 0000", Error::Missing),
+        // signature_algorithms twice.
+        (
+            "00 0010 000d 0004 0002 0403 000d 0004 0002 0403",
+            Error::Decode,
+        ),
+        ("00 0006 000d 0002 0000", Error::Decode),
+    ] {
+        let mut refused = Script::new(Kind::P384);
+        refused.request = Some(hex(request));
+        let (error_found, alerts) = outcome(refused, HOST, &[], TEST_NOW);
+        assert_eq!(error_found, Some(error), "{request}");
+        assert_eq!(alerts.len(), 1);
+    }
 }
 
 #[test]
@@ -1828,16 +2037,23 @@ fn version() {
 fn input_backpressure() {
     let store = Identity::new(Kind::P256).store();
     let (mut client, mut server) = connected(&store);
-    for _ in 0..RECORDS_PER_INPUT + 8 {
+    // As many empty records as are taken in a row (IDLE_MAX), then more
+    // after a byte of data.
+    assert!(RECORDS_PER_INPUT <= usize::from(IDLE_MAX));
+    for at in 0..RECORDS_PER_INPUT + 8 {
+        if at == RECORDS_PER_INPUT {
+            server.send(APPLICATION, b"!");
+        }
         server.send(APPLICATION, b"");
     }
     let empty = server.take();
-    let size = empty.len() / (RECORDS_PER_INPUT + 8);
+    let size = (empty.len() - 1) / (RECORDS_PER_INPUT + 9);
     assert_eq!(client.input(&empty), Ok(RECORDS_PER_INPUT * size));
-    assert_eq!(
-        client.input(&empty[RECORDS_PER_INPUT * size..]),
-        Ok(8 * size)
-    );
+    let rest = &empty[RECORDS_PER_INPUT * size..];
+    assert_eq!(client.input(rest), Ok(size + 1));
+    assert_eq!(client.read(), b"!");
+    client.consume(1);
+    assert_eq!(client.input(&rest[size + 1..]), Ok(8 * size));
     server.send(APPLICATION, b"first");
     server.send(APPLICATION, b"second");
     let bytes = server.take();
@@ -1957,7 +2173,10 @@ fn handshake(b: &mut Bencher) {
 /// included, and what is left once data both ways and a KeyUpdate are
 /// done.
 fn held(client: &Client<'_>) -> usize {
-    let context = client.context.as_ref().map_or(0, Vec::capacity);
+    let kem = client
+        .kem
+        .as_ref()
+        .map_or(0, |_| size_of::<mlkem::DecapsulationKey>());
     size_of::<Client<'_>>()
         + client.rx.capacity()
         + client.tx.capacity()
@@ -1965,14 +2184,14 @@ fn held(client: &Client<'_>) -> usize {
         + client.leaf.capacity()
         + client.offer.capacity()
         + client.host.capacity()
-        + context
+        + kem
 }
 
 #[test]
 fn memory() {
     let mut script = Script::new(Kind::RsaSha256);
     script.alpn = Some(b"h2");
-    script.request = true;
+    script.request = Some(hex("00 0008 000d 0004 0002 0403"));
     let store = script.identity.store();
     let mut server = Server::new(script);
     let mut split = Split { piece: 7, seed: 3 };

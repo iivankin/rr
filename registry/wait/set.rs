@@ -25,9 +25,9 @@
 //! ms unless the program asked for a finer one.
 //!
 //! A descriptor is in a Set once, and is removed before it is closed:
-//! close does both, and on Windows closes the socket once the system
-//! confirms that it holds nothing more of it, so that no report of it
-//! comes for the socket that takes its handle next. One closed first is
+//! close does both, so that nothing the system still holds of it is
+//! reported for the descriptor that takes its number next. One closed
+//! first is
 //! dropped by the system, and its entry stays, with its deadline, until
 //! it is removed or a new descriptor gets its number: that one is added
 //! as new, the old entry goes, and its token names nothing; what the
@@ -301,9 +301,8 @@ impl Set {
     }
 
     /// Removes the entry and closes its descriptor, which the caller
-    /// gives up: on Windows the socket stays open until the system
-    /// confirms its removal. False, and nothing closed, when the token
-    /// names no entry with a descriptor.
+    /// gives up. False, and nothing closed, when the token names no
+    /// entry with a descriptor.
     pub fn close(&mut self, token: Token) -> bool {
         let Some(slot) = self.slot_mut(token) else {
             return false;

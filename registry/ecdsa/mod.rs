@@ -1,31 +1,33 @@
-//! ECDSA signature verification on P-256 and P-384 (FIPS 186-4, SEC 1
-//! 4.1.4). Everything it reads is public: the key, the hash and the
+//! ECDSA signature verification on P-256, P-384 and P-521 (FIPS 186-4,
+//! SEC 1 4.1.4). Everything it reads is public: the key, the hash and the
 //! signature. So the arithmetic is not constant time, but every length
 //! an attacker picks is checked before it is used.
 //!
 //! Field elements are little-endian 64-bit limbs in Montgomery form,
 //! multiplied and reduced (Montgomery) against each modulus as a
-//! constant, so that the compiler unrolls four limbs for P-256 and six
-//! for P-384; P-256's reduction is shifts of its special prime. Points
-//! are Jacobian; u1 G + u2 Q is one run of doublings over both scalars
-//! in NAF, G's multiples a constant table.
+//! constant, so that the compiler unrolls four limbs for P-256, six for
+//! P-384 and nine for P-521. P-256's reduction is shifts of its special
+//! prime; P-521's p = 2^521 - 1 reduces by adding the bits past 521 to
+//! those below, with R = 1. Points are Jacobian; u1 G + u2 Q is one run
+//! of doublings over both scalars in NAF, G's multiples a constant table.
 
-/// Limbs of the widest number, P-384's.
-const LIMBS: usize = 6;
-/// The digits of a NAF of a scalar below 2^384, one more than its bits.
+/// Limbs of the widest number, P-521's.
+const LIMBS: usize = 9;
+/// The digits of a NAF of a scalar below 2^576, one more than its bits.
 const DIGITS: usize = 64 * LIMBS + 1;
 /// Odd multiples P, 3P, ..., 15P that a width-5 NAF picks from.
 const TABLE: usize = 8;
 /// The odd multiples of P-256's G, for width 7.
 const BASE_P256: usize = 32;
 
-/// A number below 2^384; P-256's use the low four limbs.
+/// A number below 2^576; P-256's use the low four limbs, P-384's six.
 type Fe = [u64; LIMBS];
 
 /// The curves this verifies on.
 pub enum Curve {
     P256,
     P384,
+    P521,
 }
 
 /// A modulus and what Montgomery multiplication by it needs.
@@ -46,6 +48,8 @@ struct Params {
     b: Fe,
     /// Bytes of a coordinate and of a scalar.
     bytes: usize,
+    /// Bits of the order n.
+    bits: usize,
 }
 
 /// A point (x, y) in Montgomery form.
@@ -71,6 +75,9 @@ const P256: Params = Params {
             0xffffffff00000001,
             0,
             0,
+            0,
+            0,
+            0,
         ],
         m0inv: 0x0000000000000001,
         rr: [
@@ -78,6 +85,9 @@ const P256: Params = Params {
             0xfffffffbffffffff,
             0xfffffffffffffffe,
             0x00000004fffffffd,
+            0,
+            0,
+            0,
             0,
             0,
         ],
@@ -90,6 +100,9 @@ const P256: Params = Params {
             0xffffffff00000000,
             0,
             0,
+            0,
+            0,
+            0,
         ],
         m0inv: 0xccd1c8aaee00bc4f,
         rr: [
@@ -97,6 +110,9 @@ const P256: Params = Params {
             0x4699799c49bd6fa6,
             0x2845b2392b6bec59,
             0x66e12d94f3d95620,
+            0,
+            0,
+            0,
             0,
             0,
         ],
@@ -108,8 +124,12 @@ const P256: Params = Params {
         0x5ac635d8aa3a93e7,
         0,
         0,
+        0,
+        0,
+        0,
     ],
     bytes: 32,
+    bits: 256,
 };
 
 const P384: Params = Params {
@@ -121,6 +141,9 @@ const P384: Params = Params {
             0xffffffffffffffff,
             0xffffffffffffffff,
             0xffffffffffffffff,
+            0,
+            0,
+            0,
         ],
         m0inv: 0x0000000100000001,
         rr: [
@@ -130,6 +153,9 @@ const P384: Params = Params {
             0x0000000200000000,
             0x0000000000000001,
             0x0000000000000000,
+            0,
+            0,
+            0,
         ],
     },
     n: Modulus {
@@ -140,6 +166,9 @@ const P384: Params = Params {
             0xffffffffffffffff,
             0xffffffffffffffff,
             0xffffffffffffffff,
+            0,
+            0,
+            0,
         ],
         m0inv: 0x6ed46089e88fdc45,
         rr: [
@@ -149,6 +178,9 @@ const P384: Params = Params {
             0xd40d49174aab1cc5,
             0x3fb05b7a28266895,
             0x0c84ee012b39bf21,
+            0,
+            0,
+            0,
         ],
     },
     b: [
@@ -158,14 +190,75 @@ const P384: Params = Params {
         0x181d9c6efe814112,
         0x988e056be3f82d19,
         0xb3312fa7e23ee7e4,
+        0,
+        0,
+        0,
     ],
     bytes: 48,
+    bits: 384,
+};
+
+const P521: Params = Params {
+    p: Modulus {
+        m: [
+            0xffffffffffffffff,
+            0xffffffffffffffff,
+            0xffffffffffffffff,
+            0xffffffffffffffff,
+            0xffffffffffffffff,
+            0xffffffffffffffff,
+            0xffffffffffffffff,
+            0xffffffffffffffff,
+            0x00000000000001ff,
+        ],
+        // Unused: P-521 reduces mod p by its shape, with R = 1.
+        m0inv: 0x0000000000000001,
+        rr: [0x0000000000000001, 0, 0, 0, 0, 0, 0, 0, 0],
+    },
+    n: Modulus {
+        m: [
+            0xbb6fb71e91386409,
+            0x3bb5c9b8899c47ae,
+            0x7fcc0148f709a5d0,
+            0x51868783bf2f966b,
+            0xfffffffffffffffa,
+            0xffffffffffffffff,
+            0xffffffffffffffff,
+            0xffffffffffffffff,
+            0x00000000000001ff,
+        ],
+        m0inv: 0x1d2f5ccd79a995c7,
+        rr: [
+            0x137cd04dcf15dd04,
+            0xf707badce5547ea3,
+            0x12a78d38794573ff,
+            0xd3721ef557f75e06,
+            0xdd6e23d82e49c7db,
+            0xcff3d142b7756e3e,
+            0x5bcc6d61a8e567bc,
+            0x2d8e03d1492d0d45,
+            0x000000000000003d,
+        ],
+    },
+    b: [
+        0xef451fd46b503f00,
+        0x3573df883d2c34f1,
+        0x1652c0bd3bb1bf07,
+        0x56193951ec7e937b,
+        0xb8b489918ef109e1,
+        0xa2da725b99b315f3,
+        0x929a21a0b68540ee,
+        0x953eb9618e1c9a1f,
+        0x0000000000000051,
+    ],
+    bytes: 66,
+    bits: 521,
 };
 
 // G, 3G, 5G, ... as affine x and y in Montgomery form: 32 of them for
 // P-256, whose u1 is in width-7 NAF, an addition per eight bits, and 8
-// for P-384, width 5. registry/ecdsa/ecdsa-gen.py in rr's repository writes
-// both, and the test constants recomputes them.
+// for P-384 and P-521, width 5. registry/ecdsa/ecdsa-gen.py in rr's
+// repository writes them, and the test constants recomputes them.
 
 #[rustfmt::skip]
 const P256_G: [[[u64; 4]; 2]; BASE_P256] = [
@@ -255,11 +348,41 @@ const P384_G: [[[u64; 6]; 2]; TABLE] = [
      [0x2309cc9d6fe989bb, 0x61609cbd144bd586, 0x4b23d3a0de06610c, 0xdddc2866d898f470, 0x8733fc41400c5797, 0x5a68c6fed0bc2716]],
 ];
 
+#[rustfmt::skip]
+const P521_G: [[[u64; 9]; 2]; TABLE] = [
+    [[0xf97e7e31c2e5bd66, 0x3348b3c1856a429b, 0xfe1dc127a2ffa8de, 0xa14b5e77efe75928, 0xf828af606b4d3dba, 0x9c648139053fb521, 0x9e3ecb662395b442, 0x858e06b70404e9cd, 0x00000000000000c6],
+     [0x88be94769fd16650, 0x353c7086a272c240, 0xc550b9013fad0761, 0x97ee72995ef42640, 0x17afbd17273e662c, 0x98f54449579b4468, 0x5c8a5fb42c7d1bd9, 0x39296a789a3bc004, 0x0000000000000118]],
+    [[0xa5919d2ede37ad7d, 0xaeb490862c32ea05, 0x1da6bd16b59fe21b, 0xad3f164a3a483205, 0xe5ad7a112d7a8dd1, 0xb52a6e5b123d9ab9, 0xd91d6a64b5959479, 0x3d352443de29195d, 0x00000000000001a7],
+     [0x5f588ca1ee86c0e5, 0xf105c9bc93a59042, 0x2d5aced1dec3c70c, 0x2e2dd4cf8dc575b0, 0xd2f8ab1fa355ceec, 0xf1557fa82a9d0317, 0x979f86c6cab814f2, 0x9b03b97dfa62ddd9, 0x000000000000013e]],
+    [[0xd5ab5096ec8f3078, 0x29d7e1e6d8931738, 0x7112feaf137e79a3, 0x383c0c6d5e301423, 0xcf03dab8f177ace4, 0x7a596efdb53f0d24, 0x3dbc3391c04eb0bf, 0x2bf3c52927a432c7, 0x0000000000000065],
+     [0x173cc3e8deb090cb, 0xd1f007257354f7f8, 0x311540211cf5ff79, 0xbb6897c9072cf374, 0xedd817c9a0347087, 0x1cd8fe8e872e0051, 0x8a2b73114a811291, 0xe6ef1bdd6601d6ec, 0x000000000000015b]],
+    [[0x01cead882816ecd4, 0x6f953f50fdc2619a, 0xc9a6df30dce3bbc4, 0x8c308d0abfc698d8, 0xf018d2c2f7114c5d, 0x5f22e0e8f5483228, 0xeeb65fda0b073a0c, 0xd5d1d99d5b7f6346, 0x0000000000000056],
+     [0x5c6b8bc90525251b, 0x9e76712a5ddefc7b, 0x9523a34591ce1a5f, 0x6bd0f293cdec9e2b, 0x71dbd98a26cbde55, 0xb5c582d02824f0dd, 0xd1d8317a39d68478, 0x2d1b7d9baaa2a110, 0x000000000000003d]],
+    [[0x1f45627967cbe207, 0x4f50babd85cd2866, 0xf3c556df725a318f, 0x7429e1396134da35, 0x2c4ab145b8c6b665, 0xed34541b98874699, 0xa2f5bf157156d488, 0x5389e359e1e21826, 0x0000000000000158],
+     [0x3aa0ea86b9ad2a4e, 0x736c2ae928880f34, 0x0ff56ecf4abfd87d, 0x0d69e5756057ac84, 0xc825ba263ddb446e, 0x3088a654ee1cebb6, 0x0b55557a27ae938e, 0x2e618c9a8aedf39f, 0x000000000000002a]],
+    [[0xecc0e02dda0cdb9a, 0x015c024fa4c9a902, 0xd19b1aebe3191085, 0xf3dbc5332663da1b, 0x43ef2c54f2991652, 0xed5dc7ed7c178495, 0x6f1a39573b4315cf, 0x75841259fdedff54, 0x000000000000008a],
+     [0x58874f92ce48c808, 0xdcac80e3f4819b5d, 0x3892331914a95336, 0x1bc8a90e8b42a4ab, 0xed2e95d4e0b9b82b, 0x3add566210bd0493, 0x9d0ca877054fb229, 0xfb303fcbba212984, 0x0000000000000096]],
+    [[0x1887848d32fbcda7, 0x4bec3b00ab38eff8, 0x3550a5e79ab88ee9, 0x32c45908e03c996a, 0x4eedd2beaf5b8661, 0x93f736cde1b4c238, 0xd7865d2b4924861a, 0x3e98f984c396ad9c, 0x000000000000007e],
+     [0x291a01fb022a71c9, 0x6199eaaf9117e9f7, 0x26dfdd351cbfbbc3, 0xc1bd5d5838bc763f, 0x9c7a67ae5c1e212a, 0xced50a386d5421c6, 0x1a1926daa3ed5a08, 0xee58eb6d781feda9, 0x0000000000000108]],
+    [[0xe9afe337bcb8db55, 0x9b8d96981e3f92bd, 0x7875bd1c8fc0331d, 0xb91cce27dbd00ffe, 0xd697b532df128e11, 0xb8fbcc30b40a0852, 0x41558fc546d4300f, 0x6ad89abcb92465f0, 0x000000000000006b],
+     [0x56343480a1475465, 0x46fd90cc446abdd9, 0x2148e2232c96c992, 0x7e9062c899470a80, 0x4b62106997485ed5, 0xdf0496a9bad20cba, 0x7ce64d2333edbf63, 0x68da271571391d6a, 0x00000000000001b4]],
+];
+
 impl Curve {
     fn params(&self) -> &'static Params {
         match self {
             Curve::P256 => &P256,
             Curve::P384 => &P384,
+            Curve::P521 => &P521,
+        }
+    }
+
+    /// The limbs of the curve's numbers, of the LIMBS of each Fe.
+    fn limbs(&self) -> usize {
+        match self {
+            Curve::P256 => 4,
+            Curve::P384 => 6,
+            Curve::P521 => 9,
         }
     }
 }
@@ -296,30 +419,27 @@ pub fn verify(curve: &Curve, public: &[u8], hash: &[u8], signature: &[u8]) -> bo
 /// byte; None unless the encoding is DER's one encoding of them (X.690
 /// 8.3 and 10.1), each at most bytes long, with nothing after.
 fn parse(signature: &[u8], bytes: usize) -> Option<(&[u8], &[u8])> {
-    let body = element(signature, 0x30)?;
-    if body.len() + 2 != signature.len() {
+    let (body, []) = element(signature, 0x30)? else {
         return None;
-    }
-    let r = element(body, 0x02)?;
-    let rest = body.get(r.len() + 2..)?;
-    let s = element(rest, 0x02)?;
-    if s.len() + 2 != rest.len() {
+    };
+    let (r, rest) = element(body, 0x02)?;
+    let (s, []) = element(rest, 0x02)? else {
         return None;
-    }
+    };
     Some((positive(r, bytes)?, positive(s, bytes)?))
 }
 
-/// The contents of the element of tag at the start of input. Contents
-/// of these two curves are under 128 bytes, so the length is one byte:
-/// a long form would be either not minimal or too long.
-fn element(input: &[u8], tag: u8) -> Option<&[u8]> {
-    let [found, length, rest @ ..] = input else {
-        return None;
+/// The contents of the element of tag at the start of input, and what
+/// follows it. Contents here are under 256 bytes: a length below 128 is
+/// one byte, and one from 128 is 81 and a byte; any other form is either
+/// not minimal or too long.
+fn element(input: &[u8], tag: u8) -> Option<(&[u8], &[u8])> {
+    let (length, rest) = match input {
+        [found, length, rest @ ..] if *found == tag && *length < 0x80 => (*length, rest),
+        [found, 0x81, length, rest @ ..] if *found == tag && *length >= 0x80 => (*length, rest),
+        _ => return None,
     };
-    if *found != tag || *length >= 0x80 {
-        return None;
-    }
-    rest.get(..usize::from(*length))
+    rest.split_at_checked(usize::from(length))
 }
 
 /// A positive INTEGER's magnitude, at most bytes long: no sign bit set,
@@ -378,23 +498,31 @@ fn public_point(curve: &Curve, public: &[u8]) -> Option<Affine> {
     Some(Affine { x, y })
 }
 
-/// The hash as a number mod n: its leftmost bits, as many as n has. Both
-/// orders fill whole bytes, so the cut is at a byte.
+/// The hash as a number mod n: its leftmost bits, as many as n has.
+/// P-521's order has a byte of one bit at the top, so a hash of its 66
+/// bytes or more is cut there and shifted down by the 7 bits past 521.
 fn truncated(curve: &Curve, hash: &[u8]) -> Fe {
     let params = curve.params();
-    let hash = hash.get(..params.bytes).unwrap_or(hash);
+    let (hash, excess) = match hash.get(..params.bytes) {
+        Some(head) => (head, 8 * params.bytes - params.bits),
+        None => (hash, 0),
+    };
     let mut e = [0; LIMBS];
     for (limb, chunk) in e.iter_mut().zip(hash.rchunks(8)) {
         *limb = chunk
             .iter()
             .fold(0, |acc, byte| (acc << 8) | u64::from(*byte));
     }
+    if excess > 0 {
+        // rr: escape(cast): excess is 7, P-521's 66 bytes less its 521 bits.
+        shift_right(&mut e, 0, excess as u32);
+    }
     // e < 2^bits < 2n: one subtraction reduces it.
     let (reduced, below) = sub_limbs(&e, &params.n.m);
     if below { e } else { reduced }
 }
 
-/// Big-endian bytes as limbs; None past 48 bytes.
+/// Big-endian bytes as limbs; None past 72 bytes.
 fn load(bytes: &[u8]) -> Option<Fe> {
     if bytes.len() > 8 * LIMBS {
         return None;
@@ -436,13 +564,15 @@ fn combine(curve: &Curve, k1: &Fe, q: &Affine, k2: &Fe, acc: &mut Point) {
     odd_multiples(curve, q, &mut table);
     let width = match curve {
         Curve::P256 => 7,
-        Curve::P384 => 5,
+        Curve::P384 | Curve::P521 => 5,
     };
+    let limbs = curve.limbs();
     let (mut d1, mut d2) = ([0; DIGITS], [0; DIGITS]);
-    naf(k1, width, &mut d1);
-    naf(k2, 5, &mut d2);
+    naf(k1, width, limbs, &mut d1);
+    naf(k2, 5, limbs, &mut d2);
     *acc = infinity();
-    for (g_digit, q_digit) in d1.iter().zip(&d2).rev() {
+    // A scalar of the curve's limbs has 64 limbs + 1 digits at most.
+    for (g_digit, q_digit) in d1.iter().zip(&d2).take(64 * limbs + 1).rev() {
         double(curve, acc);
         if *g_digit != 0 {
             let entry = base_multiple(curve, *g_digit);
@@ -463,11 +593,13 @@ fn base_multiple(curve: &Curve, digit: i8) -> Affine {
     };
     let coordinates: (&[u64], &[u64]) = match curve {
         // rr: escape(panic): naf's digits for G are odd and in [-63, 63]
-        // on P-256, [-15, 15] on P-384, so half the magnitude is below
+        // on P-256, [-15, 15] on P-384 and P-521, so half the magnitude is below
         // the table's length.
         Curve::P256 => (&P256_G[index][0], &P256_G[index][1]),
         // rr: escape(panic): as above.
         Curve::P384 => (&P384_G[index][0], &P384_G[index][1]),
+        // rr: escape(panic): as above.
+        Curve::P521 => (&P521_G[index][0], &P521_G[index][1]),
     };
     for (limb, word) in entry.x.iter_mut().zip(coordinates.0) {
         *limb = *word;
@@ -515,10 +647,11 @@ fn odd_multiples(curve: &Curve, p: &Affine, table: &mut [Point; TABLE]) {
     }
 }
 
-/// The NAF of k of a width up to 7, least significant digit first: each
-/// digit 0 or odd and below 2^(width - 1) in magnitude, and of any width
-/// in a row at most one is nonzero.
-fn naf(k: &Fe, width: u32, digits: &mut [i8; DIGITS]) {
+/// The NAF of k, of the given limbs, of a width up to 7, least
+/// significant digit first: each digit 0 or odd and below 2^(width - 1)
+/// in magnitude, and of any width in a row at most one is nonzero. The
+/// digits past 64 limbs + 1 are zero.
+fn naf(k: &Fe, width: u32, limbs: usize, digits: &mut [i8; DIGITS]) {
     // One limb more: rounding a digit up may carry past k's top.
     let mut rest = [0_u64; LIMBS + 1];
     for (limb, word) in rest.iter_mut().zip(k) {
@@ -526,7 +659,7 @@ fn naf(k: &Fe, width: u32, digits: &mut [i8; DIGITS]) {
     }
     let size = 1 << width;
     digits.fill(0);
-    for digit in digits.iter_mut() {
+    for digit in digits.iter_mut().take(64 * limbs + 1) {
         let low = rest[0] & (size - 1);
         if low & 1 == 1 {
             if low < size / 2 {
@@ -545,7 +678,8 @@ fn naf(k: &Fe, width: u32, digits: &mut [i8; DIGITS]) {
             }
         }
         let mut high = 0_u64;
-        for limb in rest.iter_mut().rev() {
+        // rr: escape(panic): limbs is at most LIMBS; the words above are 0.
+        for limb in rest[..=limbs].iter_mut().rev() {
             let next = *limb << 63;
             *limb = (*limb >> 1) | high;
             high = next;
@@ -704,7 +838,8 @@ fn add_affine(curve: &Curve, a: &mut Point, b: &Affine) {
 fn invert_scalar(curve: &Curve, s: &Fe) -> Fe {
     match curve {
         Curve::P256 => invert(&P256.n.m[..4], P256.n.m0inv, s),
-        Curve::P384 => invert(&P384.n.m, P384.n.m0inv, s),
+        Curve::P384 => invert(&P384.n.m[..6], P384.n.m0inv, s),
+        Curve::P521 => invert(&P521.n.m, P521.n.m0inv, s),
     }
 }
 
@@ -821,7 +956,8 @@ fn one(curve: &Curve) -> Fe {
 fn fmul(curve: &Curve, a: &Fe, b: &Fe) -> Fe {
     match curve {
         Curve::P256 => reduce_p256(&product(&a[..4], &b[..4])),
-        Curve::P384 => reduce(&P384.p.m, P384.p.m0inv, product(a, b)),
+        Curve::P384 => reduce(&P384.p.m[..6], P384.p.m0inv, product(&a[..6], &b[..6])),
+        Curve::P521 => reduce_p521(&product(a, b)),
     }
 }
 
@@ -830,7 +966,8 @@ fn fmul(curve: &Curve, a: &Fe, b: &Fe) -> Fe {
 fn fsqr(curve: &Curve, a: &Fe) -> Fe {
     match curve {
         Curve::P256 => reduce_p256(&square(&a[..4])),
-        Curve::P384 => reduce(&P384.p.m, P384.p.m0inv, square(a)),
+        Curve::P384 => reduce(&P384.p.m[..6], P384.p.m0inv, square(&a[..6])),
+        Curve::P521 => reduce_p521(&square(a)),
     }
 }
 
@@ -839,7 +976,8 @@ fn fsqr(curve: &Curve, a: &Fe) -> Fe {
 fn nmul(curve: &Curve, a: &Fe, b: &Fe) -> Fe {
     match curve {
         Curve::P256 => reduce(&P256.n.m[..4], P256.n.m0inv, product(&a[..4], &b[..4])),
-        Curve::P384 => reduce(&P384.n.m, P384.n.m0inv, product(a, b)),
+        Curve::P384 => reduce(&P384.n.m[..6], P384.n.m0inv, product(&a[..6], &b[..6])),
+        Curve::P521 => reduce(&P521.n.m, P521.n.m0inv, product(a, b)),
     }
 }
 
@@ -848,7 +986,8 @@ fn nmul(curve: &Curve, a: &Fe, b: &Fe) -> Fe {
 fn fadd(curve: &Curve, a: &Fe, b: &Fe) -> Fe {
     match curve {
         Curve::P256 => add_mod(&P256.p.m[..4], &a[..4], &b[..4]),
-        Curve::P384 => add_mod(&P384.p.m, a, b),
+        Curve::P384 => add_mod(&P384.p.m[..6], &a[..6], &b[..6]),
+        Curve::P521 => add_mod(&P521.p.m, a, b),
     }
 }
 
@@ -857,7 +996,8 @@ fn fadd(curve: &Curve, a: &Fe, b: &Fe) -> Fe {
 fn fsub(curve: &Curve, a: &Fe, b: &Fe) -> Fe {
     match curve {
         Curve::P256 => sub_mod(&P256.p.m[..4], &a[..4], &b[..4]),
-        Curve::P384 => sub_mod(&P384.p.m, a, b),
+        Curve::P384 => sub_mod(&P384.p.m[..6], &a[..6], &b[..6]),
+        Curve::P521 => sub_mod(&P521.p.m, a, b),
     }
 }
 
@@ -942,7 +1082,7 @@ fn reduce_p256(t: &[u64; 2 * LIMBS]) -> Fe {
     let ([t2, t3, t4, t5], over) = round_p256([t1, t2, t3, t4, t5], over);
     let ([t3, t4, t5, t6], over) = round_p256([t2, t3, t4, t5, t6], over);
     let ([t4, t5, t6, t7], over) = round_p256([t3, t4, t5, t6, t7], over);
-    let r = [t4, t5, t6, t7, 0, 0];
+    let r = [t4, t5, t6, t7, 0, 0, 0, 0, 0];
     let (reduced, below) = sub_limbs(&r, &P256.p.m[..4]);
     if over || !below { reduced } else { r }
 }
@@ -960,6 +1100,26 @@ fn round_p256(words: [u64; 5], over: bool) -> ([u64; 4], bool) {
     let (s4, o1) = w4.overflowing_add(c3);
     let (s4, o2) = s4.overflowing_add(u64::from(over));
     ([s1, s2, s3, s4], o1 | o2)
+}
+
+/// t mod P-521's p = 2^521 - 1, for t below p^2: 2^521 is 1 mod p, so
+/// t is its low 521 bits plus the rest shifted down, a sum below 2p that
+/// one subtraction brings below p. Its numbers are plain, as if R were 1,
+/// and its constants rr say so.
+#[inline(always)]
+fn reduce_p521(t: &[u64; 2 * LIMBS]) -> Fe {
+    let mut low = [0; LIMBS];
+    for (word, limb) in low.iter_mut().zip(t) {
+        *word = *limb;
+    }
+    low[LIMBS - 1] &= 0x1ff;
+    let mut high = [0; LIMBS];
+    for ((word, below), above) in high.iter_mut().zip(t.iter().skip(8)).zip(t.iter().skip(9)) {
+        *word = (below >> 9) | (above << 55);
+    }
+    let (sum, _) = add_limbs(&low, &high);
+    let (reduced, below) = sub_limbs(&sum, &P521.p.m);
+    if below { sum } else { reduced }
 }
 
 /// t / 2^(64 n) mod m for t below m 2^(64 n): n rounds that each add the
@@ -1048,12 +1208,12 @@ pub fn fuzz_verify(input: &[u8]) {
     let Some((&choice, rest)) = input.split_first() else {
         return;
     };
-    let curve = if choice & 1 == 0 {
-        Curve::P256
-    } else {
-        Curve::P384
+    let curve = match choice % 3 {
+        0 => Curve::P256,
+        1 => Curve::P384,
+        _ => Curve::P521,
     };
-    let split = usize::from(choice >> 1).min(rest.len());
+    let split = usize::from(choice / 3).min(rest.len());
     let (hash, rest) = rest.split_at(split);
     let half = rest.len() / 2;
     let (public, signature) = rest.split_at(half);
@@ -1071,17 +1231,22 @@ pub fn fuzz_verify(input: &[u8]) {
             encoded.extend_from_slice(integer);
         }
         let body = u8::try_from(encoded.len()).unwrap();
-        assert_eq!(rest.get(..2), Some(&[0x30, body][..]));
-        assert_eq!(rest.get(2..), Some(&encoded[..]));
+        let head: &[u8] = if body < 0x80 {
+            &[0x30, body]
+        } else {
+            &[0x30, 0x81, body]
+        };
+        assert_eq!(rest.get(..head.len()), Some(head));
+        assert_eq!(rest.get(head.len()..), Some(&encoded[..]));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        BASE_P256, Curve, Fe, LIMBS, P256, P384, TABLE, add, add_affine, add_mod, base_multiple,
-        combine, double, fmul, fsqr, infinity, invert_scalar, is_zero, nmul, product, public_point,
-        reduce, reduce_p256, sub_limbs, verify,
+        BASE_P256, Curve, Fe, LIMBS, P256, P384, P521, TABLE, add, add_affine, add_mod,
+        base_multiple, combine, double, fmul, fsqr, infinity, invert_scalar, is_zero, nmul,
+        product, public_point, reduce, reduce_p256, reduce_p521, square, sub_limbs, verify,
     };
     use alloc::vec::Vec;
     use test::Bencher;
@@ -1107,99 +1272,97 @@ mod tests {
     const SIG256: &str = "3045022100b292a619339f6e567a305c951c0dcbcc42d16e47f219f9e98e76e09d877\
                           0b34a02200177e60492c5a8242f76f07bfe3661bde59ec2a17ce5bd2dab2abebdf89a62e2";
 
-    /// Wycheproof's cases (C2SP/wycheproof testvectors_v1), each named
-    /// by file and tcId; the hash is that of the case's message.
+    /// Wycheproof's ECDSA cases with DER signatures (ecdsa-wycheproof.py):
+    /// each curve under its own hash, every case, and a hash longer and
+    /// shorter than the order. Valid ones verify, the rest do not.
     #[test]
     fn wycheproof() {
-        let key384 = "0429bdb76d5fa741bfd70233cb3a66cc7d44beb3b0663d92a8136650478bcefb61\
-                      ef182e155a54345a5e8e5e88f064e5bc9a525ab7f764dad3dae1468c2b419f3b62b9\
-                      ba917d5e8c4fb1ec47404a3fc76474b2713081be9db4c00e043ada9fc4a3";
-        let large256 = "040ad99500288d466940031d72a9f5445a4d43784640855bf0a69874d2de5fe103\
-                        c5011e6ef2c42dcd50d5d3d29f99ae6eba2c80c9244f4c5422f0979ff0c3ba5e";
-        let large384 = "044bf4e52f958427ebb5915fb8c9595551b4d3a3fdab67badd9d6c3093f425ba43\
-                        630df71f42f0eb7ceaa94d9f6448a85dd30331588249fd2fdc0b309ec7ed8481bc16\
-                        f27800c13d7db700fc82e1b1c8545aa0c0d3b56e3bfe789fc18a916887c2";
-        let hash_large256 = "bb5a52f42f9c9261ed4361f59422a1e30036e7c32b270c8807a419feca605023";
-        let hash_large384 = "f9b127f0d81ebcd17b7ba0ea131c660d340b05ce557c82160e0f793de07d3817\
-                             9023942871acb7002dfafdfffc8deace";
-        for (curve, key, hash, signature, valid) in [
-            // secp256r1_sha256 1.
-            (Curve::P256, KEY256, EMPTY256, SIG256, true),
-            // secp256r1_sha512 1: a 64-byte hash, cut to 32.
-            (
-                Curve::P256,
-                KEY256,
-                "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce\
-                 47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e",
-                "30440220093f3825c0cf820cced816a3a67446c85606a6d529e43857643fccc11e1f\
-                 705f0220769782888c63058630f97a5891c8700e82979e4f233586bfc5042fa73cb70a4e",
-                true,
-            ),
-            // secp384r1_sha384 1.
-            (
-                Curve::P384,
-                key384,
-                "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da\
-                 274edebfe76f65fbd51ad2f14898b95b",
-                "3064023032401249714e9091f05a5e109d5c1216fdc05e98614261aa0dbd9e9cd441\
-                 5dee29238afbd3b103c1e40ee5c9144aee0f02304326756fb2c4fd726360dd6479b5\
-                 849478c7a9d054a833a58c1631c33b63c3441336ddf2c7fe0ed129aae6d4ddfeb753",
-                true,
-            ),
-            // secp384r1_sha256 1: a hash shorter than the order.
-            (
-                Curve::P384,
-                key384,
-                EMPTY256,
-                "3065023100d670d637fcb2da85a22f74ac92939ee2ee5e7d1bb8d6d0afd6f1ef0f88\
-                 3a43872ba285430d4df43f93784e1cd6e6f63702303774da5d699f6bd62b329376e3\
-                 b6d3612abc67cb945a109d506d3fde45f4c33893c4428250ef6ccfd6e417400344eabb",
-                true,
-            ),
-            // secp256r1_sha256 350: x of k G is past n, and r is x - n.
-            (
-                Curve::P256,
-                large256,
-                hash_large256,
-                "303502104319055358e8617b0c46353d039cdaab022100ffffffff00000000ffff\
-                 ffffffffffffbce6faada7179e84f3b9cac2fc63254e",
-                true,
-            ),
-            // secp256r1_sha256 351: the same with r = x, not below n.
-            (
-                Curve::P256,
-                large256,
-                hash_large256,
-                "3046022100ffffffff00000001000000000000000000000000ffffffffffffffff\
-                 fffffffc022100ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9\
-                 cac2fc63254e",
-                false,
-            ),
-            // secp384r1_sha384 382 and 383, the same on P-384.
-            (
-                Curve::P384,
-                large384,
-                hash_large384,
-                "304d0218389cb27e0bc8d21fa7e5f24cb74f58851313e696333ad68b023100ffff\
-                 ffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0d\
-                 b248b0a77aecec196accc52970",
-                true,
-            ),
-            (
-                Curve::P384,
-                large384,
-                hash_large384,
-                "3066023100ffffffffffffffffffffffffffffffffffffffffffffffffffffffff\
-                 fffffffeffffffff0000000000000000fffffffe023100ffffffffffffffffffff\
-                 ffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec19\
-                 6accc52970",
-                false,
-            ),
+        let (mut keys, mut hashes) = (Vec::new(), Vec::new());
+        let mut cases = [0; 3];
+        for line in include_str!("ecdsa-wycheproof.txt").lines() {
+            if line.starts_with('#') {
+                continue;
+            }
+            let mut fields = [""; 7];
+            let mut words = line.split(' ');
+            for (slot, word) in fields.iter_mut().zip(&mut words) {
+                *slot = word;
+            }
+            assert!(words.next().is_none(), "{line}");
+            match fields {
+                ["key", _, point, "", "", "", ""] => keys.push(hex(point)),
+                ["hash", _, digest, "", "", "", ""] => hashes.push(hex(digest)),
+                ["sig", bits, key, hash, id, valid, signature] => {
+                    let (curve, count) = match bits {
+                        "256" => (Curve::P256, &mut cases[0]),
+                        "384" => (Curve::P384, &mut cases[1]),
+                        _ => (Curve::P521, &mut cases[2]),
+                    };
+                    *count += 1;
+                    let key = &keys[key.parse::<usize>().unwrap()];
+                    let hash = &hashes[hash.parse::<usize>().unwrap()];
+                    let signature = if signature == "-" {
+                        Vec::new()
+                    } else {
+                        hex(signature)
+                    };
+                    let verified = verify(&curve, key, hash, &signature);
+                    assert_eq!(verified, valid == "1", "{bits} tcId {id}");
+                }
+                _ => panic!("{line}"),
+            }
+        }
+        assert_eq!(cases, [727, 666, 542]);
+    }
+
+    /// Wycheproof's first valid P-521 case: SHA-512 of the empty message,
+    /// and a signature whose SEQUENCE is over 127 bytes, so of DER's long
+    /// form of length.
+    const KEY521: &str = "04012a908bfc5b70e17bdfae74294994808bf2a42dab59af8b0523a026d640a2a3d6\
+                          d344520b62177e2cfa339ca42fb0883ec425904fbda2833a3b5b0a9a00811365d801\
+                          2333d532f8f8eb1a623c378a3694651192bbda833e3b8d7b8f90b2bfc9b045f8a55e\
+                          1b6a5fe1512c400c4bc9c86fd7c699d642f5cee9bb827c8b0abc0da01cef1e";
+    const EMPTY512: &str = "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce\
+                            47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e";
+    const SIG521: &str = "308188024201625d6115092a8e2ee21b9f8a425aa73814dec8b2335e86150ab4229f\
+                          5a3421d2e6256d632c7a4365a1ee01dd2a936921bbb4551a512d1d4b5a56c314e4a0\
+                          2534c5024201b792d23f2649862595451055777bda1b02dc6cc8fef23231e44b921b\
+                          16155cd42257441d75a790371e91819f0a9b1fd0ebd02c90b5b774527746ed9bfe74\
+                          3dbe2f";
+
+    /// P-521's length and hash: the long form only where it is minimal,
+    /// and a hash of 66 bytes or more cut to its leftmost 521 bits, so
+    /// that the SHA-512 digest moved up by the bits past them verifies.
+    #[test]
+    fn p521() {
+        let (key, hash, signature) = (hex(KEY521), hex(EMPTY512), hex(SIG521));
+        assert!(verify(&Curve::P521, &key, &hash, &signature));
+        assert!(!verify(&Curve::P384, &key, &hash, &signature));
+        let body = &signature[3..];
+        for bad in [
+            der(&[0x30, 0x82, 0, 0x88], &[body]),
+            der(&[0x30, 0x88], &[body]),
+            der(&[0x30, 0x81, 0x89], &[body, &[0]]),
         ] {
-            assert_eq!(
-                verify(&curve, &hex(key), &hex(hash), &hex(signature)),
-                valid
-            );
+            assert!(!verify(&Curve::P521, &key, &hash, &bad));
+        }
+        let mut moved = Vec::new();
+        for length in [66, 67, 80] {
+            // The digest times 2^(8 length - 521), in length bytes.
+            let shift = 8 * length - 521;
+            moved.clear();
+            moved.resize(length, 0);
+            let end = length - shift / 8;
+            moved[end - hash.len()..end].copy_from_slice(&hash);
+            let mut carry = 0;
+            for byte in moved.iter_mut().rev() {
+                let wide = (u16::from(*byte) << (shift % 8)) | carry;
+                *byte = u8::try_from(wide & 0xff).unwrap();
+                carry = wide >> 8;
+            }
+            assert!(verify(&Curve::P521, &key, &moved, &signature));
+            moved[0] ^= 0x80;
+            assert!(!verify(&Curve::P521, &key, &moved, &signature));
         }
     }
 
@@ -1273,16 +1436,22 @@ mod tests {
             0x77037d812deb33a0,
             0xf8bce6e563a440f2,
             0x6b17d1f2e12c4247,
-            0,
-            0,
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
         ],
         [
             0xcbb6406837bf51f5,
             0x2bce33576b315ece,
             0x8ee7eb4a7c0f9e16,
             0x4fe342e2fe1a7f9b,
-            0,
-            0,
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
         ],
     ];
     const G384: [Fe; 2] = [
@@ -1293,6 +1462,9 @@ mod tests {
             0x6e1d3b628ba79b98,
             0x8eb1c71ef320ad74,
             0xaa87ca22be8b0537,
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
         ],
         [
             0x7a431d7c90ea0e5f,
@@ -1301,6 +1473,33 @@ mod tests {
             0xf8f41dbd289a147c,
             0x5d9e98bf9292dc29,
             0x3617de4a96262c6f,
+            0x0000000000000000,
+            0x0000000000000000,
+            0x0000000000000000,
+        ],
+    ];
+    const G521: [Fe; 2] = [
+        [
+            0xf97e7e31c2e5bd66,
+            0x3348b3c1856a429b,
+            0xfe1dc127a2ffa8de,
+            0xa14b5e77efe75928,
+            0xf828af606b4d3dba,
+            0x9c648139053fb521,
+            0x9e3ecb662395b442,
+            0x858e06b70404e9cd,
+            0x00000000000000c6,
+        ],
+        [
+            0x88be94769fd16650,
+            0x353c7086a272c240,
+            0xc550b9013fad0761,
+            0x97ee72995ef42640,
+            0x17afbd17273e662c,
+            0x98f54449579b4468,
+            0x5c8a5fb42c7d1bd9,
+            0x39296a789a3bc004,
+            0x0000000000000118,
         ],
     ];
 
@@ -1309,27 +1508,33 @@ mod tests {
     #[test]
     fn constants() {
         let mut key = Vec::new();
-        for (curve, params, limbs, base, count) in [
-            (Curve::P256, &P256, 4, G256, BASE_P256),
-            (Curve::P384, &P384, 6, G384, TABLE),
+        // P-521's p has R = 1: its products are reduced by its shape.
+        for (curve, params, limbs, r_bits, base, count) in [
+            (Curve::P256, &P256, 4, 256, G256, BASE_P256),
+            (Curve::P384, &P384, 6, 384, G384, TABLE),
+            (Curve::P521, &P521, 9, 0, G521, TABLE),
         ] {
-            for modulus in [&params.p, &params.n] {
+            for (modulus, bits) in [(&params.p, r_bits), (&params.n, 64 * limbs)] {
                 assert_eq!(modulus.m[0].wrapping_mul(modulus.m0inv), u64::MAX);
                 let mut rr = [0; LIMBS];
                 rr[0] = 1;
-                for _ in 0..2 * 64 * limbs {
+                for _ in 0..2 * bits {
                     rr = add_mod(&modulus.m[..limbs], &rr[..limbs], &rr[..limbs]);
                 }
                 assert_eq!(rr, modulus.rr);
             }
             // The table's (x, y) is the Jacobian (X, Y, Z) that adding G
-            // gives when x Z^2 = X and y Z^3 = Y.
+            // gives when x Z^2 = X and y Z^3 = Y. Each coordinate goes in
+            // its curve's bytes: P-521's 66 of 9 limbs.
             key.clear();
             key.push(4);
+            let skip = 8 * limbs - params.bytes;
             for coordinate in base {
                 for limb in coordinate.iter().take(limbs).rev() {
                     key.extend_from_slice(&limb.to_be_bytes());
                 }
+                let start = key.len() - params.bytes - skip;
+                key.drain(start..start + skip);
             }
             let g = public_point(&curve, &key).unwrap();
             // G added to infinity is G.
@@ -1359,15 +1564,24 @@ mod tests {
         }
     }
 
-    /// The P-256 reduction agrees with the generic one, up to (p - 1)^2,
-    /// and squares agree with products on both curves.
+    /// The P-256 reduction agrees with the generic one, up to (p - 1)^2;
+    /// P-521's gives (p - 1)^2 = 1 and (p - 1) 1 = p - 1; and squares
+    /// agree with products on each curve.
     #[test]
     fn reductions() {
+        let mut minus_one = P521.p.m;
+        minus_one[0] -= 1;
+        let mut one = [0; LIMBS];
+        one[0] = 1;
+        assert_eq!(reduce_p521(&product(&minus_one, &minus_one)), one);
+        assert_eq!(reduce_p521(&square(&minus_one)), one);
+        assert_eq!(reduce_p521(&product(&minus_one, &one)), minus_one);
+        assert_eq!(reduce_p521(&product(&one, &[0; LIMBS])), [0; LIMBS]);
         let mut top = P256.p.m;
         top[0] -= 1;
         let mut a = P256.b;
         for _ in 0..1000 {
-            for b in [a, top, G256[0], [1, 0, 0, 0, 0, 0], [0; LIMBS]] {
+            for b in [a, top, G256[0], [1, 0, 0, 0, 0, 0, 0, 0, 0], [0; LIMBS]] {
                 let t = product(&a[..4], &b[..4]);
                 assert_eq!(reduce_p256(&t), reduce(&P256.p.m[..4], 1, t));
                 assert_eq!(fsqr(&Curve::P256, &b), fmul(&Curve::P256, &b, &b));
@@ -1376,14 +1590,16 @@ mod tests {
         }
         let t = product(&top[..4], &top[..4]);
         assert_eq!(reduce_p256(&t), reduce(&P256.p.m[..4], 1, t));
-        top = P384.p.m;
-        top[0] -= 1;
-        a = P384.b;
-        for _ in 0..1000 {
-            for b in [a, top] {
-                assert_eq!(fsqr(&Curve::P384, &b), fmul(&Curve::P384, &b, &b));
+        for (curve, params, x) in [(Curve::P384, &P384, G384[0]), (Curve::P521, &P521, G521[0])] {
+            top = params.p.m;
+            top[0] -= 1;
+            a = params.b;
+            for _ in 0..1000 {
+                for b in [a, top] {
+                    assert_eq!(fsqr(&curve, &b), fmul(&curve, &b, &b));
+                }
+                a = fmul(&curve, &a, &x);
             }
-            a = fmul(&Curve::P384, &a, &G384[0]);
         }
     }
 
@@ -1393,7 +1609,11 @@ mod tests {
     fn scalar_inverse() {
         let mut one = [0; LIMBS];
         one[0] = 1;
-        for (curve, params) in [(Curve::P256, &P256), (Curve::P384, &P384)] {
+        for (curve, params) in [
+            (Curve::P256, &P256),
+            (Curve::P384, &P384),
+            (Curve::P521, &P521),
+        ] {
             let (top, _) = sub_limbs(&params.n.m, &one);
             let mut s = params.n.rr;
             let mut power = one;
@@ -1414,6 +1634,13 @@ mod tests {
     fn verify_p256(b: &mut Bencher) {
         let (key, hash, signature) = (hex(KEY256), hex(EMPTY256), hex(SIG256));
         b.iter(|| verify(&Curve::P256, &key, &hash, &signature));
+    }
+
+    /// One P-521 verification.
+    #[bench]
+    fn verify_p521(b: &mut Bencher) {
+        let (key, hash, signature) = (hex(KEY521), hex(EMPTY512), hex(SIG521));
+        b.iter(|| verify(&Curve::P521, &key, &hash, &signature));
     }
 
     /// One P-384 verification.

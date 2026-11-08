@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""Generates the base-point tables P256_G and P384_G of ecdsa/mod.rs.
+"""Generates the base-point tables P256_G, P384_G and P521_G of
+ecdsa/mod.rs.
 
 Each table lists G, 3G, 5G, ... as affine (x, y), each coordinate in
-Montgomery form (times R = 2^(64 limbs) mod p) as little-endian 64-bit
-limbs: 32 points for P-256 (u1 in width-7 NAF), 8 for P-384 (width 5).
-The curve constants are FIPS 186-4's. Each coordinate is one line, under
-#[rustfmt::skip]: rr fmt would put each limb on a line of its own.
+Montgomery form (times R = 2^(64 limbs) mod p; R is 1 on P-521, whose
+products ecdsa reduces by the shape of p) as little-endian 64-bit
+limbs: 32 points for P-256 (u1 in width-7 NAF), 8 for P-384 and P-521
+(width 5). The curve constants are FIPS 186-4's. Each coordinate is one
+line, under #[rustfmt::skip]: rr fmt would put each limb on a line of
+its own.
 
     python3 registry/ecdsa/ecdsa-gen.py                          # print them
     python3 registry/ecdsa/ecdsa-gen.py --write registry/ecdsa/mod.rs
     python3 registry/ecdsa/ecdsa-gen.py --check registry/ecdsa/mod.rs
 
---write replaces the two tables in the file, from the #[rustfmt::skip]
-of P256_G to the "];" closing P384_G; then run the tests: ecdsa's test
+--write replaces the three tables in the file, from the #[rustfmt::skip]
+of P256_G to the "];" closing P521_G; then run the tests: ecdsa's test
 constants recomputes every entry. --check compares instead and exits 1
 if they differ. rr add does not copy this script: ecdsa.json
 does not list it.
@@ -44,6 +47,19 @@ CURVES = [
         * 2**128
         + 0x0A60B1CE1D7E819D7A431D7C90EA0E5F,
     ),
+    (
+        "P521",
+        9,
+        8,
+        "TABLE",
+        2**521 - 1,
+        0x00C6858E06B70404E9CD9E3ECB662395B4429C648139053FB521F828AF606B4D3DBA
+        * 2**256
+        + 0xA14B5E77EFE75928FE1DC127A2FFA8DE3348B3C1856A429BF97E7E31C2E5BD66,
+        0x011839296A789A3BC0045C8A5FB42C7D1BD998F54449579B446817AFBD17273E662C
+        * 2**256
+        + 0x97EE72995EF42640C550B9013FAD0761353C7086A272C24088BE94769FD16650,
+    ),
 ]
 
 
@@ -62,7 +78,8 @@ def limbs(value, count):
 
 
 def table(name, count, entries, length, p, gx, gy):
-    r = 2 ** (64 * count)
+    # P-521 reduces mod p by its shape, without Montgomery's R: R is 1.
+    r = 1 if name == "P521" else 2 ** (64 * count)
     lines = ["#[rustfmt::skip]", "const %s_G: [[[u64; %d]; 2]; %s] = [" % (name, count, length)]
     g = (gx, gy)
     twice = add(g, g, p)
@@ -77,11 +94,11 @@ def table(name, count, entries, length, p, gx, gy):
 
 
 def span(text):
-    """Where the two tables are, old layout or new."""
+    """Where the tables are, from P256_G to the end of P521_G."""
     first = text.index("const P256_G")
     if text[:first].endswith("#[rustfmt::skip]\n"):
         first -= len("#[rustfmt::skip]\n")
-    return first, text.index("];\n", text.index("const P384_G")) + 3
+    return first, text.index("];\n", text.index("const P521_G")) + 3
 
 
 def main():

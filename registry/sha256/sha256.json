@@ -11,6 +11,9 @@
     },
     {
       "path": "sys.rs"
+    },
+    {
+      "path": "sha256-wycheproof.txt"
     }
   ]
 }

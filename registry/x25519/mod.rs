@@ -380,6 +380,40 @@ mod tests {
         assert_eq!(shared(&alice, &order8), None);
     }
 
+    /// The 4 fields of a case's line, split at spaces.
+    fn fields(line: &str) -> [&str; 4] {
+        let mut out = [""; 4];
+        let mut words = line.split(' ');
+        for slot in &mut out {
+            *slot = words.next().unwrap();
+        }
+        assert!(words.next().is_none(), "{line}");
+        out
+    }
+
+    /// Wycheproof's x25519_test, every case (x25519-wycheproof.py): the
+    /// shared secret, twists and non-canonical points included, or None
+    /// for the low-order points, whose secret is zero.
+    #[test]
+    fn wycheproof() {
+        let mut cases = 0;
+        for line in include_str!("x25519-wycheproof.txt").lines() {
+            if line.starts_with('#') {
+                continue;
+            }
+            let [id, secret, peer, out] = fields(line);
+            let out = hex(out);
+            let expected = if out == [0; KEY_BYTES] {
+                None
+            } else {
+                Some(out)
+            };
+            assert_eq!(shared(&hex(secret), &hex(peer)), expected, "tcId {id}");
+            cases += 1;
+        }
+        assert_eq!(cases, 518);
+    }
+
     /// One key agreement.
     #[bench]
     fn one_shared(b: &mut Bencher) {

@@ -422,6 +422,85 @@ mod tests {
         }
     }
 
+    /// The 7 fields of a case's line, split at spaces.
+    fn fields(line: &str) -> [&str; 7] {
+        let mut out = [""; 7];
+        let mut words = line.split(' ');
+        for slot in &mut out {
+            *slot = words.next().unwrap();
+        }
+        assert!(words.next().is_none(), "{line}");
+        out
+    }
+
+    /// A key of a block is used as it is, one byte longer is hashed first;
+    /// the MACs are Python's hmac module's.
+    #[test]
+    fn hmac_block_keys() {
+        let mut key = [0; BLOCK_BYTES + 1];
+        for (byte, value) in key.iter_mut().zip(0..) {
+            *byte = value;
+        }
+        for (length, expected) in [
+            (
+                BLOCK_BYTES - 1,
+                "05b4c37caeb9f29609dfc1434f265560dd90c1487991f4b447e68e40722ff2c6",
+            ),
+            (
+                BLOCK_BYTES,
+                "bce37f45655b63e30db834ef4db42ca0baa5bc2f6fc93b46a15a029aede10477",
+            ),
+            (
+                BLOCK_BYTES + 1,
+                "da82063dff087119d9d8411e923b4aac10e89a3e5f8711fbaa6575ac8d8ab24f",
+            ),
+        ] {
+            let mut hmac = Hmac::new(&key[..length]);
+            hmac.update(b"a key of a block");
+            assert_eq!(hmac.finish()[..], hex(expected)[..], "key of {length}");
+        }
+    }
+
+    /// Wycheproof's hmac_sha256_test and hkdf_sha256_test, every case
+    /// (sha256-wycheproof.py): a MAC whose first tag bytes match exactly
+    /// when the case is valid, and HKDF's output, or a refusal past 255
+    /// blocks.
+    #[test]
+    fn wycheproof() {
+        let field = |text: &str| if text == "-" { Vec::new() } else { hex(text) };
+        let (mut macs, mut keys) = (0, 0);
+        let mut out = Vec::new();
+        for line in include_str!("sha256-wycheproof.txt").lines() {
+            if line.starts_with('#') {
+                continue;
+            }
+            match fields(line) {
+                ["hmac", id, valid, size, key, message, tag] => {
+                    let size: usize = size.parse().unwrap();
+                    let mut hmac = Hmac::new(&field(key));
+                    hmac.update(&field(message));
+                    let matches = hmac.finish()[..size] == field(tag)[..];
+                    assert_eq!(matches, valid == "1", "hmac tcId {id}");
+                    macs += 1;
+                }
+                ["hkdf", id, input, salt, info, size, okm] => {
+                    let key = hkdf_extract(&field(salt), &field(input));
+                    out.clear();
+                    out.resize(size.parse().unwrap(), 0);
+                    let expected = field(okm);
+                    let done = hkdf_expand(&key, &field(info), &mut out);
+                    assert_eq!(done, !expected.is_empty(), "hkdf tcId {id}");
+                    if done {
+                        assert_eq!(out, expected, "hkdf tcId {id}");
+                    }
+                    keys += 1;
+                }
+                _ => panic!("{line}"),
+            }
+        }
+        assert_eq!((macs, keys), (174, 86));
+    }
+
     /// RFC 5869's cases 1 to 3: two and three output blocks, a long salt
     /// and info, and none at all.
     #[test]

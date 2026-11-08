@@ -3,7 +3,8 @@
 //! reads and writes what the system takes now, without blocking. The
 //! loop waits for them in a wait Set: watch puts a socket in it with an
 //! interest and a key, close hands it to the Set, which takes it out and
-//! closes it (on Windows once the system holds nothing more of it). A
+//! closes it, so that nothing the system still holds of it is reported
+//! for the socket that takes its number next. A
 //! socket dropped without close is closed all the same, and the system
 //! stops watching it; its entry in the Set stays until a new socket
 //! takes its number, so a loop closes with close. Small writes go at

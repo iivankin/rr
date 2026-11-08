@@ -1,6 +1,6 @@
 {
   "name": "x509",
-  "description": "X.509 (RFC 5280) for TLS server authentication without I/O: a strict DER parser that borrows the certificate, a store of trust anchors from PEM or DER, and chain verification for a host at a given time, with paths built through intermediates in any order, name constraints as Go enforces them, bounded depth and signature checks, and the leaf's key for TLS 1.3's CertificateVerify.",
+  "description": "X.509 (RFC 5280) for TLS server authentication without I/O: a strict DER parser that borrows the certificate, a store of trust anchors from PEM or DER, and chain verification for a host at a given time, with paths built through intermediates in any order, name constraints as Go enforces them, bounded depth and signature checks (ECDSA P-256, P-384, P-521; RSA PKCS #1 and PSS; SHA-256, SHA-384, SHA-512), anyExtendedKeyUsage honoured on a leaf only, and the leaf's key for TLS 1.3's CertificateVerify.",
   "rr": "0.5.2",
   "dependencies": [
     "sha256",

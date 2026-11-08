@@ -757,6 +757,50 @@ mod tests {
         }
     }
 
+    /// The 8 fields of a case's line, split at spaces.
+    fn fields(line: &str) -> [&str; 8] {
+        let mut out = [""; 8];
+        let mut words = line.split(' ');
+        for slot in &mut out {
+            *slot = words.next().unwrap();
+        }
+        assert!(words.next().is_none(), "{line}");
+        out
+    }
+
+    /// Wycheproof's aes_gcm_test, the cases of a 128-bit key, a 96-bit
+    /// nonce and a 128-bit tag (aesgcm-wycheproof.py), on both paths: a
+    /// valid one seals to its ciphertext and tag and opens back; an
+    /// invalid one is refused and leaves the ciphertext.
+    #[test]
+    fn wycheproof() {
+        let field = |text: &str| if text == "-" { Vec::new() } else { unhex(text) };
+        let mut cases = 0;
+        for line in include_str!("aesgcm-wycheproof.txt").lines() {
+            if line.starts_with('#') {
+                continue;
+            }
+            let [id, valid, k, nonce, aad, pt, ct, tag] = fields(line);
+            let nonce: [u8; 12] = unhex(nonce).try_into().unwrap();
+            let tag: [u8; 16] = unhex(tag).try_into().unwrap();
+            let aad = field(aad);
+            for g in both(k) {
+                if valid == "1" {
+                    let mut data = field(pt);
+                    let sealed = g.seal(&nonce, &aad, &mut data).unwrap();
+                    assert_eq!((data, sealed), (field(ct), tag), "tcId {id}");
+                }
+                let mut data = field(ct);
+                let opened = g.open(&nonce, &aad, &mut data, &tag);
+                assert_eq!(opened.is_ok(), valid == "1", "tcId {id}");
+                let expected = if valid == "1" { field(pt) } else { field(ct) };
+                assert_eq!(data, expected, "tcId {id}");
+            }
+            cases += 1;
+        }
+        assert_eq!(cases, 67);
+    }
+
     /// A changed tag, ciphertext, AAD or nonce is refused, and the data is
     /// left the ciphertext it came as.
     #[test]

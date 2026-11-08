@@ -62,9 +62,8 @@ impl Socket {
         self.entry.map(|(token, _)| token)
     }
 
-    /// Hands the socket to its Set, which takes it out and closes it
-    /// (on Windows once the system has nothing more of it); one in no Set
-    /// drop closes.
+    /// Hands the socket to its Set, which takes it out and closes it; one
+    /// in no Set drop closes.
     fn close(&mut self, set: &mut Set) {
         if let Some((token, _)) = self.entry.take() {
             self.open = !set.close(token);

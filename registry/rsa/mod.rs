@@ -1,6 +1,7 @@
 //! RSA signature verification (RFC 8017): RSASSA-PKCS1-v1_5, which
 //! certificates use, and RSASSA-PSS with MGF1 and a salt as long as the
-//! hash, which TLS 1.3's CertificateVerify uses (RFC 8446 4.2.3).
+//! hash, which TLS 1.3's CertificateVerify uses (RFC 8446 4.2.3); with
+//! SHA-256, SHA-384 or SHA-512, as the Web PKI allows.
 //!
 //! The key, the digest and the signature are public, so the arithmetic
 //! is not constant time; what an attacker controls is bounded instead:
@@ -16,6 +17,7 @@ use crate::base::sha384;
 pub enum Hash {
     Sha256,
     Sha384,
+    Sha512,
 }
 
 const MODULUS_BITS_MIN: usize = 2048;
@@ -34,6 +36,10 @@ const SHA384_PREFIX: [u8; 19] = [
     0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02, 0x05,
     0x00, 0x04, 0x30,
 ];
+const SHA512_PREFIX: [u8; 19] = [
+    0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05,
+    0x00, 0x04, 0x40,
+];
 
 /// A public key, checked: an odd modulus of MODULUS_BITS_MIN to
 /// MODULUS_BITS_MAX bits and an odd exponent from 3 to 2^33 - 1.
@@ -51,13 +57,14 @@ impl Hash {
         match self {
             Hash::Sha256 => sha256::DIGEST_BYTES,
             Hash::Sha384 => sha384::DIGEST_BYTES,
+            Hash::Sha512 => sha384::SHA512_BYTES,
         }
     }
 
     /// The digest of the parts one after another, in the first len()
     /// bytes.
-    fn digest(&self, parts: &[&[u8]]) -> [u8; sha384::DIGEST_BYTES] {
-        let mut out = [0; sha384::DIGEST_BYTES];
+    fn digest(&self, parts: &[&[u8]]) -> [u8; sha384::SHA512_BYTES] {
+        let mut out = [0; sha384::SHA512_BYTES];
         match self {
             Hash::Sha256 => {
                 let mut hash = sha256::Sha256::new();
@@ -70,6 +77,15 @@ impl Hash {
             }
             Hash::Sha384 => {
                 let mut hash = sha384::Sha384::new();
+                for part in parts {
+                    hash.update(part);
+                }
+                for (byte, digest) in out.iter_mut().zip(hash.finish()) {
+                    *byte = digest;
+                }
+            }
+            Hash::Sha512 => {
+                let mut hash = sha384::Sha512::new();
                 for part in parts {
                     hash.update(part);
                 }
@@ -103,8 +119,9 @@ pub fn verify_pkcs1(
     let prefix = match hash {
         Hash::Sha256 => &SHA256_PREFIX,
         Hash::Sha384 => &SHA384_PREFIX,
+        Hash::Sha512 => &SHA512_PREFIX,
     };
-    // A 2048-bit key leaves 256 - 3 - 19 - 48 bytes of padding at least.
+    // A 2048-bit key leaves 256 - 3 - 19 - 64 bytes of padding at least.
     let Some(padding) = em.len().checked_sub(3 + prefix.len() + digest.len()) else {
         return false;
     };
@@ -572,12 +589,12 @@ pub fn fuzz_verify(input: &[u8]) {
     let Some((&[choice, split], rest)) = input.split_first_chunk::<2>() else {
         return;
     };
-    let hash = if choice & 1 == 0 {
-        Hash::Sha256
-    } else {
-        Hash::Sha384
+    let hash = match choice % 3 {
+        0 => Hash::Sha256,
+        1 => Hash::Sha384,
+        _ => Hash::Sha512,
     };
-    let (exponent, rest) = rest.split_at(usize::from(choice >> 1).min(rest.len()));
+    let (exponent, rest) = rest.split_at(usize::from(choice / 3).min(rest.len()));
     let (digest, rest) = rest.split_at(hash.len().min(rest.len()));
     let modulus_length = rest.len() / 2 + usize::from(split % 3);
     let (modulus, signature) = rest.split_at(modulus_length.min(rest.len()));
@@ -595,8 +612,8 @@ pub fn fuzz_signature(input: &[u8]) {
     for (byte, given) in signature.iter_mut().skip(1).zip(input) {
         *byte = *given;
     }
-    for hash in [Hash::Sha256, Hash::Sha384] {
-        let digest = [0x5a; 48];
+    for hash in [Hash::Sha256, Hash::Sha384, Hash::Sha512] {
+        let digest = [0x5a; 64];
         let digest = &digest[..hash.len()];
         for exponent in [&[3][..], &[1, 0, 1]] {
             verify_pkcs1(&modulus, exponent, &hash, digest, &signature);
@@ -648,37 +665,53 @@ mod tests {
         a1d02f40891ca43695cd4c088b05a8054c89c595a47e274816f35384226f74459ee63e25a1bfc03c36049055\
         2ec38343f8ace502f065303b00bc0ec320711b211fde92e57feb9013c3609342495ec0d7cabdec21e54acc38";
 
-    /// Wycheproof's first cases verify; its case 8 of PKCS #1, a
-    /// DigestInfo without the NULL parameters that some accept, does not.
+    /// Wycheproof's PKCS #1 and PSS cases (rsa-wycheproof.py), with the
+    /// digest of each message: valid ones verify, and the rest do not,
+    /// among them a DigestInfo without its NULL, which some accept, and
+    /// PSS signatures of another salt length or MGF1 hash.
     #[test]
     fn wycheproof() {
-        let (modulus, e, empty) = (hex(MODULUS), [1, 0, 1], hex(EMPTY));
-        assert!(verify_pkcs1(
-            &modulus,
-            &e,
-            &Hash::Sha256,
-            &empty,
-            &hex(PKCS1)
-        ));
-        assert!(verify_pss(&modulus, &e, &Hash::Sha256, &empty, &hex(PSS)));
-        let missing_null = hex(
-            "095dad1fd82bcd36652a381b7f4dd656bd89b40aa58b56da4f6aa8247874b935e65d2b86752d53\
-             7df7103884d39dd9ad3d65f87404526b09094c5615c6249979b0dc58d2199ae8696a5b76b4bb03ea\
-             f08c2ab6aec686c6b1b289c9b44f648bd30cb1ac6a64a73d68e59cd05e7aa1b780f4bfd7b83dfe3b\
-             884ec11821a93dc5bbb47a00eea4557b6b96b5656276001f1f295ddbbbc511a99b9a665b9c2674c8\
-             af0d812286d0be3ce74817ba2cad283757de35dfb149f2835f60cb03ff155524a57f78b148feceb8\
-             4cd20b0ae22e3e48f433fbd9bfd60be8afec93165ee0310be961d3695f309d031320c830aa6ba08b\
-             5a51d943797097c57630be391bd23736cc",
-        );
-        // SHA-256 of "123400".
-        let digest = hex("bb5a52f42f9c9261ed4361f59422a1e30036e7c32b270c8807a419feca605023");
-        assert!(!verify_pkcs1(
-            &modulus,
-            &e,
-            &Hash::Sha256,
-            &digest,
-            &missing_null
-        ));
+        let mut keys = Vec::new();
+        let (mut pkcs1, mut pss) = (0, 0);
+        for line in include_str!("rsa-wycheproof.txt").lines() {
+            if line.starts_with('#') {
+                continue;
+            }
+            let mut fields = [""; 7];
+            let mut words = line.split(' ');
+            for (slot, word) in fields.iter_mut().zip(&mut words) {
+                *slot = word;
+            }
+            assert!(words.next().is_none(), "{line}");
+            match fields {
+                ["key", _, modulus, exponent, "", "", ""] => {
+                    keys.push((hex(modulus), hex(exponent)))
+                }
+                [kind, bits, key, id, valid, digest, signature] => {
+                    let hash = match bits {
+                        "256" => Hash::Sha256,
+                        "384" => Hash::Sha384,
+                        _ => Hash::Sha512,
+                    };
+                    let (modulus, exponent) = &keys[key.parse::<usize>().unwrap()];
+                    let signature = if signature == "-" {
+                        Vec::new()
+                    } else {
+                        hex(signature)
+                    };
+                    let verify = if kind == "pkcs1" {
+                        pkcs1 += 1;
+                        verify_pkcs1
+                    } else {
+                        pss += 1;
+                        verify_pss
+                    };
+                    let verified = verify(modulus, exponent, &hash, &hex(digest), &signature);
+                    assert_eq!(verified, valid == "1", "{kind} {bits} tcId {id}");
+                }
+            }
+        }
+        assert_eq!((keys.len(), pkcs1, pss), (15, 326, 339));
     }
 
     /// A 2049-bit key with exponent 3, whose PSS encoding is a byte

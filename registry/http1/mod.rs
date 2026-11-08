@@ -11,8 +11,9 @@ use alloc::vec::Vec;
 /// The most bytes of heads one response may carry: interim heads, the
 /// final head and the trailers together.
 pub const HEAD_MAX: usize = 64 * 1024;
-/// The most header fields of one head.
-pub const HEADERS_MAX: usize = 128;
+/// The most header fields of one head, twice what servers commonly send
+/// at most (Apache's LimitRequestFields is 100).
+pub const HEADERS_MAX: usize = 256;
 /// The most bytes of a chunk-size line with its extensions.
 const CHUNK_LINE_MAX: usize = 4096;
 
@@ -20,7 +21,9 @@ const CHUNK_LINE_MAX: usize = 4096;
 #[cfg_attr(any(test, fuzzing), derive(Debug, PartialEq))]
 pub enum Error {
     /// A request field holds a byte its grammar does not allow, CR, LF
-    /// and NUL among them, or names a header the framing writes.
+    /// and NUL among them, or names a header the framing writes, or
+    /// Expect, whose 100-continue would have the caller hold the body
+    /// back until an interim response this does not hand out.
     Field,
     /// The status line is not HTTP/1.x with a code of 100 to 599; a minor
     /// version past 1 reads as 1.1.
@@ -76,7 +79,7 @@ pub enum Event<'a> {
 /// headers and the body's framing header. A field that could end a line
 /// or forge another header is refused, and out is then left as it was;
 /// so are Host, Content-Length and Transfer-Encoding among the headers,
-/// which this writes itself.
+/// which this writes itself, and Expect.
 pub fn request(
     out: &mut Vec<u8>,
     method: &[u8],
@@ -92,9 +95,14 @@ pub fn request(
         if !is_token(name) || !value.iter().all(|byte| field_byte(*byte)) {
             return Err(Error::Field);
         }
-        if [&b"host"[..], b"content-length", b"transfer-encoding"]
-            .iter()
-            .any(|framing| name.eq_ignore_ascii_case(framing))
+        if [
+            &b"host"[..],
+            b"content-length",
+            b"transfer-encoding",
+            b"expect",
+        ]
+        .iter()
+        .any(|framing| name.eq_ignore_ascii_case(framing))
         {
             return Err(Error::Field);
         }
@@ -357,7 +365,10 @@ impl Response {
     }
 
     /// The connection closed: Ok when that ends the response, as it ends
-    /// a body without a length.
+    /// a body without a length. Over TLS the connection closed only with
+    /// the server's close_notify (tls's Client::closed): a TCP close
+    /// without it may be an attacker's, which cuts such a body short
+    /// (RFC 8446 6.1), so it is Truncated, not eof.
     pub fn eof(&mut self) -> Result<(), Error> {
         match self.state {
             State::Close | State::Done => {
@@ -1067,6 +1078,7 @@ mod tests {
                 &b"Host"[..],
                 b"content-length",
                 b"Transfer-Encoding",
+                b"Expect",
                 b"A B",
                 b"A:",
             ] {

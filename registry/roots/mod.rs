@@ -4,7 +4,9 @@
 //! trusts to issue server certificates, and for a root Mozilla
 //! distrusts after a date, a "# distrust-after:" line that
 //! x509::Store::add_pem reads: leaves issued later do not chain to it.
-//! curl's cacert.pem drops those dates. The data is Mozilla's, under
+//! Chrome's announced distrusts of roots Mozilla still trusts (Chunghwa
+//! Telecom's and NetLock's, after 2025-07-31) come in the same lines,
+//! the earlier date winning. curl's cacert.pem drops those dates. The data is Mozilla's, under
 //! the Mozilla Public License 2.0.
 //!
 //! revoked.txt is Mozilla's OneCRL: the certificates Firefox refuses
@@ -16,8 +18,8 @@
 //! To refresh both, run `python3 registry/roots/roots-gen.py --tag
 //! NSS_3_xxx_RTM` there, or scripts/roots-gen.py in a project, and update the
 //! counts in the test below; `--check` says whether
-//! roots.pem is what its tag gives and revoked.txt what OneCRL holds now. A root outside x509's profile, such
-//! as one with a P-521 key, is skipped and counted.
+//! roots.pem is what its tag gives and revoked.txt what OneCRL holds now. A root outside x509's profile is
+//! skipped and counted.
 //!
 //! A program may trust the system's bundle instead, or as well: the
 //! caller reads the file SSL_CERT_FILE names, or else the first that
@@ -50,20 +52,21 @@ mod tests {
     use alloc::vec::Vec;
     use test::Bencher;
 
-    /// NSS 3.133 trusts 118 roots for TLS servers; one has a P-521 key,
-    /// outside x509's profile, and Izenpe.com is distrusted after
-    /// 2026-04-15.
+    /// NSS 3.133 trusts 118 roots for TLS servers, all in x509's profile;
+    /// Izenpe.com is distrusted after 2026-04-15, and HiPKI Root CA - G1
+    /// and NetLock Arany by Chrome after 2025-07-31.
     #[test]
     fn anchors() {
         let store = mozilla();
-        assert_eq!((store.len(), store.skipped()), (117, 1));
+        // Every anchor loads, e-Szigno's P-521 root among them.
+        assert_eq!((store.len(), store.skipped()), (118, 0));
         // OneCRL at timestamp 1793748796854: 1,920 records, 1,916 distinct.
         assert_eq!(store.revocations(), 1916);
         let dates = MOZILLA
             .split(|byte| *byte == b'\n')
             .filter(|line| line.starts_with(b"# distrust-after: "))
             .count();
-        assert_eq!(dates, 1);
+        assert_eq!(dates, 3);
     }
 
     /// Chains of x509's tests end at Mozilla's anchors.

@@ -16,6 +16,13 @@ before its PEM block, which x509::Store::add_pem reads: a path ending at
 it fails when the leaf's notBefore is later. curl's cacert.pem leaves
 those dates out and so trusts such roots fully.
 
+Chrome's distrusts of roots Mozilla still trusts are applied too, from
+Google's announcements (CHROME below), the earlier date winning: Chrome
+judges by a certificate's earliest SCT, which x509 does not read, so the
+leaf's notBefore stands for it, as for Mozilla's dates. Chrome's root
+store also sunsets old roots for its newest versions; those are its
+own policy for its own store, and are left out.
+
 certdata.txt rather than CCADB's CSV report: it is what Firefox ships,
 it is versioned by NSS's release tags, so --check reproduces the file
 from a fixed input, and its trust records are the ones NSS applies.
@@ -49,6 +56,19 @@ TAG = "NSS_3_133_RTM"
 URL = "https://hg.mozilla.org/projects/nss/raw-file/{tag}/lib/ckfw/builtins/certdata.txt"
 ONECRL = "https://firefox.settings.services.mozilla.com/v1/buckets/security-state/collections/onecrl/records"
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+# Roots Chrome distrusts for certificates whose earliest SCT is after the
+# date, by the SHA-256 of their DER: Chrome 139 and later, announced
+# 2025-05-30 at
+# https://blog.google/security/sustaining-digital-certificate-security-chrome-root-store-changes/
+CHROME = {
+    # OU=ePKI Root Certification Authority, O=Chunghwa Telecom Co., Ltd.
+    "c0a6f4dc63a24bfdcf54ef2a6a082a0a72de35803e2ff5ff527ae5d87206dfd5": "2025-07-31T23:59:59Z",
+    # CN=HiPKI Root CA - G1, O=Chunghwa Telecom Co., Ltd.
+    "f015ce3cc239bfef064be9f1d2c417e1a0264a0a94be1f0c8d121864eb6949cc": "2025-07-31T23:59:59Z",
+    # CN=NetLock Arany (Class Gold) Főtanúsítvány, O=NetLock Kft.
+    "6c61dac3a2def031506be036d2a6fe401994fbd13df9c8d466599274c446ec98": "2025-07-31T23:59:59Z",
+}
 
 
 def objects(text):
@@ -106,7 +126,8 @@ def build(text, tag):
         "The data is Mozilla's, under the Mozilla Public License 2.0",
         "(http://mozilla.org/MPL/2.0/). Kept: the roots NSS trusts to issue",
         "TLS server certificates; a distrust-after line gives the time after",
-        "which a leaf's notBefore makes a path to that root fail.",
+        "which a leaf's notBefore makes a path to that root fail, Mozilla's",
+        "or Chrome's, whichever is earlier.",
         "",
     ]
     count = 0
@@ -119,8 +140,13 @@ def build(text, tag):
         out.append(label)
         out.append("=" * len(label))
         distrust = item.get("CKA_NSS_SERVER_DISTRUST_AFTER", ("", ""))
-        if distrust[0] == "MULTILINE_OCTAL":
-            out.append("# distrust-after: " + iso(distrust[1]))
+        dates = [iso(distrust[1])] if distrust[0] == "MULTILINE_OCTAL" else []
+        chrome = CHROME.get(hashlib.sha256(item["CKA_VALUE"][1]).hexdigest())
+        if chrome:
+            dates.append(chrome)
+        if dates:
+            # RFC 3339 times of one form sort as they come.
+            out.append("# distrust-after: " + min(dates))
         encoded = base64.b64encode(item["CKA_VALUE"][1]).decode("ascii")
         out.append("-----BEGIN CERTIFICATE-----")
         out.extend(encoded[i : i + 64] for i in range(0, len(encoded), 64))
