@@ -125,12 +125,12 @@ impl Trust {
 }
 
 /// x509::verify on store, at once.
-fn verify_with(store: &x509::Store, chain: &[&[u8]], host: &str, now: i64) -> Result<Path, Error> {
+fn verify_with(store: &x509::Store, chain: &[&[u8]], host: &str, now: i64) -> Result<Built, Error> {
     if chain.is_empty() || chain.len() > x509::CHAIN_MAX || !named(host) {
         return Err(Error::Input);
     }
     match x509::verify(chain, store, host, now) {
-        Ok(_leaf) => Ok(Path::new()),
+        Ok(_leaf) => Ok(Built::one(Path::new())),
         Err(error) => Err(Error::Untrusted(error)),
     }
 }
@@ -175,6 +175,41 @@ impl Path {
     }
 }
 
+/// The paths the system's verifier took, best first: one, or on Windows
+/// each chain it built that passed, as Go's systemVerify keeps them.
+pub struct Built {
+    paths: Vec<Path>,
+    /// Windows: why its best chain failed, when a lower-quality one
+    /// passed; the error a policy that refuses them all gives, as Go
+    /// returns the highest quality context's.
+    refused: Option<Error>,
+}
+
+impl Built {
+    fn one(path: Path) -> Built {
+        Built {
+            paths: Vec::from([path]),
+            refused: None,
+        }
+    }
+
+    /// Whether policy takes one of the paths: the first that it does,
+    /// as Go keeps the chains its blocklist leaves; when it takes none,
+    /// the best chain's error.
+    fn screen(self, policy: &x509::Store) -> Result<(), Error> {
+        let mut first = None;
+        for path in &self.paths {
+            match path.screen(policy) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    first.get_or_insert(error);
+                }
+            }
+        }
+        Err(self.refused.or(first).unwrap_or(Error::Input))
+    }
+}
+
 /// One chain's check. Dropping it cancels it.
 pub struct Check<'t> {
     os: os::Check,
@@ -191,8 +226,8 @@ impl Check<'_> {
         }
         let answer = self.os.poll()?;
         self.polled = true;
-        Some(answer.and_then(|path| match self.policy {
-            Some(policy) => path.screen(policy),
+        Some(answer.and_then(|built| match self.policy {
+            Some(policy) => built.screen(policy),
             None => Ok(()),
         }))
     }
@@ -807,7 +842,7 @@ mod posix {
 mod os {
     pub use super::disk::LINUX as DEFAULTS;
     pub use super::posix::{System, variable};
-    use super::{Error, Path, Wait};
+    use super::{Built, Error, Wait};
 
     /// No verifier but x509: Trust always holds anchors here.
     pub fn check(_chain: &[&[u8]], _host: &str, _now: i64) -> Check {
@@ -816,17 +851,17 @@ mod os {
 
     /// A check that was done when it started.
     pub struct Check {
-        result: Option<Result<Path, Error>>,
+        result: Option<Result<Built, Error>>,
     }
 
     impl Check {
-        pub fn answered(result: Result<Path, Error>) -> Check {
+        pub fn answered(result: Result<Built, Error>) -> Check {
             Check {
                 result: Some(result),
             }
         }
 
-        pub fn poll(&mut self) -> Option<Result<Path, Error>> {
+        pub fn poll(&mut self) -> Option<Result<Built, Error>> {
             self.result.take()
         }
     }
@@ -841,7 +876,7 @@ mod os {
     pub use super::disk::MACOS as DEFAULTS;
     pub use super::posix::{System, variable};
     pub use super::thread::{Check, wait};
-    use super::{Error, Found, Path};
+    use super::{Built, Error, Found, Path};
     use crate::base::x509;
     use alloc::vec::Vec;
     use core::ffi::c_void;
@@ -1180,8 +1215,8 @@ mod os {
     }
 
     impl Job {
-        pub fn run(&self) -> Result<Path, Error> {
-            evaluate(self.trust.0)
+        pub fn run(&self) -> Result<Built, Error> {
+            evaluate(self.trust.0).map(Built::one)
         }
     }
 
@@ -1286,7 +1321,7 @@ mod os {
     pub use super::disk::WINDOWS as DEFAULTS;
     use super::disk::{ENOENT, Files};
     pub use super::thread::{Check, wait};
-    use super::{Error, Found, Path};
+    use super::{Built, Error, Found, Path};
     use crate::base::x509;
     use alloc::vec::Vec;
     use core::ffi::{CStr, c_char, c_void};
@@ -1294,12 +1329,12 @@ mod os {
 
     /// CERT_CONTEXT, from wincrypt.h.
     #[repr(C)]
-    struct Context {
-        encoding: u32,
-        encoded: *const u8,
-        length: u32,
-        info: *mut c_void,
-        store: *mut c_void,
+    pub struct Context {
+        pub encoding: u32,
+        pub encoded: *const u8,
+        pub length: u32,
+        pub info: *mut c_void,
+        pub store: *mut c_void,
     }
 
     /// CERT_ENHKEY_USAGE, from wincrypt.h.
@@ -1326,33 +1361,37 @@ mod os {
         requested: UsageMatch,
     }
 
-    /// The start of CERT_CHAIN_CONTEXT: its size, CERT_TRUST_STATUS, and
-    /// its simple chains.
+    /// The start of CERT_CHAIN_CONTEXT: its size, CERT_TRUST_STATUS, its
+    /// simple chains, and the lower-quality chain contexts
+    /// CERT_CHAIN_RETURN_LOWER_QUALITY_CONTEXTS asks for. Public in this
+    /// file for the tests, which lay out one of their own.
     #[repr(C)]
-    struct ChainContext {
-        size: u32,
-        error_status: u32,
-        info_status: u32,
-        count: u32,
-        chains: *const *const SimpleChain,
+    pub struct ChainContext {
+        pub size: u32,
+        pub error_status: u32,
+        pub info_status: u32,
+        pub count: u32,
+        pub chains: *const *const SimpleChain,
+        pub lower_count: u32,
+        pub lower: *const *const ChainContext,
     }
 
     /// The start of CERT_SIMPLE_CHAIN: its size, CERT_TRUST_STATUS, and
     /// its elements, leaf first.
     #[repr(C)]
-    struct SimpleChain {
-        size: u32,
-        error_status: u32,
-        info_status: u32,
-        count: u32,
-        elements: *const *const Element,
+    pub struct SimpleChain {
+        pub size: u32,
+        pub error_status: u32,
+        pub info_status: u32,
+        pub count: u32,
+        pub elements: *const *const Element,
     }
 
     /// The start of CERT_CHAIN_ELEMENT: its size and its certificate.
     #[repr(C)]
-    struct Element {
-        size: u32,
-        context: *const Context,
+    pub struct Element {
+        pub size: u32,
+        pub context: *const Context,
     }
 
     /// WIN32_FIND_DATAW.
@@ -1414,10 +1453,13 @@ mod os {
     const _: () = assert!(size_of::<PolicyPara>() == 16);
     const _: () = assert!(size_of::<PolicyStatus>() == 24);
     const _: () = assert!(size_of::<FileTime>() == 8);
-    // The prefixes read of CERT_CHAIN_CONTEXT and CERT_SIMPLE_CHAIN, whose
-    // pointer to pointers is at 16, and of CERT_CHAIN_ELEMENT, whose
-    // pCertContext is at 8; WIN32_FIND_DATAW whole.
-    const _: () = assert!(size_of::<ChainContext>() == 24);
+    // The prefixes read of CERT_CHAIN_CONTEXT, whose rgpChain is at 16,
+    // cLowerQualityChainContext at 24 and rgpLowerQualityChainContext at
+    // 32 (Go's CertChainContext, windows-sys's CERT_CHAIN_CONTEXT), of
+    // CERT_SIMPLE_CHAIN, whose rgpElement is at 16, and of
+    // CERT_CHAIN_ELEMENT, whose pCertContext is at 8; WIN32_FIND_DATAW
+    // whole. The tests check the offsets.
+    const _: () = assert!(size_of::<ChainContext>() == 40);
     const _: () = assert!(size_of::<SimpleChain>() == 24);
     const _: () = assert!(size_of::<Element>() == 16);
     const _: () = assert!(size_of::<FindData>() == 592);
@@ -1507,6 +1549,12 @@ mod os {
     const CHAIN_POLICY_SSL: usize = 4;
     const STORE_ADD_ALWAYS: u32 = 4;
     const USAGE_MATCH_TYPE_AND: u32 = 0;
+    /// CERT_CHAIN_RETURN_LOWER_QUALITY_CONTEXTS, as Go passes it.
+    const CHAIN_RETURN_LOWER_QUALITY_CONTEXTS: u32 = 0x80;
+    /// The chain contexts weighed of one CertGetCertificateChain: the
+    /// best and the lower-quality ones after it, which a few
+    /// cross-signatures make (Go weighs them all).
+    pub const CHAINS_MAX: usize = 16;
     const AUTHTYPE_SERVER: u32 = 2;
     const SERVER_AUTH_C: &[u8] = b"1.3.6.1.5.5.7.3.1\0";
     /// 100 ns intervals from 1601 to 1970.
@@ -1655,7 +1703,7 @@ mod os {
             }
         }
 
-        pub fn run(&self) -> Result<Path, Error> {
+        pub fn run(&self) -> Result<Built, Error> {
             evaluate(self)
         }
     }
@@ -1687,10 +1735,14 @@ mod os {
         }
     }
 
-    /// The system's verdict on the chain in shared: a chain to a root
-    /// it trusts for server authentication, then the SSL policy for the
-    /// host, as Go's systemVerify asks. It may fetch over the network.
-    fn evaluate(shared: &Job) -> Result<Path, Error> {
+    /// The system's verdict on the chain in shared, as Go's systemVerify
+    /// asks it: the chain contexts CertGetCertificateChain built, the
+    /// best and then the lower-quality ones, each to a root it trusts for
+    /// server authentication and passing the SSL policy for the host
+    /// (candidate). The paths of those that pass, best first, for a
+    /// policy to screen; none is the best's error. It may fetch over the
+    /// network.
+    fn evaluate(shared: &Job) -> Result<Built, Error> {
         let provider = without_provenance::<c_char>(STORE_PROVIDER_MEMORY);
         // rr: escape(unsafe): a memory store takes no parameter.
         let store = unsafe { CertOpenStore(provider, 0, 0, 0, null()) };
@@ -1744,7 +1796,7 @@ mod os {
                 &raw const shared.time,
                 store.0,
                 &raw const parameters,
-                0,
+                CHAIN_RETURN_LOWER_QUALITY_CONTEXTS,
                 null_mut(),
                 &raw mut chain,
             )
@@ -1752,21 +1804,65 @@ mod os {
         if built == 0 || chain.is_null() {
             return Err(Error::System(last_error()));
         }
+        // Freeing the best context frees the lower-quality ones it holds.
         let chain = Chain(chain);
         // rr: escape(unsafe): the chain context starts with these members.
-        let status = unsafe { (*chain.0).error_status };
-        if status != 0 {
-            return Err(Error::Chain(status));
+        let best = unsafe { &*chain.0 };
+        let mut taken = Built {
+            paths: Vec::new(),
+            refused: None,
+        };
+        match candidate(best, &shared.host) {
+            Ok(path) => taken.paths.push(path),
+            Err(error) => taken.refused = Some(error),
         }
-        policy(&chain, &shared.host)?;
-        path_of(&chain)
+        for lower in lower(best) {
+            // rr: escape(unsafe): a lower-quality context lives while the
+            // best does, and starts as it does.
+            if let Ok(path) = candidate(unsafe { &*lower }, &shared.host) {
+                taken.paths.push(path);
+            }
+        }
+        if taken.paths.is_empty() {
+            return Err(taken.refused.unwrap_or(Error::Input));
+        }
+        Ok(taken)
     }
 
-    /// The path of chain's last simple chain, leaf first, as Go's
+    /// One chain context's verdict, as Go's verifyChain gives it: its
+    /// trust status, the SSL policy for host, then its path.
+    fn candidate(context: &ChainContext, host: &[u16]) -> Result<Path, Error> {
+        if context.error_status != 0 {
+            return Err(Error::Chain(context.error_status));
+        }
+        policy(context, host)?;
+        path_of(context)
+    }
+
+    /// The lower-quality chain contexts of best, at most CHAINS_MAX less
+    /// best; none that is null.
+    pub fn lower(best: &ChainContext) -> Vec<*const ChainContext> {
+        let count = usize::try_from(best.lower_count)
+            .unwrap_or(0)
+            .min(CHAINS_MAX - 1);
+        let mut lower = Vec::with_capacity(count);
+        if best.lower.is_null() {
+            return lower;
+        }
+        for index in 0..count {
+            // rr: escape(unsafe): lower holds lower_count pointers to
+            // chain contexts.
+            let context = unsafe { best.lower.wrapping_add(index).read() };
+            if !context.is_null() {
+                lower.push(context);
+            }
+        }
+        lower
+    }
+
+    /// The path of context's last simple chain, leaf first, as Go's
     /// extractSimpleChain takes it to screen.
-    fn path_of(chain: &Chain) -> Result<Path, Error> {
-        // rr: escape(unsafe): the chain context starts with these members.
-        let context = unsafe { &*chain.0 };
+    pub fn path_of(context: &ChainContext) -> Result<Path, Error> {
         let Some(last) = usize::try_from(context.count)
             .ok()
             .and_then(|count| count.checked_sub(1))
@@ -2004,9 +2100,10 @@ mod os {
         }
     }
 
-    /// CERT_CHAIN_POLICY_SSL on chain for a server named host (UTF-16
-    /// with its NUL).
-    fn policy(chain: &Chain, host: &[u16]) -> Result<(), Error> {
+    /// CERT_CHAIN_POLICY_SSL on context for a server named host (UTF-16
+    /// with its NUL). It weighs the context's own simple chains alone,
+    /// so each lower-quality one is asked on its own, as Go asks.
+    fn policy(context: &ChainContext, host: &[u16]) -> Result<(), Error> {
         let ssl = SslPolicyPara {
             size: size32(size_of::<SslPolicyPara>()),
             auth_type: AUTHTYPE_SERVER,
@@ -2026,11 +2123,12 @@ mod os {
             extra: null_mut(),
         };
         let ssl_policy = without_provenance::<c_char>(CHAIN_POLICY_SSL);
-        // rr: escape(unsafe): the chain is ours; the rest are locals.
+        // rr: escape(unsafe): the context is the system's, alive while its
+        // best is; the rest are locals.
         let done = unsafe {
             CertVerifyCertificateChainPolicy(
                 ssl_policy,
-                chain.0,
+                context,
                 &raw const parameters,
                 &raw mut status,
             )
@@ -2062,7 +2160,7 @@ mod os {
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod thread {
     use super::os::Job;
-    use super::{Error, Path};
+    use super::{Built, Error};
     use crate::base::wait::{self, Signal, Wait};
     use alloc::boxed::Box;
     use core::cell::UnsafeCell;
@@ -2075,7 +2173,7 @@ mod thread {
     struct Shared {
         holders: AtomicUsize,
         done: AtomicBool,
-        result: UnsafeCell<Result<Path, Error>>,
+        result: UnsafeCell<Result<Built, Error>>,
         signal: Signal,
         job: Job,
     }
@@ -2105,7 +2203,7 @@ mod thread {
     pub struct Check {
         shared: *mut Shared,
         /// The answer, once known and not yet polled.
-        taken: Option<Result<Path, Error>>,
+        taken: Option<Result<Built, Error>>,
         /// The work, to take out of spawn's line when dropped before it
         /// started.
         ticket: Option<wait::Ticket>,
@@ -2113,7 +2211,7 @@ mod thread {
 
     impl Check {
         /// A check whose answer is known.
-        pub fn answered(result: Result<Path, Error>) -> Check {
+        pub fn answered(result: Result<Built, Error>) -> Check {
             Check {
                 shared: null_mut(),
                 taken: Some(result),
@@ -2162,7 +2260,7 @@ mod thread {
             check
         }
 
-        pub fn poll(&mut self) -> Option<Result<Path, Error>> {
+        pub fn poll(&mut self) -> Option<Result<Built, Error>> {
             if self.taken.is_none() && !self.shared.is_null() {
                 // rr: escape(unsafe): this check holds shared.
                 let shared = unsafe { &*self.shared };
@@ -2205,7 +2303,7 @@ mod thread {
 #[cfg(test)]
 mod tests {
     use super::disk::{self, Defaults, ENOENT, Files, LINUX, MACOS, Paths, WINDOWS};
-    use super::{Error, Found, Path, pem_block};
+    use super::{Built, Error, Found, Path, pem_block};
     use crate::base::x509::{Store, TEST_NOW, test_certificate, test_revocation};
     use alloc::vec::Vec;
 
@@ -2573,6 +2671,166 @@ mod tests {
             path.screen(&revoking("test.inter")),
             Err(Error::Untrusted(crate::base::x509::Error::Revoked))
         );
+    }
+
+    /// A path of the named test certificates.
+    fn path(names: &[&str]) -> Path {
+        let mut path = Path::new();
+        for name in names {
+            path.push(&test_certificate(name).unwrap());
+        }
+        path
+    }
+
+    /// The first path the policy takes is the verdict, as Go keeps any
+    /// chain its blocklist leaves; when it takes none, the best chain's
+    /// error stands: why the system refused it, or the policy did.
+    #[test]
+    fn screens_built() {
+        let test = ["test.leaf", "test.inter", "test.root"];
+        let openai = ["openai.leaf", "openai.we1", "openai.r4cross"];
+        // The best was refused; a lower-quality one passed.
+        let lower = || Built {
+            paths: Vec::from([path(&test)]),
+            refused: Some(Error::Chain(1)),
+        };
+        assert_eq!(lower().screen(&revoking("openai.we1")), Ok(()));
+        assert_eq!(
+            lower().screen(&revoking("test.inter")),
+            Err(Error::Chain(1))
+        );
+        // Both passed: the best is screened out, the other is taken.
+        let both = || Built {
+            paths: Vec::from([path(&openai), path(&test)]),
+            refused: None,
+        };
+        assert_eq!(both().screen(&revoking("openai.we1")), Ok(()));
+        assert_eq!(both().screen(&revoking("test.root")), Ok(()));
+        let mut policy = revoking("openai.we1");
+        assert_eq!(
+            policy.add_revoked(&test_revocation(&test_certificate("test.inter").unwrap())),
+            1
+        );
+        assert_eq!(
+            both().screen(&policy),
+            Err(Error::Untrusted(crate::base::x509::Error::Revoked))
+        );
+    }
+
+    /// The chain contexts read of one laid out as wincrypt.h lays it:
+    /// the lower-quality ones after the best, null ones left out and at
+    /// most CHAINS_MAX, and the path of a context's last simple chain.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn lower_quality_contexts() {
+        use super::os::{CHAINS_MAX, ChainContext, Context, Element, SimpleChain, lower, path_of};
+        use core::ptr::{null, null_mut};
+        let ders = certificates(&["test.leaf", "test.inter", "test.root"]);
+        // rr: escape(copy): a CERT_CONTEXT of each certificate.
+        let contexts: Vec<Context> = ders
+            .iter()
+            .map(|der| Context {
+                encoding: 1,
+                encoded: der.as_ptr(),
+                length: u32::try_from(der.len()).unwrap(),
+                info: null_mut(),
+                store: null_mut(),
+            })
+            .collect();
+        // rr: escape(copy): a CERT_CHAIN_ELEMENT of each context.
+        let elements: Vec<Element> = contexts
+            .iter()
+            .map(|context| Element {
+                size: 16,
+                context: &raw const *context,
+            })
+            .collect();
+        // rr: escape(copy): the pointers a simple chain holds.
+        let pointers: Vec<*const Element> = elements.iter().map(|e| &raw const *e).collect();
+        let simple = |count: usize| SimpleChain {
+            size: 24,
+            error_status: 0,
+            info_status: 0,
+            count: u32::try_from(count).unwrap(),
+            elements: pointers.as_ptr(),
+        };
+        // The last simple chain is the path: leaf, intermediate, root.
+        let short = simple(1);
+        let whole = simple(3);
+        let chains = [&raw const short, &raw const whole];
+        let context = |count: u32| ChainContext {
+            size: 40,
+            error_status: 0,
+            info_status: 0,
+            count,
+            chains: chains.as_ptr(),
+            lower_count: 0,
+            lower: null(),
+        };
+        let first = context(2);
+        let second = context(1);
+        // The offsets wincrypt.h gives the members read, on 64-bit Windows.
+        let chain_at = (&raw const first).addr();
+        assert_eq!((&raw const first.chains).addr() - chain_at, 16);
+        assert_eq!((&raw const first.lower_count).addr() - chain_at, 24);
+        assert_eq!((&raw const first.lower).addr() - chain_at, 32);
+        let simple_at = (&raw const whole).addr();
+        assert_eq!((&raw const whole.elements).addr() - simple_at, 16);
+        let element_at = (&raw const elements[0]).addr();
+        assert_eq!((&raw const elements[0].context).addr() - element_at, 8);
+        let context_at = (&raw const contexts[0]).addr();
+        assert_eq!((&raw const contexts[0].encoded).addr() - context_at, 8);
+        assert_eq!((&raw const contexts[0].length).addr() - context_at, 16);
+        let built = path_of(&first).unwrap();
+        assert_eq!(built.bytes, ders.concat());
+        let leaf = ders[0].len();
+        let inter = leaf + ders[1].len();
+        assert_eq!(built.ends, [leaf, inter, inter + ders[2].len()]);
+        assert_eq!(path_of(&second).unwrap().ends, [leaf]);
+        assert!(path_of(&context(0)).is_err());
+        let held = [&raw const first, null(), &raw const second];
+        let mut best = context(2);
+        assert!(lower(&best).is_empty());
+        best.lower_count = 3;
+        assert!(lower(&best).is_empty());
+        best.lower = held.as_ptr();
+        assert_eq!(lower(&best), [&raw const first, &raw const second]);
+        // Past CHAINS_MAX less the best, the rest are not read.
+        let many = [&raw const first; 40];
+        best.lower = many.as_ptr();
+        best.lower_count = 40;
+        assert_eq!(lower(&best).len(), CHAINS_MAX - 1);
+    }
+
+    /// The system builds each real chain with its lower-quality
+    /// contexts: every path it took starts at the leaf sent, the best
+    /// first, and the check took at least one.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn system_contexts() {
+        for (names, host) in CHAINS {
+            let certificates = certificates(names);
+            // rr: escape(copy): the chain check takes, borrowed from them.
+            let chain: Vec<&[u8]> = certificates.iter().map(Vec::as_slice).collect();
+            let mut check = super::os::check(&chain, host, TEST_NOW);
+            let built = (0..1000)
+                .find_map(|_| {
+                    let result = check.poll();
+                    if result.is_none() {
+                        crate::base::wait::block(&super::os::wait(&check));
+                    }
+                    result
+                })
+                .unwrap()
+                .unwrap();
+            assert!(!built.paths.is_empty(), "{host}");
+            assert!(built.paths.len() <= super::os::CHAINS_MAX, "{host}");
+            assert!(built.refused.is_none(), "{host}");
+            for path in &built.paths {
+                assert!(path.ends.get(1).is_some(), "{host}");
+                assert_eq!(path.bytes.get(..path.ends[0]), Some(chain[0]), "{host}");
+            }
+        }
     }
 
     /// One check of OpenAI's chain by the system's verifier.
