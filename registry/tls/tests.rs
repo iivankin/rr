@@ -3,10 +3,10 @@
 //! and retries, splits, tampers and misbehaves as each test asks.
 
 use super::{
-    ALERT, APPLICATION, CHANGE_CIPHER_SPEC, Client, Error, HANDSHAKE, HELLO_RETRY, IDLE_MAX,
-    KEY_RECORDS_MAX, Keys, MESSAGE_MAX, PENDING_MAX, RANDOM_BYTES, RECORD_MAX, RECORDS_PER_INPUT,
-    Reader, SECP256R1, State, VERIFY_CONTEXT, Verify, X25519, X25519MLKEM768, derive, expand,
-    handshake_secrets, mac,
+    AES_128_GCM_SHA256, AES_256_GCM_SHA384, ALERT, APPLICATION, CHANGE_CIPHER_SPEC, Client, Digest,
+    Error, HANDSHAKE, HELLO_RETRY, IDLE_MAX, KEY_RECORDS_MAX, Keys, MESSAGE_MAX, PENDING_MAX,
+    RANDOM_BYTES, RECORD_MAX, RECORDS_PER_INPUT, Reader, SECP256R1, State, Transcript,
+    VERIFY_CONTEXT, Verify, X25519, X25519MLKEM768, derive, expand, handshake_secrets, mac,
 };
 use crate::base::ecdh;
 use crate::base::mlkem;
@@ -505,10 +505,16 @@ struct Script {
     retry_group: Option<u16>,
     /// The group ServerHello chooses without a retry that names one.
     group: u16,
+    /// The suite ServerHello chooses, and the one a HelloRetryRequest
+    /// names.
+    suite: u16,
+    retry_suite: u16,
     /// The protocol EncryptedExtensions chooses, if any.
     alpn: Option<&'static [u8]>,
     /// Extensions added to EncryptedExtensions, as on the wire.
     extensions: Vec<u8>,
+    /// The leaf's CertificateEntry extensions, as on the wire.
+    entry: Vec<u8>,
     /// A CertificateRequest's body, before the Certificate.
     request: Option<Vec<u8>>,
     /// A change_cipher_spec after ServerHello.
@@ -526,8 +532,11 @@ impl Script {
             cookie: None,
             retry_group: None,
             group: X25519MLKEM768,
+            suite: AES_128_GCM_SHA256,
+            retry_suite: AES_128_GCM_SHA256,
             alpn: None,
             extensions: Vec::new(),
+            entry: Vec::new(),
             request: None,
             compatible: false,
             flight: true,
@@ -555,11 +564,11 @@ struct Hello {
 /// The test server: it answers each record the client sends.
 struct Server {
     script: Script,
-    transcript: Sha256,
+    transcript: Transcript,
     read: Option<Keys>,
     write: Option<Keys>,
-    master: [u8; 32],
-    client_secret: [u8; 32],
+    master: Digest,
+    client_secret: Digest,
     retried: bool,
     input: Vec<u8>,
     /// Bytes for the client.
@@ -585,11 +594,11 @@ impl Server {
     fn new(script: Script) -> Server {
         Server {
             script,
-            transcript: Sha256::new(),
+            transcript: Transcript::new(),
             read: None,
             write: None,
-            master: [0; 32],
-            client_secret: [0; 32],
+            master: Digest::Sha256([0; 32]),
+            client_secret: Digest::Sha256([0; 32]),
             retried: false,
             input: Vec::new(),
             output: Vec::new(),
@@ -611,9 +620,8 @@ impl Server {
         }
     }
 
-    fn hash(&self) -> [u8; 32] {
-        // rr: escape(copy): the transcript goes on.
-        self.transcript.clone().finish()
+    fn hash(&self) -> Digest {
+        self.transcript.hash()
     }
 
     /// Takes the client's bytes and answers each whole record.
@@ -658,14 +666,8 @@ impl Server {
                 self.certificate = Some(message.to_vec());
             }
             20 => {
-                let mut key = [0; 32];
-                expand(
-                    &self.read.as_ref().unwrap().secret,
-                    b"finished",
-                    &[],
-                    &mut key,
-                );
-                assert_eq!(message[4..], mac(&key, &self.hash()));
+                let key = derive(&self.read.as_ref().unwrap().secret, b"finished", &[]);
+                assert_eq!(message[4..], *mac(&key, &self.hash()).bytes());
                 self.read = Some(Keys::new(&self.client_secret));
                 self.finished = true;
             }
@@ -770,11 +772,14 @@ impl Server {
             prefixed(&mut extensions, 2 + cookie.len(), &[]);
             prefixed(&mut extensions, cookie.len(), cookie);
         }
-        let retry = hello_message(&HELLO_RETRY, &self.hello.session, &extensions);
+        let suite = self.script.retry_suite;
+        let retry = hello_message(&HELLO_RETRY, &self.hello.session, suite, &extensions);
+        self.transcript.select(suite).unwrap();
         let first = self.hash();
-        self.transcript = Sha256::new();
-        self.transcript.update(&[254, 0, 0, 32]);
-        self.transcript.update(&first);
+        self.transcript.restart();
+        let length = u8::try_from(first.bytes().len()).unwrap();
+        self.transcript.update(&[254, 0, 0, length]);
+        self.transcript.update(first.bytes());
         self.transcript.update(&retry);
         self.plain(HANDSHAKE, &retry);
     }
@@ -820,7 +825,13 @@ impl Server {
         let mut extensions = Vec::from([0, 43, 0, 2, 3, 4, 0, 51]);
         prefixed(&mut extensions, share.len() + 4, &group.to_be_bytes());
         prefixed(&mut extensions, share.len(), &share);
-        let hello = hello_message(&[0x7e; 32], &self.hello.session, &extensions);
+        let suite = self.script.suite;
+        let hello = hello_message(&[0x7e; 32], &self.hello.session, suite, &extensions);
+        if self.transcript.select(suite).is_err() {
+            // Another suite than the retry's: the client refuses it at
+            // once, and the server goes no further.
+            return self.plain(HANDSHAKE, &hello);
+        }
         self.transcript.update(&hello);
         self.plain(HANDSHAKE, &hello);
         if self.script.compatible {
@@ -854,10 +865,11 @@ impl Server {
             self.add(&mut flight, 13, &request);
         }
         let mut list = Vec::new();
-        for der in &self.script.identity.chain {
+        for (at, der) in self.script.identity.chain.iter().enumerate() {
             list.extend_from_slice(&u24(der.len()));
             list.extend_from_slice(der);
-            list.extend_from_slice(&[0, 0]);
+            let entry = if at == 0 { &self.script.entry[..] } else { &[] };
+            prefixed(&mut list, entry.len(), entry);
         }
         body.clear();
         body.push(0);
@@ -866,22 +878,22 @@ impl Server {
         self.add(&mut flight, 11, &body);
         let mut content = Vec::from([0x20; 64]);
         content.extend_from_slice(VERIFY_CONTEXT);
-        content.extend_from_slice(&self.hash());
+        content.extend_from_slice(self.hash().bytes());
         let signature = self.script.identity.sign(&content);
         body.clear();
         body.extend_from_slice(&self.script.identity.scheme.to_be_bytes());
         prefixed(&mut body, signature.len(), &signature);
         self.add(&mut flight, 15, &body);
-        let mut key = [0; 32];
-        expand(&secrets.server, b"finished", &[], &mut key);
+        let key = derive(&secrets.server, b"finished", &[]);
         let verify = mac(&key, &self.hash());
-        self.add(&mut flight, 20, &verify);
+        self.add(&mut flight, 20, verify.bytes());
         for piece in flight.chunks(self.script.piece) {
             self.send(HANDSHAKE, piece);
         }
         let hash = self.hash();
-        self.client_secret = derive(&self.master, b"c ap traffic", &hash);
-        self.write = Some(Keys::new(&derive(&self.master, b"s ap traffic", &hash)));
+        self.client_secret = derive(&self.master, b"c ap traffic", hash.bytes());
+        let server = derive(&self.master, b"s ap traffic", hash.bytes());
+        self.write = Some(Keys::new(&server));
     }
 
     /// A message of kind into the flight and the transcript.
@@ -935,13 +947,14 @@ impl Server {
 }
 
 /// A ServerHello, or a HelloRetryRequest by its random, echoing the
-/// client's session ID.
-fn hello_message(random: &[u8; 32], session: &[u8], extensions: &[u8]) -> Vec<u8> {
+/// client's session ID and choosing suite.
+fn hello_message(random: &[u8; 32], session: &[u8], suite: u16, extensions: &[u8]) -> Vec<u8> {
     let mut m = Vec::from([2, 0, 0, 0, 3, 3]);
     m.extend_from_slice(random);
     m.push(u8::try_from(session.len()).unwrap());
     m.extend_from_slice(session);
-    m.extend_from_slice(&[0x13, 0x01, 0]);
+    m.extend_from_slice(&suite.to_be_bytes());
+    m.push(0);
     prefixed(&mut m, extensions.len(), extensions);
     let length = u24(m.len() - 4);
     m[1..4].copy_from_slice(&length);
@@ -1206,7 +1219,7 @@ const CLIENT_DATA_RECORD: &str = "\
     2b9819a8a5b46b395bd54a9a20441e2b62974e1f5a6292a2977014bd1e3deae6\
     3aeebb21694915e4";
 
-fn key_of(secret: &[u8; 32]) -> Vec<u8> {
+fn key_of(secret: &Digest) -> Vec<u8> {
     let mut key = [0; 16];
     expand(secret, b"key", &[], &mut key);
     Vec::from(key)
@@ -1232,20 +1245,20 @@ fn rfc8448_simple_1rtt() {
     client.session = None;
     client.kem = None;
     client.sent(client.pending().len());
-    client.transcript = Sha256::new();
+    client.transcript = Transcript::new();
     client.transcript.update(&hex(CLIENT_HELLO));
     let hello = hex(SERVER_HELLO_RECORD);
     assert_eq!(client.input(&hello), Ok(hello.len()));
     let reading = client.input_keys.as_ref().unwrap();
     let writing = client.output_keys.as_ref().unwrap();
-    assert_eq!(reading.secret[..], hex(SERVER_HS));
-    assert_eq!(writing.secret[..], hex(CLIENT_HS));
-    assert_eq!(client.master[..], hex(MASTER));
+    assert_eq!(reading.secret.bytes(), hex(SERVER_HS));
+    assert_eq!(writing.secret.bytes(), hex(CLIENT_HS));
+    assert_eq!(client.master.bytes(), hex(MASTER));
     assert_eq!(key_of(&reading.secret), hex(SERVER_HS_KEY));
     assert_eq!(reading.iv[..], hex(SERVER_HS_IV));
     assert_eq!(key_of(&writing.secret), hex(CLIENT_HS_KEY));
     assert_eq!(writing.iv[..], hex(CLIENT_HS_IV));
-    assert_eq!(client.server_finished[..], hex(SERVER_FINISHED_KEY));
+    assert_eq!(client.server_finished.bytes(), hex(SERVER_FINISHED_KEY));
     let mut flight = hex(SERVER_FLIGHT);
     let keys = client.input_keys.as_mut().unwrap();
     let kind = opened(keys, &mut flight);
@@ -1279,8 +1292,8 @@ fn rfc8448_simple_1rtt() {
     assert_eq!(client.pending(), hex(CLIENT_FINISHED_RECORD));
     let app_reading = client.input_keys.as_ref().unwrap();
     let app_writing = client.output_keys.as_ref().unwrap();
-    assert_eq!(app_reading.secret[..], hex(SERVER_AP));
-    assert_eq!(app_writing.secret[..], hex(CLIENT_AP));
+    assert_eq!(app_reading.secret.bytes(), hex(SERVER_AP));
+    assert_eq!(app_writing.secret.bytes(), hex(CLIENT_AP));
     assert_eq!(key_of(&app_reading.secret), hex(SERVER_AP_KEY));
     assert_eq!(app_reading.iv[..], hex(SERVER_AP_IV));
     assert_eq!(key_of(&app_writing.secret), hex(CLIENT_AP_KEY));
@@ -1310,7 +1323,7 @@ fn client_hello() {
     let hello = &server.hello;
     assert_eq!(hello.name.as_deref(), Some(&b"api.example.test"[..]));
     assert_eq!(hello.alpn, [&b"h2"[..], b"http/1.1"]);
-    assert_eq!(hello.suites, [0x1301]);
+    assert_eq!(hello.suites, [AES_128_GCM_SHA256, AES_256_GCM_SHA384]);
     assert_eq!(
         hello.signatures,
         [
@@ -1518,7 +1531,7 @@ fn server_hello_refused() {
         if let Some(group) = asked {
             let mut all = hex("002b 0002 0304  0033 0002");
             all.extend(hex(group));
-            let retry = hello_message(&HELLO_RETRY, &SESSION, &all);
+            let retry = hello_message(&HELLO_RETRY, &SESSION, AES_128_GCM_SHA256, &all);
             let mut record = Vec::from([22, 3, 3]);
             prefixed(&mut record, retry.len(), &retry);
             assert_eq!(client.input(&record), Ok(record.len()));
@@ -1529,7 +1542,7 @@ fn server_hello_refused() {
         entry.resize(4 + length, 9);
         prefixed(&mut all, entry.len(), &entry);
         let echo = if session { &SESSION[..] } else { &[][..] };
-        let hello = hello_message(&[0x7e; 32], echo, &all);
+        let hello = hello_message(&[0x7e; 32], echo, AES_128_GCM_SHA256, &all);
         let mut record = Vec::from([22, 3, 3]);
         prefixed(&mut record, hello.len(), &hello);
         assert_eq!(client.input(&record), Err(Error::Parameter), "{share}");
@@ -1589,7 +1602,7 @@ fn retried(extensions: Vec<u8>, twice: bool) -> Option<Error> {
     let store = Store::new();
     let mut all = hex("002b 0002 0304");
     all.extend(extensions);
-    let retry = hello_message(&HELLO_RETRY, &SESSION, &all);
+    let retry = hello_message(&HELLO_RETRY, &SESSION, AES_128_GCM_SHA256, &all);
     let mut record = Vec::from([22, 3, 3]);
     prefixed(&mut record, retry.len(), &retry);
     let mut client = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
@@ -1865,6 +1878,9 @@ fn alerts() {
     // A long alert.
     let (result, _, alerts) = after(|server| server.send(ALERT, &[2, 80, 0]), 1);
     assert_eq!((result, alerts), (Some(Error::Decode), Vec::from([50])));
+    // An empty one, sealed: unexpected_message (RFC 9846 5.4).
+    let (empty, _, refused) = after(|server| server.send(ALERT, &[]), 1);
+    assert_eq!((empty, refused), (Some(Error::Unexpected), Vec::from([10])));
     // close_notify during the handshake.
     assert_eq!(after_hello(Some(ALERT), &[1, 0]), Some(Error::Alert(0)));
 }
@@ -2032,17 +2048,193 @@ fn record_boundaries() {
     assert_eq!(after_hello(None, &clear), Some(Error::Unexpected));
 }
 
-/// A ServerHello of TLS 1.2, without supported_versions.
-#[test]
-fn version() {
+/// What the client makes of a ServerHello of TLS 1.2, without
+/// supported_versions: random's last 8 bytes, and its extensions block
+/// or none; and the alert it sends back.
+fn tls12(tail: [u8; 8], extensions: Option<&[u8]>) -> (Option<Error>, Vec<u8>) {
     let store = Store::new();
     let mut client = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
-    let mut record = Vec::from([22, 3, 3, 0, 49, 2, 0, 0, 45, 3, 3]);
-    record.resize(43, 0x11);
-    record.extend_from_slice(&[0, 0xc0, 0x2f, 0, 0, 5, 0xff, 1, 0, 1, 0]);
-    assert_eq!(client.input(&record), Err(Error::Version));
-    let pending = client.pending();
-    assert_eq!(pending[pending.len() - 7..], [21, 3, 3, 0, 2, 2, 70]);
+    client.sent(client.pending().len());
+    let mut body = Vec::from([3, 3]);
+    body.extend_from_slice(&[0x11; 24]);
+    body.extend_from_slice(&tail);
+    body.extend_from_slice(&[0, 0xc0, 0x2f, 0]);
+    if let Some(block) = extensions {
+        prefixed(&mut body, block.len(), block);
+    }
+    let mut message = Vec::from([2]);
+    message.extend_from_slice(&u24(body.len()));
+    message.extend_from_slice(&body);
+    let mut record = Vec::from([22, 3, 3]);
+    prefixed(&mut record, message.len(), &message);
+    let error = client.input(&record).err();
+    // rr: escape(copy): the client goes, its alert stays for the test.
+    (error, client.pending().to_vec())
+}
+
+/// A ServerHello of TLS 1.2, with extensions or without the block (RFC
+/// 9846 E.1): protocol_version; one that ends in a downgrade sentinel:
+/// illegal_parameter (4.2.3).
+#[test]
+fn version() {
+    let plain = [0x11; 8];
+    let renegotiation: &[u8] = &[0xff, 1, 0, 1, 0];
+    for (tail, extensions, error) in [
+        (plain, Some(renegotiation), Error::Version),
+        (plain, None, Error::Version),
+        (*b"DOWNGRD\x01", Some(renegotiation), Error::Parameter),
+        (*b"DOWNGRD\x01", None, Error::Parameter),
+        (*b"DOWNGRD\x00", None, Error::Parameter),
+        (*b"DOWNGRD\x02", None, Error::Version),
+    ] {
+        let (found, pending) = tls12(tail, extensions);
+        assert_eq!(found, Some(error));
+        // The alert alone, in the clear.
+        assert_eq!(pending, [21, 3, 3, 0, 2, 2, error.alert().unwrap()]);
+    }
+}
+
+/// The server chooses TLS_AES_256_GCM_SHA384, with or without a retry
+/// that names it: the handshake by SHA-384, AES-256-GCM records both
+/// ways, a KeyUpdate each way, and close_notify.
+#[test]
+fn aes_256_gcm_sha384() {
+    for (retry, cookie) in [
+        (None, None),
+        (Some(SECP256R1), None),
+        (None, Some(&b"\x07"[..])),
+    ] {
+        let mut script = Script::new(Kind::P384);
+        script.suite = AES_256_GCM_SHA384;
+        script.retry_suite = AES_256_GCM_SHA384;
+        script.retry_group = retry;
+        script.cookie = cookie;
+        let store = script.identity.store();
+        let mut server = Server::new(script);
+        let mut split = Split { piece: 50, seed: 5 };
+        let mut client = connect(&store, &mut server, HOST, &[], &mut split).unwrap();
+        assert!(client.connected() && server.finished);
+        let keys = client.output_keys.as_ref().unwrap();
+        assert!(matches!(keys.secret, Digest::Sha384(_)));
+        assert!(matches!(client.transcript, Transcript::Sha256(_)));
+        assert_eq!(client.write(b"ping"), Ok(4));
+        server.update(true);
+        server.send(APPLICATION, b"pong");
+        assert_eq!(
+            exchange(&mut client, &mut server, &mut split),
+            Ok(Vec::from(*b"pong"))
+        );
+        assert_eq!(client.write(b"again"), Ok(5));
+        client.close();
+        assert_eq!(
+            exchange(&mut client, &mut server, &mut split),
+            Ok(Vec::new())
+        );
+        assert_eq!(server.received, b"pingagain");
+        assert_eq!((server.updates, server.alerts.as_slice()), (1, &[0][..]));
+    }
+}
+
+/// A suite the client did not offer, in a ServerHello or a retry, and a
+/// ServerHello whose suite is not the retry's (RFC 9846 4.2.4):
+/// illegal_parameter.
+#[test]
+fn suites_refused() {
+    for suite in [0x1303, 0x1304, 0xc02f, 0] {
+        let mut script = Script::new(Kind::P256);
+        script.suite = suite;
+        assert_eq!(
+            outcome(script, HOST, &[], TEST_NOW),
+            (Some(Error::Parameter), Vec::from([47]))
+        );
+        let retry = hello_message(
+            &HELLO_RETRY,
+            &SESSION,
+            suite,
+            &hex("002b 0002 0304 0033 0002 0017"),
+        );
+        let store = Store::new();
+        let mut client = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
+        let mut record = Vec::from([22, 3, 3]);
+        prefixed(&mut record, retry.len(), &retry);
+        assert_eq!(client.input(&record), Err(Error::Parameter));
+    }
+    for (first, second) in [
+        (AES_128_GCM_SHA256, AES_256_GCM_SHA384),
+        (AES_256_GCM_SHA384, AES_128_GCM_SHA256),
+    ] {
+        let mut script = Script::new(Kind::P256);
+        script.retry_group = Some(SECP256R1);
+        script.retry_suite = first;
+        script.suite = second;
+        let (error, alerts) = outcome(script, HOST, &[], TEST_NOW);
+        assert_eq!((error, alerts), (Some(Error::Parameter), Vec::from([47])));
+    }
+}
+
+/// An extension in a CertificateEntry: the client asks for none, so any
+/// is unsupported_extension (RFC 9846 4.5.1), with Verify::Caller before
+/// the caller is asked; one that does not frame is decode_error.
+#[test]
+fn certificate_entry_extensions() {
+    for (entry, error) in [
+        ("", None),
+        // status_request and signed_certificate_timestamp, unsolicited.
+        ("0005 0000", Some(Error::Extension)),
+        ("0012 0003 000102", Some(Error::Extension)),
+        ("ff99 0000", Some(Error::Extension)),
+        ("0005", Some(Error::Decode)),
+        ("0005 0002 00", Some(Error::Decode)),
+        ("0005 0000 0012", Some(Error::Decode)),
+    ] {
+        let mut script = Script::new(Kind::P256);
+        script.entry = hex(entry);
+        let (found, alerts) = outcome(script, HOST, &[], TEST_NOW);
+        assert_eq!(found, error, "{entry}");
+        assert_eq!(alerts, Vec::from_iter(error.and_then(Error::alert)));
+        let mut asked = Script::new(Kind::P256);
+        asked.entry = hex(entry);
+        let verdict = caller(asked, HOST, WHOLE, &Judge::Always(true));
+        assert_eq!(verdict.error, error, "{entry}");
+        assert_eq!(verdict.waits, usize::from(error.is_none()));
+    }
+}
+
+/// The client's own limits are internal_error: a sequence number that
+/// would wrap, either way (RFC 9846 5.3), and a record past the pending
+/// buffer or a record's length.
+#[test]
+fn internal_errors() {
+    let store = Identity::new(Kind::P256).store();
+    let (mut client, mut server) = connected(&store);
+    client.output_keys.as_mut().unwrap().seq = u64::MAX;
+    assert_eq!(client.write(b"x"), Err(Error::Internal));
+    // No number is left for the alert either.
+    assert!(client.pending().is_empty());
+    server.receive(client.pending());
+    assert!(server.received.is_empty() && server.alerts.is_empty());
+    let (mut reading, mut other) = connected(&store);
+    reading.input_keys.as_mut().unwrap().seq = u64::MAX;
+    other.send(APPLICATION, b"x");
+    assert_eq!(reading.input(&other.take()), Err(Error::Internal));
+    other.receive(reading.pending());
+    assert_eq!(other.alerts, [80]);
+    let mut keys = Keys::new(&Digest::Sha256([1; 32]));
+    let mut tx = Vec::new();
+    tx.resize(super::TX_MAX - 20, 0);
+    assert_eq!(
+        super::seal(&mut keys, &mut tx, APPLICATION, &[0; 4]),
+        Err(Error::Internal)
+    );
+    tx.clear();
+    let mut large = Vec::new();
+    large.resize(1 << 16, 0);
+    assert_eq!(
+        super::seal(&mut keys, &mut tx, APPLICATION, &large),
+        Err(Error::Internal)
+    );
+    assert_eq!((tx.len(), keys.seq), (0, 0));
+    assert_eq!(Error::Internal.alert(), Some(80));
 }
 
 /// input stops after RECORDS_PER_INPUT records, and at plaintext not yet
@@ -2173,6 +2365,24 @@ fn input_record(b: &mut Bencher) {
 fn handshake(b: &mut Bencher) {
     let store = Identity::new(Kind::P256).store();
     let mut server = Server::new(Script::new(Kind::P256));
+    let client = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
+    server.receive(client.pending());
+    let flight = server.take();
+    b.iter(|| {
+        let mut fresh = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
+        assert_eq!(fresh.input(&flight), Ok(flight.len()));
+        assert!(fresh.connected());
+    });
+}
+
+/// The same with the server choosing TLS_AES_256_GCM_SHA384: SHA-384
+/// beside SHA-256 until ServerHello, then alone.
+#[bench]
+fn handshake_aes256(b: &mut Bencher) {
+    let mut script = Script::new(Kind::P256);
+    script.suite = AES_256_GCM_SHA384;
+    let store = script.identity.store();
+    let mut server = Server::new(script);
     let client = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
     server.receive(client.pending());
     let flight = server.take();
@@ -2448,4 +2658,114 @@ fn caller_with_x509() {
     let other = Judge::X509(&store, "x.test");
     let refused = caller(Script::new(Kind::P256), HOST, 9, &other);
     assert_eq!(refused.error, Some(Error::Untrusted));
+}
+
+/// A connected client with "queued" written and not sent, and its server.
+fn queued(store: &Store) -> (Client<'_>, Server) {
+    let (mut client, server) = connected(store);
+    assert_eq!(client.write(b"queued"), Ok(6));
+    (client, server)
+}
+
+/// After a failure nothing that was queued goes out (RFC 9846 6, 6.2):
+/// the server's fatal alert leaves nothing to send, the client's own
+/// error only its alert, under the keys and number the server expects.
+#[test]
+fn failure_drops_pending() {
+    let store = Identity::new(Kind::P256).store();
+    let (mut alerted, mut sender) = queued(&store);
+    sender.send(ALERT, &[2, 40]);
+    assert_eq!(alerted.input(&sender.take()), Err(Error::Alert(40)));
+    assert!(alerted.pending().is_empty());
+    let (mut client, mut server) = queued(&store);
+    server.output.extend_from_slice(&[99, 3, 3, 0, 0]);
+    assert_eq!(client.input(&server.take()), Err(Error::Unexpected));
+    server.receive(client.pending());
+    assert!(server.received.is_empty());
+    assert_eq!(server.alerts, [10]);
+    // A close_notify not yet begun gives way to the error's alert.
+    let (mut closing, mut its_server) = queued(&store);
+    closing.close();
+    its_server.output.extend_from_slice(&[99, 3, 3, 0, 0]);
+    assert_eq!(closing.input(&its_server.take()), Err(Error::Unexpected));
+    its_server.receive(closing.pending());
+    assert!(its_server.received.is_empty());
+    assert_eq!(its_server.alerts, [10]);
+}
+
+/// A record the caller began to send is finished before the alert: a
+/// torn one would garble it.
+#[test]
+fn failure_finishes_a_begun_record() {
+    let store = Identity::new(Kind::P256).store();
+    let (mut client, mut server) = queued(&store);
+    assert_eq!(client.write(b"dropped"), Ok(7));
+    server.receive(&client.pending()[..10]);
+    client.sent(10);
+    server.output.extend_from_slice(&[99, 3, 3, 0, 0]);
+    assert_eq!(client.input(&server.take()), Err(Error::Unexpected));
+    server.receive(client.pending());
+    assert_eq!(server.received, b"queued");
+    assert_eq!(server.alerts, [10]);
+    // close_notify begun: nothing goes after it.
+    let (mut closing, mut its_server) = connected(&store);
+    closing.close();
+    its_server.receive(&closing.pending()[..3]);
+    closing.sent(3);
+    its_server.output.extend_from_slice(&[99, 3, 3, 0, 0]);
+    assert_eq!(closing.input(&its_server.take()), Err(Error::Unexpected));
+    its_server.receive(closing.pending());
+    assert_eq!(its_server.alerts, [0]);
+}
+
+/// Dropped records past a change of keys take the keys back: data before
+/// a KeyUpdate the client answers with, and the client's Finished with
+/// data after it, are not sent, and the alert goes under the keys the
+/// server reads with.
+#[test]
+fn failure_takes_the_keys_back() {
+    let store = Identity::new(Kind::P256).store();
+    let (mut client, mut server) = queued(&store);
+    server.update(true);
+    server.output.extend_from_slice(&[99, 3, 3, 0, 0]);
+    let bytes = server.take();
+    assert_eq!(client.input(&bytes), Err(Error::Unexpected));
+    server.receive(client.pending());
+    assert!(server.received.is_empty());
+    assert_eq!((server.updates, server.alerts.as_slice()), (0, &[10][..]));
+    // The whole flight in, the client's own not yet sent.
+    let mut fresh = Server::new(Script::new(Kind::P256));
+    let mut early = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
+    fresh.receive(early.pending());
+    early.sent(early.pending().len());
+    let flight = fresh.take();
+    assert_eq!(early.input(&flight), Ok(flight.len()));
+    assert!(early.connected());
+    assert_eq!(early.write(b"early"), Ok(5));
+    assert_eq!(early.input(&[99, 3, 3, 0, 0]), Err(Error::Unexpected));
+    fresh.receive(early.pending());
+    assert!(!fresh.finished && fresh.received.is_empty());
+    assert_eq!((fresh.ccs, fresh.alerts.as_slice()), (0, &[10][..]));
+}
+
+/// close before the handshake is complete ends it: the client's Finished
+/// never goes, it never connects, and what the server sends after is
+/// taken and ignored.
+#[test]
+fn close_during_handshake() {
+    let store = Identity::new(Kind::P256).store();
+    let mut server = Server::new(Script::new(Kind::P256));
+    let mut client = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
+    server.receive(client.pending());
+    client.sent(client.pending().len());
+    let flight = server.take();
+    let hello = 5 + usize::from(u16::from_be_bytes([flight[3], flight[4]]));
+    assert_eq!(client.input(&flight[..hello]), Ok(hello));
+    client.close();
+    assert_eq!(client.input(&flight[hello..]), Ok(flight.len() - hello));
+    assert!(!client.connected() && !client.awaiting() && !client.closed());
+    assert_eq!(client.write(b"x"), Err(Error::Closed));
+    server.receive(client.pending());
+    assert!(!server.finished);
+    assert_eq!(server.alerts, [0]);
 }

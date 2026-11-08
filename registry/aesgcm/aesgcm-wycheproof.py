@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Writes aesgcm-wycheproof.txt, Wycheproof's AES-GCM cases that aesgcm
-can run: a 128-bit key, a 96-bit nonce and a 128-bit tag.
+can run: a 128- or 256-bit key, a 96-bit nonce and a 128-bit tag.
 
     python3 aesgcm-wycheproof.py               # fetch, write the file
     python3 aesgcm-wycheproof.py --check       # the file is what it gives
     python3 aesgcm-wycheproof.py --dir DIR     # aes_gcm_test.json from DIR
 
 The JSON comes from C2SP/wycheproof at COMMIT and must hash to its
-SHA-256 in SOURCES. The other groups (192- and 256-bit keys, other
-nonce sizes) are counted in the header and left out. A case is a line
+SHA-256 in SOURCES. The other groups (192-bit keys, other nonce
+sizes) are counted in the header and left out. A case is a line
 of fields in hex, - for an empty one:
 
     tcId valid key nonce aad message ciphertext tag
@@ -51,7 +51,7 @@ def text(directory):
     doc = source(directory, "aes_gcm_test.json")
     kept, skipped, cases = [], 0, 0
     for group in doc["testGroups"]:
-        if (group["keySize"], group["ivSize"], group["tagSize"]) != (128, 96, 128):
+        if group["keySize"] not in (128, 256) or (group["ivSize"], group["tagSize"]) != (96, 128):
             skipped += 1
             cases += len(group["tests"])
             continue

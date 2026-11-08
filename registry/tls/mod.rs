@@ -2,7 +2,9 @@
 //! between the socket and the client, which serves a blocking loop, a
 //! poll loop or a thread alike.
 //!
-//! The profile: TLS_AES_128_GCM_SHA256; key shares for X25519MLKEM768,
+//! The profile: TLS_AES_128_GCM_SHA256 and TLS_AES_256_GCM_SHA384, in
+//! that order, as Go and BoringSSL offer them where the CPU has AES
+//! instructions; key shares for X25519MLKEM768,
 //! post-quantum, and X25519 on one X25519 key, as Go and browsers send
 //! them, and P-256, which RFC 9846 9.1 requires, for a server that asks
 //! in a HelloRetryRequest; server signatures ECDSA P-256, P-384 and
@@ -61,6 +63,7 @@ use crate::base::aesgcm::{self, AesGcm};
 use crate::base::ecdh;
 use crate::base::mlkem;
 use crate::base::sha256::{self, Sha256};
+use crate::base::sha384::{self, Sha384};
 use crate::base::x509;
 use crate::base::x25519;
 use alloc::boxed::Box;
@@ -102,17 +105,23 @@ const SEALED_MAX: usize = HEADER + RECORD_MAX + 1 + TAG;
 /// Records under one key before the client updates its own: RFC 9846
 /// 5.5 allows AES-GCM 2^24.5 full records.
 const KEY_RECORDS_MAX: u64 = 1 << 24;
-const HASH: usize = sha256::DIGEST_BYTES;
+/// The longest hash of a suite: SHA-384's.
+const HASH_MAX: usize = sha384::DIGEST_BYTES;
+/// Key changes in pending at once, each a Mark: the handshake keys after
+/// the ClientHello, the application keys after Finished, one KeyUpdate
+/// that answers the server and one of the client's own.
+const MARKS_MAX: usize = 4;
 /// A KeyUpdate and an alert, sealed.
 const KEY_UPDATE_SEALED: usize = HEADER + 4 + 1 + 1 + TAG;
 const ALERT_SEALED: usize = HEADER + 2 + 1 + TAG;
 /// The first ClientHello's key shares: X25519MLKEM768's and X25519's.
 const SHARES_BYTES: usize = 6 + (4 + HYBRID_SHARE) + (4 + x25519::KEY_BYTES);
-/// The longest ClientHello: header and fixed fields with the session ID,
+/// The longest ClientHello: header and fixed fields with two suites and
+/// the session ID,
 /// SNI of 253 bytes, groups, signatures, versions, the key shares, the
 /// whole ALPN list and the largest cookie, as hello writes them.
 const HELLO_MAX: usize =
-    4 + 43 + 32 + (9 + 253) + 12 + 24 + 7 + SHARES_BYTES + (6 + ALPN_MAX) + (6 + COOKIE_MAX);
+    4 + 45 + 32 + (9 + 253) + 12 + 24 + 7 + SHARES_BYTES + (6 + ALPN_MAX) + (6 + COOKIE_MAX);
 /// The middlebox compatibility record: change_cipher_spec.
 const CCS_RECORD: [u8; 6] = [CHANGE_CIPHER_SPEC, 3, 3, 0, 1, 1];
 /// What the handshake may leave pending when the caller sends none of
@@ -121,7 +130,7 @@ const CCS_RECORD: [u8; 6] = [CHANGE_CIPHER_SPEC, 3, 3, 0, 1, 1];
 const HANDSHAKE_PENDING_MAX: usize = 2 * (HEADER + HELLO_MAX)
     + CCS_RECORD.len()
     + (HEADER + 4 + 1 + 3 + 1 + TAG)
-    + (HEADER + 4 + HASH + 1 + TAG)
+    + (HEADER + 4 + HASH_MAX + 1 + TAG)
     + ALERT_SEALED;
 /// What pending holds at most once connected. write adds a record only
 /// while pending stays within PENDING_MAX, with the client's own
@@ -165,6 +174,7 @@ const KEY_SHARE: u16 = 51;
 
 const TLS13: u16 = 0x0304;
 const AES_128_GCM_SHA256: u16 = 0x1301;
+const AES_256_GCM_SHA384: u16 = 0x1302;
 // Named groups.
 const SECP256R1: u16 = 0x0017;
 const X25519: u16 = 0x001d;
@@ -186,12 +196,19 @@ const HELLO_RETRY: [u8; 32] = [
     0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
 ];
 
+/// The last 8 bytes of ServerHello.random from a TLS 1.3 server that
+/// negotiates TLS 1.2, or below it (RFC 9846 4.2.3).
+const DOWNGRADE_TLS12: [u8; 8] = *b"DOWNGRD\x01";
+const DOWNGRADE_TLS11: [u8; 8] = *b"DOWNGRD\x00";
+
 /// What CertificateVerify's signature covers before the transcript hash.
 const VERIFY_CONTEXT: &[u8; 34] = b"TLS 1.3, server CertificateVerify\0";
 
 /// Why the connection failed, or a call was refused. A failure sticks:
-/// each later input and write returns it, and pending holds the alert
-/// that tells the server, when there is one.
+/// each later input and write returns it, and pending holds only the
+/// rest of a record the caller began to send and the alert that tells
+/// the server, when there is one: records queued but not begun are
+/// dropped.
 #[derive(Clone, Copy)]
 #[cfg_attr(any(test, fuzzing), derive(Debug, PartialEq))]
 pub enum Error {
@@ -238,6 +255,9 @@ pub enum Error {
     Signature,
     /// The server's Finished does not verify (decrypt_error).
     Finished,
+    /// A limit of the client's own: a sequence number or the pending
+    /// buffer would overflow (internal_error).
+    Internal,
     /// The server sent this alert. close_notify (0) during the handshake
     /// is one too.
     Alert(u8),
@@ -264,6 +284,7 @@ impl Error {
             Error::Decode | Error::TooLarge => Some(50),
             Error::Signature | Error::Finished => Some(51),
             Error::Version => Some(70),
+            Error::Internal => Some(80),
             Error::Extension => Some(110),
             Error::Host | Error::Alpn | Error::Alert(_) | Error::NotConnected | Error::Closed => {
                 None
@@ -329,26 +350,91 @@ enum State {
     /// The server sent close_notify after the handshake: what comes
     /// after it is ignored.
     Closed,
+    /// close came before the handshake was complete: the client's
+    /// Finished never goes, so it never connects, and what comes is
+    /// ignored.
+    Abandoned,
+}
+
+/// A secret or a transcript hash, of the suite's hash: SHA-256 for
+/// TLS_AES_128_GCM_SHA256, SHA-384 for TLS_AES_256_GCM_SHA384. A secret
+/// keeps its hash through the key schedule.
+#[derive(Clone, Copy)]
+enum Digest {
+    Sha256([u8; sha256::DIGEST_BYTES]),
+    Sha384([u8; sha384::DIGEST_BYTES]),
+}
+
+impl Digest {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Digest::Sha256(bytes) => bytes,
+            Digest::Sha384(bytes) => bytes,
+        }
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        match self {
+            Digest::Sha256(bytes) => bytes,
+            Digest::Sha384(bytes) => bytes,
+        }
+    }
+
+    /// Zeros as long as the hash.
+    fn zero(&self) -> Digest {
+        match self {
+            Digest::Sha256(_) => Digest::Sha256([0; sha256::DIGEST_BYTES]),
+            Digest::Sha384(_) => Digest::Sha384([0; sha384::DIGEST_BYTES]),
+        }
+    }
+
+    /// The hash of data, by the same hash.
+    fn of(&self, data: &[u8]) -> Digest {
+        match self {
+            Digest::Sha256(_) => Digest::Sha256(sha256::digest(data)),
+            Digest::Sha384(_) => Digest::Sha384(sha384::digest(data)),
+        }
+    }
+
+    /// HKDF-Extract of input with this as the salt.
+    fn extract(&self, input: &[u8]) -> Digest {
+        match self {
+            Digest::Sha256(salt) => Digest::Sha256(sha256::hkdf_extract(salt, input)),
+            Digest::Sha384(salt) => Digest::Sha384(sha384::hkdf_extract(salt, input)),
+        }
+    }
 }
 
 /// One direction's record protection: the traffic secret, for
 /// KeyUpdate, its key and IV, and the next record's sequence number.
+/// The secret's hash names the suite: AES-128-GCM after SHA-256's,
+/// AES-256-GCM after SHA-384's.
 struct Keys {
-    secret: [u8; HASH],
+    secret: Digest,
     aead: AesGcm,
     iv: [u8; aesgcm::NONCE_LEN],
     seq: u64,
 }
 
 impl Keys {
-    fn new(secret: &[u8; HASH]) -> Keys {
-        let mut key = [0; aesgcm::KEY_LEN];
+    fn new(secret: &Digest) -> Keys {
         let mut iv = [0; aesgcm::NONCE_LEN];
-        expand(secret, b"key", &[], &mut key);
         expand(secret, b"iv", &[], &mut iv);
+        let aead = match secret {
+            Digest::Sha256(_) => {
+                let mut key = [0; aesgcm::KEY_LEN];
+                expand(secret, b"key", &[], &mut key);
+                AesGcm::new(&key)
+            }
+            Digest::Sha384(_) => {
+                let mut key = [0; aesgcm::KEY256_LEN];
+                expand(secret, b"key", &[], &mut key);
+                AesGcm::new256(&key)
+            }
+        };
         Keys {
             secret: *secret,
-            aead: AesGcm::new(&key),
+            aead,
             iv,
             seq: 0,
         }
@@ -356,9 +442,7 @@ impl Keys {
 
     /// The keys after a KeyUpdate (RFC 9846 7.2).
     fn next(&self) -> Keys {
-        let mut secret = [0; HASH];
-        expand(&self.secret, b"traffic upd", &[], &mut secret);
-        Keys::new(&secret)
+        Keys::new(&derive(&self.secret, b"traffic upd", &[]))
     }
 
     /// The next record's nonce: the sequence number XORed into the IV's
@@ -368,10 +452,96 @@ impl Keys {
         for (byte, number) in nonce.iter_mut().skip(4).zip(self.seq.to_be_bytes()) {
             *byte ^= number;
         }
-        // 2^64 records would take a peer longer than a connection lasts.
-        self.seq = self.seq.checked_add(1).ok_or(Error::Unexpected)?;
+        // 2^64 records would take a peer longer than a connection lasts;
+        // the client ends it rather than wrap (RFC 9846 5.3), on its own
+        // limit: internal_error.
+        self.seq = self.seq.checked_add(1).ok_or(Error::Internal)?;
         Ok(nonce)
     }
+}
+
+/// The transcript (RFC 9846 4.1): by both hashes until ServerHello, or a
+/// HelloRetryRequest, names the suite, then by its hash alone. SHA-384's
+/// state is boxed, so that a client of TLS_AES_128_GCM_SHA256 stays small
+/// once it drops it.
+enum Transcript {
+    Both(Sha256, Box<Sha384>),
+    Sha256(Sha256),
+    Sha384(Box<Sha384>),
+}
+
+impl Transcript {
+    fn new() -> Transcript {
+        Transcript::Both(Sha256::new(), Box::new(Sha384::new()))
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        match self {
+            Transcript::Both(a, b) => {
+                a.update(data);
+                b.update(data);
+            }
+            Transcript::Sha256(a) => a.update(data),
+            Transcript::Sha384(b) => b.update(data),
+        }
+    }
+
+    /// The hash so far; SHA-256's while both run, which no caller asks for.
+    fn hash(&self) -> Digest {
+        match self {
+            // rr: escape(copy): the transcript goes on past this hash.
+            Transcript::Both(a, _) | Transcript::Sha256(a) => Digest::Sha256(a.clone().finish()),
+            // rr: escape(copy): the transcript goes on past this hash.
+            Transcript::Sha384(b) => Digest::Sha384(Sha384::clone(b).finish()),
+        }
+    }
+
+    /// Keeps the hash of the suite the server chose: one the client did
+    /// not offer, or after a HelloRetryRequest another than it named, is
+    /// illegal_parameter (RFC 9846 4.2.3, 4.2.4).
+    fn select(&mut self, suite: u16) -> Result<(), Error> {
+        match (&*self, suite) {
+            (Transcript::Sha256(_), AES_128_GCM_SHA256)
+            | (Transcript::Sha384(_), AES_256_GCM_SHA384) => return Ok(()),
+            (Transcript::Both(..), AES_128_GCM_SHA256 | AES_256_GCM_SHA384) => {}
+            _ => return Err(Error::Parameter),
+        }
+        let both = core::mem::replace(self, Transcript::Sha256(Sha256::new()));
+        if let Transcript::Both(a, b) = both {
+            *self = if suite == AES_256_GCM_SHA384 {
+                Transcript::Sha384(b)
+            } else {
+                Transcript::Sha256(a)
+            };
+        }
+        Ok(())
+    }
+
+    /// A new transcript by the same hash, which a HelloRetryRequest starts
+    /// with the first ClientHello's hash.
+    fn restart(&mut self) {
+        match self {
+            Transcript::Both(a, b) => {
+                *a = Sha256::new();
+                **b = Sha384::new();
+            }
+            Transcript::Sha256(a) => *a = Sha256::new(),
+            Transcript::Sha384(b) => **b = Sha384::new(),
+        }
+    }
+}
+
+/// Where the output keys changed in pending: the record at at is the
+/// first under the next keys, and the ones before end under secret
+/// (none: in the clear) at sequence number seq. A failure takes the
+/// keys back to the first record not yet begun, which it drops.
+// rr: escape(copy): a mark is copied when it is made, and when the
+// caller's sending moves the ones after it forward: a few a connection.
+#[derive(Clone, Copy)]
+struct Mark {
+    at: usize,
+    secret: Option<Digest>,
+    seq: u64,
 }
 
 /// Fields of a handshake message, front to back.
@@ -459,11 +629,11 @@ pub struct Client<'a> {
     /// Records in a row that carried nothing.
     idle: u8,
     state: State,
-    transcript: Sha256,
+    transcript: Transcript,
     /// The key that checks the server's Finished.
-    server_finished: [u8; HASH],
+    server_finished: Digest,
     /// The master secret, which the application keys come from.
-    master: [u8; HASH],
+    master: Digest,
     /// The leaf's DER, whose key checks CertificateVerify, the message
     /// after its own, once that message's buffer has moved on.
     // rr: escape(bound): x509 refuses a certificate over
@@ -488,6 +658,9 @@ pub struct Client<'a> {
     /// Where a KeyUpdate this sent ends in tx: one not yet sent answers
     /// the server's later requests too.
     reply_end: usize,
+    /// The output keys' changes in tx after tx_at, oldest first.
+    marks: [Mark; MARKS_MAX],
+    marked: usize,
     /// close_notify or a fatal alert is queued: nothing goes after it.
     close_sent: bool,
     failed: Option<Error>,
@@ -561,9 +734,9 @@ impl<'a> Client<'a> {
             ccs: Ccs::Due,
             idle: 0,
             state: State::Hello,
-            transcript: Sha256::new(),
-            server_finished: [0; HASH],
-            master: [0; HASH],
+            transcript: Transcript::new(),
+            server_finished: Digest::Sha256([0; sha256::DIGEST_BYTES]),
+            master: Digest::Sha256([0; sha256::DIGEST_BYTES]),
             leaf: Vec::new(),
             requested: false,
             input_keys: None,
@@ -575,6 +748,12 @@ impl<'a> Client<'a> {
             tx: Vec::with_capacity(TX_MAX),
             tx_at: 0,
             reply_end: 0,
+            marks: [Mark {
+                at: 0,
+                secret: None,
+                seq: 0,
+            }; MARKS_MAX],
+            marked: 0,
             close_sent: false,
             failed: None,
         };
@@ -614,6 +793,15 @@ impl<'a> Client<'a> {
     /// Marks n bytes of pending as written.
     pub fn sent(&mut self, n: usize) {
         self.tx_at = self.tx_at.saturating_add(n).min(self.tx.len());
+        // A key change whose first record has begun is past taking back.
+        let begun = self
+            .marks
+            .iter()
+            .take(self.marked)
+            .take_while(|mark| mark.at <= self.tx_at)
+            .count();
+        self.marks.copy_within(begun..self.marked, 0);
+        self.marked -= begun;
         self.drained();
     }
 
@@ -672,12 +860,20 @@ impl<'a> Client<'a> {
         matches!(self.state, State::Closed)
     }
 
-    /// Queues close_notify; nothing is written after it.
+    /// Queues close_notify; nothing is written after it. Before the
+    /// handshake is complete it ends the handshake: the client's Finished
+    /// is never sent, so the client never connects, and input takes and
+    /// ignores what the server sends.
     pub fn close(&mut self) {
         if self.close_sent {
             return;
         }
         self.close_sent = true;
+        if !matches!(self.state, State::Connected | State::Closed) {
+            self.state = State::Abandoned;
+            self.hs = Vec::new();
+            self.leaf = Vec::new();
+        }
         if let Err(error) = self.records(ALERT, &[1, 0], 3) {
             self.fail(error);
         }
@@ -730,16 +926,23 @@ impl<'a> Client<'a> {
         }
     }
 
-    /// Ends the connection on error: the alert for it, if any, is queued
-    /// unless close_notify went before it, and everything else stops.
+    /// Ends the connection on error: nothing more goes out (RFC 9846 6,
+    /// 6.2) but the rest of a record the caller began to send, which a
+    /// torn record would garble, and the alert for the error, if any,
+    /// unless close_notify began before it. Everything else stops.
     fn fail(&mut self, error: Error) {
         self.failed = Some(error);
         self.app_at = 0;
         self.app_end = 0;
         self.rx.clear();
         self.hs.clear();
+        let kept = self.begun();
+        // close_notify is the last record: it began if nothing after the
+        // kept ones is left.
+        let closed = self.close_sent && kept == self.tx.len();
+        self.rewind(kept);
         if let Some(code) = error.alert()
-            && !self.close_sent
+            && !closed
         {
             // rr: escape(discard): the connection is over whether the
             // alert is queued or not.
@@ -748,10 +951,83 @@ impl<'a> Client<'a> {
         self.close_sent = true;
     }
 
+    /// Where the first record of tx not yet begun starts: the end of the
+    /// record tx_at is in, or tx_at between records.
+    fn begun(&self) -> usize {
+        let mut at = 0;
+        while at < self.tx_at {
+            let Some(&[_, _, _, high, low]) =
+                self.tx.get(at..).and_then(<[u8]>::first_chunk::<HEADER>)
+            else {
+                return self.tx.len();
+            };
+            at += HEADER + usize::from(u16::from_be_bytes([high, low]));
+        }
+        at.min(self.tx.len())
+    }
+
+    /// Drops the records of tx from kept on, and takes the output keys
+    /// back to those the first of them was sealed under, at its sequence
+    /// number: what goes next follows the records the server gets.
+    fn rewind(&mut self, kept: usize) {
+        if kept >= self.tx.len() {
+            return;
+        }
+        let mut secret = self.output_keys.as_ref().map(|keys| keys.secret);
+        let mut seq = self.output_keys.as_ref().map_or(0, |keys| keys.seq);
+        let mut end = self.tx.len();
+        let mut changed = false;
+        for mark in self.marks.iter().take(self.marked).rev() {
+            if mark.at <= kept {
+                break;
+            }
+            (secret, seq, end, changed) = (mark.secret, mark.seq, mark.at, true);
+        }
+        // The sealed records dropped under those keys: each took a number.
+        let mut at = kept;
+        while at < end {
+            let Some(&[kind, _, _, high, low]) =
+                self.tx.get(at..).and_then(<[u8]>::first_chunk::<HEADER>)
+            else {
+                break;
+            };
+            if kind == APPLICATION && secret.is_some() {
+                seq = seq.saturating_sub(1);
+            }
+            at += HEADER + usize::from(u16::from_be_bytes([high, low]));
+        }
+        if changed {
+            self.output_keys = secret.map(|secret| Keys::new(&secret));
+        }
+        if let Some(keys) = &mut self.output_keys {
+            keys.seq = seq;
+        }
+        self.tx.truncate(kept);
+        self.marked = 0;
+        self.reply_end = self.reply_end.min(kept);
+    }
+
+    /// The output keys from here on: the keys before, and where they end
+    /// in tx, are kept while what they sealed is not yet sent.
+    fn rekey(&mut self, keys: Keys) -> Result<(), Error> {
+        let at = self.tx.len();
+        if at > self.tx_at {
+            let slot = self.marks.get_mut(self.marked).ok_or(Error::Internal)?;
+            *slot = Mark {
+                at,
+                secret: self.output_keys.as_ref().map(|old| old.secret),
+                seq: self.output_keys.as_ref().map_or(0, |old| old.seq),
+            };
+            self.marked += 1;
+        }
+        self.output_keys = Some(keys);
+        Ok(())
+    }
+
     fn take(&mut self, bytes: &[u8]) -> Result<usize, Error> {
         let mut taken = 0;
         for _ in 0..RECORDS_PER_INPUT {
-            if matches!(self.state, State::Closed) {
+            if matches!(self.state, State::Closed | State::Abandoned) {
                 return Ok(bytes.len());
             }
             if self.app_end != 0 || matches!(self.state, State::Awaiting) {
@@ -889,7 +1165,9 @@ impl<'a> Client<'a> {
 
     /// The alert at rx[start..stop].
     fn alert(&mut self, start: usize, stop: usize) -> Result<(), Error> {
-        if !self.hs.is_empty() {
+        // An alert record without content is unexpected_message (RFC 9846
+        // 5.4), and so is one inside a handshake message.
+        if !self.hs.is_empty() || start == stop {
             return Err(Error::Unexpected);
         }
         let Some(&[_, description]) = self.rx.get(start..stop) else {
@@ -994,9 +1272,14 @@ impl<'a> Client<'a> {
         let session = fields.vector(1)?;
         let suite = fields.u16()?;
         let compression = fields.u8()?;
-        let mut extensions = Reader {
-            rest: fields.vector(2)?,
+        // A server below TLS 1.3 may send no extensions at all (RFC 9846
+        // E.1), as Go's parser takes it: the version check below answers.
+        let block = if fields.rest.is_empty() {
+            &[][..]
+        } else {
+            fields.vector(2)?
         };
+        let mut extensions = Reader { rest: block };
         fields.end()?;
         let retry = random == HELLO_RETRY;
         let mut selected = None;
@@ -1026,21 +1309,35 @@ impl<'a> Client<'a> {
             }
             data.end()?;
         }
-        // A server below TLS 1.3 sends neither (protocol_version); one
-        // that selects a version the client did not offer is wrong
-        // (illegal_parameter, RFC 9846 4.3.1).
+        // A server below TLS 1.3 sends neither (protocol_version, RFC 9846
+        // E.1); one that selects a version the client did not offer is
+        // wrong (illegal_parameter, 4.3.1). A ServerHello of TLS 1.2 or
+        // below that ends in a downgrade sentinel is illegal_parameter
+        // first: 4.2.3 asks every TLS 1.3 client to check it. Go and
+        // BoringSSL, which check it only once they accept TLS 1.2, answer
+        // protocol_version when TLS 1.3 alone is enabled.
         match (version, selected) {
             (0x0303, Some(TLS13)) => {}
             (0x0303, Some(_)) => return Err(Error::Parameter),
+            (..=0x0303, None)
+                if random
+                    .last_chunk::<8>()
+                    .is_some_and(|tail| *tail == DOWNGRADE_TLS12 || *tail == DOWNGRADE_TLS11) =>
+            {
+                return Err(Error::Parameter);
+            }
             _ => return Err(Error::Version),
         }
         if stray {
             return Err(Error::Extension);
         }
         let ours = self.session.as_ref().map_or(&[][..], |id| &id[..]);
-        if session != ours || suite != AES_128_GCM_SHA256 || compression != 0 {
+        if session != ours || compression != 0 {
             return Err(Error::Parameter);
         }
+        // A suite not offered, or after a HelloRetryRequest not the one it
+        // named, is illegal_parameter (RFC 9846 4.2.3, 4.2.4).
+        self.transcript.select(suite)?;
         if retry {
             return self.retry(message, share, cookie);
         }
@@ -1054,12 +1351,10 @@ impl<'a> Client<'a> {
         self.kem = None;
         self.transcript.update(message);
         let secrets = handshake_secrets(shared.get(..length).unwrap_or_default(), &self.hash());
-        let mut finished = [0; HASH];
-        expand(&secrets.server, b"finished", &[], &mut finished);
-        self.server_finished = finished;
+        self.server_finished = derive(&secrets.server, b"finished", &[]);
         self.master = secrets.master;
         self.input_keys = Some(Keys::new(&secrets.server));
-        self.output_keys = Some(Keys::new(&secrets.client));
+        self.rekey(Keys::new(&secrets.client))?;
         self.state = State::Extensions;
         Ok(true)
     }
@@ -1139,11 +1434,13 @@ impl<'a> Client<'a> {
         if cookie.len() > COOKIE_MAX {
             return Err(Error::TooLarge);
         }
-        // The first ClientHello stands in the transcript as its hash.
+        // The first ClientHello stands in the transcript as its hash, by
+        // the hash of the suite the retry names (RFC 9846 4.1).
         let first = self.hash();
-        self.transcript = Sha256::new();
-        self.transcript.update(&[MESSAGE_HASH, 0, 0, 32]);
-        self.transcript.update(&first);
+        let length = u8::try_from(first.bytes().len()).unwrap_or(u8::MAX);
+        self.transcript.restart();
+        self.transcript.update(&[MESSAGE_HASH, 0, 0, length]);
+        self.transcript.update(first.bytes());
         self.transcript.update(message);
         self.state = State::Retried;
         let hello = self.hello(cookie);
@@ -1328,21 +1625,23 @@ impl<'a> Client<'a> {
             return Err(Error::Parameter);
         }
         // RFC 9846 4.5.2: 64 spaces, the context string and the hash.
-        let mut content = [0x20; 64 + VERIFY_CONTEXT.len() + HASH];
+        let mut space = [0x20; 64 + VERIFY_CONTEXT.len() + HASH_MAX];
         let hash = self.hash();
-        for (byte, value) in content
+        for (byte, value) in space
             .iter_mut()
             .skip(64)
-            .zip(VERIFY_CONTEXT.iter().chain(&hash))
+            .zip(VERIFY_CONTEXT.iter().chain(hash.bytes()))
         {
             *byte = *value;
         }
+        let covered = 64 + VERIFY_CONTEXT.len() + hash.bytes().len();
+        let content = space.get(..covered).unwrap_or_default();
         let certificate = x509::parse(&self.leaf)?;
         let leaf = x509::Leaf {
             der: certificate.der,
             key: certificate.key,
         };
-        if !leaf.verify_tls13(scheme, &content, signature) {
+        if !leaf.verify_tls13(scheme, content, signature) {
             return Err(Error::Signature);
         }
         self.leaf = Vec::new();
@@ -1354,16 +1653,17 @@ impl<'a> Client<'a> {
     /// The server's Finished; the client's flight and the application
     /// keys follow it.
     fn finished(&mut self, message: &[u8], body: &[u8]) -> Result<bool, Error> {
-        if body.len() != HASH {
+        let expected = mac(&self.server_finished, &self.hash());
+        if body.len() != expected.bytes().len() {
             return Err(Error::Decode);
         }
-        if !same(body, &mac(&self.server_finished, &self.hash())) {
+        if !same(body, expected.bytes()) {
             return Err(Error::Finished);
         }
         self.transcript.update(message);
         let hash = self.hash();
-        let client = derive(&self.master, b"c ap traffic", &hash);
-        let server = derive(&self.master, b"s ap traffic", &hash);
+        let client = derive(&self.master, b"c ap traffic", hash.bytes());
+        let server = derive(&self.master, b"s ap traffic", hash.bytes());
         self.input_keys = Some(Keys::new(&server));
         // Middlebox compatibility: change_cipher_spec before the client's
         // encrypted flight, unless it went before a second ClientHello.
@@ -1376,18 +1676,18 @@ impl<'a> Client<'a> {
         let Some(keys) = &self.output_keys else {
             return Err(Error::Unexpected);
         };
-        let mut key = [0; HASH];
-        expand(&keys.secret, b"finished", &[], &mut key);
-        let mut ours = [0; 4 + HASH];
-        for (byte, value) in ours.iter_mut().zip(
-            message_header(FINISHED, HASH)
-                .iter()
-                .chain(&mac(&key, &self.hash())),
-        ) {
+        let key = derive(&keys.secret, b"finished", &[]);
+        let verify = mac(&key, &self.hash());
+        let size = verify.bytes().len();
+        let mut ours = [0; 4 + HASH_MAX];
+        for (byte, value) in ours
+            .iter_mut()
+            .zip(message_header(FINISHED, size).iter().chain(verify.bytes()))
+        {
             *byte = *value;
         }
-        self.handshake_message(&ours, 3)?;
-        self.output_keys = Some(Keys::new(&client));
+        self.handshake_message(ours.get(..4 + size).unwrap_or_default(), 3)?;
+        self.rekey(Keys::new(&client))?;
         // Of the ALPN offer, only the choice is kept, for alpn.
         if let Some((at, length)) = self.chosen {
             self.offer.drain(..at);
@@ -1397,8 +1697,10 @@ impl<'a> Client<'a> {
             self.offer.clear();
         }
         self.offer.shrink_to_fit();
-        self.master = [0; HASH];
-        self.server_finished = [0; HASH];
+        self.master = self.master.zero();
+        self.server_finished = self.server_finished.zero();
+        // The transcript is done with: SHA-384's box goes.
+        self.transcript = Transcript::Sha256(Sha256::new());
         self.state = State::Connected;
         Ok(true)
     }
@@ -1426,8 +1728,7 @@ impl<'a> Client<'a> {
     fn update(&mut self) -> Result<(), Error> {
         self.records(HANDSHAKE, &[KEY_UPDATE, 0, 0, 1, 0], 3)?;
         let next = self.output_keys.as_ref().ok_or(Error::Unexpected)?.next();
-        self.output_keys = Some(next);
-        Ok(())
+        self.rekey(next)
     }
 
     fn encrypt(&mut self, data: &[u8]) -> Result<usize, Error> {
@@ -1460,6 +1761,7 @@ impl<'a> Client<'a> {
             self.tx.clear();
             self.tx_at = 0;
             self.reply_end = 0;
+            self.marked = 0;
         }
     }
 
@@ -1491,10 +1793,9 @@ impl<'a> Client<'a> {
         Ok(())
     }
 
-    /// The transcript's hash so far.
-    fn hash(&self) -> [u8; HASH] {
-        // rr: escape(copy): the transcript goes on past this hash.
-        self.transcript.clone().finish()
+    /// The transcript's hash so far, by the suite's hash.
+    fn hash(&self) -> Digest {
+        self.transcript.hash()
     }
 
     /// A ClientHello with the cookie, if any (RFC 9846 4.2.2). The
@@ -1504,11 +1805,13 @@ impl<'a> Client<'a> {
         m.extend_from_slice(&[CLIENT_HELLO, 0, 0, 0, 3, 3]);
         m.extend_from_slice(&self.random);
         // A session ID of 32 random bytes, for middlebox compatibility
-        // (RFC 9846 E.4); one suite and no compression.
+        // (RFC 9846 E.4); the suites, AES-128 first as Go and BoringSSL
+        // order them where the CPU has AES instructions, and no
+        // compression.
         let session = self.session.as_ref().map_or(&[][..], |id| &id[..]);
         m.push(u8::try_from(session.len()).unwrap_or(0));
         m.extend_from_slice(session);
-        m.extend_from_slice(&[0, 2, 0x13, 0x01, 1, 0]);
+        m.extend_from_slice(&[0, 4, 0x13, 0x01, 0x13, 0x02, 1, 0]);
         let extensions = m.len();
         m.extend_from_slice(&[0, 0]);
         if !self.literal {
@@ -1615,9 +1918,18 @@ fn certificates<'m>(body: &'m [u8], out: &mut [&'m [u8]]) -> Result<usize, Error
     };
     fields.end()?;
     let mut count = 0;
+    let mut unsolicited = false;
     while !list.rest.is_empty() {
         let der = list.vector(3)?;
-        list.vector(2)?;
+        let mut extensions = Reader {
+            rest: list.vector(2)?,
+        };
+        // Each extension framed whole, or decode_error.
+        while !extensions.rest.is_empty() {
+            extensions.u16()?;
+            extensions.vector(2)?;
+            unsolicited = true;
+        }
         let slot = out.get_mut(count).ok_or(Error::Certificate)?;
         if der.is_empty() {
             return Err(Error::Decode);
@@ -1627,6 +1939,12 @@ fn certificates<'m>(body: &'m [u8], out: &mut [&'m [u8]]) -> Result<usize, Error
     }
     if count == 0 {
         return Err(Error::Decode);
+    }
+    // The client asks for neither status_request nor SCTs, so an entry's
+    // extension answers nothing it sent: unsupported_extension (RFC 9846
+    // 4.3, 4.5.1), as BoringSSL and rustls refuse it.
+    if unsolicited {
+        return Err(Error::Extension);
     }
     Ok(count)
 }
@@ -1644,14 +1962,17 @@ fn message_header(kind: u8, length: usize) -> [u8; 4] {
 }
 
 /// Seals data as one record of kind at the end of tx (RFC 9846 5.2):
-/// the header, the data, its type and the tag, sealed in place.
+/// the header, the data, its type and the tag, sealed in place. A record
+/// past the client's own limits is internal_error.
 fn seal(keys: &mut Keys, tx: &mut Vec<u8>, kind: u8, data: &[u8]) -> Result<(), Error> {
     let Ok(length) = u16::try_from(data.len() + 1 + TAG) else {
-        return Err(Error::Overflow);
+        return Err(Error::Internal);
     };
     if tx.len() + HEADER + usize::from(length) > TX_MAX {
-        return Err(Error::Overflow);
+        return Err(Error::Internal);
     }
+    // The number first: a record that cannot have one is never begun.
+    let nonce = keys.nonce()?;
     let start = tx.len();
     let [high, low] = length.to_be_bytes();
     tx.extend_from_slice(&[APPLICATION, 3, 3, high, low]);
@@ -1659,48 +1980,61 @@ fn seal(keys: &mut Keys, tx: &mut Vec<u8>, kind: u8, data: &[u8]) -> Result<(), 
     // buffer, and the caller's data is borrowed.
     tx.extend_from_slice(data);
     tx.push(kind);
-    let nonce = keys.nonce()?;
     let (head, body) = tx
         .split_at_mut_checked(start + HEADER)
-        .ok_or(Error::Overflow)?;
+        .ok_or(Error::Internal)?;
     let header = head.get(start..).unwrap_or_default();
-    let tag = keys.aead.seal(&nonce, header, body)?;
+    let tag = keys
+        .aead
+        .seal(&nonce, header, body)
+        .map_err(|error| local(&error))?;
     tx.extend_from_slice(&tag);
     Ok(())
 }
 
-/// The secrets ServerHello's key share leads to (RFC 9846 7.1).
-struct Secrets {
-    client: [u8; HASH],
-    server: [u8; HASH],
-    master: [u8; HASH],
-}
-
-/// The handshake traffic secrets and the master secret, from the key
-/// exchange's shared secret and the hash of ClientHello..ServerHello. Without a
-/// PSK the early secret is HKDF-Extract of zeros.
-fn handshake_secrets(shared: &[u8], hash: &[u8; HASH]) -> Secrets {
-    let empty = sha256::digest(&[]);
-    let early = sha256::hkdf_extract(&[0; HASH], &[0; HASH]);
-    let handshake = sha256::hkdf_extract(&derive(&early, b"derived", &empty), shared);
-    Secrets {
-        client: derive(&handshake, b"c hs traffic", hash),
-        server: derive(&handshake, b"s hs traffic", hash),
-        master: sha256::hkdf_extract(&derive(&handshake, b"derived", &empty), &[0; HASH]),
+/// An error sealing a record of the client's own, which only a limit of
+/// its own can cause: internal_error.
+fn local(error: &aesgcm::Error) -> Error {
+    match error {
+        aesgcm::Error::TooLong | aesgcm::Error::Forged => Error::Internal,
     }
 }
 
-/// Derive-Secret: HKDF-Expand-Label of a transcript hash.
-fn derive(secret: &[u8; HASH], label: &[u8], hash: &[u8; HASH]) -> [u8; HASH] {
-    let mut out = [0; HASH];
-    expand(secret, label, hash, &mut out);
+/// The secrets ServerHello's key share leads to (RFC 9846 7.1).
+struct Secrets {
+    client: Digest,
+    server: Digest,
+    master: Digest,
+}
+
+/// The handshake traffic secrets and the master secret, from the key
+/// exchange's shared secret and the hash of ClientHello..ServerHello, by
+/// that hash's function. Without a PSK the early secret is HKDF-Extract
+/// of zeros.
+fn handshake_secrets(shared: &[u8], hash: &Digest) -> Secrets {
+    let zero = hash.zero();
+    let empty = hash.of(&[]);
+    let early = zero.extract(zero.bytes());
+    let handshake = derive(&early, b"derived", empty.bytes()).extract(shared);
+    Secrets {
+        client: derive(&handshake, b"c hs traffic", hash.bytes()),
+        server: derive(&handshake, b"s hs traffic", hash.bytes()),
+        master: derive(&handshake, b"derived", empty.bytes()).extract(zero.bytes()),
+    }
+}
+
+/// Derive-Secret: HKDF-Expand-Label of a transcript hash, or of nothing,
+/// as long as the secret.
+fn derive(secret: &Digest, label: &[u8], hash: &[u8]) -> Digest {
+    let mut out = secret.zero();
+    expand(secret, label, hash, out.bytes_mut());
     out
 }
 
 /// HKDF-Expand-Label (RFC 9846 7.1). The labels are this file's, at most
-/// 12 bytes, and a context is a hash at most: info fits 64 bytes.
-fn expand(secret: &[u8; HASH], label: &[u8], context: &[u8], out: &mut [u8]) {
-    let mut info = [0; 64];
+/// 12 bytes, and a context is a hash at most: info fits 80 bytes.
+fn expand(secret: &Digest, label: &[u8], context: &[u8], out: &mut [u8]) {
+    let mut info = [0; 80];
     let lengths = [out.len(), 6 + label.len(), context.len()]
         .map(|length| u8::try_from(length).unwrap_or(u8::MAX));
     let [size, labelled, hashed] = lengths;
@@ -1718,17 +2052,21 @@ fn expand(secret: &[u8; HASH], label: &[u8], context: &[u8], out: &mut [u8]) {
         at += part.len();
     }
     let info = info.get(..at).unwrap_or_default();
-    if !sha256::hkdf_expand(secret, info, out) {
-        // rr: escape(panic): out is at most 32 bytes, far under HKDF's
-        // limit of 8160.
+    let expanded = match secret {
+        Digest::Sha256(key) => sha256::hkdf_expand(key, info, out),
+        Digest::Sha384(key) => sha384::hkdf_expand(key, info, out),
+    };
+    if !expanded {
+        // rr: escape(panic): out is at most 48 bytes, far under HKDF's
+        // limit of 255 hashes.
         unreachable!();
     }
 }
 
-/// HMAC-SHA256 of data under key, which HKDF-Extract is with key as
-/// the salt: a Finished's verify_data (RFC 9846 4.5.3).
-fn mac(key: &[u8; HASH], data: &[u8; HASH]) -> [u8; HASH] {
-    sha256::hkdf_extract(key, data)
+/// HMAC of data under key by the suite's hash, which HKDF-Extract is
+/// with key as the salt: a Finished's verify_data (RFC 9846 4.5.3).
+fn mac(key: &Digest, data: &Digest) -> Digest {
+    key.extract(data.bytes())
 }
 
 /// Whether a equals b, in time that does not depend on where they
