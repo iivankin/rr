@@ -17,12 +17,21 @@
 //! the system's verifier is not asked; SSL_CERT_DIR's list is separated
 //! by ':', or ';' on Windows.
 //!
+//! Windows builds more than one chain where cross-signatures allow it:
+//! as Go's systemVerify, trust asks for the lower-quality chain contexts
+//! as well (CERT_CHAIN_RETURN_LOWER_QUALITY_CONTEXTS) and weighs each,
+//! the best first, as it weighs the best: its trust status, then the SSL
+//! policy for the host. A chain passes when one of them does, and the
+//! policy below screens each that did; when none passes, the best's
+//! error is the answer, as in Go. Freeing the best context frees the
+//! rest.
+//!
 //! A policy laid over the trust (Trust::with_policy), such as Mozilla's
 //! OneCRL and distrust dates that roots::policy gives, holds wherever the
 //! chain is verified: x509's anchors take it on, and the path the
-//! system's verifier built is screened with x509::screen, as Go screens
-//! the system's chains for its own blocklist (root_darwin.go,
-//! root_windows.go). The dependency stays one way: trust needs only
+//! system's verifier built (on Windows, each it took, until one passes)
+//! is screened with x509::screen, as Go screens the system's chains for
+//! its own blocklist (root_darwin.go, root_windows.go). The dependency stays one way: trust needs only
 //! x509, and a program that adds roots hands its policy over:
 //! `Trust::new()?.with_policy(roots::policy())`.
 //!
