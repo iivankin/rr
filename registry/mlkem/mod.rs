@@ -16,10 +16,8 @@ pub const SEED_BYTES: usize = 64;
 pub const ENCAPSULATION_KEY_BYTES: usize = K * POLY_BYTES + 32;
 /// Bytes of a ciphertext.
 pub const CIPHERTEXT_BYTES: usize = K * U_BYTES + V_BYTES;
-/// Bytes of the shared secret.
-// rr: escape(duplicate): each component stands alone; ecdh's is P-256's
-// x-coordinate, a size of its own.
-pub const SHARED_BYTES: usize = 32;
+/// Bytes of the shared secret key, K in FIPS 203.
+pub const SHARED_KEY_BYTES: usize = 32;
 /// Bytes of the randomness m an encapsulation takes.
 pub const MESSAGE_BYTES: usize = 32;
 /// Bytes of a decapsulation key in FIPS 203's expanded encoding.
@@ -176,7 +174,7 @@ pub fn generate(seed: &[u8; SEED_BYTES]) -> DecapsulationKey {
 pub fn encapsulate(
     key: &[u8; ENCAPSULATION_KEY_BYTES],
     m: &[u8; MESSAGE_BYTES],
-) -> Option<([u8; CIPHERTEXT_BYTES], [u8; SHARED_BYTES])> {
+) -> Option<([u8; CIPHERTEXT_BYTES], [u8; SHARED_KEY_BYTES])> {
     Some(EncapsulationKey::parse(key)?.encapsulate(m))
 }
 
@@ -215,7 +213,7 @@ impl EncapsulationKey {
     pub fn encapsulate(
         &self,
         m: &[u8; MESSAGE_BYTES],
-    ) -> ([u8; CIPHERTEXT_BYTES], [u8; SHARED_BYTES]) {
+    ) -> ([u8; CIPHERTEXT_BYTES], [u8; SHARED_KEY_BYTES]) {
         let g = sha3_512(&[m, &self.h]);
         let (shared, r) = halves(&g);
         (self.encrypt(m, &r), shared)
@@ -263,11 +261,11 @@ impl DecapsulationKey {
     /// ML-KEM.Decaps_internal (FIPS 203 Algorithm 18): the shared secret.
     /// A ciphertext that does not re-encrypt to itself gives
     /// J(z || c), a secret the peer cannot know, in the same time.
-    pub fn decapsulate(&self, ciphertext: &[u8; CIPHERTEXT_BYTES]) -> [u8; SHARED_BYTES] {
+    pub fn decapsulate(&self, ciphertext: &[u8; CIPHERTEXT_BYTES]) -> [u8; SHARED_KEY_BYTES] {
         let m = self.decrypt(ciphertext);
         let g = sha3_512(&[&m, &self.ek.h]);
         let (shared, r) = halves(&g);
-        let mut rejected = [0; SHARED_BYTES];
+        let mut rejected = [0; SHARED_KEY_BYTES];
         shake256(&[&self.z, ciphertext], &mut rejected);
         let again = self.ek.encrypt(&m, &r);
         let differ = ciphertext
@@ -276,7 +274,7 @@ impl DecapsulationKey {
             .fold(0, |acc, (x, y)| acc | (x ^ y));
         // 0xff when the ciphertexts are equal, 0 when not, by arithmetic.
         let mask = core::hint::black_box(u16::from(differ).wrapping_sub(1) >> 8);
-        let mut out = [0; SHARED_BYTES];
+        let mut out = [0; SHARED_KEY_BYTES];
         for ((o, k), j) in out.iter_mut().zip(shared).zip(rejected) {
             *o = narrow((u16::from(k) & mask) | (u16::from(j) & !mask));
         }
@@ -801,8 +799,8 @@ mod tests {
     use super::{
         CIPHERTEXT_BYTES, DECAPSULATION_KEY_BYTES, DecapsulationKey, ENCAPSULATION_KEY_BYTES,
         EncapsulationKey, K, MESSAGE_BYTES, N, POLY_BYTES, Q, RATE_SHAKE128, SEED_BYTES,
-        SHARED_BYTES, SUFFIX_SHAKE, Sponge, decode12, encapsulate, encode12, generate, sha3_256,
-        sha3_512, shake256, sponge,
+        SHARED_KEY_BYTES, SUFFIX_SHAKE, Sponge, decode12, encapsulate, encode12, generate,
+        sha3_256, sha3_512, shake256, sponge,
     };
     use test::Bencher;
 
@@ -1131,6 +1129,6 @@ mod tests {
         let dk = generate(&[42; SEED_BYTES]);
         let (c, _) = encapsulate(&dk.encapsulation_key(), &[3; MESSAGE_BYTES])
             .expect("a generated key is valid");
-        b.iter(|| -> [u8; SHARED_BYTES] { dk.decapsulate(core::hint::black_box(&c)) });
+        b.iter(|| -> [u8; SHARED_KEY_BYTES] { dk.decapsulate(core::hint::black_box(&c)) });
     }
 }
