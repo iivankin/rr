@@ -2768,6 +2768,7 @@ fn close_during_handshake() {
     server.receive(client.pending());
     assert!(!server.finished);
     assert_eq!(server.alerts, [0]);
+}
 
 /// A chain the caller trusts still needs a leaf whose key may sign the
 /// handshake: keyUsage keyEncipherment alone is refused before the
