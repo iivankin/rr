@@ -329,8 +329,9 @@ fn echo_both_families() {
     for address in [v4(), v6()] {
         let mut set = Set::new().unwrap();
         let (mut client, mut server) = pair(&mut set, address);
-        client.no_delay().unwrap();
-        server.no_delay().unwrap();
+        // On by default; Nagle's algorithm and back.
+        client.no_delay(false).unwrap();
+        client.no_delay(true).unwrap();
         assert!(client.watch(&mut set, READ | WRITE, 1));
         assert!(server.watch(&mut set, READ, 2));
         let total = 4 << 20;
@@ -718,5 +719,47 @@ fn removed_and_added_again() {
         until(&mut set, 2, READ);
         set.remove(again);
         client.close(&mut set);
+    }
+}
+
+/// The peer finished while the writer waits for room: writing still
+/// works, and the hangup, which ends reading, does not wake a Set that
+/// waits for writing alone.
+#[test]
+fn half_closed_writer() {
+    let chunk = [7u8; 16 * 1024];
+    for mut set in sets() {
+        let (mut client, server) = pair(&mut set, v4());
+        let mut sent = 0usize;
+        while let Io::Done(count) = client.write(&chunk).unwrap() {
+            sent += count;
+            assert!(sent < 1 << 30, "never blocked");
+        }
+        server.finish().unwrap();
+        assert!(client.watch(&mut set, WRITE, 1));
+        assert!(
+            wakeups(&mut set, 100) <= 3,
+            "a hangup woke a Set waiting to write"
+        );
+        client.close(&mut set);
+        server.close(&mut set);
+    }
+}
+
+/// Sockets closed through the Set while the system still has news of
+/// them, a reset, and new ones made at once, which take their handles
+/// on Windows: none of the old news is reported for the new.
+#[test]
+fn closed_handles_taken_again() {
+    for mut set in sets() {
+        for round in 0..50u64 {
+            let (mut client, mut server) = pair(&mut set, v4());
+            assert!(client.watch(&mut set, READ, 2 * round + 1));
+            assert!(server.watch(&mut set, READ, 2 * round + 2));
+            quiet(&mut set, 2 * round + 1, HUP | ERROR, 10);
+            quiet(&mut set, 2 * round + 2, HUP | ERROR, 10);
+            client.abort(&mut set);
+            server.close(&mut set);
+        }
     }
 }

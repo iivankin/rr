@@ -24,15 +24,19 @@
 //! milliseconds, rounded up, and Windows wakes on its timer's tick, 15.6
 //! ms unless the program asked for a finer one.
 //!
-//! A descriptor is in a Set once, and is removed before it is closed.
-//! One closed first is dropped by the system, and its entry stays, with
-//! its deadline, until it is removed or a new descriptor gets its number:
-//! that one is added as new, the old entry goes, and its token names
-//! nothing. On
-//! Linux that holds only when the closed descriptor was the last open on
-//! its socket: epoll watches the socket, not the number, so after dup or
-//! fork another descriptor keeps it watched, and its events come back
-//! on every wait for an entry the Set no longer reports.
+//! A descriptor is in a Set once, and is removed before it is closed:
+//! close does both, and on Windows closes the socket once the system
+//! confirms that it holds nothing more of it, so that no report of it
+//! comes for the socket that takes its handle next. One closed first is
+//! dropped by the system, and its entry stays, with its deadline, until
+//! it is removed or a new descriptor gets its number: that one is added
+//! as new, the old entry goes, and its token names nothing; what the
+//! system had queued for the old one may then be reported for it once,
+//! as a spurious report. On Linux that holds only when the closed
+//! descriptor was the last open on its socket: epoll watches the socket,
+//! not the number, so after dup or fork another descriptor keeps it
+//! watched, and its events come back on every wait for an entry the Set
+//! no longer reports.
 //!
 //! A Set is one thread's; a Waker wakes it from another.
 
@@ -89,7 +93,9 @@ impl Instant {
 }
 
 /// An entry of a Set, until it is removed: a token of a removed entry
-/// names nothing, even once its place is taken again.
+/// names nothing, even once its place is taken again. A token is for the
+/// Set that gave it: another Set reads it as its own entry of that place,
+/// as an index into the wrong array would be.
 #[derive(Clone, Copy)]
 pub struct Token {
     index: u32,
@@ -176,6 +182,17 @@ pub struct Set {
     batch: u64,
     /// The key wakes are reported with.
     woken: u64,
+}
+
+/// How an entry's descriptor leaves the system's watch.
+#[derive(Clone, Copy)]
+enum Detach {
+    /// Told to, while it is open.
+    Remove,
+    /// Told to, and then closed.
+    Close,
+    /// Closed already: the poller forgets its record.
+    Forget,
 }
 
 impl Set {
@@ -279,8 +296,25 @@ impl Set {
             return;
         }
         self.deadline(token, None);
-        self.detach(token.index, true);
+        self.detach(token.index, Detach::Remove);
         self.release(token.index);
+    }
+
+    /// Removes the entry and closes its descriptor, which the caller
+    /// gives up: on Windows the socket stays open until the system
+    /// confirms its removal. False, and nothing closed, when the token
+    /// names no entry with a descriptor.
+    pub fn close(&mut self, token: Token) -> bool {
+        let Some(slot) = self.slot_mut(token) else {
+            return false;
+        };
+        if slot.fd.is_none() || !slot.attached {
+            return false;
+        }
+        self.deadline(token, None);
+        self.detach(token.index, Detach::Close);
+        self.release(token.index);
+        true
     }
 
     /// What wakes this Set from another thread; its wakes are reported
@@ -437,7 +471,7 @@ impl Set {
 
     /// The entry of a descriptor closed before it was removed goes.
     fn forget(&mut self, index: u32) {
-        self.detach(index, false);
+        self.detach(index, Detach::Forget);
         self.clear(index);
         self.release(index);
     }
@@ -473,10 +507,8 @@ impl Set {
         self.free.push(index);
     }
 
-    /// The system stops watching the entry's descriptor.
-    /// The system stops watching the entry's descriptor: told to, while
-    /// it is open; or the poller forgets it, once it was closed.
-    fn detach(&mut self, index: u32, open: bool) {
+    /// The system stops watching the entry's descriptor, as how says.
+    fn detach(&mut self, index: u32, how: Detach) {
         let Some(slot) = usize::try_from(index)
             .ok()
             .and_then(|at| self.slots.get_mut(at))
@@ -495,13 +527,15 @@ impl Set {
         if self.owners.get(&fd) == Some(&index) {
             self.owners.remove(&fd);
         }
-        if open {
-            self.poller.remove(fd, key, interest);
-        } else {
+        match how {
+            Detach::Remove => self.poller.remove(fd, key, interest),
+            Detach::Close => self.poller.close(fd, key, interest),
             // epoll and kqueue dropped it with the descriptor and keep
             // nothing; Windows's pollers keep their own record of it.
             #[cfg(target_os = "windows")]
-            self.poller.forget(key);
+            Detach::Forget => self.poller.forget(key),
+            #[cfg(not(target_os = "windows"))]
+            Detach::Forget => {}
         }
     }
 

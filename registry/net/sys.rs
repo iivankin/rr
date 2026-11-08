@@ -34,10 +34,12 @@ pub enum Io {
 /// The bytes of a sockaddr_in6, the larger of the two.
 const ADDRESS_BYTES: usize = 28;
 
-/// A socket, and its entry in a Set with the key it was watched with.
+/// A socket, and its entry in a Set with the key it was watched with;
+/// open until its Set or its drop closes it.
 struct Socket {
     fd: Raw,
     entry: Option<(Token, u64)>,
+    open: bool,
 }
 
 impl Socket {
@@ -60,17 +62,21 @@ impl Socket {
         self.entry.map(|(token, _)| token)
     }
 
-    /// Takes the socket out of the Set, before drop closes it.
-    fn leave(&mut self, set: &mut Set) {
+    /// Hands the socket to its Set, which takes it out and closes it
+    /// (on Windows once the system has nothing more of it); one in no Set
+    /// drop closes.
+    fn close(&mut self, set: &mut Set) {
         if let Some((token, _)) = self.entry.take() {
-            set.remove(token);
+            self.open = !set.close(token);
         }
     }
 }
 
 impl Drop for Socket {
     fn drop(&mut self) {
-        os::close(self.fd);
+        if self.open {
+            os::close(self.fd);
+        }
     }
 }
 
@@ -86,7 +92,9 @@ impl Stream {
         let socket = Socket {
             fd: os::open(&address)?,
             entry: None,
+            open: true,
         };
+        os::no_delay(socket.fd, true)?;
         let (bytes, length) = encode(&address);
         os::connect(socket.fd, bytes.get(..length).unwrap_or_default())?;
         Ok(Stream { socket })
@@ -114,10 +122,11 @@ impl Stream {
         os::finish(self.socket.fd)
     }
 
-    /// Sends small writes at once (TCP_NODELAY), as a server that answers
-    /// requests wants.
-    pub fn no_delay(&self) -> Result<(), Error> {
-        os::no_delay(self.socket.fd)
+    /// Whether small writes go at once (TCP_NODELAY, on for every stream,
+    /// as Go has it: a loop writes whole messages), or wait to be joined
+    /// with the next (Nagle's algorithm), for one that writes in pieces.
+    pub fn no_delay(&self, on: bool) -> Result<(), Error> {
+        os::no_delay(self.socket.fd, on)
     }
 
     pub fn local(&self) -> Option<SocketAddr> {
@@ -144,16 +153,16 @@ impl Stream {
         self.socket.fd
     }
 
-    /// Takes the stream out of set, then closes it.
+    /// Takes the stream out of set, and closes it.
     pub fn close(mut self, set: &mut Set) {
-        self.socket.leave(set);
+        self.socket.close(set);
     }
 
     /// Closes with a reset (SO_LINGER 0), as for a peer that misbehaved:
     /// what was not sent is dropped.
     pub fn abort(mut self, set: &mut Set) {
-        self.socket.leave(set);
         os::reset(self.socket.fd);
+        self.socket.close(set);
     }
 }
 
@@ -169,6 +178,7 @@ impl Listener {
         let socket = Socket {
             fd: os::open(&address)?,
             entry: None,
+            open: true,
         };
         os::prepare(socket.fd, address.is_ipv6())?;
         let (bytes, length) = encode(&address);
@@ -183,8 +193,16 @@ impl Listener {
             return Ok(None);
         };
         let stream = Stream {
-            socket: Socket { fd, entry: None },
+            socket: Socket {
+                fd,
+                entry: None,
+                open: true,
+            },
         };
+        if stream.no_delay(true).is_err() {
+            // Only Nagle's algorithm stays, as Go leaves it then; a socket
+            // that cannot take the option shows its error at its read.
+        }
         Ok(Some((stream, peer)))
     }
 
@@ -204,9 +222,9 @@ impl Listener {
         self.socket.watch(set, interest, key)
     }
 
-    /// Takes the listener out of set, then closes it.
+    /// Takes the listener out of set, and closes it.
     pub fn close(mut self, set: &mut Set) {
-        self.socket.leave(set);
+        self.socket.close(set);
     }
 }
 
@@ -298,6 +316,14 @@ mod os {
             pub(super) fn accept(fd: c_int, address: *mut u8, length: *mut u32) -> c_int;
             pub(super) fn connect(fd: c_int, address: *const u8, length: u32) -> c_int;
             pub(super) fn getsockname(fd: c_int, address: *mut u8, length: *mut u32) -> c_int;
+            #[cfg(target_os = "macos")]
+            pub(super) fn sysctlbyname(
+                name: *const core::ffi::c_char,
+                old: *mut c_void,
+                old_length: *mut usize,
+                new: *const c_void,
+                new_length: usize,
+            ) -> c_int;
             pub(super) fn getpeername(fd: c_int, address: *mut u8, length: *mut u32) -> c_int;
             pub(super) fn getsockopt(
                 fd: c_int,
@@ -530,8 +556,8 @@ mod os {
         Ok(())
     }
 
-    pub fn no_delay(fd: c_int) -> Result<(), Error> {
-        option(fd, IPPROTO_TCP, TCP_NODELAY, 1)
+    pub fn no_delay(fd: c_int, on: bool) -> Result<(), Error> {
+        option(fd, IPPROTO_TCP, TCP_NODELAY, i32::from(on))
     }
 
     pub fn bind(fd: c_int, address: &[u8]) -> Result<(), Error> {
@@ -730,6 +756,35 @@ mod os {
     #[cfg(target_os = "macos")]
     const RLIMIT_NOFILE: c_int = 8;
 
+    /// macOS's kern.maxfilesperproc, the most descriptors a process may
+    /// hold whatever its hard limit says; no limit when it cannot be read.
+    #[cfg(target_os = "macos")]
+    fn per_process() -> u64 {
+        let mut most = 0i32;
+        let mut length = size_of::<i32>();
+        // rr: escape(unsafe): the name is NUL-terminated; most is an int
+        // of length bytes.
+        let read = unsafe {
+            c::sysctlbyname(
+                c"kern.maxfilesperproc".as_ptr(),
+                (&raw mut most).cast(),
+                &raw mut length,
+                core::ptr::null(),
+                0,
+            )
+        };
+        match (read, u64::try_from(most)) {
+            (0, Ok(most)) if most > 0 => most,
+            _ => u64::MAX,
+        }
+    }
+
+    /// Linux keeps the hard limit within fs.nr_open itself.
+    #[cfg(target_os = "linux")]
+    fn per_process() -> u64 {
+        u64::MAX
+    }
+
     pub fn descriptors(want: u64) -> u64 {
         let mut limit = [0u64; 2];
         // rr: escape(unsafe): limit is a local struct rlimit.
@@ -737,20 +792,15 @@ mod os {
             return 0;
         }
         let [current, most] = limit;
-        // macOS refuses more than kern.maxfilesperproc, and Linux more
-        // than fs.nr_open, though either may be under the hard limit:
-        // asked again for half, as often as 32 times, down to what it has.
-        let mut asked = want.min(most);
-        for _ in 0..32 {
-            if asked <= current {
-                break;
-            }
+        // Up to the hard limit, which Linux keeps within fs.nr_open, and
+        // on macOS within kern.maxfilesperproc as well, which the hard
+        // limit (often unlimited there) does not show: as Go raises it.
+        let asked = want.min(most).min(per_process());
+        if asked > current {
             let raised = [asked, most];
-            // rr: escape(unsafe): raised is a local struct rlimit.
-            if unsafe { c::setrlimit(RLIMIT_NOFILE, raised.as_ptr()) } == 0 {
-                break;
-            }
-            asked /= 2;
+            // rr: escape(unsafe): raised is a local struct rlimit. Refused,
+            // the limit stays as it was.
+            unsafe { c::setrlimit(RLIMIT_NOFILE, raised.as_ptr()) };
         }
         // What the system holds now, which it may have cut.
         // rr: escape(unsafe): limit is a local struct rlimit.
@@ -922,8 +972,8 @@ mod os {
         Ok(())
     }
 
-    pub fn no_delay(socket: usize) -> Result<(), Error> {
-        option(socket, IPPROTO_TCP, TCP_NODELAY, 1)
+    pub fn no_delay(socket: usize, on: bool) -> Result<(), Error> {
+        option(socket, IPPROTO_TCP, TCP_NODELAY, i32::from(on))
     }
 
     /// Binds; with SO_EXCLUSIVEADDRUSE, an address another socket holds
