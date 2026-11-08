@@ -1707,8 +1707,11 @@ mod poller {
         /// registration takes the new filter; one with no interest is
         /// removed, as the port refuses an empty filter and a disabled
         /// registration may not be enabled again before the port says it
-        /// is disabled. While a removal is unconfirmed the interest waits
-        /// for it.
+        /// is disabled. While a removal is unconfirmed the socket is
+        /// registered under a new key if the port takes it, as it takes a
+        /// new socket that has the handle of one closed (whose removal's
+        /// word closesocket may have dropped); the same socket it refuses
+        /// until the word, and the interest waits for it.
         fn watch(&mut self, socket: usize, key: u64, interest: u8) -> bool {
             let registration = self.sockets.get(&socket).map_or(0, |w| w.registration);
             self.sockets.insert(
@@ -1719,9 +1722,7 @@ mod poller {
                     registration,
                 },
             );
-            if self.removing.values().any(|waiting| *waiting == socket) {
-                return true;
-            }
+            let waiting = self.removing.values().any(|removed| *removed == socket);
             match (registration, interest) {
                 (0, 0) => true,
                 (_, 0) => {
@@ -1735,8 +1736,9 @@ mod poller {
                     if let (true, Some(watched)) = (taken, self.sockets.get_mut(&socket)) {
                         watched.registration = fresh;
                         self.registrations.insert(fresh, socket);
+                        self.removing.retain(|_, removed| *removed != socket);
                     }
-                    taken
+                    taken || waiting
                 }
                 (_, _) => self.register(enable(socket, registration, interest)),
             }
