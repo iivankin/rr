@@ -1598,8 +1598,12 @@ impl<'a> Client<'a> {
             (Verify::Store(store), _) => x509::verify(chain, store, &self.host, self.now)?.der,
             (Verify::Caller, State::Trusted) => {
                 let leaf = chain.first().copied().unwrap_or_default();
-                // The key must be one CertificateVerify can be checked with.
-                x509::parse(leaf)?;
+                // The key must be one CertificateVerify can be checked
+                // with, and allowed to sign it, whoever verified the chain,
+                // as BoringSSL has it (tls13_both.cc).
+                if !x509::parse(leaf)?.signs_handshake() {
+                    return Err(x509::Error::Usage.into());
+                }
                 leaf
             }
             (Verify::Caller, _) => {

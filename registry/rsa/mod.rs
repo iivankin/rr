@@ -5,10 +5,11 @@
 //!
 //! The key, the digest and the signature are public, so the arithmetic
 //! is not constant time; what an attacker controls is bounded instead:
-//! moduli of 2048 to 4096 bits and exponents of at most 33 bits, as
-//! BoringSSL allows, so one verification costs at most 33 squarings of
-//! 4096 bits. Numbers are little-endian 64-bit limbs, multiplied in the
-//! Montgomery domain.
+//! moduli of 2048 to 8192 bits, as webpki takes them for TLS servers
+//! (ring_algs.rs) and Go's TLS does, and exponents of at most 33 bits,
+//! as BoringSSL allows, so one verification costs at most 33 squarings
+//! of 8192 bits. Numbers are little-endian 64-bit limbs, multiplied in
+//! the Montgomery domain.
 
 use crate::base::sha256;
 use crate::base::sha384;
@@ -21,7 +22,7 @@ pub enum Hash {
 }
 
 const MODULUS_BITS_MIN: usize = 2048;
-const MODULUS_BITS_MAX: usize = 4096;
+const MODULUS_BITS_MAX: usize = 8192;
 const EXPONENT_BITS_MAX: u32 = 33;
 const LIMBS_MAX: usize = MODULUS_BITS_MAX / 64;
 const BYTES_MAX: usize = MODULUS_BITS_MAX / 8;
@@ -204,7 +205,8 @@ pub fn verify_pss(
 }
 
 /// db ^= MGF1(seed) (RFC 8017 B.2.1): the hash of seed and a 32-bit
-/// counter, block by block. db is under 512 bytes, so the counter is too.
+/// counter, block by block. db is under 1024 bytes, so the counter is
+/// too.
 fn mgf1_xor(hash: &Hash, seed: &[u8], db: &mut [u8]) {
     for (counter, chunk) in (0_u32..).zip(db.chunks_mut(hash.len())) {
         let mask = hash.digest(&[seed, &counter.to_be_bytes()]);
@@ -464,8 +466,8 @@ impl Operand<'_> {
 }
 
 /// A sum of products of two limbs, three words: a column of at most 2
-/// LIMBS_MAX of them, under 2^135, with what the column below carries
-/// in, stays below 2^136, so top never wraps.
+/// LIMBS_MAX (256) of them, under 2^136, with what the column below
+/// carries in, stays below 2^137, so top never wraps.
 struct Column {
     low: u128,
     top: u64,
@@ -828,26 +830,133 @@ mod tests {
         }
     }
 
-    /// Moduli of 2048 to 4096 bits, odd; exponents odd, from 3 to 2^33 -
+    /// An 8192-bit key, exponent 65537, made and used by openssl 3.6:
+    /// genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:8192, then dgst
+    /// -sign over "rr RSA-8192 test vector\n", with SHA-256 and PKCS #1,
+    /// and with SHA-384 and PSS (-sigopt rsa_padding_mode:pss
+    /// rsa_pss_saltlen:digest rsa_mgf1_md:sha384). It is x509's test
+    /// rsa8192root.
+    #[test]
+    fn key_8192() {
+        let modulus = hex(
+            "d32aeb666756a20e0fb6f3f73b6492cb47a261bcbceed02843ad99264ce99a977afa54fa73566e07\
+             be627c6b74c54fe32d02b9587905b8002ae03ecf2d61f4a73151c0c69b90a260df8a9b46b245d1f8\
+             68e87f6394d13c5ec6067daa52dc254c374a83f3ff2e428804f086b9435a4006d549027f0bab268b\
+             f79e5fddc85f321a7b81adefdd8d796d2c7f07e4b9f9ac3ffbfd218713007efcbb38dd1688310df2\
+             915b1cebdc7688c80e33ccae7bb0b2dac069a5f1894dc18f108f51db96598ecb69c3f2f6476aa240\
+             03d6127a0295ba535bdc971b5a3c6a3f623bacca5daeaafff11fc4cb8e581a00a1b6c19c9e07203f\
+             0da8fbccf7c1811fc03001d04dcb33d6115d5011e440dd09f5f67ad795003e9777152f7ff8b63c19\
+             75872fd0a0d92ff7d16c09cefb7bc819c8f3e4a1a097c745e3a9d264cc35b2966c949bf8dca2ac9a\
+             5643b4b1bd3d3c25d443234243b11beac048efb49aab1f1cad8ddeb9668e2f8f31e6a6da05579d65\
+             7999f5e4052318007d615c29db5df51d178593eaf819f3c0efa1f2fc07eb085a47761de493f46f25\
+             98a0ce6a90e4832f6453dd467d45bcce9f0c35f568be706d1bcb335da49bee16a6f8496a2bccb78f\
+             aca99529344385ebc777d9bf0f6801b712f0418c1ebca5719fcdb6aba271b035d0d3b797abab601e\
+             8fe88f7477df57f51ba9716813c003ec23b7234be42375b9c310ece4d6bdf703b6b99d503f8e675c\
+             863c1df0cf3046e0f49e506c0eca4a87b25c57ef1bb374fa4e735368da792fce01c640a6809d0aa4\
+             0ebe7da0afcd86b59ae4808eaa9ee42fa61c90f866763f5f36606f02b99197fc5cb658352b83c3b3\
+             f5d5461b8db02ce96fea940895678e91b7aeb2a207c0fc9ef8a4ce4757fb7654f50c99cb401bafcf\
+             50d8d96b4fe26b83db7444365f9f72f263aa58375ca4752f129a1cb5ed629953e4178633de170984\
+             10b472b41c0d79922894690d1f91da69d801aa7ba1af278400bcaa8927f5ea75ef32cd2d2431d758\
+             356dda4bd0f61afc5115db3738e54a72eef159fdd2e6fcc2451750aa893ff09510880f65f5229e57\
+             f2d0cf208ab9fbebe9cb807411fbc880a93bb2ba1d942fa489cac3ed827d65c5e09ad55e4d9ddab8\
+             2fc02d716854d54483f54fc41d9a48b63153dce5a63a081e964b2ce76dbe6d5db2b0263b63997a41\
+             3c0c2aaf739d52445a74702f487e0e098b74557fa139fb51badfede3aa7915b2f35b701493580163\
+             be8ef3a27d1e4823a0e40d33a79727eb6f2f93c671997afde717e9900cac693d03d2670b88701631\
+             f0e5fc83c95374b78b2e612cc5418dc89df2385dd85fc8397a8256bdab4c496b8a1da9463d28e5eb\
+             d1a2528841d468005b6bf534ecc5fdbbd809de858aaabc8e31a13c97f32d92dc7f0eb9982eaf2caa\
+             5cc5d6fa3a1eb4223a486cd3a2f68348ddcc7630d7ee3e67",
+        );
+        let pkcs1 = hex(
+            "89b3c39ee896df8ac2b0de9bb8429a25aea6f17620b103760913ba23c480b2d56827eefc989095a0\
+             3939ced6796162e83508c85925a438680c9fbc6e869a85b0d3e35d528a3d29c9cadd66e232311e8b\
+             239be886d9d7a9cb84d3fbced59382d45e3328fbe2b755fbab404485c54b8f13fb9bf19c7ccb7348\
+             b5af8e55d51191c0924b2b189141a92416e5ce0c548a0ea1fb1cb2e0da944285194734d8f14b219f\
+             7b69f4080326ae255029e917da2fec2f959e6c51b1a896e17c62a1e538fd0dc124cb0f4187ec0795\
+             9aff5f618b2e1c83ec80028bb20bf2c65ee8f57b2d5bdb1866093d678851edb92e74eb1dc55bfe12\
+             aac01d6a7655c81db7ba589ee7807c1b64c849e7fc5cd02a84fbfe008227d3db35cb749dd94fc5a6\
+             2798b6ec004b0836ff578e86738a1c46817b5315e63557643578d007b39f69ad0cb2e87ac0bfedec\
+             3b6e489b4a5056fa660c947917b208f4d86eb60daec3db41ac3d1405ee28c3bab07158b4c5acda65\
+             1c4aefccb8680d50261f5f853e9a8af16b8c03c6802e37d6f2c83b1d3521220419921910429e0b70\
+             15e92a0fea6faea35d0749eddf81b433f9c9c1504adaf87babf02da7f0228d4c6e6da4dc7773ba65\
+             a4440ef86510040175437ffac766e3b3b33bbb4621f63655d8fd83029048c53cdd06278dfd1c0a8a\
+             f14c348d9b0a29ef675dcba6fcc2be6516abf0a199d5fc9bcebd50c48541d2f2dc29e0a0e74f6b69\
+             1ff38cb976fbac6d7dd7318dbf73c31e66069eb0df0e23cd1ad9501583fa07610e9b43d3c052b414\
+             6774098ed11fd19ebcc406627add7fdcda1cb1a9837bf4174dc8d64c64c359ad6d55bb0b0297a9b3\
+             0a1f83e3dba7f740f92d8fad6ffdf0e211eedc3a1f520ccb11a2d446b0d81cd6ff136970f0d87ff2\
+             f3dd2d90ab86098add5885d784c78e7e918eb4ebdfd8d5d8a648a17a92982d0bde224763055a30a1\
+             570e99ff0e726d7da985e793126e0da6a4fb84dc48bd9f9ed3054363d2f5c2112c1f204691e321d5\
+             7a252dbc96976fd7a3bf13f2beca14c21b513e392356073aa579521c1abe296d18f7e284407e85ae\
+             b3a49cf8bae7ebd6279c2b97fb43d92f785330aa127ec5f76ae8bd776600dba92f37391e16725427\
+             ca9a2308400e5f34d39b793acc9c6b44497848a91364b07a65a4160550dff418eff44e9716d6630b\
+             393eaba7b84b88ba92c9b2ce1f698c11b468fb734876a4be7dd77e4efe82601d5a9e5c0de29853dc\
+             82b4c1ab751521be8fde4097d8ad66bfbadfea3fb5bcd659c5042ca4221a27495f99c7601df1458f\
+             e2df0b0a1a3e92688e3c2ac056a99c50d3c9b355922e084af17f412642dbed3f0fcbca3b56c8a8c9\
+             633745bdc07456991c14c5eedddfd8d3c176d95dc5b51a113b3d5b261ec062fb642e64ad722927f0\
+             35f983ff35a7f088fea4f11b50eaa3777753a7347a8e7923",
+        );
+        let pss = hex(
+            "649170ab89e6ba3b40afaf714205e5bf07cf857d2d15b201c3da8fadc5a4d199f997b4ee99e7af88\
+             735bfc05e7b22a25ec5f49513118e3842535496fec5259fb7123b4d769cd14448b0ebfd4fd280bf7\
+             c843e2f09182fe6def413054831a08f1ddc191c5451800cb02f05bafc6d01bd3311259c874875916\
+             5b719ff50567e561e79ac744b0fa9143b5f1daf2c56f9ccd237657d85a8798b36995c11df485b2a4\
+             f7816d14e0aee94e8708bdbe43a2ba559f9c0d77a9409eb9dcfbcc0f44ff57bd5b15d159d56c98ad\
+             28df2f8290af5c97f34ebb31344643bb78218c8535414030bbf521647273a3194bd6a983ac2b6057\
+             aa7cebbb5ac16be9a298c33d42771d393d657363869a9932e0f455084452539709c3b09657f61095\
+             f0e6be0448dec5cdf3b9ec6b7f81f00a47fa731035cfc1869f4c65937489109375d78d497d4976b5\
+             9bd7f273020a5bd64144f7428d2b65ab050e27d271edd0bd4ea6f358ee91600f2bfa2cd684b03517\
+             0eef7de46f604621b0fb38fa7e1aa1618ff44d4176baa31a65eeabf217215b50d697b1b07e827419\
+             c91f80745700814e1fb7421d72b6db0e6f5ef79750ab925cea65d82191d094497521fd86a38e0440\
+             feab76ec620c08707e5df7c66192326e3be497fa34e0e27dd5cee033d195e84f474090897776419b\
+             bd224d271002fd12b6c62d0bfaeeb7a3ae7c1f7a7f8cac4031bd6bd6ce8974a085567cab4c4cdac8\
+             c6acf9a630562986abd8870640625639e8eada715a119bb7206fa4677a71b71b2ad21bbafc45cae1\
+             bd084f2187fa61d2469fe436ad17aa098fe66d26e865b8e91a921c5be6244ca54b1f0cba79592ccf\
+             d525421ad8217aa43c08061aa010e35fc956f100c79cd04b7bf8025e11972dc38d2934a142479eaa\
+             4dde8a8c76f8934dee4bd373d52c79a49226fea371e534cde817d71a1953d287a746c6012f2eb43f\
+             f6e03e7243576f1e0d7cae3b6c1514b452fae481ba2c10f2cb6c1de0004d618603fd56be89b201cd\
+             47a3ca03a3e9b0e6fa2a7e22a0b4c0930ab2a69e880bd824edc965a7cda9b9b4b542bfb63bd3d659\
+             80c4e826146a4d78723d741c20a7c0342fb91cdf24747384e3da6c7725d9eafd13828dc3f1b7beb4\
+             daae617a57ba6cb12c20c2929db1bda356aee2e49151dd77a3f8b8d50cbe211c8075cc4680d795fc\
+             67c7c87c033550cf9ca68c3f1920e4266ae0d1140f0337abdaa1c3aec5d7254412cd568013d876b2\
+             100b83d809c75efe4151b5ffa0dcc7fa84ca16c972b7c7f964ec5d88772e906ae4a4ce45882229e7\
+             014b5bf007253aa90a3b44176bd7a007ed44a75ac838982f1e87eab3e71f6e46cd49d1a422fcb276\
+             2bf7b2f10b81fd5589373263392f3bb41f6075f0825b8a65bee43ed102345176eb50b854d960a009\
+             0143ed7e1de459ee5b9cc7ce54ba3b09fa37c167fb08ff04",
+        );
+        let sha256 = hex("c5ff8eb61a0ba7fc9fc35f80753ba14cd65b9d7e180c3d9ef631e563f46c402b");
+        let sha384 = hex(
+            "f0def41019e38082a9cd4dd079c3d8c277801d4a05b3016376e1d133c24f9d7e\
+             c9540c96ad4f366c314134760d8260d1",
+        );
+        let e = [1, 0, 1];
+        assert!(verify_pkcs1(&modulus, &e, &Hash::Sha256, &sha256, &pkcs1));
+        assert!(verify_pss(&modulus, &e, &Hash::Sha384, &sha384, &pss));
+        assert!(!verify_pss(&modulus, &e, &Hash::Sha256, &sha256, &pkcs1));
+        assert!(!verify_pkcs1(&modulus, &e, &Hash::Sha384, &sha384, &pss));
+        let mut changed = pss;
+        changed[1000] ^= 1;
+        assert!(!verify_pss(&modulus, &e, &Hash::Sha384, &sha384, &changed));
+    }
+
+    /// Moduli of 2048 to 8192 bits, odd; exponents odd, from 3 to 2^33 -
     /// 1. The numbers need not be keys: the bounds come first.
     #[test]
     fn key_bounds() {
-        let mut modulus = [0xff; 513];
+        let mut modulus = [0xff; 1025];
         modulus[0] = 1;
         let e = [1, 0, 1];
-        assert!(Key::new(&modulus[257..], &e).is_some());
+        assert!(Key::new(&modulus[769..], &e).is_some());
         assert!(Key::new(&modulus[1..], &e).is_some());
         assert!(Key::new(&modulus, &e).is_none());
-        assert!(Key::new(&modulus[258..], &e).is_none());
-        modulus[257] = 0x7f;
-        assert!(Key::new(&modulus[257..], &e).is_none());
-        modulus[257] = 0x80;
-        assert!(Key::new(&modulus[257..], &e).is_some());
-        modulus[512] = 0xfe;
-        assert!(Key::new(&modulus[257..], &e).is_none());
-        modulus[512] = 0xff;
+        assert!(Key::new(&modulus[770..], &e).is_none());
+        modulus[769] = 0x7f;
+        assert!(Key::new(&modulus[769..], &e).is_none());
+        modulus[769] = 0x80;
+        assert!(Key::new(&modulus[769..], &e).is_some());
+        modulus[1024] = 0xfe;
+        assert!(Key::new(&modulus[769..], &e).is_none());
+        modulus[1024] = 0xff;
         assert!(Key::new(&[], &e).is_none());
-        let modulus = &modulus[257..];
+        let modulus = &modulus[769..];
         for (exponent, valid) in [
             (&[3][..], true),
             (&[1, 0xff, 0xff, 0xff, 0xff], true),

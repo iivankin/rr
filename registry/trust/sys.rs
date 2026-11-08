@@ -10,12 +10,13 @@ pub use crate::base::wait::Wait;
 /// Why a chain was refused, or the system gave no anchors.
 #[cfg_attr(test, derive(Debug, PartialEq))]
 pub enum Error {
-    /// A system call failed: an errno on Linux, an OSStatus on macOS, a
-    /// GetLastError code on Windows.
+    /// A system call failed: an errno on Linux and macOS (a file read),
+    /// an OSStatus on macOS, a GetLastError code on Windows.
     System(i32),
-    /// Why x509 refused: on Linux the chain, x509::verify's error; on
-    /// every system a leaf that does not name the host, x509::Error::Host,
-    /// before the system is asked.
+    /// Why x509 refused: the chain, x509::verify's error, where x509
+    /// verifies; the path the system built, x509::screen's, under a
+    /// policy; on every system a leaf that does not name the host,
+    /// x509::Error::Host, before the system is asked.
     Untrusted(x509::Error),
     /// macOS: the OSStatus SecTrustEvaluateWithError refused it with,
     /// such as errSecNotTrusted or errSecHostNameMismatch.
@@ -24,7 +25,7 @@ pub enum Error {
     Chain(u32),
     /// Windows: the SSL policy's error, such as CERT_E_CN_NO_MATCH.
     Policy(u32),
-    /// Linux: the system has no anchors.
+    /// Where x509 verifies: no anchors were found.
     NoRoots,
     /// No certificate, too many, or one the system cannot read.
     Input,
@@ -37,27 +38,59 @@ pub enum Error {
 
 /// The system's trust, made once for the program.
 pub struct Trust {
-    os: os::Trust,
+    /// The anchors x509 verifies with: on Linux the system's, on macOS
+    /// and Windows those SSL_CERT_FILE and SSL_CERT_DIR name, or the
+    /// caller's (with). None: the system verifies.
+    store: Option<x509::Store>,
+    /// Distrust laid over the system's verdict (with_policy).
+    policy: Option<x509::Store>,
 }
 
 impl Trust {
-    /// The system's trust; on Linux its anchors, an error when it has
-    /// none.
+    /// The system's trust. On Linux its anchors, an error when it has
+    /// none; on macOS and Windows its verifier, unless SSL_CERT_FILE or
+    /// SSL_CERT_DIR is set, when x509 verifies with the anchors they name
+    /// instead, as Go does since 1.27 (root.go's loadSystemRoots).
     pub fn new() -> Result<Trust, Error> {
-        // Only Linux's can fail; the type is the same on every system.
-        #[cfg(target_os = "linux")]
-        let os = os::Trust::new();
         #[cfg(not(target_os = "linux"))]
-        let os: Result<os::Trust, Error> = Ok(os::Trust);
-        os.map(|os| Trust { os })
+        if !overridden() {
+            return Ok(Trust {
+                store: None,
+                policy: None,
+            });
+        }
+        let store = store()?;
+        if store.is_empty() {
+            return Err(Error::NoRoots);
+        }
+        Ok(Trust {
+            store: Some(store),
+            policy: None,
+        })
     }
 
-    /// Linux: trust in the anchors of store instead of the system's.
-    #[cfg(target_os = "linux")]
+    /// Trust in the anchors of store instead of the system's: x509
+    /// verifies, on every system.
     pub fn with(store: x509::Store) -> Trust {
         Trust {
-            os: os::Trust { store },
+            store: Some(store),
+            policy: None,
         }
+    }
+
+    /// Lays policy's distrust over this trust, as roots::policy gives
+    /// Mozilla's: where x509 verifies, the anchors take it on
+    /// (x509::Store::add_policy); where the system does, the path it
+    /// built is screened (x509::screen) before a check says yes, as Go
+    /// screens the system's chains for its own blocklist.
+    pub fn with_policy(mut self, policy: x509::Store) -> Trust {
+        match &mut self.store {
+            Some(store) => {
+                store.add_policy(&policy);
+            }
+            None => self.policy = Some(policy),
+        }
+        self
     }
 
     /// Starts checking chain, DER certificates leaf first, for host at
@@ -65,9 +98,14 @@ impl Trust {
     /// empty or holds a NUL is Error::Input on every system: Windows reads
     /// the name as a C string, which would end at the NUL, and checks
     /// none for an empty one.
-    pub fn check(&self, chain: &[&[u8]], host: &str, now: i64) -> Check {
+    pub fn check(&self, chain: &[&[u8]], host: &str, now: i64) -> Check<'_> {
+        let os = match &self.store {
+            Some(store) => os::Check::answered(verify_with(store, chain, host, now)),
+            None => os::check(chain, host, now),
+        };
         Check {
-            os: os::check(&self.os, chain, host, now),
+            os,
+            policy: self.policy.as_ref(),
             polled: false,
         }
     }
@@ -86,14 +124,66 @@ impl Trust {
     }
 }
 
+/// x509::verify on store, at once.
+fn verify_with(store: &x509::Store, chain: &[&[u8]], host: &str, now: i64) -> Result<Path, Error> {
+    if chain.is_empty() || chain.len() > x509::CHAIN_MAX || !named(host) {
+        return Err(Error::Input);
+    }
+    match x509::verify(chain, store, host, now) {
+        Ok(_leaf) => Ok(Path::new()),
+        Err(error) => Err(Error::Untrusted(error)),
+    }
+}
+
+/// The path the system's verifier built, leaf first: the certificates'
+/// DER one after another, and where each ends. Empty where x509
+/// verified.
+pub struct Path {
+    // rr: escape(bound): at most x509::CHAIN_MAX certificates, which
+    // each system's path holds.
+    bytes: Vec<u8>,
+    // rr: escape(bound): one for each certificate of bytes.
+    ends: Vec<usize>,
+}
+
+impl Path {
+    fn new() -> Path {
+        Path {
+            bytes: Vec::new(),
+            ends: Vec::new(),
+        }
+    }
+
+    /// Appends a certificate: macOS and Windows, of the path they built.
+    fn push(&mut self, der: &[u8]) {
+        self.bytes.extend_from_slice(der);
+        self.ends.push(self.bytes.len());
+    }
+
+    /// Whether policy takes the path; an empty one it has no say on.
+    fn screen(&self, policy: &x509::Store) -> Result<(), Error> {
+        if self.ends.is_empty() {
+            return Ok(());
+        }
+        let mut start = 0;
+        let mut certificates = Vec::with_capacity(self.ends.len());
+        for end in &self.ends {
+            certificates.push(self.bytes.get(start..*end).unwrap_or_default());
+            start = *end;
+        }
+        x509::screen(&certificates, policy).map_err(Error::Untrusted)
+    }
+}
+
 /// One chain's check. Dropping it cancels it.
-pub struct Check {
+pub struct Check<'t> {
     os: os::Check,
+    policy: Option<&'t x509::Store>,
     /// Whether poll gave the answer.
     polled: bool,
 }
 
-impl Check {
+impl Check<'_> {
     /// None while the system works; then the answer, once.
     pub fn poll(&mut self) -> Option<Result<(), Error>> {
         if self.polled {
@@ -101,7 +191,10 @@ impl Check {
         }
         let answer = self.os.poll()?;
         self.polled = true;
-        Some(answer)
+        Some(answer.and_then(|path| match self.policy {
+            Some(policy) => path.screen(policy),
+            None => Ok(()),
+        }))
     }
 
     /// What to wait on before polling again.
@@ -114,10 +207,12 @@ impl Check {
 const FOUND_BYTES_MAX: usize = 16 << 20;
 
 /// Adds the system's trusted roots for TLS server authentication to
-/// store; how many it added. An error only when it added none.
+/// store; how many it added. An error only when it added none. On macOS
+/// and Windows with SSL_CERT_FILE or SSL_CERT_DIR set, the anchors they
+/// name instead, as Go's SystemCertPool gives them since 1.27.
 pub fn system(store: &mut x509::Store) -> Result<usize, Error> {
     let mut found = Found::new();
-    let result = os::collect(&mut found);
+    let result = collect(&mut found);
     let added = found.add_to(store);
     match result {
         Err(error) if added == 0 => Err(error),
@@ -131,6 +226,34 @@ pub fn store() -> Result<x509::Store, Error> {
     system(&mut store)?;
     Ok(store)
 }
+
+/// The anchors into found: from the files SSL_CERT_FILE and SSL_CERT_DIR
+/// name, or else the system's, its files on Linux (Go's root.go).
+fn collect(found: &mut Found) -> Result<(), Error> {
+    let (file, dirs) = (os::variable(FILE_VARIABLE), os::variable(DIR_VARIABLE));
+    #[cfg(not(target_os = "linux"))]
+    if file.is_none() && dirs.is_none() {
+        return os::collect(found);
+    }
+    let paths = disk::Paths {
+        file: file.as_deref(),
+        dirs: dirs.as_deref(),
+    };
+    match disk::collect(&mut os::System, &paths, &os::DEFAULTS, found) {
+        Some(error) => Err(Error::System(error)),
+        None => Ok(()),
+    }
+}
+
+/// Whether SSL_CERT_FILE or SSL_CERT_DIR is set, and not empty.
+#[cfg(not(target_os = "linux"))]
+fn overridden() -> bool {
+    os::variable(FILE_VARIABLE).is_some() || os::variable(DIR_VARIABLE).is_some()
+}
+
+/// The variables' names, with their NUL.
+const FILE_VARIABLE: &[u8] = b"SSL_CERT_FILE\0";
+const DIR_VARIABLE: &[u8] = b"SSL_CERT_DIR\0";
 
 /// Certificates found, as DER in one buffer: those trusted, and those
 /// the system denies, which are left out wherever else they are found.
@@ -184,7 +307,6 @@ impl Found {
     /// Adds each CERTIFICATE block of PEM text as trusted. A block that
     /// is not plain base64, such as one with headers, is skipped, as Go
     /// skips it.
-    #[cfg(any(target_os = "linux", test))]
     fn pem(&mut self, text: &[u8]) {
         let mut rest = text;
         while let Some((body, after)) = pem_block(rest) {
@@ -200,7 +322,6 @@ impl Found {
             }
         }
     }
-
     /// Adds the trusted certificates to store, each once and none that
     /// is denied; how many the store took.
     fn add_to(mut self, store: &mut x509::Store) -> usize {
@@ -261,13 +382,10 @@ fn platform_host<'h>(chain: &[&[u8]], host: &'h str) -> Result<&'h str, Error> {
     Ok(bare.strip_suffix('.').unwrap_or(bare))
 }
 
-#[cfg(any(target_os = "linux", test))]
 const PEM_BEGIN: &[u8] = b"-----BEGIN CERTIFICATE-----";
-#[cfg(any(target_os = "linux", test))]
 const PEM_END: &[u8] = b"-----END CERTIFICATE-----";
 
 /// The base64 of the next CERTIFICATE block, and the text after it.
-#[cfg(any(target_os = "linux", test))]
 fn pem_block(text: &[u8]) -> Option<(&[u8], &[u8])> {
     let begin = position(text, PEM_BEGIN)?;
     let body = text.get(begin + PEM_BEGIN.len()..)?;
@@ -275,7 +393,6 @@ fn pem_block(text: &[u8]) -> Option<(&[u8], &[u8])> {
     Some((body.get(..end)?, body.get(end + PEM_END.len()..)?))
 }
 
-#[cfg(any(target_os = "linux", test))]
 fn position(text: &[u8], needle: &[u8]) -> Option<usize> {
     text.windows(needle.len())
         .position(|window| window == needle)
@@ -283,7 +400,6 @@ fn position(text: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// Appends what base64 text decodes to, white space aside; whether it
 /// was base64.
-#[cfg(any(target_os = "linux", test))]
 fn base64(text: &[u8], out: &mut Vec<u8>) -> bool {
     let (mut bits, mut count, mut padding) = (0u32, 0u32, 0u32);
     for &byte in text {
@@ -315,27 +431,58 @@ fn base64(text: &[u8], out: &mut Vec<u8>) -> bool {
     padding <= 2 && bits == 0
 }
 
-/// Linux as Go reads it, on files a Files gives: the first bundle that
-/// reads, then every file of the certificate directories.
-#[cfg(any(target_os = "linux", test))]
-mod unix {
+/// Anchors from files, as Go reads them (root.go's loadOnDiskRoots), on
+/// files a Files gives: the first bundle that reads, then every file of
+/// the certificate directories.
+mod disk {
     use super::Found;
     use alloc::vec::Vec;
 
-    /// Go's bundles, the first that reads of them: Debian, Ubuntu,
-    /// Gentoo and Arch; Fedora and RHEL 6; OpenSUSE; OpenELEC; CentOS
-    /// and RHEL 7; Alpine.
-    pub const CERT_FILES: [&[u8]; 6] = [
-        b"/etc/ssl/certs/ca-certificates.crt",
-        b"/etc/pki/tls/certs/ca-bundle.crt",
-        b"/etc/ssl/ca-bundle.pem",
-        b"/etc/pki/tls/cacert.pem",
-        b"/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
-        b"/etc/ssl/cert.pem",
-    ];
-    /// Go's directories, SLES and Fedora's, colon-separated as
-    /// SSL_CERT_DIR is.
-    pub const CERT_DIRECTORIES: &[u8] = b"/etc/ssl/certs:/etc/pki/tls/certs";
+    /// Where a system keeps its anchors in files, when nothing is set.
+    pub struct Defaults {
+        /// The bundles, the first that reads of them.
+        pub files: &'static [&'static [u8]],
+        /// The directories, in a list as SSL_CERT_DIR's.
+        pub dirs: &'static [u8],
+        /// What separates SSL_CERT_DIR's directories: ':', and ';' on
+        /// Windows, as OpenSSL and Go read it (filepath.SplitList).
+        pub separator: u8,
+    }
+
+    /// What SSL_CERT_FILE and SSL_CERT_DIR say, when set.
+    pub struct Paths<'a> {
+        pub file: Option<&'a [u8]>,
+        pub dirs: Option<&'a [u8]>,
+    }
+
+    /// Linux's, Go's: the bundles of Debian, Ubuntu, Gentoo and Arch;
+    /// Fedora and RHEL 6; OpenSUSE; OpenELEC; CentOS and RHEL 7; Alpine.
+    /// The directories SLES's and Fedora's.
+    pub const LINUX: Defaults = Defaults {
+        files: &[
+            b"/etc/ssl/certs/ca-certificates.crt",
+            b"/etc/pki/tls/certs/ca-bundle.crt",
+            b"/etc/ssl/ca-bundle.pem",
+            b"/etc/pki/tls/cacert.pem",
+            b"/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+            b"/etc/ssl/cert.pem",
+        ],
+        dirs: b"/etc/ssl/certs:/etc/pki/tls/certs",
+        separator: b':',
+    };
+    /// macOS's and Windows's: none, as in Go (root_darwin.go's and
+    /// root_windows.go's certFiles and certDirectories): their anchors
+    /// come from files only when a variable names them.
+    pub const MACOS: Defaults = Defaults {
+        files: &[],
+        dirs: b"",
+        separator: b':',
+    };
+    pub const WINDOWS: Defaults = Defaults {
+        files: &[],
+        dirs: b"",
+        separator: b';',
+    };
     /// The most directories SSL_CERT_DIR names that are read.
     const DIRECTORIES_MAX: usize = 64;
     pub const ENOENT: i32 = 2;
@@ -343,7 +490,7 @@ mod unix {
     /// The file system, as the loader needs it.
     pub trait Files {
         /// The file at path into text, which it clears first; the error
-        /// number when it cannot be read.
+        /// number when it cannot be read, ENOENT when it is not there.
         fn read(&mut self, path: &[u8], text: &mut Vec<u8>) -> Result<(), i32>;
         /// The names of dir's entries into names, each ended by a NUL:
         /// all but . and .. and a link to a file beside it (one with
@@ -351,25 +498,26 @@ mod unix {
         fn list(&mut self, dir: &[u8], names: &mut Vec<u8>) -> Result<(), i32>;
     }
 
-    /// Reads into found SSL_CERT_FILE's bundle (file) or the first of
-    /// Go's that reads, then each file in SSL_CERT_DIR's directories
-    /// (dirs) or Go's. Returns the first error other than a missing
-    /// file, which counts only when nothing was found.
+    /// Reads into found the bundle paths name (SSL_CERT_FILE) or the
+    /// first of the defaults' that reads, then each file in the
+    /// directories paths name (SSL_CERT_DIR) or the defaults'. Returns
+    /// the first error other than a missing file, which counts only
+    /// when nothing was found.
     pub fn collect(
         files: &mut dyn Files,
-        file: Option<&[u8]>,
-        dirs: Option<&[u8]>,
+        paths: &Paths<'_>,
+        defaults: &Defaults,
         found: &mut Found,
     ) -> Option<i32> {
         let mut first = None;
         let mut text = Vec::new();
         let named;
-        let bundles: &[&[u8]] = match file {
+        let bundles: &[&[u8]] = match paths.file {
             Some(file) => {
                 named = [file];
                 &named
             }
-            None => &CERT_FILES,
+            None => defaults.files,
         };
         for bundle in bundles {
             match files.read(bundle, &mut text) {
@@ -382,9 +530,9 @@ mod unix {
         }
         let mut names = Vec::new();
         let mut path = Vec::new();
-        let dirs = dirs.unwrap_or(CERT_DIRECTORIES);
+        let dirs = paths.dirs.unwrap_or(defaults.dirs);
         for dir in dirs
-            .split(|byte| *byte == b':')
+            .split(|byte| *byte == defaults.separator)
             .filter(|dir| !dir.is_empty())
             .take(DIRECTORIES_MAX)
         {
@@ -417,17 +565,19 @@ mod unix {
     }
 }
 
-#[cfg(target_os = "linux")]
-mod os {
-    use super::unix::{self, Files};
-    use super::{Error, Found, Wait};
-    use crate::base::wait::{EINTR, O_CLOEXEC};
-    use crate::base::x509;
+/// The C library's files and environment, on Linux and macOS.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod posix {
+    use super::disk::Files;
+    use crate::base::wait::EINTR;
+    #[cfg(target_os = "linux")]
+    use crate::base::wait::O_CLOEXEC;
     use alloc::vec::Vec;
     use core::ffi::{CStr, c_char, c_int, c_void};
 
     /// struct dirent of glibc and musl on 64-bit Linux: the inode, the
     /// offset, the record's length, the type, then the name.
+    #[cfg(target_os = "linux")]
     #[repr(C)]
     struct Dirent {
         inode: u64,
@@ -438,6 +588,26 @@ mod os {
         name: [c_char; 256],
     }
 
+    /// struct dirent of macOS with 64-bit inodes (the only kind on
+    /// arm64, and $INODE64's on x86_64): the inode, the seek offset, the
+    /// record's length, the name's, the type, then the name.
+    #[cfg(target_os = "macos")]
+    #[repr(C)]
+    struct Dirent {
+        inode: u64,
+        offset: u64,
+        length: u16,
+        name_length: u16,
+        // rr: escape(tag): d_type is dirent.h's own field, a DT_ number.
+        kind: u8,
+        name: [c_char; 1024],
+    }
+
+    #[cfg(target_os = "linux")]
+    const _: () = assert!(size_of::<Dirent>() == 280);
+    #[cfg(target_os = "macos")]
+    const _: () = assert!(size_of::<Dirent>() == 1048);
+
     #[link(name = "c")]
     // rr: escape(unsafe): each signature is the C library's, from its headers.
     unsafe extern "C" {
@@ -445,16 +615,30 @@ mod os {
         fn open(path: *const c_char, flags: c_int, ...) -> c_int;
         fn read(fd: c_int, buffer: *mut c_void, size: usize) -> isize;
         fn close(fd: c_int) -> c_int;
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86_64"),
+            link_name = "opendir$INODE64"
+        )]
         fn opendir(path: *const c_char) -> *mut c_void;
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86_64"),
+            link_name = "readdir$INODE64"
+        )]
         fn readdir(dir: *mut c_void) -> *mut Dirent;
         fn closedir(dir: *mut c_void) -> c_int;
         fn dirfd(dir: *mut c_void) -> c_int;
         fn readlinkat(fd: c_int, path: *const c_char, buffer: *mut c_char, size: usize) -> isize;
+        #[cfg(target_os = "linux")]
         fn __errno_location() -> *mut c_int;
+        #[cfg(target_os = "macos")]
+        fn __error() -> *mut c_int;
     }
 
-    // fcntl.h's, dirent.h's and errno.h's, the same on every Linux.
+    // fcntl.h's, dirent.h's and errno.h's, the same on Linux and macOS;
+    // macOS's O_CLOEXEC, Linux's wait's.
     const O_RDONLY: c_int = 0;
+    #[cfg(target_os = "macos")]
+    const O_CLOEXEC: c_int = 0x100_0000;
     const DT_UNKNOWN: u8 = 0;
     const DT_LNK: u8 = 10;
     const EINVAL: i32 = 22;
@@ -467,18 +651,10 @@ mod os {
     /// What read takes at once.
     const CHUNK_BYTES: usize = 64 << 10;
 
-    pub fn collect(found: &mut Found) -> Result<(), Error> {
-        let file = variable(c"SSL_CERT_FILE");
-        let dirs = variable(c"SSL_CERT_DIR");
-        match unix::collect(&mut System, file, dirs, found) {
-            Some(error) => Err(Error::System(error)),
-            None => Ok(()),
-        }
-    }
-
-    /// The environment's value of name, when it is there and not empty,
-    /// as Go's Getenv takes it.
-    fn variable(name: &CStr) -> Option<&'static [u8]> {
+    /// The environment's value of name (with its NUL), when it is there
+    /// and not empty, as Go's Getenv takes it.
+    pub fn variable(name: &[u8]) -> Option<Vec<u8>> {
+        let name = CStr::from_bytes_with_nul(name).ok()?;
         // rr: escape(unsafe): name is a C string; the value lives as long
         // as the environment, which the program does not change.
         let value = unsafe { getenv(name.as_ptr()) };
@@ -487,13 +663,22 @@ mod os {
         }
         // rr: escape(unsafe): getenv gave a C string.
         let value = unsafe { CStr::from_ptr(value) }.to_bytes();
-        if value.is_empty() { None } else { Some(value) }
+        if value.is_empty() {
+            None
+        } else {
+            // rr: escape(copy): the value, owned as Windows's must be.
+            Some(Vec::from(value))
+        }
     }
 
     /// This thread's errno.
     fn errno() -> i32 {
+        #[cfg(target_os = "linux")]
         // rr: escape(unsafe): __errno_location gives this thread's errno.
         let at = unsafe { __errno_location() };
+        #[cfg(target_os = "macos")]
+        // rr: escape(unsafe): __error gives this thread's errno.
+        let at = unsafe { __error() };
         // rr: escape(unsafe): the pointer is to this thread's live errno.
         unsafe { *at }
     }
@@ -533,7 +718,7 @@ mod os {
     }
 
     /// The file system, through the C library.
-    struct System;
+    pub struct System;
 
     impl Files for System {
         fn read(&mut self, path: &[u8], text: &mut Vec<u8>) -> Result<(), i32> {
@@ -616,44 +801,32 @@ mod os {
             }
         }
     }
+}
 
-    /// The system's anchors, loaded once.
-    pub struct Trust {
-        pub store: x509::Store,
-    }
+#[cfg(target_os = "linux")]
+mod os {
+    pub use super::disk::LINUX as DEFAULTS;
+    pub use super::posix::{System, variable};
+    use super::{Error, Path, Wait};
 
-    impl Trust {
-        pub fn new() -> Result<Self, Error> {
-            let store = super::store()?;
-            if store.is_empty() {
-                return Err(Error::NoRoots);
-            }
-            Ok(Self { store })
-        }
-    }
-
-    /// x509::verify, at once.
-    pub fn check(trust: &Trust, chain: &[&[u8]], host: &str, now: i64) -> Check {
-        let result = if chain.is_empty() || chain.len() > x509::CHAIN_MAX || !super::named(host) {
-            Err(Error::Input)
-        } else {
-            match x509::verify(chain, &trust.store, host, now) {
-                Ok(_leaf) => Ok(()),
-                Err(error) => Err(Error::Untrusted(error)),
-            }
-        };
-        Check {
-            result: Some(result),
-        }
+    /// No verifier but x509: Trust always holds anchors here.
+    pub fn check(_chain: &[&[u8]], _host: &str, _now: i64) -> Check {
+        Check::answered(Err(Error::NoRoots))
     }
 
     /// A check that was done when it started.
     pub struct Check {
-        result: Option<Result<(), Error>>,
+        result: Option<Result<Path, Error>>,
     }
 
     impl Check {
-        pub fn poll(&mut self) -> Option<Result<(), Error>> {
+        pub fn answered(result: Result<Path, Error>) -> Check {
+            Check {
+                result: Some(result),
+            }
+        }
+
+        pub fn poll(&mut self) -> Option<Result<Path, Error>> {
             self.result.take()
         }
     }
@@ -663,11 +836,12 @@ mod os {
         Wait::READY
     }
 }
-
 #[cfg(target_os = "macos")]
 mod os {
+    pub use super::disk::MACOS as DEFAULTS;
+    pub use super::posix::{System, variable};
     pub use super::thread::{Check, wait};
-    use super::{Error, Found};
+    use super::{Error, Found, Path};
     use crate::base::x509;
     use alloc::vec::Vec;
     use core::ffi::c_void;
@@ -734,6 +908,7 @@ mod os {
         ) -> i32;
         fn SecTrustSetVerifyDate(trust: *const c_void, date: *const c_void) -> i32;
         fn SecTrustEvaluateWithError(trust: *const c_void, error: *mut *const c_void) -> u8;
+        fn SecTrustCopyCertificateChain(trust: *const c_void) -> *const c_void;
     }
 
     const ERR_SEC_NOT_TRUSTED: i32 = -67843;
@@ -845,27 +1020,56 @@ mod os {
         first
     }
 
-    /// Adds certificate to found as its setting says: TrustRoot holds
-    /// for a self-issued certificate only, TrustAsRoot for another.
-    fn add(found: &mut Found, certificate: *const c_void, setting: Setting) {
-        // rr: escape(unsafe): certificate is a SecCertificateRef of the array.
-        let data = Owned(unsafe { SecCertificateCopyData(certificate) });
+    /// The path SecTrustEvaluateWithError built, leaf first.
+    fn built(trust: *const c_void) -> Result<Path, Error> {
+        // rr: escape(unsafe): trust is a SecTrust that was evaluated.
+        let chain = Owned(unsafe { SecTrustCopyCertificateChain(trust) });
+        if chain.0.is_null() {
+            return Err(Error::Refused(ERR_SEC_NOT_TRUSTED));
+        }
+        let mut path = Path::new();
+        // rr: escape(unsafe): chain is a CFArray of certificates.
+        let count = unsafe { CFArrayGetCount(chain.0) };
+        let most = isize::try_from(x509::CHAIN_MAX).unwrap_or(0);
+        for index in 0..count.min(most) {
+            // rr: escape(unsafe): index is below the array's count.
+            let certificate = unsafe { CFArrayGetValueAtIndex(chain.0, index) };
+            // rr: escape(unsafe): certificate is a SecCertificateRef of the array.
+            let data = Owned(unsafe { SecCertificateCopyData(certificate) });
+            let Some(der) = bytes(&data) else {
+                return Err(Error::Input);
+            };
+            path.push(der);
+        }
+        Ok(path)
+    }
+
+    /// The bytes of a CFData of ours, while it lives.
+    fn bytes(data: &Owned) -> Option<&[u8]> {
         if data.0.is_null() {
-            return;
+            return None;
         }
         // rr: escape(unsafe): data is a CFData.
         let length = unsafe { CFDataGetLength(data.0) };
         // rr: escape(unsafe): data is a CFData.
         let bytes = unsafe { CFDataGetBytePtr(data.0) };
-        let Ok(length) = usize::try_from(length) else {
-            return;
-        };
+        let length = usize::try_from(length).ok()?;
         if bytes.is_null() {
-            return;
+            return None;
         }
         // rr: escape(unsafe): a CFData holds length bytes at its pointer
-        // while it lives, and data outlives der.
-        let der = unsafe { core::slice::from_raw_parts(bytes, length) };
+        // while it lives, and data outlives what is returned.
+        Some(unsafe { core::slice::from_raw_parts(bytes, length) })
+    }
+
+    /// Adds certificate to found as its setting says: TrustRoot holds
+    /// for a self-issued certificate only, TrustAsRoot for another.
+    fn add(found: &mut Found, certificate: *const c_void, setting: Setting) {
+        // rr: escape(unsafe): certificate is a SecCertificateRef of the array.
+        let data = Owned(unsafe { SecCertificateCopyData(certificate) });
+        let Some(der) = bytes(&data) else {
+            return;
+        };
         let root =
             crate::base::x509::parse(der).is_ok_and(|parsed| parsed.issuer == parsed.subject);
         match setting {
@@ -963,10 +1167,7 @@ mod os {
         Setting::Unspecified
     }
 
-    /// The system verifies; nothing is kept.
-    pub struct Trust;
-
-    pub fn check(_trust: &Trust, chain: &[&[u8]], host: &str, now: i64) -> Check {
+    pub fn check(chain: &[&[u8]], host: &str, now: i64) -> Check {
         let job = super::platform_host(chain, host)
             .and_then(|host| evaluation(chain, host, now))
             .map(|trust| Job { trust });
@@ -979,7 +1180,7 @@ mod os {
     }
 
     impl Job {
-        pub fn run(&self) -> Result<(), Error> {
+        pub fn run(&self) -> Result<Path, Error> {
             evaluate(self.trust.0)
         }
     }
@@ -1033,6 +1234,11 @@ mod os {
         }
         // rr: escape(unsafe): name is a CFString of ours.
         let policy = Owned(unsafe { SecPolicyCreateSSL(1, name.0) });
+        // With no policy SecTrustCreateWithCertificates would take the
+        // basic X.509 one, which checks no name and no usage (SecTrust.c).
+        if policy.0.is_null() {
+            return Err(Error::System(ERR_SEC_ALLOCATE));
+        }
         let mut trust = null();
         // rr: escape(unsafe): both are CF objects of ours; trust is a local
         // out-parameter.
@@ -1053,14 +1259,16 @@ mod os {
         Ok(trust)
     }
 
-    /// The system's verdict on trust; it may fetch over the network.
-    fn evaluate(trust: *const c_void) -> Result<(), Error> {
+    /// The system's verdict on trust, and the path it built, leaf
+    /// first, as Go's systemVerify takes it to screen; it may fetch over
+    /// the network.
+    fn evaluate(trust: *const c_void) -> Result<Path, Error> {
         let mut error = null();
         // rr: escape(unsafe): trust is a SecTrust; error a local out-parameter.
         let trusted = unsafe { SecTrustEvaluateWithError(trust, &raw mut error) };
         let error = Owned(error);
         if trusted != 0 {
-            return Ok(());
+            return built(trust);
         }
         if error.0.is_null() {
             return Err(Error::Refused(ERR_SEC_NOT_TRUSTED));
@@ -1075,8 +1283,10 @@ mod os {
 
 #[cfg(target_os = "windows")]
 mod os {
+    pub use super::disk::WINDOWS as DEFAULTS;
+    use super::disk::{ENOENT, Files};
     pub use super::thread::{Check, wait};
-    use super::{Error, Found};
+    use super::{Error, Found, Path};
     use crate::base::x509;
     use alloc::vec::Vec;
     use core::ffi::{CStr, c_char, c_void};
@@ -1116,12 +1326,47 @@ mod os {
         requested: UsageMatch,
     }
 
-    /// The start of CERT_CHAIN_CONTEXT: its size and CERT_TRUST_STATUS.
+    /// The start of CERT_CHAIN_CONTEXT: its size, CERT_TRUST_STATUS, and
+    /// its simple chains.
     #[repr(C)]
     struct ChainContext {
         size: u32,
         error_status: u32,
         info_status: u32,
+        count: u32,
+        chains: *const *const SimpleChain,
+    }
+
+    /// The start of CERT_SIMPLE_CHAIN: its size, CERT_TRUST_STATUS, and
+    /// its elements, leaf first.
+    #[repr(C)]
+    struct SimpleChain {
+        size: u32,
+        error_status: u32,
+        info_status: u32,
+        count: u32,
+        elements: *const *const Element,
+    }
+
+    /// The start of CERT_CHAIN_ELEMENT: its size and its certificate.
+    #[repr(C)]
+    struct Element {
+        size: u32,
+        context: *const Context,
+    }
+
+    /// WIN32_FIND_DATAW.
+    #[repr(C)]
+    struct FindData {
+        attributes: u32,
+        created: FileTime,
+        accessed: FileTime,
+        written: FileTime,
+        size_high: u32,
+        size_low: u32,
+        reserved: [u32; 2],
+        name: [u16; 260],
+        alternate: [u16; 14],
     }
 
     /// SSL_EXTRA_CERT_CHAIN_POLICY_PARA.
@@ -1169,6 +1414,13 @@ mod os {
     const _: () = assert!(size_of::<PolicyPara>() == 16);
     const _: () = assert!(size_of::<PolicyStatus>() == 24);
     const _: () = assert!(size_of::<FileTime>() == 8);
+    // The prefixes read of CERT_CHAIN_CONTEXT and CERT_SIMPLE_CHAIN, whose
+    // pointer to pointers is at 16, and of CERT_CHAIN_ELEMENT, whose
+    // pCertContext is at 8; WIN32_FIND_DATAW whole.
+    const _: () = assert!(size_of::<ChainContext>() == 24);
+    const _: () = assert!(size_of::<SimpleChain>() == 24);
+    const _: () = assert!(size_of::<Element>() == 16);
+    const _: () = assert!(size_of::<FindData>() == 592);
 
     #[link(name = "crypt32", kind = "raw-dylib")]
     // rr: escape(unsafe): each signature is crypt32's, from its documentation.
@@ -1225,6 +1477,27 @@ mod os {
     unsafe extern "system" {
         fn GetLastError() -> u32;
         fn SetLastError(code: u32);
+        fn GetEnvironmentVariableW(name: *const u16, buffer: *mut u16, size: u32) -> u32;
+        fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            security: *const c_void,
+            disposition: u32,
+            flags: u32,
+            template: *mut c_void,
+        ) -> *mut c_void;
+        fn ReadFile(
+            file: *mut c_void,
+            buffer: *mut u8,
+            size: u32,
+            read: *mut u32,
+            overlapped: *mut c_void,
+        ) -> i32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+        fn FindFirstFileW(name: *const u16, data: *mut FindData) -> *mut c_void;
+        fn FindNextFileW(find: *mut c_void, data: *mut FindData) -> i32;
+        fn FindClose(find: *mut c_void) -> i32;
     }
 
     const X509_PKCS7_ENCODING: u32 = 0x0001_0001;
@@ -1347,10 +1620,7 @@ mod os {
         })
     }
 
-    /// The system verifies; nothing is kept.
-    pub struct Trust;
-
-    pub fn check(_trust: &Trust, chain: &[&[u8]], host: &str, now: i64) -> Check {
+    pub fn check(chain: &[&[u8]], host: &str, now: i64) -> Check {
         Check::start(super::platform_host(chain, host).map(|host| Job::new(chain, host, now)))
     }
 
@@ -1385,7 +1655,7 @@ mod os {
             }
         }
 
-        pub fn run(&self) -> Result<(), Error> {
+        pub fn run(&self) -> Result<Path, Error> {
             evaluate(self)
         }
     }
@@ -1420,7 +1690,7 @@ mod os {
     /// The system's verdict on the chain in shared: a chain to a root
     /// it trusts for server authentication, then the SSL policy for the
     /// host, as Go's systemVerify asks. It may fetch over the network.
-    fn evaluate(shared: &Job) -> Result<(), Error> {
+    fn evaluate(shared: &Job) -> Result<Path, Error> {
         let provider = without_provenance::<c_char>(STORE_PROVIDER_MEMORY);
         // rr: escape(unsafe): a memory store takes no parameter.
         let store = unsafe { CertOpenStore(provider, 0, 0, 0, null()) };
@@ -1488,7 +1758,250 @@ mod os {
         if status != 0 {
             return Err(Error::Chain(status));
         }
-        policy(&chain, &shared.host)
+        policy(&chain, &shared.host)?;
+        path_of(&chain)
+    }
+
+    /// The path of chain's last simple chain, leaf first, as Go's
+    /// extractSimpleChain takes it to screen.
+    fn path_of(chain: &Chain) -> Result<Path, Error> {
+        // rr: escape(unsafe): the chain context starts with these members.
+        let context = unsafe { &*chain.0 };
+        let Some(last) = usize::try_from(context.count)
+            .ok()
+            .and_then(|count| count.checked_sub(1))
+        else {
+            return Err(Error::Input);
+        };
+        if context.chains.is_null() {
+            return Err(Error::Input);
+        }
+        // rr: escape(unsafe): chains holds count pointers to simple chains.
+        let simple = unsafe { context.chains.wrapping_add(last).read() };
+        if simple.is_null() {
+            return Err(Error::Input);
+        }
+        // rr: escape(unsafe): a simple chain of the context starts so.
+        let simple = unsafe { &*simple };
+        let count = usize::try_from(simple.count).unwrap_or(0);
+        if simple.elements.is_null() || count > x509::CHAIN_MAX {
+            return Err(Error::Input);
+        }
+        let mut path = Path::new();
+        for index in 0..count {
+            // rr: escape(unsafe): elements holds count pointers to elements.
+            let element = unsafe { simple.elements.wrapping_add(index).read() };
+            if element.is_null() {
+                return Err(Error::Input);
+            }
+            // rr: escape(unsafe): an element of the chain starts so.
+            let held = unsafe { (*element).context };
+            if held.is_null() {
+                return Err(Error::Input);
+            }
+            // rr: escape(unsafe): the context lives while the chain does.
+            let certificate = unsafe { &*held };
+            if certificate.encoded.is_null() {
+                return Err(Error::Input);
+            }
+            let length = usize::try_from(certificate.length).unwrap_or(0);
+            // rr: escape(unsafe): the context holds length bytes of DER.
+            path.push(unsafe { core::slice::from_raw_parts(certificate.encoded, length) });
+        }
+        Ok(path)
+    }
+
+    // winnt.h's, winbase.h's and winerror.h's.
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const FILE_SHARE_READ_WRITE: u32 = 3;
+    const OPEN_EXISTING: u32 = 3;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+    const ERROR_PATH_NOT_FOUND: i32 = 3;
+    const ERROR_NO_MORE_FILES: i32 = 18;
+    const ERROR_INVALID_NAME: i32 = 123;
+    const ERROR_FILE_TOO_LARGE: i32 = 223;
+    /// A bundle larger than this is not one, as on Linux and macOS.
+    const FILE_BYTES_MAX: usize = 8 << 20;
+    /// The entries read of a directory, and what ReadFile takes at once.
+    const ENTRIES_MAX: usize = 4096;
+    const CHUNK_BYTES: usize = 64 << 10;
+    /// The longest value of a variable read: a path list.
+    const VARIABLE_UNITS_MAX: usize = 32 << 10;
+
+    /// The environment's value of name (ASCII with its NUL) as UTF-8,
+    /// when it is there, not empty, and Unicode.
+    pub fn variable(name: &[u8]) -> Option<Vec<u8>> {
+        // rr: escape(copy): the name in UTF-16, as Windows takes it.
+        let wide: Vec<u16> = name.iter().map(|byte| u16::from(*byte)).collect();
+        let mut value: Vec<u16> = Vec::new();
+        value.resize(256, 0);
+        // Twice at most: the first call says the size it needs.
+        for _ in 0..2 {
+            let size = u32::try_from(value.len()).unwrap_or(0);
+            // rr: escape(unsafe): wide is NUL-terminated; value holds size units.
+            let n = unsafe { GetEnvironmentVariableW(wide.as_ptr(), value.as_mut_ptr(), size) };
+            let n = usize::try_from(n).unwrap_or(0);
+            if n == 0 || n > VARIABLE_UNITS_MAX {
+                return None;
+            }
+            if n < value.len() {
+                let mut text = Vec::new();
+                for character in char::decode_utf16(value.iter().take(n).copied()) {
+                    let mut buffer = [0; 4];
+                    text.extend_from_slice(character.ok()?.encode_utf8(&mut buffer).as_bytes());
+                }
+                return Some(text);
+            }
+            value.resize(n, 0);
+        }
+        None
+    }
+
+    /// path (UTF-8) in UTF-16 with a NUL, then suffix; None when it holds
+    /// a NUL or is not UTF-8.
+    fn wide(path: &[u8], suffix: &str) -> Option<Vec<u16>> {
+        let text = core::str::from_utf8(path).ok()?;
+        if text.contains('\0') {
+            return None;
+        }
+        // rr: escape(copy): the path in UTF-16, as Windows takes it.
+        let mut wide: Vec<u16> = text.encode_utf16().chain(suffix.encode_utf16()).collect();
+        wide.push(0);
+        Some(wide)
+    }
+
+    /// A missing file or directory is ENOENT, as the loader counts it.
+    fn file_error() -> i32 {
+        match last_error() {
+            ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => ENOENT,
+            error => error,
+        }
+    }
+
+    /// A handle of ours, closed on drop.
+    struct Handle(*mut c_void);
+
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            // rr: escape(unsafe): the handle is ours and unused from here.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    /// A find handle of ours, closed on drop.
+    struct Find(*mut c_void);
+
+    impl Drop for Find {
+        fn drop(&mut self) {
+            // rr: escape(unsafe): the find handle is ours and unused from here.
+            unsafe { FindClose(self.0) };
+        }
+    }
+
+    /// INVALID_HANDLE_VALUE, which CreateFileW and FindFirstFileW give
+    /// on failure.
+    fn invalid(handle: *mut c_void) -> bool {
+        // rr: escape(sentinel): INVALID_HANDLE_VALUE is the API's own.
+        handle.addr() == usize::MAX
+    }
+
+    /// The file system, through kernel32.
+    pub struct System;
+
+    impl Files for System {
+        fn read(&mut self, path: &[u8], text: &mut Vec<u8>) -> Result<(), i32> {
+            text.clear();
+            let name = wide(path, "").ok_or(ERROR_INVALID_NAME)?;
+            // rr: escape(unsafe): name is NUL-terminated; the rest are plain.
+            let file = unsafe {
+                CreateFileW(
+                    name.as_ptr(),
+                    GENERIC_READ,
+                    FILE_SHARE_READ_WRITE,
+                    null(),
+                    OPEN_EXISTING,
+                    0,
+                    null_mut(),
+                )
+            };
+            if invalid(file) {
+                return Err(file_error());
+            }
+            let file = Handle(file);
+            // Each turn reads a chunk, or ends; the limit ends it too.
+            loop {
+                if text.len() > FILE_BYTES_MAX {
+                    return Err(ERROR_FILE_TOO_LARGE);
+                }
+                let at = text.len();
+                text.resize(at + CHUNK_BYTES, 0);
+                let mut n = 0u32;
+                let size = u32::try_from(CHUNK_BYTES).unwrap_or(0);
+                let into = text.get_mut(at..).unwrap_or_default();
+                // rr: escape(unsafe): into holds CHUNK_BYTES bytes; n is a local.
+                let done =
+                    unsafe { ReadFile(file.0, into.as_mut_ptr(), size, &raw mut n, null_mut()) };
+                if done == 0 {
+                    text.truncate(at);
+                    return Err(last_error());
+                }
+                let n = usize::try_from(n).unwrap_or(0);
+                text.truncate(at + n);
+                if n == 0 {
+                    return Ok(());
+                }
+            }
+        }
+
+        /// Every entry but a directory: Go reads one and fails, and links
+        /// are not told apart, as a certificate found twice is added once.
+        fn list(&mut self, dir: &[u8], names: &mut Vec<u8>) -> Result<(), i32> {
+            let pattern = wide(dir, "\\*").ok_or(ERROR_INVALID_NAME)?;
+            let mut data = FindData {
+                attributes: 0,
+                created: FileTime { low: 0, high: 0 },
+                accessed: FileTime { low: 0, high: 0 },
+                written: FileTime { low: 0, high: 0 },
+                size_high: 0,
+                size_low: 0,
+                reserved: [0; 2],
+                name: [0; 260],
+                alternate: [0; 14],
+            };
+            // rr: escape(unsafe): pattern is NUL-terminated; data is a local.
+            let find = unsafe { FindFirstFileW(pattern.as_ptr(), &raw mut data) };
+            if invalid(find) {
+                return Err(file_error());
+            }
+            let find = Find(find);
+            for _ in 0..ENTRIES_MAX {
+                let length = data.name.iter().position(|unit| *unit == 0).unwrap_or(0);
+                let name = data.name.get(..length).unwrap_or_default();
+                let directory = data.attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+                let start = names.len();
+                for character in char::decode_utf16(name.iter().copied()) {
+                    let mut buffer = [0; 4];
+                    let character = character.unwrap_or(char::REPLACEMENT_CHARACTER);
+                    names.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+                }
+                if directory || length == 0 {
+                    names.truncate(start);
+                } else {
+                    names.push(0);
+                }
+                // rr: escape(unsafe): find is open; data is a local.
+                if unsafe { FindNextFileW(find.0, &raw mut data) } == 0 {
+                    let error = last_error();
+                    return if error == ERROR_NO_MORE_FILES {
+                        Ok(())
+                    } else {
+                        Err(error)
+                    };
+                }
+            }
+            Ok(())
+        }
     }
 
     /// CERT_CHAIN_POLICY_SSL on chain for a server named host (UTF-16
@@ -1548,8 +2061,8 @@ mod os {
 /// never waits for it.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod thread {
-    use super::Error;
     use super::os::Job;
+    use super::{Error, Path};
     use crate::base::wait::{self, Signal, Wait};
     use alloc::boxed::Box;
     use core::cell::UnsafeCell;
@@ -1562,7 +2075,7 @@ mod thread {
     struct Shared {
         holders: AtomicUsize,
         done: AtomicBool,
-        result: UnsafeCell<Result<(), Error>>,
+        result: UnsafeCell<Result<Path, Error>>,
         signal: Signal,
         job: Job,
     }
@@ -1592,13 +2105,22 @@ mod thread {
     pub struct Check {
         shared: *mut Shared,
         /// The answer, once known and not yet polled.
-        taken: Option<Result<(), Error>>,
+        taken: Option<Result<Path, Error>>,
         /// The work, to take out of spawn's line when dropped before it
         /// started.
         ticket: Option<wait::Ticket>,
     }
 
     impl Check {
+        /// A check whose answer is known.
+        pub fn answered(result: Result<Path, Error>) -> Check {
+            Check {
+                shared: null_mut(),
+                taken: Some(result),
+                ticket: None,
+            }
+        }
+
         /// Runs job on a thread of its own, or answers with its error.
         pub fn start(job: Result<Job, Error>) -> Check {
             let mut check = Check {
@@ -1640,7 +2162,7 @@ mod thread {
             check
         }
 
-        pub fn poll(&mut self) -> Option<Result<(), Error>> {
+        pub fn poll(&mut self) -> Option<Result<Path, Error>> {
             if self.taken.is_none() && !self.shared.is_null() {
                 // rr: escape(unsafe): this check holds shared.
                 let shared = unsafe { &*self.shared };
@@ -1682,9 +2204,9 @@ mod thread {
 }
 #[cfg(test)]
 mod tests {
-    use super::unix::{self, CERT_FILES, ENOENT, Files};
-    use super::{Error, Found, pem_block};
-    use crate::base::x509::{Store, TEST_NOW, test_certificate};
+    use super::disk::{self, Defaults, ENOENT, Files, LINUX, MACOS, Paths, WINDOWS};
+    use super::{Error, Found, Path, pem_block};
+    use crate::base::x509::{Store, TEST_NOW, test_certificate, test_revocation};
     use alloc::vec::Vec;
 
     /// x509's test certificates: anchors, intermediates and leaves.
@@ -1735,8 +2257,16 @@ mod tests {
     }
 
     fn load(fake: &mut Fake<'_>, file: Option<&[u8]>, dirs: Option<&[u8]>) -> Result<usize, Error> {
+        load_on(fake, &Paths { file, dirs }, &LINUX)
+    }
+
+    fn load_on(
+        fake: &mut Fake<'_>,
+        paths: &Paths<'_>,
+        defaults: &Defaults,
+    ) -> Result<usize, Error> {
         let mut found = Found::new();
-        let error = unix::collect(fake, file, dirs, &mut found);
+        let error = disk::collect(fake, paths, defaults, &mut found);
         let added = found.add_to(&mut Store::new());
         match error {
             Some(error) if added == 0 => Err(Error::System(error)),
@@ -1750,7 +2280,7 @@ mod tests {
     fn debian() {
         let mut fake = Fake {
             files: &[
-                (CERT_FILES[0], Ok(TESTS)),
+                (LINUX.files[0], Ok(TESTS)),
                 (b"/etc/ssl/certs/a.pem", Ok(block("anchor.sectigo-e46"))),
             ],
             dirs: &[(b"/etc/ssl/certs", b"ca-certificates.crt\0a.pem\0")],
@@ -1766,9 +2296,9 @@ mod tests {
     fn first_bundle() {
         let mut fake = Fake {
             files: &[
-                (CERT_FILES[1], Err(EACCES)),
-                (CERT_FILES[4], Ok(block("anchor.sectigo-e46"))),
-                (CERT_FILES[5], Ok(block("anchor.gts-r4"))),
+                (LINUX.files[1], Err(EACCES)),
+                (LINUX.files[4], Ok(block("anchor.sectigo-e46"))),
+                (LINUX.files[5], Ok(block("anchor.gts-r4"))),
                 (b"/etc/pki/tls/certs/b.pem", Ok(block("anchor.isrg-x2"))),
             ],
             dirs: &[(b"/etc/pki/tls/certs", b"b.pem\0")],
@@ -1782,7 +2312,7 @@ mod tests {
     fn environment() {
         let mut fake = Fake {
             files: &[
-                (CERT_FILES[0], Ok(TESTS)),
+                (LINUX.files[0], Ok(TESTS)),
                 (b"/x.pem", Ok(block("anchor.sectigo-e46"))),
                 (b"/d1/c", Ok(block("anchor.gts-r4"))),
                 (b"/d2/c", Ok(block("anchor.isrg-x2"))),
@@ -1796,6 +2326,41 @@ mod tests {
         assert_eq!(load(&mut fake, Some(b"/x.pem"), Some(b"/d1::/d2")), Ok(3));
     }
 
+    /// macOS and Windows read files only when a variable names them, as
+    /// Go 1.27 does: SSL_CERT_DIR alone reads no bundle, Linux's or other,
+    /// and its list is separated by ';' on Windows.
+    #[test]
+    fn environment_elsewhere() {
+        let mut fake = Fake {
+            files: &[
+                (LINUX.files[0], Ok(TESTS)),
+                (b"/x.pem", Ok(block("anchor.sectigo-e46"))),
+                (b"C:/d1/c", Ok(block("anchor.gts-r4"))),
+                (b"C:/d2/c", Ok(block("anchor.isrg-x2"))),
+            ],
+            dirs: &[
+                (b"/etc/ssl/certs", b"ca-certificates.crt\0"),
+                (b"C:/d1", b"c\0"),
+                (b"C:/d2", b"c\0"),
+            ],
+        };
+        let none = Paths {
+            file: None,
+            dirs: None,
+        };
+        assert_eq!(load_on(&mut fake, &none, &MACOS), Ok(0));
+        let dirs = Paths {
+            file: None,
+            dirs: Some(b"C:/d1;C:/d2"),
+        };
+        assert_eq!(load_on(&mut fake, &dirs, &WINDOWS), Ok(2));
+        let both = Paths {
+            file: Some(b"/x.pem"),
+            dirs: Some(b"C:/d1"),
+        };
+        assert_eq!(load_on(&mut fake, &both, &WINDOWS), Ok(2));
+    }
+
     /// Nothing there is no anchor and no error; nothing found past an
     /// error is that error.
     #[test]
@@ -1806,7 +2371,7 @@ mod tests {
         };
         assert_eq!(load(&mut empty, None, None), Ok(0));
         let mut refused = Fake {
-            files: &[(CERT_FILES[2], Err(EACCES))],
+            files: &[(LINUX.files[2], Err(EACCES))],
             dirs: &[],
         };
         assert_eq!(load(&mut refused, None, None), Err(Error::System(EACCES)));
@@ -1915,6 +2480,17 @@ mod tests {
             // A check dropped while it runs is let go.
             drop(trust.check(&chain, host, TEST_NOW));
         }
+        // The path the system built is screened by a policy laid over it.
+        let screened = super::Trust::new()
+            .unwrap()
+            .with_policy(revoking("openai.we1"));
+        let openai = certificates(CHAINS[0].0);
+        // rr: escape(copy): the chain check takes, borrowed from them.
+        let sent: Vec<&[u8]> = openai.iter().map(Vec::as_slice).collect();
+        assert_eq!(
+            screened.verify(&sent, CHAINS[0].1, TEST_NOW),
+            Err(Error::Untrusted(crate::base::x509::Error::Revoked))
+        );
         let certificates = certificates(&["test.leaf", "test.inter", "test.root"]);
         // rr: escape(copy): the chain check takes, borrowed from them.
         let chain: Vec<&[u8]> = certificates.iter().map(Vec::as_slice).collect();
@@ -1939,14 +2515,11 @@ mod tests {
         );
     }
 
-    /// Linux's Trust is x509::verify on its anchors: here the test
-    /// anchors, which the real chains end at.
-    #[cfg(target_os = "linux")]
+    /// Trust::with is x509::verify on its anchors, on every system: here
+    /// the test anchors, which the real chains end at.
     #[test]
     fn verifies_on_anchors() {
-        let mut store = Store::new();
-        store.add_pem(TESTS);
-        let trust = super::Trust::with(store);
+        let trust = super::Trust::with(test_anchors());
         for (names, host) in CHAINS {
             let certificates = certificates(names);
             // rr: escape(copy): the chain check takes, borrowed from them.
@@ -1955,6 +2528,51 @@ mod tests {
             let wrong = trust.verify(&chain, "example.com", TEST_NOW);
             assert_eq!(wrong, Err(Error::Untrusted(crate::base::x509::Error::Host)));
         }
+        // A policy that revokes an intermediate, laid over the anchors.
+        let policed = super::Trust::with(test_anchors()).with_policy(revoking("openai.we1"));
+        let certificates = certificates(CHAINS[0].0);
+        // rr: escape(copy): the chain check takes, borrowed from them.
+        let chain: Vec<&[u8]> = certificates.iter().map(Vec::as_slice).collect();
+        assert_eq!(
+            policed.verify(&chain, CHAINS[0].1, TEST_NOW),
+            Err(Error::Untrusted(crate::base::x509::Error::Revoked))
+        );
+    }
+
+    /// The anchors CHAINS end at: a bundle of all the tests would hold
+    /// their leaves as well, each an anchor of itself.
+    fn test_anchors() -> Store {
+        let mut store = Store::new();
+        for name in ["anchor.sectigo-e46", "anchor.gts-r4", "anchor.isrg-x2"] {
+            assert!(store.add_der(&test_certificate(name).unwrap()));
+        }
+        store
+    }
+
+    /// A policy store that revokes the named test certificate.
+    fn revoking(name: &str) -> Store {
+        let line = test_revocation(&test_certificate(name).unwrap());
+        let mut policy = Store::new();
+        assert_eq!(policy.add_revoked(&line), 1);
+        policy
+    }
+
+    /// A path of nothing is not screened; one of the test PKI is, by
+    /// what the policy revokes.
+    #[test]
+    fn screens_paths() {
+        let mut path = Path::new();
+        assert_eq!(path.screen(&revoking("test.inter")), Ok(()));
+        for name in ["test.leaf", "test.inter", "test.root"] {
+            path.bytes
+                .extend_from_slice(&test_certificate(name).unwrap());
+            path.ends.push(path.bytes.len());
+        }
+        assert_eq!(path.screen(&revoking("openai.we1")), Ok(()));
+        assert_eq!(
+            path.screen(&revoking("test.inter")),
+            Err(Error::Untrusted(crate::base::x509::Error::Revoked))
+        );
     }
 
     /// One check of OpenAI's chain by the system's verifier.

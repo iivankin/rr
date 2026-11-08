@@ -4,7 +4,8 @@
 //! a server's chain for a host name at a given time.
 //!
 //! The profile: keys P-256, P-384, P-521 (uncompressed) and RSA of 2048
-//! to 4096 bits; signatures ECDSA, RSA PKCS #1 v1.5 and RSA-PSS, each
+//! to 8192 bits, as webpki and Go's TLS take them; signatures ECDSA, RSA
+//! PKCS #1 v1.5 and RSA-PSS, each
 //! with SHA-256, SHA-384 or SHA-512, RSA-PSS with MGF1 of the same hash
 //! and a salt of its length (RFC 4055's parameters in DER, as Go and
 //! OpenSSL write them). An anchor's own signature is never checked, so
@@ -16,10 +17,27 @@
 //! Issuer and subject are compared as raw Name DER, byte for byte. The
 //! host is matched against subjectAltName only (the common name is
 //! ignored): dNSName with one left-most wildcard label (RFC 6125), and
-//! iPAddress for an IP literal. Name constraints on dNSName and
-//! iPAddress are enforced on every certificate below the CA that sets
-//! them, as Go's crypto/x509 does; a critical constraint on another
-//! form refuses the CA.
+//! iPAddress for an IP literal. A leaf that is a CA is refused, as
+//! Firefox and webpki refuse one. When ExtKeyUsage is present only
+//! serverAuth allows a TLS server, on a leaf as on a CA:
+//! anyExtendedKeyUsage counts nowhere, as in Firefox and webpki.
+//!
+//! Name constraints on dNSName and iPAddress are enforced as Go's
+//! crypto/x509 does, and on directoryName as Chrome does (RFC 5280
+//! 4.2.1.10), against the subject and the directoryNames of every
+//! certificate below the CA that sets them; a self-issued intermediate's
+//! subject aside. A constraint on a form this does not compare (an
+//! rfc822Name, a URI, any other) refuses a certificate below that has a
+//! name of that form, as webpki does, critical or not; for rfc822Name,
+//! a subject's emailAddress counts when there is no subjectAltName, as
+//! in Chrome. Mozilla's constraints imposed on a CA's name (a store's
+//! "# name-constraints:" lines) hold as its own do.
+//!
+//! An anchor is trusted by being in the store: any certificate in the
+//! profile loads. It issues when it is a CA or a v1 certificate, which
+//! has no basicConstraints to say so, as in Firefox; any anchor, a
+//! self-signed server certificate among them, also verifies as the leaf
+//! itself, as in Go and Firefox.
 
 use crate::base::ecdsa;
 use crate::base::rsa;
@@ -32,18 +50,18 @@ use alloc::vec::Vec;
 pub enum Error {
     /// Not DER, or not a certificate's structure.
     Malformed,
-    /// A key outside the profile: a curve other than P-256 and P-384,
-    /// a compressed point, or RSA outside 2048 to 4096 bits.
+    /// A key outside the profile: a curve other than P-256, P-384 and
+    /// P-521, a compressed point, or RSA outside 2048 to 8192 bits.
     Unsupported,
-    /// A critical extension this does not process, or a critical name
-    /// constraint on a form of name it does not enforce.
+    /// A critical extension this does not process.
     Critical,
     /// The same extension twice.
     Duplicate,
     /// The time is outside a certificate's validity.
     Expired,
     /// A key usage or extended key usage that does not allow a TLS
-    /// server certificate, or a CA's that does not allow issuing it.
+    /// server certificate, or a CA's that does not allow issuing it; a
+    /// leaf that is a CA.
     Usage,
     /// The leaf does not name the host.
     Host,
@@ -51,7 +69,9 @@ pub enum Error {
     NotCa,
     /// A CA's pathLenConstraint is exceeded.
     PathLength,
-    /// A CA's name constraints refuse a name below it.
+    /// A CA's name constraints, or those imposed on its name, refuse a
+    /// name below it, or constrain a form of name below it that this
+    /// does not compare.
     Constrained,
     /// A signature that does not verify.
     Signature,
@@ -100,6 +120,9 @@ pub struct Certificate<'a> {
     spki: &'a [u8],
     pub key: Key<'a>,
     ext: Extensions<'a>,
+    /// A v1 certificate: no extensions, so nothing says whether it is a
+    /// CA; as an anchor it may issue.
+    version1: bool,
 }
 
 /// The server's certificate once its chain is verified: its key checks
@@ -120,6 +143,9 @@ pub struct Store {
     /// The revoked certificates' digests (revocation_digest), sorted;
     /// add_revoked holds them to REVOKED_MAX.
     revoked: Vec<[u8; 32]>,
+    // rr: escape(bound): one for each "# name-constraints:" line kept,
+    // whose bytes STORE_BYTES_MAX bounds.
+    imposed: Vec<Imposed>,
 }
 
 /// Where an anchor's DER and subject are in a store.
@@ -128,6 +154,14 @@ struct Anchor {
     subject: (usize, usize),
     /// Leaves issued after this time do not chain to it.
     distrust: Option<i64>,
+}
+
+/// Name constraints imposed on every CA of a name, as Firefox imposes
+/// them (NSS's CERT_GetImposedNameConstraints): where the name's DER and
+/// the NameConstraints DER are in a store's bytes.
+struct Imposed {
+    subject: (usize, usize),
+    constraints: (usize, usize),
 }
 
 /// The signature algorithms of the profile; Other never verifies.
@@ -169,6 +203,14 @@ struct Extensions<'a> {
 
 /// Permitted and excluded subtrees of NameConstraints.
 type Subtrees<'a> = (Option<&'a [u8]>, Option<&'a [u8]>);
+
+/// What path building reads: the certificates sent, the store and the
+/// time.
+struct Search<'s, 'c> {
+    pool: &'s [Certificate<'c>],
+    store: &'s Store,
+    now: i64,
+}
 
 /// One DER element: its identifier octet, its contents and the whole
 /// encoding.
@@ -233,9 +275,20 @@ const SET: u8 = 0x31;
 /// [0] EXPLICIT version and [3] EXPLICIT extensions of TBSCertificate.
 const VERSION: u8 = 0xa0;
 const EXTENSIONS: u8 = 0xa3;
-/// GeneralName's [2] dNSName and [7] iPAddress, both IMPLICIT.
+/// GeneralName's [1] rfc822Name, [2] dNSName and [7] iPAddress, IMPLICIT,
+/// and [4] directoryName, EXPLICIT as Name is a CHOICE.
+const RFC822_NAME: u8 = 0x81;
 const DNS_NAME: u8 = 0x82;
+const DIRECTORY_NAME: u8 = 0xa4;
 const IP_ADDRESS: u8 = 0x87;
+/// The string types of attribute values Chrome compares without case.
+const UTF8_STRING: u8 = 0x0c;
+const PRINTABLE_STRING: u8 = 0x13;
+const IA5_STRING: u8 = 0x16;
+const UNIVERSAL_STRING: u8 = 0x1c;
+const BMP_STRING: u8 = 0x1e;
+/// The most attributes of one RDN that names are compared by.
+const ATTRIBUTES_MAX: usize = 16;
 /// AuthorityKeyIdentifier's [0] keyIdentifier.
 const KEY_ID: u8 = 0x80;
 /// NameConstraints' [0] permittedSubtrees and [1] excludedSubtrees.
@@ -285,12 +338,14 @@ const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
 const NAME_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x1e];
 const AUTHORITY_KEY_ID: &[u8] = &[0x55, 0x1d, 0x23];
 const EXTENDED_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x25];
-const ANY_USAGE: &[u8] = &[0x55, 0x1d, 0x25, 0x00];
 const SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
+/// PKCS #9's emailAddress, of a Name.
+const EMAIL_ADDRESS: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x09, 0x01];
 
 const PEM_BEGIN: &[u8] = b"-----BEGIN CERTIFICATE-----";
 const PEM_END: &[u8] = b"-----END CERTIFICATE-----";
 const DISTRUST_AFTER: &[u8] = b"# distrust-after: ";
+const NAME_CONSTRAINTS_LINE: &[u8] = b"# name-constraints: ";
 
 impl<'a> Reader<'a> {
     fn new(data: &'a [u8]) -> Self {
@@ -502,6 +557,7 @@ pub fn parse(der: &[u8]) -> Result<Certificate<'_>, Error> {
         spki: spki.whole,
         key,
         ext,
+        version1: !v3,
     })
 }
 
@@ -649,10 +705,10 @@ fn public_key(body: &[u8]) -> Result<Key<'_>, Error> {
             let modulus = unsigned(numbers.take(INTEGER)?)?;
             let exponent = unsigned(numbers.take(INTEGER)?)?;
             numbers.end()?;
-            // rsa takes 2048 to 4096 bits and exponents of 33 bits at most.
+            // rsa takes 2048 to 8192 bits and exponents of 33 bits at most.
             let fits = match modulus.len() {
                 256 => modulus.first().is_some_and(|top| *top >= 0x80),
-                257..=512 => true,
+                257..=1024 => true,
                 _ => false,
             };
             if fits && exponent.len() <= 5 {
@@ -710,7 +766,7 @@ fn extensions(body: &[u8]) -> Result<Extensions<'_>, Error> {
             EXTENDED_KEY_USAGE => out.server_auth = Some(server_auth(value.take(SEQUENCE)?)?),
             SUBJECT_ALT_NAME => out.names = Some(general_names(value.take(SEQUENCE)?)?),
             NAME_CONSTRAINTS => {
-                (out.permitted, out.excluded) = name_constraints(value.take(SEQUENCE)?, critical)?;
+                (out.permitted, out.excluded) = name_constraints(value.take(SEQUENCE)?)?;
             }
             SUBJECT_KEY_ID => out.subject_key = Some(value.take(OCTET_STRING)?),
             AUTHORITY_KEY_ID => {
@@ -765,11 +821,10 @@ fn key_usage(body: &[u8]) -> Result<u16, Error> {
 enum Purpose {
     /// It names serverAuth.
     Server,
-    /// It names anyExtendedKeyUsage, not serverAuth: a leaf's serves, as
-    /// RFC 5280 and Go have it; a CA's does not, as Firefox (mozilla::
-    /// pkix) and the CA/Browser Forum's baseline requirements have it.
-    Any,
-    /// Neither.
+    /// It does not. anyExtendedKeyUsage is no serverAuth, on a leaf or
+    /// a CA, as Firefox (pkixcheck.cpp's MatchEKU) and webpki (its
+    /// ExtendedKeyUsage::validate) have it, and the CA/Browser Forum's
+    /// baseline requirements forbid it in a TLS server certificate.
     Other,
 }
 
@@ -781,13 +836,8 @@ fn server_auth(body: &[u8]) -> Result<Purpose, Error> {
     }
     let mut allows = Purpose::Other;
     while !purposes.is_empty() {
-        let purpose = purposes.oid()?;
-        if purpose == SERVER_AUTH {
+        if purposes.oid()? == SERVER_AUTH {
             allows = Purpose::Server;
-        } else if purpose == ANY_USAGE && allows == Purpose::Other {
-            allows = Purpose::Any;
-        } else {
-            // Another purpose adds nothing for a TLS server.
         }
     }
     Ok(allows)
@@ -819,8 +869,9 @@ fn general_names(body: &[u8]) -> Result<&[u8], Error> {
 
 /// NameConstraints: permitted and excluded GeneralSubtrees, one at
 /// least. A subtree has only its base: minimum and maximum are absent
-/// in RFC 5280's profile.
-fn name_constraints(body: &[u8], critical: bool) -> Result<Subtrees<'_>, Error> {
+/// in RFC 5280's profile. A base of a form this does not compare is
+/// kept: it refuses names of its form below (within).
+fn name_constraints(body: &[u8]) -> Result<Subtrees<'_>, Error> {
     let mut fields = Reader::new(body);
     let permitted = fields.optional(PERMITTED)?;
     let excluded = fields.optional(EXCLUDED)?;
@@ -840,13 +891,14 @@ fn name_constraints(body: &[u8], critical: bool) -> Result<Subtrees<'_>, Error> 
             let valid = match base.id {
                 DNS_NAME => base.body.iter().all(|byte| (0x21..0x7f).contains(byte)),
                 IP_ADDRESS => matches!(base.body.len(), 8 | 32) && prefix_mask(base.body),
-                // A form not enforced: ignored unless critical.
-                _ => !critical,
+                DIRECTORY_NAME => {
+                    let mut inner = Reader::new(base.body);
+                    name(&mut inner).is_ok() && inner.is_empty()
+                }
+                _ => true,
             };
-            match (valid, base.id) {
-                (true, _) => {}
-                (false, DNS_NAME | IP_ADDRESS) => return Err(Error::Malformed),
-                (false, _) => return Err(Error::Critical),
+            if !valid {
+                return Err(Error::Malformed);
             }
         }
     }
@@ -874,6 +926,16 @@ impl Certificate<'_> {
 
     fn self_issued(&self) -> bool {
         self.issuer == self.subject
+    }
+
+    /// Whether the key may sign a TLS handshake (CertificateVerify): no
+    /// keyUsage, or one with digitalSignature, as BoringSSL requires of
+    /// a TLS 1.3 server's certificate whoever verified it (RFC 5280
+    /// 4.2.1.3; ssl/tls13_both.cc).
+    pub fn signs_handshake(&self) -> bool {
+        self.ext
+            .key_usage
+            .is_none_or(|bits| bits & DIGITAL_SIGNATURE != 0)
     }
 
     /// Whether key signed this certificate.
@@ -946,6 +1008,7 @@ impl Store {
             anchors: Vec::new(),
             skipped: 0,
             revoked: Vec::new(),
+            imposed: Vec::new(),
         }
     }
 
@@ -987,12 +1050,21 @@ impl Store {
     /// Whether certificate is revoked here: by its issuer and serial
     /// number, or by its subject and key.
     fn revokes(&self, certificate: &Certificate<'_>) -> bool {
+        self.revokes_names(&Names {
+            issuer: certificate.issuer,
+            serial: certificate.serial,
+            subject: certificate.subject,
+            spki: certificate.spki,
+        })
+    }
+
+    fn revokes_names(&self, names: &Names<'_>) -> bool {
         if self.revoked.is_empty() {
             return false;
         }
-        let by_serial = revocation_digest(ISSUER_SERIAL, certificate.issuer, certificate.serial);
-        let key = sha256::digest(certificate.spki);
-        let by_key = revocation_digest(SUBJECT_KEY, certificate.subject, &key);
+        let by_serial = revocation_digest(ISSUER_SERIAL, names.issuer, names.serial);
+        let key = sha256::digest(names.spki);
+        let by_key = revocation_digest(SUBJECT_KEY, names.subject, &key);
         self.revoked.binary_search(&by_serial).is_ok()
             || self.revoked.binary_search(&by_key).is_ok()
     }
@@ -1006,15 +1078,17 @@ impl Store {
         self.anchors.is_empty()
     }
 
-    /// The entries refused: not DER, outside the profile, or not a CA.
+    /// The entries refused: not DER, or outside the profile.
     pub fn skipped(&self) -> usize {
         self.skipped
     }
 
     /// Adds each CERTIFICATE of PEM text, such as a CA bundle; the text
-    /// around them is ignored but for a line "# distrust-after:
-    /// YYYY-MM-DDTHH:MM:SSZ" before a block, as roots-gen.py writes
-    /// from Mozilla's data, which add_der_distrust_after's time is.
+    /// around them is ignored but for two lines before a block, which
+    /// roots-gen.py writes from Mozilla's data: "# distrust-after:
+    /// YYYY-MM-DDTHH:MM:SSZ", which add_der_distrust_after's time is, and
+    /// "# name-constraints: " and the hex of a NameConstraints, which
+    /// holds for every CA of the block's subject as its own would.
     /// Returns how many it added.
     ///
     /// A first scan counts the blocks and the bytes they decode to, so
@@ -1029,8 +1103,9 @@ impl Store {
         while let Some((before, body, after)) = pem_block(rest) {
             rest = after;
             let start = self.bytes.len();
-            // A date it cannot read leaves the anchor out, not trusted fully.
-            let Ok(distrust) = distrust_after(before) else {
+            // A date or constraints it cannot read leave the anchor out,
+            // not trusted fully.
+            let (Ok(distrust), Ok(imposed)) = (distrust_after(before), imposed_line(before)) else {
                 self.skipped += 1;
                 continue;
             };
@@ -1042,12 +1117,21 @@ impl Store {
                 self.skipped += 1;
                 continue;
             }
+            if let Some(hex) = imposed {
+                let subject = self.anchors.last().map_or((0, 0), |anchor| anchor.subject);
+                if !self.impose(subject, hex) {
+                    self.anchors.pop();
+                    self.bytes.truncate(start);
+                    self.skipped += 1;
+                    continue;
+                }
+            }
             added += 1;
         }
         added
     }
 
-    /// Adds one anchor: a CA certificate in the profile. Whether it did.
+    /// Adds one anchor: a certificate in the profile. Whether it did.
     /// Each call grows the store by what it adds; add_ders grows it once
     /// for many.
     pub fn add_der(&mut self, der: &[u8]) -> bool {
@@ -1089,7 +1173,7 @@ impl Store {
         false
     }
 
-    /// Keeps the bytes from start as an anchor when they are one: a CA
+    /// Keeps the bytes from start as an anchor when they are one: a
     /// certificate in the profile. Its subject is found in its DER; any
     /// place with the same bytes will do, as only the bytes are compared.
     fn keep(&mut self, start: usize, distrust: Option<i64>) -> bool {
@@ -1102,9 +1186,6 @@ impl Store {
         let Some(at) = find(der, anchor.subject) else {
             return false;
         };
-        if !anchor.ext.ca {
-            return false;
-        }
         let subject = start + at;
         let (end, length) = (self.bytes.len(), anchor.subject.len());
         self.anchors.push(Anchor {
@@ -1120,6 +1201,138 @@ impl Store {
         let anchor = self.anchors.get(index)?;
         parse(self.bytes.get(anchor.der.0..anchor.der.1)?).ok()
     }
+
+    /// Imposes the NameConstraints in hex on the name at subject in
+    /// bytes; whether it was one.
+    fn impose(&mut self, subject: (usize, usize), hex: &[u8]) -> bool {
+        let start = self.bytes.len();
+        let decoded = hex.len().is_multiple_of(2)
+            && hex
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|pair| hex_byte(*pair).map(|byte| self.bytes.push(byte)).is_some());
+        let end = self.bytes.len();
+        let valid = decoded
+            && self.bytes.get(start..end).is_some_and(|der| {
+                Reader::new(der)
+                    .only_sequence()
+                    .and_then(name_constraints)
+                    .is_ok()
+            });
+        if valid && self.bytes.len() < STORE_BYTES_MAX {
+            self.imposed.push(Imposed {
+                subject,
+                constraints: (start, end),
+            });
+            true
+        } else {
+            self.bytes.truncate(start);
+            false
+        }
+    }
+
+    /// The name constraints imposed on CAs named subject, when there are.
+    fn imposed_on(&self, subject: &[u8]) -> Option<Subtrees<'_>> {
+        let imposed = self.imposed.iter().find(|imposed| {
+            self.bytes.get(imposed.subject.0..imposed.subject.1) == Some(subject)
+        })?;
+        let der = self
+            .bytes
+            .get(imposed.constraints.0..imposed.constraints.1)?;
+        Reader::new(der)
+            .only_sequence()
+            .and_then(name_constraints)
+            .ok()
+    }
+
+    /// The anchor whose DER is der, when there is one.
+    fn anchor_of(&self, der: &[u8]) -> Option<usize> {
+        self.anchors
+            .iter()
+            .position(|anchor| self.bytes.get(anchor.der.0..anchor.der.1) == Some(der))
+    }
+
+    /// Takes on policy's distrust of what this store trusts, as a store
+    /// of the system's anchors may from roots::policy, which carries
+    /// Mozilla's: its revocations, the constraints it imposes on names,
+    /// and the distrust date of each of its anchors for an anchor here
+    /// with the same subject and key (the earlier date winning). Returns
+    /// how many anchors here took a date.
+    pub fn add_policy(&mut self, policy: &Store) -> usize {
+        let room = REVOKED_MAX.saturating_sub(self.revoked.len());
+        self.revoked
+            .extend(policy.revoked.iter().take(room).copied());
+        self.revoked.sort_unstable();
+        self.revoked.dedup();
+        for imposed in &policy.imposed {
+            let (Some(subject), Some(constraints)) = (
+                policy.bytes.get(imposed.subject.0..imposed.subject.1),
+                policy
+                    .bytes
+                    .get(imposed.constraints.0..imposed.constraints.1),
+            ) else {
+                continue;
+            };
+            if self.bytes.len() >= STORE_BYTES_MAX {
+                break;
+            }
+            let start = self.bytes.len();
+            self.bytes.extend_from_slice(subject);
+            self.bytes.extend_from_slice(constraints);
+            let middle = start + subject.len();
+            self.imposed.push(Imposed {
+                subject: (start, middle),
+                constraints: (middle, self.bytes.len()),
+            });
+        }
+        let mut dated = 0;
+        for (index, theirs) in policy.anchors.iter().enumerate() {
+            let (Some(after), Some(certificate)) = (theirs.distrust, policy.certificate(index))
+            else {
+                continue;
+            };
+            for mine in 0..self.anchors.len() {
+                let same = self.certificate(mine).is_some_and(|anchor| {
+                    anchor.subject == certificate.subject && anchor.spki == certificate.spki
+                });
+                if let Some(anchor) = self.anchors.get_mut(mine).filter(|_| same) {
+                    anchor.distrust = Some(anchor.distrust.map_or(after, |date| date.min(after)));
+                    dated += 1;
+                }
+            }
+        }
+        dated
+    }
+}
+
+/// What a certificate's revocation is looked up by.
+struct Names<'a> {
+    issuer: &'a [u8],
+    serial: &'a [u8],
+    subject: &'a [u8],
+    spki: &'a [u8],
+}
+
+/// The names of a certificate in der, read as far as they go, for one
+/// that another verifier accepted and parse may not: its key or its
+/// extensions outside this profile.
+fn names_of(der: &[u8]) -> Option<Names<'_>> {
+    let mut outer = Reader::new(Reader::new(der).only_sequence().ok()?);
+    let mut fields = Reader::new(outer.take(SEQUENCE).ok()?);
+    fields.optional(VERSION).ok()?;
+    let serial = fields.take(INTEGER).ok()?;
+    fields.take(SEQUENCE).ok()?;
+    let issuer = fields.expect(SEQUENCE).ok()?.whole;
+    fields.take(SEQUENCE).ok()?;
+    let subject = fields.expect(SEQUENCE).ok()?.whole;
+    let spki = fields.expect(SEQUENCE).ok()?.whole;
+    Some(Names {
+        issuer,
+        serial,
+        subject,
+        spki,
+    })
 }
 
 /// The kinds of a revocation: by issuer and serial number, or by
@@ -1144,12 +1357,17 @@ fn hex_digest(text: &[u8]) -> Option<[u8; 32]> {
     if text.len() != 64 {
         return None;
     }
-    for (byte, &[high, low]) in digest.iter_mut().zip(text.as_chunks::<2>().0) {
-        let high = char::from(high).to_digit(16)?;
-        let low = char::from(low).to_digit(16)?;
-        *byte = u8::try_from(high * 16 + low).ok()?;
+    for (byte, pair) in digest.iter_mut().zip(text.as_chunks::<2>().0) {
+        *byte = hex_byte(*pair)?;
     }
     Some(digest)
+}
+
+/// Two hex digits as a byte.
+fn hex_byte([high, low]: [u8; 2]) -> Option<u8> {
+    let high = char::from(high).to_digit(16)?;
+    let low = char::from(low).to_digit(16)?;
+    u8::try_from(high * 16 + low).ok()
 }
 
 /// The text before the next BEGIN CERTIFICATE line, the base64 between
@@ -1209,6 +1427,22 @@ fn distrust_after(text: &[u8]) -> Result<Option<i64>, Error> {
             body: &digits,
             whole: &digits,
         })?);
+    }
+    Ok(found)
+}
+
+/// The hex after the last line "# name-constraints: " in text, Ok(None)
+/// when there is none, Err when one holds anything but hex digits.
+fn imposed_line(text: &[u8]) -> Result<Option<&[u8]>, Error> {
+    let mut found = None;
+    for line in text.split(|byte| *byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if let Some(hex) = line.strip_prefix(NAME_CONSTRAINTS_LINE) {
+            if hex.is_empty() || !hex.iter().all(u8::is_ascii_hexdigit) {
+                return Err(Error::Malformed);
+            }
+            found = Some(hex);
+        }
     }
     Ok(found)
 }
@@ -1298,8 +1532,8 @@ fn base64(text: &[u8], out: &mut Vec<u8>) -> bool {
 /// Verifies a server's chain, leaf first as TLS sends it, for host at
 /// now (Unix seconds): the leaf for a TLS server and the host, then a
 /// path through the other certificates, in any order and with any
-/// extras, to an anchor of store. Returns the leaf, whose key checks
-/// the handshake's signature.
+/// extras, to an anchor of store, unless the leaf is an anchor itself.
+/// Returns the leaf, whose key checks the handshake's signature.
 pub fn verify<'a>(
     chain: &[&'a [u8]],
     store: &Store,
@@ -1316,12 +1550,9 @@ pub fn verify<'a>(
     if !leaf.current(now) {
         return Err(Error::Expired);
     }
-    if leaf
-        .ext
-        .key_usage
-        .is_some_and(|bits| bits & DIGITAL_SIGNATURE == 0)
-        || leaf.ext.server_auth == Some(Purpose::Other)
-    {
+    // A CA is no leaf: the baseline requirements' 7.1.2.3, Firefox's
+    // CheckBasicConstraints and webpki's check_basic_constraints.
+    if leaf.ext.ca || !leaf.signs_handshake() || leaf.ext.server_auth == Some(Purpose::Other) {
         return Err(Error::Usage);
     }
     if !covers(leaf.ext.names, host) {
@@ -1334,6 +1565,15 @@ pub fn verify<'a>(
         der: leaf.der,
         key: leaf.key,
     };
+    // An anchor is trusted as it is, as the leaf too: Go's Verify takes
+    // a leaf that its roots hold as the whole chain, as Firefox takes an
+    // end entity it trusts as an anchor.
+    if store
+        .anchor_of(leaf.der)
+        .is_some_and(|index| !distrusted(store, index, &leaf))
+    {
+        return Ok(found);
+    }
     let mut pool = Vec::with_capacity(chain.len());
     pool.push(leaf);
     // One that does not parse cannot be on the path: an extra is no error.
@@ -1342,16 +1582,21 @@ pub fn verify<'a>(
             pool.push(certificate);
         }
     }
-    path(&pool, store, now)?;
+    path(&Search {
+        pool: &pool,
+        store,
+        now,
+    })?;
     Ok(found)
 }
 
-/// Searches depth first, without recursion, for a path from pool's
+/// Searches depth first, without recursion, for a path from the pool's
 /// first certificate through the others to an anchor; each step tries
 /// anchors before peers, and issuers whose key identifier matches first
 /// (as Go does). The first reason a candidate failed is the error when
 /// none succeeds.
-fn path(pool: &[Certificate<'_>], store: &Store, now: i64) -> Result<(), Error> {
+fn path(search: &Search<'_, '_>) -> Result<(), Error> {
+    let (pool, store) = (search.pool, search.store);
     let leaf = pool.first().ok_or(Error::Malformed)?;
     let mut frames = Vec::with_capacity(DEPTH_MAX);
     frames.push(Frame {
@@ -1377,7 +1622,13 @@ fn path(pool: &[Certificate<'_>], store: &Store, now: i64) -> Result<(), Error> 
             Candidate::Anchor(index) if distrusted(store, index, leaf) => Err(Error::Distrusted),
             Candidate::Anchor(index) => match store.certificate(index) {
                 Some(anchor) if store.revokes(&anchor) => Err(Error::Revoked),
-                Some(anchor) => issues(&anchor, child, pool, &frames, now, &mut budget),
+                // An anchor issues when it is a CA, or a v1 certificate,
+                // which cannot say so, as Firefox's CheckBasicConstraints
+                // has it for a trust anchor.
+                Some(anchor) => {
+                    let ca = anchor.ext.ca || anchor.version1;
+                    search.issues(&anchor, ca, child, &frames, &mut budget)
+                }
                 None => Err(Error::Untrusted),
             },
             Candidate::Peer(index) => {
@@ -1388,7 +1639,7 @@ fn path(pool: &[Certificate<'_>], store: &Store, now: i64) -> Result<(), Error> 
                 if store.revokes(peer) {
                     Err(Error::Revoked)
                 } else {
-                    issues(peer, child, pool, &frames, now, &mut budget)
+                    search.issues(peer, peer.ext.ca, child, &frames, &mut budget)
                 }
             }
         };
@@ -1476,78 +1727,164 @@ fn on_path(peer: &Certificate<'_>, pool: &[Certificate<'_>], frames: &[Frame]) -
         .any(|below| below.subject == peer.subject && below.spki == peer.spki)
 }
 
-/// Whether parent may issue child, the top of the path in frames: it is
-/// current, a CA for TLS servers, its constraints hold for everything
-/// below it, and its key signed child.
-fn issues(
-    parent: &Certificate<'_>,
-    child: &Certificate<'_>,
-    pool: &[Certificate<'_>],
-    frames: &[Frame],
-    now: i64,
-    budget: &mut Budget,
-) -> Result<(), Error> {
-    if !parent.current(now) {
-        return Err(Error::Expired);
-    }
-    if !parent.ext.ca {
-        return Err(Error::NotCa);
-    }
-    if parent
-        .ext
-        .key_usage
-        .is_some_and(|bits| bits & KEY_CERT_SIGN == 0)
-        || matches!(parent.ext.server_auth, Some(Purpose::Other | Purpose::Any))
-    {
-        return Err(Error::Usage);
-    }
-    // pathLenConstraint counts the intermediates below, self-issued ones
-    // aside (RFC 5280 6.1.4 (l)); the leaf is the first frame.
-    if let Some(limit) = parent.ext.path_length {
-        let below = frames
-            .iter()
-            .skip(1)
-            .filter_map(|frame| pool.get(frame.node))
-            .filter(|below| !below.self_issued())
-            .count();
-        if below > limit {
-            return Err(Error::PathLength);
+impl Search<'_, '_> {
+    /// Whether parent may issue child, the top of the path in frames: it
+    /// is current, a CA (ca) for TLS servers, its constraints and those
+    /// imposed on its name hold for everything below it, and its key
+    /// signed child.
+    fn issues(
+        &self,
+        parent: &Certificate<'_>,
+        ca: bool,
+        child: &Certificate<'_>,
+        frames: &[Frame],
+        budget: &mut Budget,
+    ) -> Result<(), Error> {
+        if !parent.current(self.now) {
+            return Err(Error::Expired);
         }
-    }
-    if parent.ext.permitted.is_some() || parent.ext.excluded.is_some() {
-        for below in frames.iter().filter_map(|frame| pool.get(frame.node)) {
-            if let Some(names) = below.ext.names {
-                within(parent, names, &mut budget.comparisons)?;
+        if !ca {
+            return Err(Error::NotCa);
+        }
+        if parent
+            .ext
+            .key_usage
+            .is_some_and(|bits| bits & KEY_CERT_SIGN == 0)
+            || parent.ext.server_auth == Some(Purpose::Other)
+        {
+            return Err(Error::Usage);
+        }
+        // pathLenConstraint counts the intermediates below, self-issued
+        // ones aside (RFC 5280 6.1.4 (l)); the leaf is the first frame.
+        if let Some(limit) = parent.ext.path_length {
+            let below = frames
+                .iter()
+                .skip(1)
+                .filter_map(|frame| self.pool.get(frame.node))
+                .filter(|below| !below.self_issued())
+                .count();
+            if below > limit {
+                return Err(Error::PathLength);
             }
         }
-    }
-    budget.signatures = budget.signatures.checked_sub(1).ok_or(Error::TooMany)?;
-    if child.signed_by(&parent.key) {
-        Ok(())
-    } else {
-        Err(Error::Signature)
+        let own = (parent.ext.permitted, parent.ext.excluded);
+        let own =
+            Some(own).filter(|(permitted, excluded)| permitted.is_some() || excluded.is_some());
+        for subtrees in [own, self.store.imposed_on(parent.subject)]
+            .into_iter()
+            .flatten()
+        {
+            let below = frames.iter().filter_map(|frame| self.pool.get(frame.node));
+            for (depth, certificate) in below.enumerate() {
+                within(&subtrees, certificate, depth == 0, &mut budget.comparisons)?;
+            }
+        }
+        budget.signatures = budget.signatures.checked_sub(1).ok_or(Error::TooMany)?;
+        if child.signed_by(&parent.key) {
+            Ok(())
+        } else {
+            Err(Error::Signature)
+        }
     }
 }
 
-/// Whether each dNSName and iPAddress of names is inside ca's name
-/// constraints: in no excluded subtree, and in a permitted one when ca
-/// permits any of that form. Other forms are not constrained.
-fn within(ca: &Certificate<'_>, names: &[u8], comparisons: &mut usize) -> Result<(), Error> {
-    let mut list = Reader::new(names);
-    while !list.is_empty() {
-        let name = list.element()?;
-        if name.id != DNS_NAME && name.id != IP_ADDRESS {
+/// Checks a path that another verifier built, such as the system's,
+/// leaf first and its anchor last, against policy, a store such as
+/// roots::policy gives with Mozilla's distrust: a certificate on it that
+/// policy revokes, an anchor of policy with the last one's subject and
+/// key that distrusts the leaf (issued after its date), or constraints
+/// policy imposes on the name of a CA on it that a name below breaks.
+/// A certificate outside the profile is looked up by its names alone.
+pub fn screen(path: &[&[u8]], policy: &Store) -> Result<(), Error> {
+    if path.len() > CHAIN_MAX {
+        return Err(Error::TooMany);
+    }
+    let leaf = parse(path.first().ok_or(Error::Malformed)?)?;
+    for der in path {
+        if policy.revokes_names(&names_of(der).ok_or(Error::Malformed)?) {
+            return Err(Error::Revoked);
+        }
+    }
+    let top = path.last().and_then(|der| names_of(der));
+    for index in 0..policy.anchors.len() {
+        let same = |anchor: Certificate<'_>| {
+            top.as_ref()
+                .is_some_and(|top| top.subject == anchor.subject && top.spki == anchor.spki)
+        };
+        if distrusted(policy, index, &leaf) && policy.certificate(index).is_some_and(same) {
+            return Err(Error::Distrusted);
+        }
+    }
+    let mut comparisons = COMPARISONS_MAX;
+    for (at, der) in path.iter().enumerate().skip(1) {
+        let Some(subtrees) = names_of(der).and_then(|names| policy.imposed_on(names.subject))
+        else {
             continue;
+        };
+        for (depth, below) in path.iter().take(at).enumerate() {
+            within(&subtrees, &parse(below)?, depth == 0, &mut comparisons)?;
         }
-        if subtrees_hold(ca.ext.excluded, &name, true, comparisons)? {
-            return Err(Error::Constrained);
-        }
-        if ca.ext.permitted.is_some()
-            && !subtrees_hold(ca.ext.permitted, &name, false, comparisons)?
-            && has_form(ca.ext.permitted, name.id)
-        {
-            return Err(Error::Constrained);
-        }
+    }
+    Ok(())
+}
+
+/// Whether certificate's names are inside subtrees, a CA's name
+/// constraints: dNSName, iPAddress and directoryName each in no excluded
+/// subtree, and in a permitted one when they permit any of its form;
+/// a name of another form they constrain refuses it, as webpki has it
+/// (check_presented_id_conforms_to_constraints). The subject counts as a
+/// directoryName unless it is empty or a self-issued intermediate's
+/// (RFC 5280 6.1.3 (b)), and when there is no subjectAltName its
+/// emailAddress as an rfc822Name (Chrome's IsPermittedCert, after RFC
+/// 5280 4.2.1.10).
+fn within(
+    subtrees: &Subtrees<'_>,
+    certificate: &Certificate<'_>,
+    leaf: bool,
+    comparisons: &mut usize,
+) -> Result<(), Error> {
+    let mut list = Reader::new(certificate.ext.names.unwrap_or_default());
+    while !list.is_empty() {
+        name_within(subtrees, &list.element()?, comparisons)?;
+    }
+    if certificate.subject.len() > 2 && (leaf || !certificate.self_issued()) {
+        let subject = Element {
+            id: DIRECTORY_NAME,
+            body: certificate.subject,
+            whole: certificate.subject,
+        };
+        name_within(subtrees, &subject, comparisons)?;
+    }
+    if certificate.ext.names.is_none()
+        && constrains(subtrees, RFC822_NAME)
+        && has_email(certificate.subject)?
+    {
+        return Err(Error::Constrained);
+    }
+    Ok(())
+}
+
+/// Whether subtrees constrain names of form id.
+fn constrains(subtrees: &Subtrees<'_>, id: u8) -> bool {
+    has_form(subtrees.0, id) || has_form(subtrees.1, id)
+}
+
+/// Whether one name is inside subtrees, as within says.
+fn name_within(
+    subtrees: &Subtrees<'_>,
+    name: &Element<'_>,
+    comparisons: &mut usize,
+) -> Result<(), Error> {
+    match name.id {
+        DNS_NAME | IP_ADDRESS | DIRECTORY_NAME => {}
+        _ if constrains(subtrees, name.id) => return Err(Error::Constrained),
+        _ => return Ok(()),
+    }
+    if subtrees_hold(subtrees.1, name, true, comparisons)? {
+        return Err(Error::Constrained);
+    }
+    if has_form(subtrees.0, name.id) && !subtrees_hold(subtrees.0, name, false, comparisons)? {
+        return Err(Error::Constrained);
     }
     Ok(())
 }
@@ -1566,10 +1903,10 @@ fn subtrees_hold(
             continue;
         }
         *comparisons = comparisons.checked_sub(1).ok_or(Error::TooMany)?;
-        let holds = if name.id == DNS_NAME {
-            domain_within(name.body, base.body, excluded)?
-        } else {
-            address_within(name.body, base.body)
+        let holds = match name.id {
+            DNS_NAME => domain_within(name.body, base.body, excluded)?,
+            IP_ADDRESS => address_within(name.body, base.body),
+            _ => directory_within(name.body, base.body)?,
         };
         if holds {
             return Ok(true);
@@ -1586,6 +1923,180 @@ fn has_form(subtrees: Option<&[u8]>, id: u8) -> bool {
         }
     }
     false
+}
+
+/// Whether the Name DER name has an emailAddress attribute.
+fn has_email(name: &[u8]) -> Result<bool, Error> {
+    let mut rdns = Reader::new(Reader::new(name).only_sequence()?);
+    while !rdns.is_empty() {
+        let mut set = Reader::new(rdns.take(SET)?);
+        while !set.is_empty() {
+            if Reader::new(set.take(SEQUENCE)?).oid()? == EMAIL_ADDRESS {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Chrome's VerifyNameInSubtree (verify_name_match.cc): whether the
+/// Name DER name begins with the RDNs of base, each matching as RFC 5280
+/// 7.1 has it. Err when either is not a Name.
+fn directory_within(name: &[u8], base: &[u8]) -> Result<bool, Error> {
+    let mut names = Reader::new(Reader::new(name).only_sequence()?);
+    let mut bases = Reader::new(Reader::new(base).only_sequence()?);
+    while !bases.is_empty() {
+        let theirs = bases.take(SET)?;
+        if names.is_empty() {
+            return Ok(false);
+        }
+        if !rdn_matches(names.take(SET)?, theirs)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether two RDNs match: as many attributes, and each of a matching
+/// one of b, which is then used up (Chrome's VerifyRdnMatch).
+fn rdn_matches(a: &[u8], b: &[u8]) -> Result<bool, Error> {
+    // b's attributes; an empty one is used up, as none is empty.
+    let mut theirs: [&[u8]; ATTRIBUTES_MAX] = [&[]; ATTRIBUTES_MAX];
+    let mut count = 0;
+    let mut list = Reader::new(b);
+    while !list.is_empty() {
+        *theirs.get_mut(count).ok_or(Error::Constrained)? = list.take(SEQUENCE)?;
+        count += 1;
+    }
+    let mut ours = Reader::new(a);
+    let mut matched = 0;
+    while !ours.is_empty() {
+        let attribute = ours.take(SEQUENCE)?;
+        let mut found = None;
+        for (slot, other) in theirs.iter().take(count).enumerate() {
+            if !other.is_empty() && attribute_matches(attribute, other)? {
+                found = Some(slot);
+                break;
+            }
+        }
+        let Some(slot) = found.and_then(|slot| theirs.get_mut(slot)) else {
+            return Ok(false);
+        };
+        *slot = &[];
+        matched += 1;
+    }
+    Ok(matched == count)
+}
+
+/// Whether two AttributeTypeAndValue contents match: one type, and
+/// values that do (Chrome's VerifyValueMatch): strings of the five types
+/// Chrome normalizes compared folded, others byte for byte with their
+/// tags.
+fn attribute_matches(a: &[u8], b: &[u8]) -> Result<bool, Error> {
+    let (mut a, mut b) = (Reader::new(a), Reader::new(b));
+    if a.oid()? != b.oid()? {
+        return Ok(false);
+    }
+    let (ours, theirs) = (a.element()?, b.element()?);
+    let foldable = |id| {
+        matches!(
+            id,
+            PRINTABLE_STRING | UTF8_STRING | IA5_STRING | UNIVERSAL_STRING | BMP_STRING
+        )
+    };
+    if !foldable(ours.id) || !foldable(theirs.id) {
+        return Ok(ours.id == theirs.id && ours.body == theirs.body);
+    }
+    let (mut left, mut right) = (Folded::new(), Folded::new());
+    let folded = left.fold(&ours) && right.fold(&theirs);
+    Ok(folded && left.text == right.text)
+}
+
+/// The characters a string type allows once folded.
+#[derive(Clone, Copy)]
+enum Charset {
+    Printable,
+    Ascii,
+    Any,
+}
+
+/// A string as Chrome's NormalizeDirectoryString leaves it: UTF-8, A to
+/// Z folded to a to z, spaces at either end dropped and a run of them
+/// one.
+struct Folded {
+    // rr: escape(bound): at most 1.5 bytes for each byte of the value
+    // folded, which a certificate's size bounds.
+    text: Vec<u8>,
+    /// A space waits for what follows it.
+    space: bool,
+}
+
+impl Folded {
+    fn new() -> Self {
+        Self {
+            text: Vec::new(),
+            space: false,
+        }
+    }
+
+    /// Folds the string value; false when a character is not of its
+    /// type, or the value not of whole characters.
+    fn fold(&mut self, value: &Element<'_>) -> bool {
+        let body = value.body;
+        match value.id {
+            PRINTABLE_STRING => body.iter().all(|byte| self.byte(*byte, Charset::Printable)),
+            IA5_STRING => body.iter().all(|byte| self.byte(*byte, Charset::Ascii)),
+            UTF8_STRING => body.iter().all(|byte| self.byte(*byte, Charset::Any)),
+            BMP_STRING => {
+                let (units, rest) = body.as_chunks::<2>();
+                rest.is_empty()
+                    && units
+                        .iter()
+                        .all(|unit| self.character(u32::from(u16::from_be_bytes(*unit))))
+            }
+            UNIVERSAL_STRING => {
+                let (units, rest) = body.as_chunks::<4>();
+                rest.is_empty()
+                    && units
+                        .iter()
+                        .all(|unit| self.character(u32::from_be_bytes(*unit)))
+            }
+            _ => false,
+        }
+    }
+
+    fn character(&mut self, code: u32) -> bool {
+        let Some(character) = char::from_u32(code) else {
+            return false;
+        };
+        let mut buffer = [0; 4];
+        let encoded = character.encode_utf8(&mut buffer);
+        encoded.bytes().all(|byte| self.byte(byte, Charset::Any))
+    }
+
+    fn byte(&mut self, byte: u8, charset: Charset) -> bool {
+        if byte == b' ' {
+            self.space = !self.text.is_empty();
+            return true;
+        }
+        if self.space {
+            self.text.push(b' ');
+            self.space = false;
+        }
+        let byte = byte.to_ascii_lowercase();
+        let allowed = match charset {
+            Charset::Printable => {
+                byte.is_ascii_lowercase()
+                    || (b'\''..=b':').contains(&byte)
+                    || byte == b'='
+                    || byte == b'?'
+            }
+            Charset::Ascii => byte.is_ascii(),
+            Charset::Any => true,
+        };
+        self.text.push(byte);
+        allowed
+    }
 }
 
 /// Go's matchDomainConstraint: an empty constraint holds every name, a
@@ -1759,7 +2270,7 @@ fn host_matches(pattern: &[u8], host: &[u8]) -> bool {
 
 /// Any bytes as a certificate: parse answers without a panic, and what
 /// it accepts matches hosts and its own constraints, and loads as an
-/// anchor exactly when it is a CA.
+/// anchor.
 #[cfg(fuzzing)]
 pub fn fuzz_parse(input: &[u8]) {
     let Ok(certificate) = parse(input) else {
@@ -1775,13 +2286,15 @@ pub fn fuzz_parse(input: &[u8]) {
     ] {
         covers(certificate.ext.names, host);
     }
-    if let Some(names) = certificate.ext.names {
-        let mut comparisons = COMPARISONS_MAX;
-        let outcome = within(&certificate, names, &mut comparisons);
-        assert!(!matches!(outcome, Err(Error::Malformed)));
-    }
+    let subtrees = (certificate.ext.permitted, certificate.ext.excluded);
+    let mut comparisons = COMPARISONS_MAX;
+    let outcome = within(&subtrees, &certificate, true, &mut comparisons);
+    assert!(matches!(
+        outcome,
+        Ok(()) | Err(Error::Constrained | Error::TooMany | Error::Malformed)
+    ));
     let mut store = Store::new();
-    assert_eq!(store.add_der(input), certificate.ext.ca);
+    assert!(store.add_der(input));
 }
 
 /// Test certificates and the input's as a chain, for paths deeper than
@@ -1859,12 +2372,33 @@ pub fn test_certificate(name: &str) -> Option<Vec<u8>> {
     None
 }
 
+/// A line of revoked.txt that revokes the certificate in der, by its
+/// subject and key, for other components' tests.
+#[cfg(test)]
+pub fn test_revocation(der: &[u8]) -> Vec<u8> {
+    let mut line = Vec::new();
+    if let Ok(certificate) = parse(der) {
+        let key = sha256::digest(certificate.spki);
+        for byte in revocation_digest(SUBJECT_KEY, certificate.subject, &key) {
+            for nibble in [byte >> 4, byte & 15] {
+                line.extend_from_slice(
+                    b"0123456789abcdef"
+                        .get(usize::from(nibble)..=usize::from(nibble))
+                        .unwrap_or_default(),
+                );
+            }
+        }
+    }
+    line
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         Error, ISSUER_SERIAL, PEM_END, Reader, SUBJECT_KEY, Store, TEST_NOW as NOW, TESTS,
-        address_within, domain_within, extensions, find, host_matches, key_usage, parse,
-        revocation_digest, test_certificate, time, unsigned, verify,
+        address_within, attribute_matches, directory_within, domain_within, extensions, find,
+        host_matches, key_usage, parse, revocation_digest, screen, test_certificate, time,
+        unsigned, verify,
     };
     use crate::base::sha256;
     use alloc::vec::Vec;
@@ -1891,6 +2425,8 @@ mod tests {
             "test.anyroot",
             "test.p521root",
             "test.rsa512root",
+            "test.v1root",
+            "test.rsa8192root",
         ] {
             assert!(store.add_der(&der(name)));
         }
@@ -2227,15 +2763,216 @@ mod tests {
             check(&["test.crit", "test.inter"], "api.example.test", NOW),
             Err(Error::Critical)
         );
-        // anyExtendedKeyUsage serves a leaf, not a CA.
+        // anyExtendedKeyUsage serves neither a leaf nor a CA.
+        for names in [
+            &["test.anyleaf", "test.anyroot"][..],
+            &["test.underany", "test.anyca"],
+            // A CA is no leaf, and a key that cannot sign signs no
+            // handshake.
+            &["test.caleaf"],
+            &["test.kencleaf"],
+        ] {
+            assert_eq!(
+                check(names, "api.example.test", NOW),
+                Err(Error::Usage),
+                "{names:?}"
+            );
+        }
+        let kenc = der("test.kencleaf");
+        assert!(!parse(&kenc).unwrap().signs_handshake());
+        assert!(parse(&der("test.leaf")).unwrap().signs_handshake());
+    }
+
+    /// ncmail constrains rfc822Name and URI, which are not compared: a
+    /// certificate below with a name of either form, or an emailAddress
+    /// in a subject without subjectAltName, is refused; one without, as
+    /// a TLS server's, is not.
+    #[test]
+    fn unprocessed_forms() {
+        for (names, outcome) in [
+            (&["test.ncmaildns", "test.ncmail"][..], Ok(())),
+            (&["test.ncmailbox", "test.ncmail"], Err(Error::Constrained)),
+            (&["test.ncmailuri", "test.ncmail"], Err(Error::Constrained)),
+            (
+                &["test.ncmailsubleaf", "test.ncmailsub", "test.ncmail"],
+                Err(Error::Constrained),
+            ),
+        ] {
+            assert_eq!(check(names, "api.example.test", NOW), outcome, "{names:?}");
+        }
+    }
+
+    /// ncdir permits C=XX, O=rr Test: a subject under it passes, folded
+    /// as Chrome folds it too, and one elsewhere does not.
+    #[test]
+    fn directory_names() {
+        for (leaf, outcome) in [
+            ("test.ncdirgood", Ok(())),
+            ("test.ncdirfold", Ok(())),
+            ("test.ncdirbad", Err(Error::Constrained)),
+        ] {
+            assert_eq!(
+                check(&[leaf, "test.ncdir"], "api.example.test", NOW),
+                outcome,
+                "{leaf}"
+            );
+        }
+        // C=XX, O=rr Test; that and CN=server; C=XX alone.
+        let base = bytes("301f310b30090603550406130258583110300e060355040a0c0772722054657374");
+        let deeper = bytes(
+            "3030310b30090603550406130258583110300e060355040a0c0772722054657374\
+             310f300d06035504030c06736572766572",
+        );
+        let country = bytes("300d310b3009060355040613025858");
+        assert_eq!(directory_within(&deeper, &base), Ok(true));
+        assert_eq!(directory_within(&base, &base), Ok(true));
+        assert_eq!(directory_within(&base, &deeper), Ok(false));
+        assert_eq!(directory_within(&country, &base), Ok(false));
+        assert!(directory_within(&[0x30, 0x01, 0x00], &base).is_err());
+        // O=rr Test as UTF8String against PrintableString, IA5String,
+        // BMPString and UniversalString, and against values that differ.
+        let utf8 = bytes("060355040a0c0772722054657374");
+        for (other, matches) in [
+            ("060355040a13085252205445535420", true),
+            ("060355040a1609207272202074657374", true),
+            ("060355040a1e0e0072007200200054006500730074", true),
+            (
+                "060355040a1c1c00000072000000720000002000000054000000650000007300000074",
+                true,
+            ),
+            ("060355040a1306727220746573", false),
+            ("060355040b0c0772722054657374", false),
+            // A PrintableString may not hold '@': it matches nothing.
+            ("060355040a13087272205465737440", false),
+            // An OCTET STRING is compared as it is, with its tag.
+            ("060355040a040772722054657374", false),
+        ] {
+            assert_eq!(
+                attribute_matches(&utf8, &bytes(other)),
+                Ok(matches),
+                "{other}"
+            );
+        }
+    }
+
+    /// NameConstraints DER permitting dNSName .tr, as NSS imposes it on
+    /// TUBITAK's root (genname.c).
+    const TR: &str = "3009a007300582032e7472";
+
+    /// The PEM block under "# name" in TESTS, its line and all, after
+    /// lines.
+    fn block(lines: &str, name: &str) -> Vec<u8> {
+        let tests = TESTS.as_bytes();
+        let line = ["# ", name, "\n"].concat();
+        let at = find(tests, line.as_bytes()).unwrap();
+        let end = at + find(&tests[at..], PEM_END).unwrap() + PEM_END.len();
+        let mut text = Vec::new();
+        text.extend_from_slice(lines.as_bytes());
+        text.extend_from_slice(&tests[at..end]);
+        text
+    }
+
+    /// Constraints imposed on imposedroot's name hold as its own would:
+    /// api.example.tr passes, api.example.test does not; from add_pem's
+    /// line, and from a policy over a store that holds the root plainly.
+    #[test]
+    fn imposed() {
+        let lines = ["# name-constraints: ", TR, "\n"].concat();
+        let mut constrained = Store::new();
+        assert_eq!(constrained.add_pem(&block(&lines, "test.imposedroot")), 1);
+        let mut plain = Store::new();
+        assert!(plain.add_der(&der("test.imposedroot")));
+        let (tr, test) = (der("test.imposedtr"), der("test.imposedtest"));
+        assert!(verify(&[&test], &plain, "api.example.test", NOW).is_ok());
+        assert_eq!(plain.add_policy(&constrained), 0);
+        for store in [&constrained, &plain] {
+            assert!(verify(&[&tr], store, "api.example.tr", NOW).is_ok());
+            let refused = verify(&[&test], store, "api.example.test", NOW);
+            assert_eq!(refused.map(|_| ()), Err(Error::Constrained));
+            // And over a path another verifier built.
+            let root = der("test.imposedroot");
+            assert_eq!(screen(&[&tr, &root], store), Ok(()));
+            assert_eq!(screen(&[&test, &root], store), Err(Error::Constrained));
+        }
+        // A line that is not NameConstraints in hex leaves the root out.
+        for odd in ["# name-constraints: 30\n", "# name-constraints: zz\n"] {
+            let mut refused = Store::new();
+            assert_eq!(refused.add_pem(&block(odd, "test.imposedroot")), 0);
+            assert_eq!(refused.skipped(), 1);
+        }
+    }
+
+    /// A v1 anchor issues; a self-signed server certificate in the store
+    /// verifies as itself, and issues nothing, as it is no CA.
+    #[test]
+    fn anchors_as_they_are() {
         assert_eq!(
-            check(&["test.anyleaf", "test.anyroot"], "api.example.test", NOW),
+            check(&["test.v1leaf", "test.v1root"], "api.example.test", NOW),
             Ok(())
         );
+        let (own, under) = (der("test.selfleaf"), der("test.underself"));
+        let mut store = Store::new();
+        assert!(store.add_der(&own));
+        assert!(verify(&[&own], &store, "api.example.test", NOW).is_ok());
         assert_eq!(
-            check(&["test.underany", "test.anyca"], "api.example.test", NOW),
-            Err(Error::Usage)
+            verify(&[&under], &store, "api.example.test", NOW).map(|_| ()),
+            Err(Error::NotCa)
         );
+        // Not in the store, it is a leaf with no issuer.
+        assert_eq!(
+            check(&["test.selfleaf"], "api.example.test", NOW),
+            Err(Error::Untrusted)
+        );
+        // Distrusted for what it was issued after: no path at all.
+        let mut dated = Store::new();
+        assert!(dated.add_der_distrust_after(&own, 0));
+        assert_eq!(
+            verify(&[&own], &dated, "api.example.test", NOW).map(|_| ()),
+            Err(Error::Distrusted)
+        );
+    }
+
+    /// An RSA-8192 root signs a leaf with PKCS #1 and SHA-256.
+    #[test]
+    fn rsa_8192() {
+        assert_eq!(
+            check(
+                &["test.rsa8192leaf", "test.rsa8192root"],
+                "api.example.test",
+                NOW
+            ),
+            Ok(())
+        );
+    }
+
+    /// A policy's revocations and distrust dates over a path another
+    /// verifier built, and taken on by a store of the same anchors.
+    #[test]
+    fn policies() {
+        let (root, inter, leaf, late) = (
+            der("test.root"),
+            der("test.inter"),
+            der("test.leaf"),
+            der("test.late"),
+        );
+        let mut policy = Store::new();
+        assert!(policy.add_der_distrust_after(&root, 1_772_323_200));
+        let path = [&leaf[..], &inter, &root];
+        let late_path = [&late[..], &inter, &root];
+        assert_eq!(screen(&path, &policy), Ok(()));
+        assert_eq!(screen(&late_path, &policy), Err(Error::Distrusted));
+        let mut lines = Vec::new();
+        revocation_line(&inter, true, &mut lines);
+        policy.add_revoked(&lines);
+        assert_eq!(screen(&path, &policy), Err(Error::Revoked));
+        assert_eq!(screen(&[], &policy), Err(Error::Malformed));
+        let mut system = Store::new();
+        assert!(system.add_der(&root));
+        assert!(verify(&[&late, &inter], &system, "api.example.test", NOW).is_ok());
+        assert_eq!(system.add_policy(&policy), 1);
+        assert_eq!(system.revocations(), 1);
+        let refused = verify(&[&leaf, &inter], &system, "api.example.test", NOW);
+        assert_eq!(refused.map(|_| ()), Err(Error::Revoked));
     }
 
     /// PSS and PKCS #1 certificate signatures, and the four TLS 1.3
@@ -2440,24 +3177,26 @@ mod tests {
         assert!(verify(&chain, &store, "api.example.test", NOW).is_ok());
     }
 
-    /// The store loads the CAs of a bundle and counts the rest.
+    /// The store loads every certificate of a bundle in the profile, and
+    /// counts the rest.
     #[test]
     fn store() {
         let mut store = Store::new();
-        assert_eq!(store.add_pem(TESTS.as_bytes()), 30);
-        assert_eq!((store.len(), store.skipped()), (30, 27));
+        // All but test.crit, with its critical extension of no meaning.
+        assert_eq!(store.add_pem(TESTS.as_bytes()), 77);
+        assert_eq!((store.len(), store.skipped()), (77, 1));
         let bad = b"x\n-----BEGIN CERTIFICATE-----\nMII!\n-----END CERTIFICATE-----\n\
                     -----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n\
                     -----BEGIN CERTIFICATE-----\nAAAA";
         assert_eq!(store.add_pem(bad), 0);
-        assert_eq!((store.len(), store.skipped()), (30, 29));
-        assert!(!store.add_der(&der("test.leaf")));
-        assert_eq!((store.len(), store.skipped()), (30, 30));
+        assert_eq!((store.len(), store.skipped()), (77, 3));
+        assert!(!store.add_der(&[0x30, 0]));
+        assert_eq!((store.len(), store.skipped()), (77, 4));
         // A list of DER loads as the same blocks do, and verifies alike.
         let (root, inter, leaf) = (der("test.root"), der("test.inter"), der("test.leaf"));
         let mut list = Store::new();
-        assert_eq!(list.add_ders(&[&leaf, &root, &inter, &[0x30, 0]]), 2);
-        assert_eq!((list.len(), list.skipped()), (2, 2));
+        assert_eq!(list.add_ders(&[&root, &inter, &[0x30, 0]]), 2);
+        assert_eq!((list.len(), list.skipped()), (2, 1));
         assert!(verify(&[&leaf], &list, "api.example.test", NOW).is_ok());
         assert!(Store::new().is_empty());
     }

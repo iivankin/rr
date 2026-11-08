@@ -21,14 +21,14 @@ add declares it in src/base/mod.rs; the crate root declares `mod base;`.
 | mlkem | | ML-KEM-768 key encapsulation (FIPS 203), constant time, for TLS's X25519MLKEM768; its own SHA-3 and SHAKE |
 | ecdh | | P-256 Diffie-Hellman for TLS key shares, constant time |
 | ecdsa | | ECDSA verification on P-256, P-384 and P-521 |
-| rsa | sha256, sha384 | RSA PKCS#1 v1.5 and PSS verification, SHA-256, SHA-384 or SHA-512 |
-| x509 | sha256, sha384, ecdsa, rsa | certificates, a store of anchors, chain verification for a host |
-| roots | x509 | Mozilla's trust anchors and OneCRL, with Chrome's announced distrusts |
+| rsa | sha256, sha384 | RSA PKCS#1 v1.5 and PSS verification, 2048 to 8192 bits, SHA-256, SHA-384 or SHA-512 |
+| x509 | sha256, sha384, ecdsa, rsa | certificates, a store of anchors, chain verification for a host; a policy of revocations, distrust dates and imposed name constraints over other anchors or paths |
+| roots | x509 | Mozilla's trust anchors and OneCRL, with Chrome's announced distrusts and Firefox's imposed name constraints; policy() for the system's anchors |
 | tls | sha256, sha384, aesgcm, x25519, mlkem, ecdh, x509; asks for trust or roots | TLS 1.3 client, AES-128-GCM and AES-256-GCM, with post-quantum X25519MLKEM768, bytes in any split; the chain verified by x509 or by the caller (the system, through trust) |
 | http1 | | HTTP/1.1 requests and an incremental response parser |
 | net | wait | TCP for a loop of many connections: a Listener and Streams that own their socket and their entry in a wait Set; non-blocking, not inherited, no SIGPIPE; errors by kind |
 | resolve | wait | host lookup that never blocks the loop, by the system: DNSServiceGetAddrInfo on macOS and GetAddrInfoExW on Windows, asynchronous and cancellable; getaddrinfo on a thread on Linux |
-| trust | x509, wait | the system verifies a chain, as Go does: SecTrust on macOS, CertGetCertificateChain on Windows, x509 with the system's roots on Linux; never blocks |
+| trust | x509, wait | the system verifies a chain, as Go does: SecTrust on macOS, CertGetCertificateChain on Windows, x509 with the system's roots on Linux or SSL_CERT_FILE's and SSL_CERT_DIR's anywhere; a policy (roots::policy) over either; never blocks |
 | wait | | what a program's loop waits on: a Set of many sockets with deadlines (epoll, kqueue, socket notifications or WSAPoll) and wakes from other threads; a component's Wait; a thread that signals when done |
 | cpu | | what the CPU has of the instructions the components use, asked once |
 
