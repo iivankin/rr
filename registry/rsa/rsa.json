@@ -11,6 +11,18 @@
       "path": "mod.rs"
     },
     {
+      "path": "bits2048.rs"
+    },
+    {
+      "path": "bits3072.rs"
+    },
+    {
+      "path": "bits4096.rs"
+    },
+    {
+      "path": "bits8192.rs"
+    },
+    {
       "path": "rsa-wycheproof.txt"
     }
   ]
