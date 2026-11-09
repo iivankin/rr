@@ -185,6 +185,7 @@ Rules are compiler errors and cannot be lowered with `allow`, `-A rr`,
 | rr_no_recursion | Forbid a call that closes a cycle of the crate's call graph (direct or mutual recursion, see Call graph) without such a comment, such as a bound on the depth, beside the call or once above a function every such cycle passes through; and a type that owns a value of itself, whose drop recurses as deep as the data |
 | rr_unused_escape | Forbid a reason that answers nothing: a kind with no such operation beside it, a kind rr does not know, or the old form that names none |
 | rr_c_signature | Forbid a reference in a C function's declaration: C has pointers |
+| rr_must_use | Require `#[must_use]` on a function that changes something (takes `&mut`, calls foreign code, or is a C function) and returns a bool, an integer or an Option |
 | rr_unused_derive | Forbid a derived trait that nothing in the program uses |
 | rr_duplicate | Forbid a function whose body repeats another's, token for token without comments and spacing and type for type, of four statements or more, without a `duplicate` reason: one function, called from both places, says it once. Two types spelled the same way (`Self { memo: Memo::new() }`, `self.workspace.abort()`) are not a copy: one function for both would need a trait |
 
@@ -417,6 +418,21 @@ the raw arguments the system hands it. A C function is declared with C's
 types (rr_c_signature): a pointer, not a reference, which would promise
 Rust's rules about the memory to code that does not keep them; lend a
 reference with `&raw` at the call.
+
+rustc reports a dropped Result, whose type is must_use, but not
+`set.insert(x);` that meant `if !set.insert(x)`, a count of bytes
+written never compared with what was meant, or a `pop` whose value is
+lost. A function that changes something, because it takes `&mut` (itself
+or a parameter) or calls foreign code, and that returns a bool, an
+integer or an Option, is `#[must_use]` (rr_must_use); so is a C
+function that returns one, as C says there how a call went. Dropping
+such a value is then unused_must_use, and `let _: T =`, through an
+`unsafe` block too, takes an `escape(discard)` reason. No reason answers
+the rule: the attribute is always possible. A trait's method takes it
+where the trait declares it, and a function C calls (`extern "C"`) and
+test code are not looked at. Clippy's must_use_candidate looks only at
+what a library exports, which a program has none of, and at functions
+that change nothing.
 
 ## Clippy lints rr enforces
 

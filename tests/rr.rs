@@ -148,7 +148,7 @@ fn the_compilers_own_derives_and_matches_are_allowed() {
         "#![no_std]\n#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]\nstruct Id(u32);\n\
          #[cfg_attr(test, derive(Debug))]\n#[derive(PartialEq)]\nenum Error {\n Short,\n Bad(u8),\n}\n\
          struct Out;\nimpl core::fmt::Write for Out {\n fn write_str(&mut self, _: &str) -> core::fmt::Result { Ok(()) }\n}\n\
-         fn smallest(v: &mut [Id]) -> Option<u32> {\n v.sort_unstable();\n let a = v.first().copied()?;\n let b = a;\n if a == b && a < Id(9) { Some(a.0) } else { None }\n}\n\
+         #[must_use]\nfn smallest(v: &mut [Id]) -> Option<u32> {\n v.sort_unstable();\n let a = v.first().copied()?;\n let b = a;\n if a == b && a < Id(9) { Some(a.0) } else { None }\n}\n\
          fn short(e: &Error) -> bool { matches!(e, Error::Short) || *e == Error::Bad(1) }\n\
          fn show(id: Id) -> core::fmt::Result { core::fmt::Write::write_fmt(&mut Out, format_args!(\"{id:?}\")) }\n\
          pub fn run(v: &[u32]) -> bool {\n let mut ids = [Id(u32::try_from(v.len()).unwrap_or(0) & 7)];\n smallest(&mut ids).is_some() && short(&Error::Short) && show(Id(1)).is_ok()\n}",
@@ -726,7 +726,7 @@ fn a_hot_path_copies_nothing_it_holds() {
     // with a reason, and a cold call.
     accepted(&alloc_fixture(
         "fn helper(out: &mut Vec<u8>, x: &[u8]) { out.extend_from_slice(x); }\n\
-         #[rr::hot]\npub fn hot(out: &mut Vec<u8>, x: &[u8], n: u32) -> u8 {\n\
+         #[rr::hot]\n#[must_use]\npub fn hot(out: &mut Vec<u8>, x: &[u8], n: u32) -> u8 {\n\
          if out.len() + x.len() > 4096 {\n return 0;\n }\n\
          out.extend_from_slice(&n.to_be_bytes());\n out.extend_from_slice(b\"\\r\\n\");\n\
          for &b in x {\n out.push(b ^ 0x20);\n }\n\
@@ -747,7 +747,7 @@ fn a_hot_path_shifts_no_buffer_tail() {
     }
     // Taking from the end, or all of it, moves nothing.
     accepted(&alloc_fixture(
-        "#[rr::hot]\npub fn hot(out: &mut Vec<u8>) -> usize {\n out.pop();\n out.drain(1..).count() + out.drain(..).count()\n}",
+        "#[rr::hot]\n#[must_use]\npub fn hot(out: &mut Vec<u8>) -> usize {\n out.pop();\n out.drain(1..).count() + out.drain(..).count()\n}",
     ));
 }
 
@@ -773,7 +773,7 @@ fn a_variadic_c_function_is_declared_with_its_dots() {
         "rr_variadic",
     );
     accepted(
-        "#![no_std]\npub mod sys {\n// rr: escape(unsafe): the C library.\nunsafe extern \"C\" {\n pub fn open(path: *const u8, flags: i32, ...) -> i32;\n pub fn close(fd: i32) -> i32;\n}\n}",
+        "#![no_std]\npub mod sys {\n// rr: escape(unsafe): the C library.\nunsafe extern \"C\" {\n #[must_use]\n pub fn open(path: *const u8, flags: i32, ...) -> i32;\n #[must_use]\n pub fn close(fd: i32) -> i32;\n}\n}",
     );
 }
 
@@ -797,7 +797,7 @@ fn a_hot_path_moves_no_large_value() {
     );
     // Lent, written in place, or built where it ends up.
     accepted(&format!(
-        "#![no_std]\n{types}#[rr::hot]\npub fn step(s: &mut S, x: u64) -> u64 {{\n s.cur.a[0] = x;\n s.prev.a = [x; 64];\n sum(&s.prev) + sum(&s.cur)\n}}"
+        "#![no_std]\n{types}#[rr::hot]\n#[must_use]\npub fn step(s: &mut S, x: u64) -> u64 {{\n s.cur.a[0] = x;\n s.prev.a = [x; 64];\n sum(&s.prev) + sum(&s.cur)\n}}"
     ));
 }
 
@@ -838,13 +838,13 @@ fn a_field_that_grows_is_held_to_a_limit() {
     // and capacity() is what the allocator gave, not a limit.
     for body in [
         "pub fn add(q: &mut Q, b: u8) { q.items.push(b); }\npub fn reset(q: &mut Q) { q.items.clear(); }",
-        "pub fn add(q: &mut Q, b: u8) -> bool {\n if q.items.len() == q.items.capacity() {\n return false;\n }\n q.items.push(b);\n true\n}",
+        "#[must_use]\npub fn add(q: &mut Q, b: u8) -> bool {\n if q.items.len() == q.items.capacity() {\n return false;\n }\n q.items.push(b);\n true\n}",
     ] {
         rejected(&alloc_fixture(&format!("{types}{body}")), "rr_unbounded");
     }
     // A limit on its length, a reason at the field, and a value built here.
     for body in [
-        "pub fn add(q: &mut Q, b: u8) -> bool {\n if q.items.len() >= 64 {\n return false;\n }\n q.items.push(b);\n true\n}",
+        "#[must_use]\npub fn add(q: &mut Q, b: u8) -> bool {\n if q.items.len() >= 64 {\n return false;\n }\n q.items.push(b);\n true\n}",
         "pub fn make(b: u8) -> Q {\n let mut q = Q { items: Vec::new() };\n q.items.push(b);\n q\n}",
     ] {
         accepted(&alloc_fixture(&format!("{types}{body}")));
@@ -1187,7 +1187,7 @@ fn foreign_declarations_need_reasons() {
         );
     }
     accepted(
-        "#![no_std]\npub mod sys {\n// rr: escape(unsafe): libc.\nunsafe extern \"C\" {\n // rr: escape(unsafe): abs reads only its argument.\n pub safe fn abs(x: i32) -> i32;\n}\npub fn f(x: i32) -> i32 { abs(x) }\n}",
+        "#![no_std]\npub mod sys {\n// rr: escape(unsafe): libc.\nunsafe extern \"C\" {\n #[must_use]\n // rr: escape(unsafe): abs reads only its argument.\n pub safe fn abs(x: i32) -> i32;\n}\n#[must_use]\npub fn f(x: i32) -> i32 { abs(x) }\n}",
     );
 }
 
@@ -1307,7 +1307,7 @@ fn a_hot_path_sees_a_value_rebuilt_field_by_field_as_a_copy() {
     accepted(&format!(
         "#![no_std]\n{item}#[rr::hot]\npub fn scale(out: &mut [Item]) {{\n for o in out.iter_mut() {{\n *o = Item {{ position: o.position + 1, weight: o.weight * 2 }};\n }}\n}}\n\
          #[rr::hot]\npub fn rotate(ids: &mut [u32]) {{\n for i in 1..ids.len() {{\n // rr: escape(panic): i and i - 1 are below the length.\n ids[i - 1] = ids[i];\n }}\n}}\n\
-         #[rr::hot]\npub fn shift(ids: &mut [u32], at: usize) -> Option<()> {{\n for i in at..ids.len() {{\n *ids.get_mut(i)? = *ids.get(i.checked_add(1)?)?;\n }}\n Some(())\n}}"
+         #[rr::hot]\n#[must_use]\npub fn shift(ids: &mut [u32], at: usize) -> Option<()> {{\n for i in at..ids.len() {{\n *ids.get_mut(i)? = *ids.get(i.checked_add(1)?)?;\n }}\n Some(())\n}}"
     ));
     // A constant copied into a Vec builds it, as From of it does.
     accepted(&alloc_fixture(
@@ -1420,6 +1420,51 @@ fn a_function_may_return_an_iterator() {
 }
 
 #[test]
+fn an_outcome_of_a_change_is_must_use() {
+    for source in [
+        "pub struct S { n: u8 }\nimpl S { pub fn bump(&mut self) -> bool { self.n += 1; self.n > 3 } }",
+        "pub fn fill(out: &mut [u8]) -> usize { out.len() }",
+        "pub fn take(v: &mut Option<u8>) -> Option<u8> { v.take() }",
+        "pub trait Sink { fn put(&mut self, b: u8) -> bool; }",
+        // C says how a call went in what it returns.
+        "pub mod sys {\n// rr: escape(unsafe): the C library.\nunsafe extern \"C\" {\n fn close(fd: i32) -> i32;\n}\n\
+         // rr: escape(unsafe): the descriptor is the caller's.\npub fn end(fd: i32) -> bool { let r = unsafe { close(fd) }; r == 0 }\n}",
+    ] {
+        rejected(&format!("#![no_std]\n{source}"), "rr_must_use");
+    }
+    // With the mark, dropping it is an error, and `let _ =` takes a reason.
+    let marked = "pub struct S { n: u8 }\nimpl S {\n #[must_use]\n pub fn bump(&mut self) -> bool {\n self.n += 1;\n self.n > 3\n }\n}\n";
+    rejected(
+        &format!("#![no_std]\n{marked}pub fn run(s: &mut S) {{\n s.bump();\n}}"),
+        "unused_must_use",
+    );
+    accepted(&format!(
+        "#![no_std]\n{marked}pub fn run(s: &mut S) {{\n // rr: escape(discard): the first bump is never past 3.\n let _: bool = s.bump();\n}}"
+    ));
+    // Through an unsafe block, too.
+    let close = "pub mod sys {\n// rr: escape(unsafe): the C library.\nunsafe extern \"C\" {\n #[must_use]\n fn close(fd: i32) -> i32;\n}\n\
+                 pub fn end(fd: i32) {\n // rr: escape(unsafe";
+    rejected(
+        &format!(
+            "#![no_std]\n{close}): the descriptor is the caller's.\n let _: i32 = unsafe {{ close(fd) }};\n}}\n}}"
+        ),
+        "let_underscore_must_use",
+    );
+    accepted(&format!(
+        "#![no_std]\n{close}, discard): the descriptor is the caller's, closed at its end.\n let _: i32 = unsafe {{ close(fd) }};\n}}\n}}"
+    ));
+    // A Result is must_use already; a function that changes nothing, a
+    // trait's impl, which the trait's declaration marks, and a function C
+    // calls are not looked at.
+    accepted(
+        "#![no_std]\npub struct S { n: u8 }\nimpl S {\n pub fn get(&self) -> u8 { self.n }\n pub fn set(&mut self, n: u8) -> Result<u8, u8> { if n > 9 { return Err(n); } self.n = n; Ok(n) }\n}\n\
+         pub struct C(pub u8);\nimpl Iterator for C { type Item = u8; fn next(&mut self) -> Option<u8> { self.0 = self.0.checked_sub(1)?; Some(self.0) } }\n\
+         pub trait Sink {\n #[must_use]\n fn put(&mut self, b: u8) -> bool;\n}\nimpl Sink for S { fn put(&mut self, b: u8) -> bool { self.n = b; true } }\n\
+         pub extern \"C\" fn back(n: &mut u8) -> i32 { *n = 0; 0 }",
+    );
+}
+
+#[test]
 fn a_hot_path_grows_a_lent_buffer_only_up_to_a_limit() {
     rejected(
         &alloc_fixture("#[rr::hot]\npub fn put(out: &mut Vec<u8>, b: u8) { out.push(b); }"),
@@ -1430,13 +1475,13 @@ fn a_hot_path_grows_a_lent_buffer_only_up_to_a_limit() {
         "// rr: escape(alloc): one byte per event, which the caller writes out.\n out.push(b);\n true",
     ] {
         accepted(&alloc_fixture(&format!(
-            "#[rr::hot]\npub fn put(out: &mut Vec<u8>, b: u8) -> bool {{\n {body}\n}}"
+            "#[rr::hot]\n#[must_use]\npub fn put(out: &mut Vec<u8>, b: u8) -> bool {{\n {body}\n}}"
         )));
     }
     // capacity() is what the allocator gave, not a limit.
     rejected(
         &alloc_fixture(
-            "#[rr::hot]\npub fn put(out: &mut Vec<u8>, b: u8) -> bool {\n if out.len() == out.capacity() {\n return false;\n }\n out.push(b);\n true\n}",
+            "#[rr::hot]\n#[must_use]\npub fn put(out: &mut Vec<u8>, b: u8) -> bool {\n if out.len() == out.capacity() {\n return false;\n }\n out.push(b);\n true\n}",
         ),
         "rr_hot_path",
     );

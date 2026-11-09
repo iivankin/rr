@@ -12,6 +12,7 @@ pub const OUT_MAX: usize = 4096;
 /// "hello, <name>" and a newline, appended to out: a caller that greets
 /// many reuses one buffer. False, and out as it was, when out is full.
 #[cfg_attr(rr, rr::hot)]
+#[must_use]
 pub fn greet(out: &mut Vec<u8>, name: &[u8]) -> bool {
     if out.len() > OUT_MAX - GREETING_MAX {
         return false;

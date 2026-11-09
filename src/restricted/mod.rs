@@ -20,6 +20,7 @@ mod expanded;
 mod ffi;
 mod inbounds;
 mod macros;
+mod outcomes;
 mod recursion;
 mod stale;
 mod syntax;
@@ -38,6 +39,7 @@ declare_lint! { pub RR_C_SIGNATURE, Deny, "rr requires a C function declared wit
 declare_lint! { pub RR_DUPLICATE, Deny, "rr forbids a function body that repeats another's without a reason" }
 declare_lint! { pub RR_UNUSED_DERIVE, Deny, "rr forbids a derived trait that nothing in the program uses" }
 declare_lint! { pub RR_LOOP_BUFFER, Deny, "rr forbids a buffer made and freed again on every turn of a loop" }
+declare_lint! { pub RR_MUST_USE, Deny, "rr requires #[must_use] on a function that changes something and returns a bool, an integer or an Option" }
 declare_lint! { pub RR_UNBOUNDED, Deny, "rr forbids a collection kept in a field growing with nothing that holds it to a limit" }
 
 /// The kinds of rr's own rules a reason names.
@@ -349,6 +351,7 @@ pub fn register(store: &mut LintStore) {
         RR_UNUSED_DERIVE,
         RR_NO_RECURSION,
         RR_UNUSED_ESCAPE,
+        RR_MUST_USE,
     ];
     store.register_lints(lints);
     store.register_group(true, "rr", None, lints.iter().map(|lint| LintId::of(lint)).collect());
@@ -358,6 +361,7 @@ pub fn register(store: &mut LintStore) {
     store.register_late_lint_pass(Box::new(|_| Box::new(bounds::Bounds::default())));
     store.register_late_lint_pass(Box::new(|_| Box::new(chains::Chains)));
     store.register_late_lint_pass(Box::new(|_| Box::new(ffi::Ffi)));
+    store.register_late_lint_pass(Box::new(|_| Box::new(outcomes::Outcomes)));
     store.register_late_lint_pass(Box::new(|_| Box::<disguises::Disguises>::default()));
     store.register_late_lint_pass(Box::new(|_| Box::new(duplicates::Duplicates)));
     store.register_late_lint_pass(Box::new(|_| Box::new(derives::Derives::default())));

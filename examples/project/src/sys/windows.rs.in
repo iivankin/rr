@@ -28,9 +28,11 @@ unsafe extern "system" {
     fn GetProcessHeap() -> *mut c_void;
     fn HeapAlloc(heap: *mut c_void, flags: u32, size: usize) -> *mut c_void;
     fn HeapReAlloc(heap: *mut c_void, flags: u32, p: *mut c_void, size: usize) -> *mut c_void;
+    #[must_use]
     fn HeapFree(heap: *mut c_void, flags: u32, p: *mut c_void) -> i32;
     fn GetStdHandle(which: u32) -> *mut c_void;
     fn GetCommandLineW() -> *const u16;
+    #[must_use]
     fn WideCharToMultiByte(
         page: u32,
         flags: u32,
@@ -41,6 +43,7 @@ unsafe extern "system" {
         default: *const u8,
         used: *mut i32,
     ) -> i32;
+    #[must_use]
     fn WriteFile(
         file: *mut c_void,
         p: *const u8,
@@ -121,8 +124,9 @@ unsafe impl GlobalAlloc for Heap {
 
     // rr: escape(unsafe): the signature GlobalAlloc requires.
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        // rr: escape(unsafe): the block came from the process heap.
-        unsafe { HeapFree(heap(), 0, origin(p, l)) };
+        // rr: escape(unsafe, discard): the block came from the process heap,
+        // and dealloc has no way to say that freeing it failed.
+        let _: i32 = unsafe { HeapFree(heap(), 0, origin(p, l)) };
     }
 
     // rr: escape(unsafe): the signature GlobalAlloc requires.
@@ -135,8 +139,9 @@ unsafe impl GlobalAlloc for Heap {
         if !q.is_null() {
             // rr: escape(unsafe): both blocks are live and hold at least this much.
             unsafe { core::ptr::copy_nonoverlapping(p, q, l.size().min(size)) };
-            // rr: escape(unsafe): p came from this heap and is not used after.
-            unsafe { HeapFree(heap(), 0, origin(p, l)) };
+            // rr: escape(unsafe, discard): p came from this heap and is not
+            // used after; the new block is what realloc returns either way.
+            let _: i32 = unsafe { HeapFree(heap(), 0, origin(p, l)) };
         }
         q
     }
@@ -211,9 +216,13 @@ pub unsafe fn args(_argc: i32, _argv: *const *const c_char) -> Vec<&'static [u8]
         let Some(to) = text.get_mut(at..) else { break };
         let size = i32::try_from(to.len()).unwrap_or(0);
         // rr: escape(unsafe): w is NUL-terminated; to has size bytes.
-        unsafe {
+        let written = unsafe {
             WideCharToMultiByte(CP_UTF8, 0, w, -1, to.as_mut_ptr(), size, null(), null_mut())
         };
+        // What the first call counted, or an argument that did not convert.
+        if written != size {
+            break;
+        }
         spans.push((at, n.saturating_sub(1)));
     }
     // rr: escape(leak): the arguments live as long as the process, as

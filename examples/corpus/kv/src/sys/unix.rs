@@ -14,17 +14,29 @@ unsafe extern "C" {
     fn calloc(n: usize, size: usize) -> *mut c_void;
     fn realloc(p: *mut c_void, size: usize) -> *mut c_void;
     fn free(p: *mut c_void);
+    #[must_use]
     fn posix_memalign(p: *mut *mut c_void, align: usize, size: usize) -> c_int;
+    #[must_use]
     fn write(fd: c_int, p: *const c_void, n: usize) -> isize;
+    #[must_use]
     fn open(path: *const c_char, flags: c_int, ...) -> c_int;
+    #[must_use]
     fn close(fd: c_int) -> c_int;
+    #[must_use]
     fn pread(fd: c_int, p: *mut c_void, n: usize, off: i64) -> isize;
+    #[must_use]
     fn pwrite(fd: c_int, p: *const c_void, n: usize, off: i64) -> isize;
+    #[must_use]
     fn lseek(fd: c_int, off: i64, whence: c_int) -> i64;
+    #[must_use]
     fn ftruncate(fd: c_int, len: i64) -> c_int;
+    #[must_use]
     fn fsync(fd: c_int) -> c_int;
+    #[must_use]
     fn rename(from: *const c_char, to: *const c_char) -> c_int;
+    #[must_use]
     fn unlink(path: *const c_char) -> c_int;
+    #[must_use]
     fn strlen(s: *const c_char) -> usize;
     fn abort() -> !;
 }
@@ -258,8 +270,9 @@ impl File {
 
 impl Drop for File {
     fn drop(&mut self) {
-        // rr: escape(unsafe): the descriptor is this file's, and closed once.
-        unsafe { close(self.fd) };
+        // rr: escape(unsafe, discard): the descriptor is this file's, and
+        // closed once; a drop has no one to tell that closing it failed.
+        let _: i32 = unsafe { close(self.fd) };
     }
 }
 

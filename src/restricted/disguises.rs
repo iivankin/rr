@@ -164,7 +164,8 @@ impl<'tcx> LateLintPass<'tcx> for Disguises {
         let ty = cx.typeck_results().expr_ty(init);
         // A guard held to the end of its scope is what a binding is for.
         let dropped = is_result(cx, ty)
-            || ((opt_must_use_path(cx, ty).is_some() || is_must_use_func_call(cx, init))
+            || ((opt_must_use_path(cx, ty).is_some()
+                || is_must_use_func_call(cx, clippy_utils::peel_any_blocks(init)))
                 && !ty.needs_drop(cx.tcx, cx.typing_env()));
         let Node::Block(block) = cx.tcx.parent_hir_node(cx.tcx.parent_hir_id(local.hir_id)) else {
             return;

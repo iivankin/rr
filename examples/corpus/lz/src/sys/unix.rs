@@ -14,9 +14,13 @@ unsafe extern "C" {
     fn calloc(n: usize, size: usize) -> *mut c_void;
     fn realloc(p: *mut c_void, size: usize) -> *mut c_void;
     fn free(p: *mut c_void);
+    #[must_use]
     fn posix_memalign(p: *mut *mut c_void, align: usize, size: usize) -> c_int;
+    #[must_use]
     fn write(fd: c_int, p: *const c_void, n: usize) -> isize;
+    #[must_use]
     fn read(fd: c_int, p: *mut c_void, n: usize) -> isize;
+    #[must_use]
     fn strlen(s: *const c_char) -> usize;
     fn abort() -> !;
 }
@@ -102,6 +106,7 @@ fn write_all(fd: c_int, mut p: &[u8]) {
 
 /// Standard input, all of it up to max bytes, onto out; false when it
 /// holds more or cannot be read.
+#[must_use]
 pub fn stdin(out: &mut Vec<u8>, max: usize) -> bool {
     let mut buf = [0u8; 16384];
     loop {

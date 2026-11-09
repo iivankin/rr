@@ -191,7 +191,7 @@ impl<'tcx> LateLintPass<'tcx> for LetUnderscore {
                         );
                     },
                 );
-            } else if is_must_use_func_call(cx, init) {
+            } else if is_must_use_func_call(cx, clippy_utils::peel_any_blocks(init)) {
                 #[expect(clippy::collapsible_span_lint_calls, reason = "rust-clippy#7797")]
                 span_lint_and_then(
                     cx,
