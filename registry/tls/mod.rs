@@ -48,7 +48,7 @@
 //! tests.rs's program runs it:
 //!
 //! ```text
-//! let mut tls = Client::new(host, &[b"http/1.1"], Verify::Caller, now)?;
+//! let mut tls = Client::new(host, &[b"http/1.1"], Verify::Caller, now, Random::system())?;
 //! let (mut at, mut end) = (0, 0);
 //! loop {
 //!     while !tls.pending().is_empty() {
@@ -771,8 +771,10 @@ pub struct Client<'a> {
 
 /// The randomness a client draws: the ClientHello's random and
 /// legacy_session_id, and the seeds of the X25519, ML-KEM-768 and P-256
-/// keys.
-struct Random {
+/// keys. Only the system's (system) or, in a test or a fuzz target, a
+/// fixed one: never bytes a caller made up. A program takes it where it
+/// takes the time, so that a simulation can stand in for both.
+pub struct Random {
     client: [u8; 32],
     session: [u8; 32],
     x25519: random::Seed32,
@@ -781,8 +783,8 @@ struct Random {
 }
 
 impl Random {
-    /// The system's.
-    fn system() -> Random {
+    /// The system's, from the random component.
+    pub fn system() -> Random {
         let (mut client, mut session) = ([0; 32], [0; 32]);
         random::fill(&mut client);
         random::fill(&mut session);
@@ -798,7 +800,7 @@ impl Random {
     /// The same every time, so that a test or a fuzz target replays: the
     /// bytes 0x5c, an X25519 secret of x25519.
     #[cfg(any(test, fuzzing))]
-    fn fixed(x25519: [u8; x25519::KEY_BYTES]) -> Random {
+    pub fn fixed(x25519: [u8; x25519::KEY_BYTES]) -> Random {
         Random {
             client: [0x5c; 32],
             session: [0x5c; 32],
@@ -817,16 +819,6 @@ impl<'a> Client<'a> {
     /// sharing a key for both, and P-256 for a server that asks for it in
     /// a retry; its random, session ID and keys come from random.
     pub fn new(
-        host: &str,
-        alpn: &[&[u8]],
-        verify: Verify<'a>,
-        now: i64,
-    ) -> Result<Client<'a>, Error> {
-        Client::with(host, alpn, verify, now, Random::system())
-    }
-
-    /// new, with the randomness given.
-    fn with(
         host: &str,
         alpn: &[&[u8]],
         verify: Verify<'a>,
@@ -2366,7 +2358,7 @@ pub fn fuzz_server(input: &[u8]) {
             .add_der(&x509::test_certificate("test.root").unwrap())
             .is_ok()
     );
-    let mut client = Client::with(
+    let mut client = Client::new(
         "api.example.test",
         &[b"h2"],
         Verify::Store(&store),
@@ -2397,7 +2389,7 @@ pub fn fuzz_flight(input: &[u8]) {
     } else {
         Verify::Store(&store)
     };
-    let mut client = Client::with(
+    let mut client = Client::new(
         "api.example.test",
         &[b"h2"],
         verify,
