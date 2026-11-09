@@ -1,6 +1,6 @@
 use clippy_utils::diagnostics::{span_lint_and_help, span_lint_and_then};
 use rustc_ast::ast;
-use rustc_ast::visit::FnKind;
+use rustc_ast::visit::{AssocCtxt, FnCtxt, FnKind};
 use rustc_data_structures::fx::{FxBuildHasher, FxHashSet};
 use rustc_feature::is_builtin_attr_name;
 use rustc_lint::{EarlyContext, EarlyLintPass, LintContext as _};
@@ -29,9 +29,14 @@ pub struct RestrictedSyntax {
     /// `#[unsafe(no_mangle)]` on that entry, a symbol the program must define
     /// under its C name and nothing else defines: no reason.
     entry: Option<ast::AttrId>,
-    /// Where a function's parameter is `impl Fn`, `FnMut` or `FnOnce`: a
-    /// closure handed in, which the function calls.
-    closures: FxHashSet<BytePos>,
+    /// Where `impl Trait` is allowed: a function's parameter that is `impl
+    /// Fn`, `FnMut` or `FnOnce`, a closure handed in, which the function
+    /// calls; and the whole return type of a free function or an inherent
+    /// method that is `impl Iterator<Item = T>`.
+    allowed: FxHashSet<BytePos>,
+    /// Whether the item whose generics come next may have `const N:
+    /// usize`: a function, a struct, an impl or a method of one.
+    consts: bool,
 }
 impl_lint_pass!(RestrictedSyntax => [RR_NO_STD, RR_NO_GENERICS, RR_NO_MACROS, RR_SIMPLE_TRAITS, RR_UNEXPLAINED_ESCAPE]);
 
@@ -81,6 +86,19 @@ fn report(
 impl EarlyLintPass for RestrictedSyntax {
     fn check_crate(&mut self, cx: &EarlyContext<'_>, krate: &ast::Crate) {
         self.no_main = krate.attrs.iter().any(|attr| attr.has_name(sym::no_main));
+        for attr in krate.attrs.iter().filter(|attr| attr.has_name(sym::feature)) {
+            for item in attr.meta_item_list().unwrap_or_default() {
+                if item.name().is_some_and(|name| CONST_FEATURES.contains(&name.as_str())) {
+                    report(
+                        cx,
+                        RR_NO_GENERICS,
+                        item.span(),
+                        "this feature makes a const parameter more than a number, and is forbidden by rr",
+                        "a const parameter is `const N: usize`, given as a number or another such parameter",
+                    );
+                }
+            }
+        }
         if !krate.attrs.iter().any(|attr| attr.has_name(sym::no_std)) {
             report(
                 cx,
@@ -93,6 +111,10 @@ impl EarlyLintPass for RestrictedSyntax {
     }
 
     fn check_item(&mut self, cx: &EarlyContext<'_>, item: &ast::Item) {
+        self.consts = matches!(
+            item.kind,
+            ast::ItemKind::Fn(_) | ast::ItemKind::Struct(..) | ast::ItemKind::Impl(_)
+        );
         if self.no_main
             && let ast::ItemKind::Fn(f) = &item.kind
             && ENTRIES.contains(&f.ident.name.as_str())
@@ -173,18 +195,32 @@ impl EarlyLintPass for RestrictedSyntax {
         }
     }
 
+    fn check_impl_item(&mut self, _: &EarlyContext<'_>, _: &ast::AssocItem) {
+        self.consts = true;
+    }
+
     fn check_generics(&mut self, cx: &EarlyContext<'_>, generics: &ast::Generics) {
         for param in &generics.params {
-            if !matches!(param.kind, ast::GenericParamKind::Lifetime) {
-                report(
+            match &param.kind {
+                ast::GenericParamKind::Lifetime => {},
+                ast::GenericParamKind::Const { ty, default: None, .. } if self.consts && usize_path(ty) => {},
+                ast::GenericParamKind::Const { .. } => report(
                     cx,
                     RR_NO_GENERICS,
                     param.span(),
-                    "type and const parameters are forbidden by rr",
+                    "a const parameter other than `const N: usize` of a function, a struct or an impl is forbidden by rr",
+                    "write `const N: usize`, without a default, on a function, a struct, an impl or a method of one; \
+                     not on a trait, an enum or a type alias",
+                ),
+                ast::GenericParamKind::Type { .. } => report(
+                    cx,
+                    RR_NO_GENERICS,
+                    param.span(),
+                    "type parameters are forbidden by rr",
                     "use concrete types: for a set of types the crate knows, an enum with a variant for each \
                      (a slice or a reader, a string or standard output); for code that must call what the caller \
-                     brings, `&mut dyn` of a trait of the crate; lifetime parameters are allowed",
-                );
+                     brings, `&mut dyn` of a trait of the crate; lifetime parameters and `const N: usize` are allowed",
+                ),
             }
         }
         if !generics.where_clause.is_empty() {
@@ -201,7 +237,7 @@ impl EarlyLintPass for RestrictedSyntax {
     fn check_ty(&mut self, cx: &EarlyContext<'_>, ty: &ast::Ty) {
         // dyn is checked after resolution, which knows whose trait it is.
         if let ast::TyKind::ImplTrait(..) = ty.kind
-            && !self.closures.contains(&ty.span.lo())
+            && !self.allowed.contains(&ty.span.lo())
         {
             report(
                 cx,
@@ -209,7 +245,8 @@ impl EarlyLintPass for RestrictedSyntax {
                 ty.span,
                 "impl Trait is forbidden by rr",
                 "use a concrete type, an enum of the types the crate knows, or `&mut dyn` of a trait of the crate; \
-                 a parameter may be `impl Fn`, `impl FnMut` or `impl FnOnce`",
+                 a parameter may be `impl Fn`, `impl FnMut` or `impl FnOnce`, and a function or an inherent \
+                 method may return `impl Iterator<Item = T>`",
             );
         }
     }
@@ -241,13 +278,23 @@ impl EarlyLintPass for RestrictedSyntax {
     }
 
     fn check_fn(&mut self, cx: &EarlyContext<'_>, kind: FnKind<'_>, span: Span, _: ast::NodeId) {
-        if let FnKind::Fn(_, _, f) = kind {
+        if let FnKind::Fn(ctxt, _, f) = kind {
+            // An iterator returned: the compiler knows its type, and so do
+            // rr's checks, which run after it is revealed. Not in a trait,
+            // where it would be an associated type.
+            if matches!(ctxt, FnCtxt::Free | FnCtxt::Assoc(AssocCtxt::Impl { of_trait: false }))
+                && let ast::FnRetTy::Ty(output) = &f.sig.decl.output
+                && let ast::TyKind::ImplTrait(_, bounds) = &output.kind
+                && iterator_bounds(bounds)
+            {
+                self.allowed.insert(output.span.lo());
+            }
             let mut takes = None;
             for param in &f.sig.decl.inputs {
                 if let ast::TyKind::ImplTrait(_, bounds) = &param.ty.kind
                     && closure_bounds(bounds)
                 {
-                    self.closures.insert(param.ty.span.lo());
+                    self.allowed.insert(param.ty.span.lo());
                     takes = Some(param.ty.span);
                 }
             }
@@ -287,6 +334,7 @@ impl EarlyLintPass for RestrictedSyntax {
     }
 
     fn check_trait_item(&mut self, cx: &EarlyContext<'_>, item: &ast::AssocItem) {
+        self.consts = false;
         if matches!(item.kind, ast::AssocItemKind::Type(_)) {
             report(
                 cx,
@@ -335,6 +383,16 @@ impl EarlyLintPass for RestrictedSyntax {
         }
         let path = attr.path();
         let Some(&first) = path.first() else { return };
+        // A misspelt mark would mark nothing, and its check would not run.
+        if first.as_str() == "rr" && !matches!(path.as_slice(), [_, name] if RR_ATTRIBUTES.contains(&name.as_str())) {
+            report(
+                cx,
+                RR_NO_MACROS,
+                attr.span,
+                "rr knows no such attribute",
+                "rr's attributes are #[rr::hot], #[rr::poll] and #[rr::blocking]",
+            );
+        }
         let conditional_forbidden = attr.has_name(sym::cfg_attr)
             && attr
                 .meta_item_list()
@@ -359,6 +417,10 @@ impl EarlyLintPass for RestrictedSyntax {
         }
     }
 }
+
+/// rr's own attributes: a hot path's root, an event loop's handler, and
+/// a function that blocks.
+const RR_ATTRIBUTES: &[&str] = &["hot", "poll", "blocking"];
 
 /// The most lines of a function that takes a closure: the compiler copies
 /// it for each closure it is given.
@@ -390,6 +452,90 @@ fn closure_bounds(bounds: &[ast::GenericBound]) -> bool {
     }
     closures == 1
 }
+
+/// The traits an iterator returned as `impl Trait` may name besides
+/// `Iterator<Item = T>`: they add `next_back` and `len`, which the
+/// compiler resolves on the type it reveals as it does `next`, and no type
+/// of their own.
+pub(super) const ITERATOR_EXTRAS: &[&str] = &["DoubleEndedIterator", "ExactSizeIterator"];
+
+/// Whether the bounds of a returned `impl Trait` say only that it is an
+/// iterator: one `Iterator<Item = T>`, perhaps `DoubleEndedIterator` and
+/// `ExactSizeIterator`, lifetimes and `use<..>` of lifetimes. The type of
+/// the items is checked as any type is.
+fn iterator_bounds(bounds: &[ast::GenericBound]) -> bool {
+    let mut iterators = 0;
+    for bound in bounds {
+        match bound {
+            ast::GenericBound::Trait(poly) => {
+                if !poly.bound_generic_params.is_empty() || poly.modifiers != ast::TraitBoundModifiers::NONE {
+                    return false;
+                }
+                let Some(last) = poly.trait_ref.path.segments.last() else {
+                    return false;
+                };
+                let name = last.ident.name.as_str();
+                match last.args.as_deref() {
+                    None if ITERATOR_EXTRAS.contains(&name) => {},
+                    Some(ast::GenericArgs::AngleBracketed(args)) if name == "Iterator" && item_only(args) => {
+                        iterators += 1;
+                    },
+                    _ => return false,
+                }
+            },
+            ast::GenericBound::Outlives(_) => {},
+            ast::GenericBound::Use(args, _) => {
+                if !args
+                    .iter()
+                    .all(|arg| matches!(arg, ast::PreciseCapturingArg::Lifetime(_)))
+                {
+                    return false;
+                }
+            },
+        }
+    }
+    iterators == 1
+}
+
+/// Whether the arguments of `Iterator<..>` are `Item = T` alone.
+fn item_only(args: &ast::AngleBracketedArgs) -> bool {
+    let [ast::AngleBracketedArg::Constraint(c)] = args.args.as_slice() else {
+        return false;
+    };
+    c.ident.name.as_str() == "Item"
+        && c.gen_args.is_none()
+        && matches!(
+            c.kind,
+            ast::AssocItemConstraintKind::Equality { term: ast::Term::Ty(_) }
+        )
+}
+
+/// Whether ty is `usize`, by its name or its path in core.
+fn usize_path(ty: &ast::Ty) -> bool {
+    let ast::TyKind::Path(None, path) = &ty.kind else {
+        return false;
+    };
+    let names: Vec<&str> = path
+        .segments
+        .iter()
+        .filter(|segment| segment.ident.name != kw::PathRoot && segment.args.is_none())
+        .map(|segment| segment.ident.name.as_str())
+        .collect();
+    names.len() == path.segments.iter().filter(|s| s.ident.name != kw::PathRoot).count()
+        && matches!(names.as_slice(), ["usize"] | ["core", "primitive", "usize"])
+}
+
+/// The compiler's features that would let a const parameter be more than
+/// a number: a computed one, one of a type of the crate, a generic constant.
+const CONST_FEATURES: &[&str] = &[
+    "generic_const_exprs",
+    "adt_const_params",
+    "unsized_const_params",
+    "generic_const_items",
+    "min_generic_const_args",
+    "generic_const_parameter_types",
+    "generic_arg_infer",
+];
 
 fn allowed_macro_path(path: &ast::Path) -> bool {
     let names: Vec<_> = path
@@ -450,6 +596,8 @@ fn forbidden_meta(inner: &ast::MetaItemInner) -> bool {
     ) || (!is_builtin_attr_name(first)
         && !allowed_builtin_attribute(&meta.path.segments.iter().map(|s| s.ident.name).collect::<Vec<_>>())
         && !matches!(first.as_str(), "clippy" | "rustfmt" | "rr"))
+        || (first.as_str() == "rr"
+            && !matches!(meta.path.segments.as_slice(), [_, name] if RR_ATTRIBUTES.contains(&name.ident.name.as_str())))
 }
 
 /// The compiler's own derives that ordinary syntax needs on a type of the

@@ -100,6 +100,8 @@ impl<'tcx> LateLintPass<'tcx> for Allocs {
         let mut graph = None;
         let mut marked = Vec::new();
         let mut reached = FxHashMap::default();
+        // The instantiations of the crate's const-generic code, found once.
+        let mut all = None;
         for owner in cx.tcx.hir_body_owners() {
             let id = cx.tcx.local_def_id_to_hir_id(owner);
             let mark = cx
@@ -112,7 +114,7 @@ impl<'tcx> LateLintPass<'tcx> for Allocs {
             // path that allocates, marked or not.
             if mark.is_some() || allocator(cx, owner) {
                 let graph = graph.get_or_insert_with(|| Graph::new(cx));
-                reached.insert(owner, self.hot(cx, graph, owner));
+                reached.insert(owner, self.hot(cx, graph, owner, &mut all));
             }
             if let Some(span) = mark {
                 marked.push((owner, span));
@@ -788,6 +790,7 @@ fn waste<'tcx>(
     cx: &LateContext<'tcx>,
     typeck: &TypeckResults<'tcx>,
     e: &'tcx Expr<'tcx>,
+    instances: Option<&super::mono::Instances<'tcx>>,
 ) -> Option<(String, &'static str)> {
     if !super::builtins::is_user_code(e.span) {
         return None;
@@ -814,8 +817,15 @@ fn waste<'tcx>(
             "dyn",
         ));
     }
-    if let Some(size) = large_move(cx, typeck, e) {
-        return Some((format!("a move of {size} bytes, which is a memcpy,"), "move"));
+    match large_move(cx, typeck, e, instances) {
+        Some(Ok((size, with))) => return Some((format!("a move of {size} bytes{with}, which is a memcpy,"), "move")),
+        Some(Err(why)) => {
+            return Some((
+                format!("a move of a value whose size rr cannot know here ({why}), which may be a memcpy,"),
+                "move",
+            ));
+        },
+        None => {},
     }
     if scratch_call(cx, typeck, e) {
         return Some((
@@ -976,7 +986,16 @@ const MOVE_MAX: u64 = 256;
 /// expression around it takes it by value: a `let`, an assignment, an
 /// argument or a field of a value being built. Building a value in place
 /// and lending one move nothing.
-fn large_move<'tcx>(cx: &LateContext<'tcx>, typeck: &TypeckResults<'tcx>, e: &'tcx Expr<'tcx>) -> Option<u64> {
+///
+/// In const-generic code the size is that of each instantiation the path
+/// reaches, and where rr cannot know it, the move is reported as such:
+/// a check that stops is worse than one that asks.
+fn large_move<'tcx>(
+    cx: &LateContext<'tcx>,
+    typeck: &TypeckResults<'tcx>,
+    e: &'tcx Expr<'tcx>,
+    instances: Option<&super::mono::Instances<'tcx>>,
+) -> Option<Result<(u64, String), String>> {
     let place = match e.kind {
         ExprKind::Path(ref path) => matches!(typeck.qpath_res(path, e.hir_id), rustc_hir::def::Res::Local(_)),
         ExprKind::Field(..) | ExprKind::Index(..) | ExprKind::Unary(UnOp::Deref, _) => true,
@@ -1000,9 +1019,20 @@ fn large_move<'tcx>(cx: &LateContext<'tcx>, typeck: &TypeckResults<'tcx>, e: &'t
         return None;
     }
     let ty = typeck.expr_ty(e);
-    let env = ty::TypingEnv::post_analysis(cx.tcx, typeck.hir_owner.def_id);
-    let size = cx.tcx.layout_of(env.as_query_input(ty)).ok()?.size.bytes();
-    (size > MOVE_MAX).then_some(size)
+    match super::mono::sizes(cx.tcx, typeck.hir_owner.def_id, ty, instances) {
+        Ok(sizes) => {
+            // The largest instantiation, which the reason must answer.
+            let &(size, args) = sizes.iter().max_by_key(|(size, _)| *size)?;
+            let with = args.map(|args| {
+                format!(
+                    " with {}",
+                    super::mono::describe(cx.tcx, typeck.hir_owner.def_id.to_def_id(), args)
+                )
+            });
+            (size > MOVE_MAX).then(|| Ok((size, with.unwrap_or_default())))
+        },
+        Err(why) => Some(Err(format!("`{ty}`: {why}"))),
+    }
 }
 
 impl Allocs {
@@ -1013,13 +1043,26 @@ impl Allocs {
     /// item, and the callee is not followed from there; such a reason
     /// answers something only when what the path forbids, without its own
     /// reason, lies beyond the call.
-    fn hot<'g>(&mut self, cx: &LateContext<'_>, graph: &'g Graph, root: LocalDefId) -> FxHashSet<LocalDefId> {
+    fn hot<'g, 'tcx>(
+        &mut self,
+        cx: &LateContext<'tcx>,
+        graph: &'g Graph,
+        root: LocalDefId,
+        all: &mut Option<super::mono::Instances<'tcx>>,
+    ) -> FxHashSet<LocalDefId> {
         // How each function was reached: its caller and the call.
         let mut via: FxHashMap<LocalDefId, (LocalDefId, &Call)> = FxHashMap::default();
         let mut cold: Vec<&'g Call> = Vec::new();
         let mut seen = FxHashSet::default();
         let mut todo = vec![root];
         let root_name = name(cx.tcx, root);
+        // With which arguments the path runs the crate's const-generic code.
+        // A generic root runs as whatever in the crate instantiates it, and
+        // so does a function the path reaches through dyn or a pointer.
+        let instances = super::mono::any_generic(cx.tcx).then(|| {
+            let all = all.get_or_insert_with(|| super::mono::collect(cx.tcx, cx.tcx.hir_body_owners()));
+            super::mono::collect(cx.tcx, [root]).or(all)
+        });
         while let Some(owner) = todo.pop() {
             if !seen.insert(owner) {
                 continue;
@@ -1037,7 +1080,7 @@ impl Allocs {
             };
             let typeck = cx.tcx.typeck(owner);
             for_each_expr(cx.tcx, body.value, |e| {
-                let found = waste(cx, typeck, e);
+                let found = waste(cx, typeck, e, instances.as_ref());
                 if let Some((_, "copy")) = found {
                     self.spans.insert(e.span);
                 }
@@ -1090,7 +1133,7 @@ impl Allocs {
         }
         let mut wasted = FxHashMap::default();
         for call in cold {
-            if waste_beyond(cx, graph, call.to, &mut wasted) {
+            if waste_beyond(cx, graph, call.to, &mut wasted, instances.as_ref()) {
                 reason(cx, call.id, call.span, "cold");
             }
         }
@@ -1170,7 +1213,13 @@ fn redundant_marks(
 /// Whether what a hot path forbids, without its own reason, is reachable
 /// from f through calls that are not cold; wasted caches whether each
 /// body holds it.
-fn waste_beyond(cx: &LateContext<'_>, graph: &Graph, f: LocalDefId, wasted: &mut FxHashMap<LocalDefId, bool>) -> bool {
+fn waste_beyond<'tcx>(
+    cx: &LateContext<'tcx>,
+    graph: &Graph,
+    f: LocalDefId,
+    wasted: &mut FxHashMap<LocalDefId, bool>,
+    instances: Option<&super::mono::Instances<'tcx>>,
+) -> bool {
     let mut seen = FxHashSet::default();
     let mut todo = vec![f];
     while let Some(owner) = todo.pop() {
@@ -1183,7 +1232,7 @@ fn waste_beyond(cx: &LateContext<'_>, graph: &Graph, f: LocalDefId, wasted: &mut
             };
             let typeck = cx.tcx.typeck(owner);
             for_each_expr(cx.tcx, body.value, |e| {
-                if let Some((what, kind)) = waste(cx, typeck, e)
+                if let Some((what, kind)) = waste(cx, typeck, e, instances)
                     && !answerable(cx, e, &what, kind)
                 {
                     ControlFlow::Break(())

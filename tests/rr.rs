@@ -148,7 +148,7 @@ fn the_compilers_own_derives_and_matches_are_allowed() {
         "#![no_std]\n#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]\nstruct Id(u32);\n\
          #[cfg_attr(test, derive(Debug))]\n#[derive(PartialEq)]\nenum Error {\n Short,\n Bad(u8),\n}\n\
          struct Out;\nimpl core::fmt::Write for Out {\n fn write_str(&mut self, _: &str) -> core::fmt::Result { Ok(()) }\n}\n\
-         fn smallest(v: &mut [Id]) -> Option<u32> {\n v.sort_unstable();\n let a = v.first().copied()?;\n let b = a;\n if a == b && a < Id(9) { Some(a.0) } else { None }\n}\n\
+         #[must_use]\nfn smallest(v: &mut [Id]) -> Option<u32> {\n v.sort_unstable();\n let a = v.first().copied()?;\n let b = a;\n if a == b && a < Id(9) { Some(a.0) } else { None }\n}\n\
          fn short(e: &Error) -> bool { matches!(e, Error::Short) || *e == Error::Bad(1) }\n\
          fn show(id: Id) -> core::fmt::Result { core::fmt::Write::write_fmt(&mut Out, format_args!(\"{id:?}\")) }\n\
          pub fn run(v: &[u32]) -> bool {\n let mut ids = [Id(u32::try_from(v.len()).unwrap_or(0) & 7)];\n smallest(&mut ids).is_some() && short(&Error::Short) && show(Id(1)).is_ok()\n}",
@@ -236,7 +236,7 @@ fn external_macro_cannot_impersonate_a_builtin() {
 fn rejects_generic_definitions_and_impl_trait() {
     for source in [
         "pub fn id<T>(v: T) -> T { v }",
-        "pub struct Buffer<const N: usize>([u8; N]);",
+        "pub struct Buffer<const N: u8>([u8; 4]);",
         "pub fn id(v: impl Copy) {}",
     ] {
         rejected(&format!("#![no_std]\n{source}"), "rr_no_generics");
@@ -726,7 +726,7 @@ fn a_hot_path_copies_nothing_it_holds() {
     // with a reason, and a cold call.
     accepted(&alloc_fixture(
         "fn helper(out: &mut Vec<u8>, x: &[u8]) { out.extend_from_slice(x); }\n\
-         #[rr::hot]\npub fn hot(out: &mut Vec<u8>, x: &[u8], n: u32) -> u8 {\n\
+         #[rr::hot]\n#[must_use]\npub fn hot(out: &mut Vec<u8>, x: &[u8], n: u32) -> u8 {\n\
          if out.len() + x.len() > 4096 {\n return 0;\n }\n\
          out.extend_from_slice(&n.to_be_bytes());\n out.extend_from_slice(b\"\\r\\n\");\n\
          for &b in x {\n out.push(b ^ 0x20);\n }\n\
@@ -747,7 +747,7 @@ fn a_hot_path_shifts_no_buffer_tail() {
     }
     // Taking from the end, or all of it, moves nothing.
     accepted(&alloc_fixture(
-        "#[rr::hot]\npub fn hot(out: &mut Vec<u8>) -> usize {\n out.pop();\n out.drain(1..).count() + out.drain(..).count()\n}",
+        "#[rr::hot]\n#[must_use]\npub fn hot(out: &mut Vec<u8>) -> usize {\n out.pop();\n out.drain(1..).count() + out.drain(..).count()\n}",
     ));
 }
 
@@ -773,7 +773,7 @@ fn a_variadic_c_function_is_declared_with_its_dots() {
         "rr_variadic",
     );
     accepted(
-        "#![no_std]\npub mod sys {\n// rr: escape(unsafe): the C library.\nunsafe extern \"C\" {\n pub fn open(path: *const u8, flags: i32, ...) -> i32;\n pub fn close(fd: i32) -> i32;\n}\n}",
+        "#![no_std]\npub mod sys {\n// rr: escape(unsafe): the C library.\nunsafe extern \"C\" {\n #[must_use]\n pub fn open(path: *const u8, flags: i32, ...) -> i32;\n #[must_use]\n pub fn close(fd: i32) -> i32;\n}\n}",
     );
 }
 
@@ -797,7 +797,7 @@ fn a_hot_path_moves_no_large_value() {
     );
     // Lent, written in place, or built where it ends up.
     accepted(&format!(
-        "#![no_std]\n{types}#[rr::hot]\npub fn step(s: &mut S, x: u64) -> u64 {{\n s.cur.a[0] = x;\n s.prev.a = [x; 64];\n sum(&s.prev) + sum(&s.cur)\n}}"
+        "#![no_std]\n{types}#[rr::hot]\n#[must_use]\npub fn step(s: &mut S, x: u64) -> u64 {{\n s.cur.a[0] = x;\n s.prev.a = [x; 64];\n sum(&s.prev) + sum(&s.cur)\n}}"
     ));
 }
 
@@ -838,13 +838,13 @@ fn a_field_that_grows_is_held_to_a_limit() {
     // and capacity() is what the allocator gave, not a limit.
     for body in [
         "pub fn add(q: &mut Q, b: u8) { q.items.push(b); }\npub fn reset(q: &mut Q) { q.items.clear(); }",
-        "pub fn add(q: &mut Q, b: u8) -> bool {\n if q.items.len() == q.items.capacity() {\n return false;\n }\n q.items.push(b);\n true\n}",
+        "#[must_use]\npub fn add(q: &mut Q, b: u8) -> bool {\n if q.items.len() == q.items.capacity() {\n return false;\n }\n q.items.push(b);\n true\n}",
     ] {
         rejected(&alloc_fixture(&format!("{types}{body}")), "rr_unbounded");
     }
     // A limit on its length, a reason at the field, and a value built here.
     for body in [
-        "pub fn add(q: &mut Q, b: u8) -> bool {\n if q.items.len() >= 64 {\n return false;\n }\n q.items.push(b);\n true\n}",
+        "#[must_use]\npub fn add(q: &mut Q, b: u8) -> bool {\n if q.items.len() >= 64 {\n return false;\n }\n q.items.push(b);\n true\n}",
         "pub fn make(b: u8) -> Q {\n let mut q = Q { items: Vec::new() };\n q.items.push(b);\n q\n}",
     ] {
         accepted(&alloc_fixture(&format!("{types}{body}")));
@@ -1187,7 +1187,7 @@ fn foreign_declarations_need_reasons() {
         );
     }
     accepted(
-        "#![no_std]\npub mod sys {\n// rr: escape(unsafe): libc.\nunsafe extern \"C\" {\n // rr: escape(unsafe): abs reads only its argument.\n pub safe fn abs(x: i32) -> i32;\n}\npub fn f(x: i32) -> i32 { abs(x) }\n}",
+        "#![no_std]\npub mod sys {\n// rr: escape(unsafe): libc.\nunsafe extern \"C\" {\n #[must_use]\n // rr: escape(unsafe): abs reads only its argument.\n pub safe fn abs(x: i32) -> i32;\n}\n#[must_use]\npub fn f(x: i32) -> i32 { abs(x) }\n}",
     );
 }
 
@@ -1307,7 +1307,7 @@ fn a_hot_path_sees_a_value_rebuilt_field_by_field_as_a_copy() {
     accepted(&format!(
         "#![no_std]\n{item}#[rr::hot]\npub fn scale(out: &mut [Item]) {{\n for o in out.iter_mut() {{\n *o = Item {{ position: o.position + 1, weight: o.weight * 2 }};\n }}\n}}\n\
          #[rr::hot]\npub fn rotate(ids: &mut [u32]) {{\n for i in 1..ids.len() {{\n // rr: escape(panic): i and i - 1 are below the length.\n ids[i - 1] = ids[i];\n }}\n}}\n\
-         #[rr::hot]\npub fn shift(ids: &mut [u32], at: usize) -> Option<()> {{\n for i in at..ids.len() {{\n *ids.get_mut(i)? = *ids.get(i.checked_add(1)?)?;\n }}\n Some(())\n}}"
+         #[rr::hot]\n#[must_use]\npub fn shift(ids: &mut [u32], at: usize) -> Option<()> {{\n for i in at..ids.len() {{\n *ids.get_mut(i)? = *ids.get(i.checked_add(1)?)?;\n }}\n Some(())\n}}"
     ));
     // A constant copied into a Vec builds it, as From of it does.
     accepted(&alloc_fixture(
@@ -1370,6 +1370,209 @@ fn a_closure_parameter_and_dyn_of_a_crate_trait_are_allowed() {
 }
 
 #[test]
+fn a_function_may_return_an_iterator() {
+    accepted(
+        "#![no_std]\npub fn evens(v: &[u32]) -> impl Iterator<Item = u32> + '_ { v.iter().copied().filter(|x| x % 2 == 0) }\n\
+         pub struct S { v: [u8; 4] }\nimpl S {\n pub fn new() -> Self { Self { v: [1, 2, 3, 4] } }\n\
+         pub fn bytes(&self) -> impl Iterator<Item = u8> + DoubleEndedIterator + ExactSizeIterator + use<'_> { self.v.iter().copied() }\n}\n\
+         pub fn sum(v: &[u32], s: &S) -> u64 {\n let mut n = u64::try_from(s.bytes().len()).unwrap_or(0);\n for x in evens(v) {\n n += u64::from(x);\n }\n for b in s.bytes().rev() {\n n += u64::from(b);\n }\n n\n}",
+    );
+    for source in [
+        // Not an iterator returned whole by a function of the crate.
+        "pub fn take(v: impl Iterator<Item = u8>) -> usize { v.count() }",
+        "pub fn none() -> Option<impl Iterator<Item = u8>> { Some(core::iter::empty()) }",
+        "pub fn any() -> impl Iterator { core::iter::empty::<u8>() }",
+        "pub fn back() -> impl DoubleEndedIterator<Item = u8> { core::iter::empty() }",
+        "pub fn again() -> impl Iterator<Item = u8> + Clone { core::iter::empty() }",
+        "pub fn hidden() -> impl Iterator<Item = impl Copy> { core::iter::empty::<u8>() }",
+        // In a trait it is an associated type.
+        "pub trait Bytes { fn bytes(&self) -> impl Iterator<Item = u8>; }",
+    ] {
+        rejected(&format!("#![no_std]\n{source}"), "rr_no_generics");
+    }
+    // What the iterator's closures do, the function that writes them does:
+    // the hot path, the call graph and recursion see it.
+    rejected(
+        &alloc_fixture(
+            "pub struct S { v: Vec<u32> }\nimpl S {\n fn grown(&self) -> impl Iterator<Item = usize> + '_ {\n self.v.iter().map(|&x| {\n let mut b = Vec::with_capacity(4);\n b.push(x);\n b.len()\n })\n }\n}\n\
+             #[rr::hot]\npub fn hot(s: &S) -> usize {\n let mut n = 0;\n for k in s.grown() {\n n += k;\n }\n n\n}",
+        ),
+        "rr_hot_path",
+    );
+    rejected(
+        "#![no_std]\npub struct Big { pub a: [u64; 64] }\nfn firsts(v: &[Big]) -> impl Iterator<Item = u64> + '_ {\n v.iter().map(|b| {\n let keep = b.a;\n keep[0]\n })\n}\n\
+         #[rr::hot]\npub fn hot(v: &[Big]) -> u64 {\n let mut n = 0;\n for x in firsts(v) {\n n += x;\n }\n n\n}",
+        "rr_hot_path",
+    );
+    rejected(
+        "#![no_std]\n#[derive(Clone, Copy)]\npub struct Item { pub pos: u32, pub w: u32 }\nfn items(v: &[Item]) -> impl Iterator<Item = &Item> { v.iter() }\n\
+         #[rr::hot]\npub fn hot(input: &[Item], out: &mut [Item]) {\n for (o, it) in out.iter_mut().zip(items(input)) {\n *o = Item { pos: it.pos, w: it.w };\n }\n}",
+        "rr_hot_path",
+    );
+    rejected(
+        "#![no_std]\npub fn walk(n: u8) -> impl Iterator<Item = u8> {\n (0..n).map(total)\n}\npub fn total(n: u8) -> u8 {\n let mut t = 0u8;\n for x in walk(n) {\n t = t.wrapping_add(x);\n }\n t\n}",
+        "rr_no_recursion",
+    );
+    rejected(
+        "#![no_std]\npub fn walk(n: u8) -> impl Iterator<Item = u8> {\n (0..n).map(|i| total(i))\n}\npub fn total(n: u8) -> u8 {\n let mut t = 0u8;\n for x in walk(n) {\n t = t.wrapping_add(x);\n }\n t\n}",
+        "rr_no_recursion",
+    );
+}
+
+#[test]
+fn an_outcome_of_a_change_is_must_use() {
+    for source in [
+        "pub struct S { n: u8 }\nimpl S { pub fn bump(&mut self) -> bool { self.n += 1; self.n > 3 } }",
+        "pub fn fill(out: &mut [u8]) -> usize { out.len() }",
+        "pub fn take(v: &mut Option<u8>) -> Option<u8> { v.take() }",
+        "pub trait Sink { fn put(&mut self, b: u8) -> bool; }",
+        // C says how a call went in what it returns.
+        "pub mod sys {\n// rr: escape(unsafe): the C library.\nunsafe extern \"C\" {\n fn close(fd: i32) -> i32;\n}\n\
+         // rr: escape(unsafe): the descriptor is the caller's.\npub fn end(fd: i32) -> bool { let r = unsafe { close(fd) }; r == 0 }\n}",
+    ] {
+        rejected(&format!("#![no_std]\n{source}"), "rr_must_use");
+    }
+    // With the mark, dropping it is an error, and `let _ =` takes a reason.
+    let marked = "pub struct S { n: u8 }\nimpl S {\n #[must_use]\n pub fn bump(&mut self) -> bool {\n self.n += 1;\n self.n > 3\n }\n}\n";
+    rejected(
+        &format!("#![no_std]\n{marked}pub fn run(s: &mut S) {{\n s.bump();\n}}"),
+        "unused_must_use",
+    );
+    accepted(&format!(
+        "#![no_std]\n{marked}pub fn run(s: &mut S) {{\n // rr: escape(discard): the first bump is never past 3.\n let _: bool = s.bump();\n}}"
+    ));
+    // Through an unsafe block, too.
+    let close = "pub mod sys {\n// rr: escape(unsafe): the C library.\nunsafe extern \"C\" {\n #[must_use]\n fn close(fd: i32) -> i32;\n}\n\
+                 pub fn end(fd: i32) {\n // rr: escape(unsafe";
+    rejected(
+        &format!(
+            "#![no_std]\n{close}): the descriptor is the caller's.\n let _: i32 = unsafe {{ close(fd) }};\n}}\n}}"
+        ),
+        "let_underscore_must_use",
+    );
+    accepted(&format!(
+        "#![no_std]\n{close}, discard): the descriptor is the caller's, closed at its end.\n let _: i32 = unsafe {{ close(fd) }};\n}}\n}}"
+    ));
+    // A Result is must_use already; a function that changes nothing, a
+    // trait's impl, which the trait's declaration marks, and a function C
+    // calls are not looked at.
+    accepted(
+        "#![no_std]\npub struct S { n: u8 }\nimpl S {\n pub fn get(&self) -> u8 { self.n }\n pub fn set(&mut self, n: u8) -> Result<u8, u8> { if n > 9 { return Err(n); } self.n = n; Ok(n) }\n}\n\
+         pub struct C(pub u8);\nimpl Iterator for C { type Item = u8; fn next(&mut self) -> Option<u8> { self.0 = self.0.checked_sub(1)?; Some(self.0) } }\n\
+         pub trait Sink {\n #[must_use]\n fn put(&mut self, b: u8) -> bool;\n}\nimpl Sink for S { fn put(&mut self, b: u8) -> bool { self.n = b; true } }\n\
+         pub extern \"C\" fn back(n: &mut u8) -> i32 { *n = 0; 0 }",
+    );
+}
+
+#[test]
+fn const_generic_code_is_checked_in_each_instantiation() {
+    accepted(
+        "#![no_std]\npub struct Ring<const N: usize> {\n pub words: [u64; N],\n}\nimpl<const N: usize> Ring<N> {\n #[must_use]\n pub fn new() -> Self { Self { words: [0; N] } }\n #[must_use]\n pub fn first(&self) -> u64 { self.words.first().copied().unwrap_or(0) }\n}\n\
+         pub trait Len { fn len(&self) -> usize; }\nimpl<const N: usize> Len for Ring<N> { fn len(&self) -> usize { N } }\n\
+         pub fn sum<const N: usize>(v: &[u64; N]) -> u64 { v.iter().sum() }\n#[must_use]\npub fn run() -> u64 { let r = Ring::<8>::new(); sum(&r.words) + r.first() }",
+    );
+    for source in [
+        "pub struct S<T>(pub T);",
+        "pub struct S<const N: u8>(pub [u8; 4]);",
+        "pub struct S<const N: usize = 4>(pub [u8; N]);",
+        "pub enum E<const N: usize> { A([u8; N]) }",
+        "pub trait T<const N: usize> {}",
+        "pub trait T { fn f<const N: usize>(&self); }",
+        "pub type A<const N: usize> = [u8; N];",
+        "#![feature(generic_const_exprs)]\npub struct S<const N: usize>(pub [u8; N]);",
+    ] {
+        let source = match source.strip_prefix("#![feature(generic_const_exprs)]\n") {
+            Some(rest) => format!("#![no_std]\n#![feature(generic_const_exprs)]\n{rest}"),
+            None => format!("#![no_std]\n{source}"),
+        };
+        rejected(&source, "rr_no_generics");
+    }
+    // A move on a hot path is as large as the instantiation the path
+    // reaches: Ring<4> moves 32 bytes, Ring<64> 512.
+    let ring = "pub struct Ring<const N: usize> {\n pub cur: [u64; N],\n pub prev: [u64; N],\n}\nimpl<const N: usize> Ring<N> {\n #[must_use]\n fn step(&mut self) -> u64 {\n let keep = self.prev;\n self.cur = keep;\n self.cur.first().copied().unwrap_or(0)\n }\n}\n";
+    accepted(&format!(
+        "#![no_std]\n{ring}#[rr::hot]\n#[must_use]\npub fn hot(a: &mut Ring<4>) -> u64 {{\n a.step()\n}}\n#[must_use]\npub fn cold(b: &mut Ring<64>) -> u64 {{\n b.step()\n}}"
+    ));
+    let big = format!(
+        "#![no_std]\n{ring}#[rr::hot]\n#[must_use]\npub fn hot(a: &mut Ring<4>, b: &mut Ring<64>) -> u64 {{\n a.step() + b.step()\n}}"
+    );
+    rejected(&big, "rr_hot_path");
+    assert!(diagnostics(&big, false).contains("a move of 512 bytes with N = 64"));
+    // Through dyn, and a closure written in generic code.
+    rejected(
+        "#![no_std]\npub struct Big<const N: usize>(pub [u64; N]);\npub trait First { fn first(&self) -> u64; }\n\
+         impl<const N: usize> First for Big<N> {\n fn first(&self) -> u64 {\n let keep = self.0;\n keep.first().copied().unwrap_or(0)\n }\n}\n\
+         #[rr::hot]\n#[must_use]\npub fn hot(f: &dyn First) -> u64 {\n // rr: escape(dyn): one call per event.\n f.first()\n}\n#[must_use]\npub fn run(b: &Big<64>) -> u64 { hot(b) }",
+        "rr_hot_path",
+    );
+    rejected(
+        "#![no_std]\npub struct Big<const N: usize>(pub [u64; N]);\nfn each<const N: usize>(v: &[Big<N>]) -> u64 {\n let mut n = 0;\n v.iter().for_each(|b| {\n let keep = b.0;\n n += keep.first().copied().unwrap_or(0);\n });\n n\n}\n\
+         #[rr::hot]\n#[must_use]\npub fn hot(v: &[Big<64>]) -> u64 {\n each(v)\n}",
+        "rr_hot_path",
+    );
+    // A lifetime parameter is not one: the size is known as it is.
+    accepted(
+        "#![no_std]\n#[must_use]\npub fn apply(f: impl Fn(u8) -> u8) -> u8 { f(1) }\n#[derive(Clone, Copy)]\npub struct Key<'a> { pub b: &'a [u8] }\n#[must_use]\npub fn first(k: Key<'_>) -> u8 { let c = k; c.b.first().copied().unwrap_or(0).wrapping_add(k.b.first().copied().unwrap_or(0)) }",
+    );
+    // Where rr finds no instantiation, it says it cannot know the size.
+    let unknown = "#![no_std]\nextern crate alloc;\n#[must_use]\npub fn boxed<const N: usize>() -> usize {\n let b = alloc::boxed::Box::new([0u8; N]);\n b.len()\n}";
+    rejected(unknown, "rr_unexplained_escape");
+    assert!(diagnostics(unknown, false).contains("cannot know"));
+    // Box, Copy and the stack, in each instantiation.
+    for (source, says) in [
+        (
+            "extern crate alloc;\npub struct B<const N: usize>(pub [u64; N]);\n#[must_use]\npub fn boxed<const N: usize>() -> alloc::boxed::Box<B<N>> { alloc::boxed::Box::new(B([0; N])) }\n\
+             #[must_use]\npub fn run() -> u64 { boxed::<4>().0[0] + boxed::<64>().0[0] }",
+            "`Box::new` of 512 bytes with N = 64",
+        ),
+        (
+            "#[derive(Clone, Copy)]\npub struct B<const N: usize>(pub [u64; N]);\n#[must_use]\npub fn run() -> u64 { let b = B([1u64; 64]); let c = b; b.0[0] + c.0[0] }",
+            "Copy on a type of 512 bytes with N = 64",
+        ),
+        (
+            "#[must_use]\npub fn table<const N: usize>() -> u64 {\n let t = [7u8; N];\n t.iter().map(|&b| u64::from(b)).sum()\n}\n#[must_use]\npub fn run() -> u64 { table::<4>() + table::<100000>() }",
+            "an array of 100000 bytes on the stack with N = 100000",
+        ),
+    ] {
+        let source = format!("#![no_std]\n{source}");
+        let found = diagnostics(&source, false);
+        assert!(found.contains(says), "{says}: {found}");
+    }
+    // Recursion and repeated bodies are the definitions', whatever N.
+    rejected(
+        "#![no_std]\n#[must_use]\npub fn down<const N: usize>(n: usize) -> usize {\n if n == 0 { N } else { down::<N>(n - 1) }\n}",
+        "rr_no_recursion",
+    );
+    rejected(
+        "#![no_std]\n#[must_use]\npub fn a<const N: usize>(v: &[u8; N]) -> u32 {\n let mut n = 0u32;\n for b in v { n += u32::from(*b); }\n n += 1;\n n *= 3;\n n\n}\n\
+         #[must_use]\npub fn b<const N: usize>(v: &[u8; N]) -> u32 {\n let mut n = 0u32;\n for b in v { n += u32::from(*b); }\n n += 1;\n n *= 3;\n n\n}",
+        "rr_duplicate",
+    );
+}
+
+#[test]
+fn an_event_loop_path_does_not_block() {
+    let sys = "pub mod sys {\n// rr: escape(unsafe): the C library.\nunsafe extern \"C\" {\n #[must_use]\n fn sleep(s: u32) -> u32;\n}\n\
+               #[must_use]\npub fn nap(s: u32) -> u32 {\n // rr: escape(unsafe): sleep takes any count.\n unsafe { sleep(s) }\n}\n}\n\
+               #[cfg_attr(rr, rr::blocking)]\n#[must_use]\npub fn lookup(n: u8) -> u8 { n }\n";
+    for body in ["lookup(n)", "u8::try_from(sys::nap(1)).unwrap_or(n)"] {
+        let source = format!(
+            "#![no_std]\n{sys}fn handle(n: u8) -> u8 {{ {body} }}\n#[cfg_attr(rr, rr::poll)]\n#[must_use]\npub fn on_event(n: u8) -> u8 {{ handle(n) }}"
+        );
+        rejected(&source, "rr_blocking");
+    }
+    // Off the loop's path, or with a reason at the call, it may block.
+    accepted(&format!(
+        "#![no_std]\n{sys}#[must_use]\npub fn start(n: u8) -> u8 {{ lookup(n) }}\n#[cfg_attr(rr, rr::poll)]\n#[must_use]\n\
+         pub fn on_event(n: u8) -> u8 {{\n // rr: escape(block): the first event only, before any connection is open.\n lookup(n)\n}}"
+    ));
+    // A misspelt mark marks nothing: it is an error.
+    for mark in ["#[rr::hott]", "#[cfg_attr(rr, rr::pol)]"] {
+        rejected(&format!("#![no_std]\n{mark}\npub fn f() {{}}"), "rr_no_macros");
+    }
+}
+
+#[test]
 fn a_hot_path_grows_a_lent_buffer_only_up_to_a_limit() {
     rejected(
         &alloc_fixture("#[rr::hot]\npub fn put(out: &mut Vec<u8>, b: u8) { out.push(b); }"),
@@ -1380,13 +1583,13 @@ fn a_hot_path_grows_a_lent_buffer_only_up_to_a_limit() {
         "// rr: escape(alloc): one byte per event, which the caller writes out.\n out.push(b);\n true",
     ] {
         accepted(&alloc_fixture(&format!(
-            "#[rr::hot]\npub fn put(out: &mut Vec<u8>, b: u8) -> bool {{\n {body}\n}}"
+            "#[rr::hot]\n#[must_use]\npub fn put(out: &mut Vec<u8>, b: u8) -> bool {{\n {body}\n}}"
         )));
     }
     // capacity() is what the allocator gave, not a limit.
     rejected(
         &alloc_fixture(
-            "#[rr::hot]\npub fn put(out: &mut Vec<u8>, b: u8) -> bool {\n if out.len() == out.capacity() {\n return false;\n }\n out.push(b);\n true\n}",
+            "#[rr::hot]\n#[must_use]\npub fn put(out: &mut Vec<u8>, b: u8) -> bool {\n if out.len() == out.capacity() {\n return false;\n }\n out.push(b);\n true\n}",
         ),
         "rr_hot_path",
     );

@@ -222,13 +222,22 @@ impl<'a, 'tcx> Flow<'a, 'tcx> {
                         let info = data.terminator().source_info;
                         copies.push(self.written_at(info.scope, info.span));
                     }
-                    // A local function that returns what it was given.
-                    if let Ok(Some(instance)) = Instance::try_resolve(self.tcx, self.env, def, fn_args)
-                        && let InstanceKind::Item(item) = instance.def
-                        && let Some(local) = item.as_local()
-                        && summaries.returns_given(self.tcx, local)
-                        && destination.projection.is_empty()
-                    {
+                    // A local function that returns what it was given; a
+                    // method of a crate's trait that does not resolve here
+                    // may be any of its bodies, and counts as one that does.
+                    let returns_given = match Instance::try_resolve(self.tcx, self.env, def, fn_args) {
+                        Ok(Some(instance)) => match instance.def {
+                            InstanceKind::Item(item) => item
+                                .as_local()
+                                .is_some_and(|local| summaries.returns_given(self.tcx, local)),
+                            _ => false,
+                        },
+                        Ok(None) | Err(_) => self
+                            .tcx
+                            .trait_of_assoc(def)
+                            .is_some_and(rustc_span::def_id::DefId::is_local),
+                    };
+                    if returns_given && destination.projection.is_empty() {
                         self.tainted.insert(destination.local);
                     }
                 }

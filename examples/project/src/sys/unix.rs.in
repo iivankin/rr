@@ -15,8 +15,11 @@ unsafe extern "C" {
     fn calloc(n: usize, size: usize) -> *mut c_void;
     fn realloc(p: *mut c_void, size: usize) -> *mut c_void;
     fn free(p: *mut c_void);
+    #[must_use]
     fn posix_memalign(p: *mut *mut c_void, align: usize, size: usize) -> c_int;
+    #[must_use]
     fn write(fd: c_int, p: *const c_void, n: usize) -> isize;
+    #[must_use]
     fn strlen(s: *const c_char) -> usize;
     fn abort() -> !;
 }

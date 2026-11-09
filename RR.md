@@ -173,7 +173,7 @@ Rules are compiler errors and cannot be lowered with `allow`, `-A rr`,
 | Rule | Restriction |
 | --- | --- |
 | rr_no_std | Require #![no_std]; forbid explicit std imports |
-| rr_no_generics | Forbid own type/const generic parameters, impl Trait other than a closure parameter, async fn/blocks/closures and await |
+| rr_no_generics | Forbid own type parameters, const parameters other than `const N: usize` of a function, struct or impl, impl Trait other than a closure parameter or an iterator returned, async fn/blocks/closures and await |
 | rr_simple_traits | Forbid associated types/GATs, supertraits, where clauses, trait aliases and dyn of a trait from another crate |
 | rr_no_macros | Allow no_std compiler builtins, core panic/assert, matches! and seven of the compiler's own derives; forbid own/library macros, other derives and external procedural attributes, including nested calls and cfg_attr derives |
 | rr_unexplained_escape | Require a nearby real comment with a nonempty explanation for the operations below |
@@ -185,11 +185,14 @@ Rules are compiler errors and cannot be lowered with `allow`, `-A rr`,
 | rr_no_recursion | Forbid a call that closes a cycle of the crate's call graph (direct or mutual recursion, see Call graph) without such a comment, such as a bound on the depth, beside the call or once above a function every such cycle passes through; and a type that owns a value of itself, whose drop recurses as deep as the data |
 | rr_unused_escape | Forbid a reason that answers nothing: a kind with no such operation beside it, a kind rr does not know, or the old form that names none |
 | rr_c_signature | Forbid a reference in a C function's declaration: C has pointers |
+| rr_must_use | Require `#[must_use]` on a function that changes something (takes `&mut`, calls foreign code, or is a C function) and returns a bool, an integer or an Option |
+| rr_blocking | Forbid a call on a path marked #[rr::poll] to a C function that always blocks, or to a function marked #[rr::blocking], without a `block` reason |
 | rr_unused_derive | Forbid a derived trait that nothing in the program uses |
 | rr_duplicate | Forbid a function whose body repeats another's, token for token without comments and spacing and type for type, of four statements or more, without a `duplicate` reason: one function, called from both places, says it once. Two types spelled the same way (`Self { memo: Memo::new() }`, `self.workspace.abort()`) are not a copy: one function for both would need a trait |
 
 Lifetime parameters, ordinary traits/impls, and concrete uses of existing generic
-library types such as Vec<u8> remain allowed. A function's parameter may be
+library types such as Vec<u8> remain allowed, and so does `const N: usize`
+(below). A function's parameter may be
 `impl Fn(..)`, `impl FnMut(..)` or `impl FnOnce(..)`: a closure handed in,
 one bound and nothing else, so that work around a call, such as undoing a
 step when it fails, is written once. `Send` and `Sync` may stand beside
@@ -201,7 +204,22 @@ calls the rest as an ordinary function. A closure is part of the function that
 writes it: what it calls, that function calls. `dyn` may name a trait of the
 crate: every implementation is then in the crate, and a call through it
 reaches each in the call graph, as a hot path and recursion see it; a
-trait of another crate behind dyn hides what runs. This policy restricts user-defined
+trait of another crate behind dyn hides what runs.
+
+A function or an inherent method may return `impl Iterator<Item = T>`,
+the whole of its return type, with `+ 'a`, `+ use<'a>`, and
+`DoubleEndedIterator` and `ExactSizeIterator`, which add `next_back` and
+`len` and no type of their own. Chained adaptors with closures compile
+to the loop one would write; a struct whose `next` filters, run by
+`sum` or `map`, measured up to twenty times slower, and its remedy, an
+own `fold`, would be generic. The compiler knows the type behind the
+`impl`, and rr's checks read MIR after it is revealed: a `for` over the
+iterator calls what the type's `next` calls, and the iterator's closures
+are part of the function that writes them, so the call graph, a hot
+path and recursion see what they do. Any other `impl Trait` in return
+position (`impl Fn`, `Option<impl Iterator>`, `+ Clone`, `Item = impl
+Copy`), an iterator taken as a parameter, and one returned by a trait's
+method, which is an associated type, stay forbidden. This policy restricts user-defined
 generics, not every generic inside core/alloc. It checks the current crate and
 its local modules, not previously compiled dependencies.
 
@@ -248,6 +266,32 @@ a string from one character that needs escaping to the next, an indent
 as one slice of a constant of spaces, a number formatted into a small
 array on the stack; a `push(char)` per character is a call to memcpy
 for each, which rr prof counts.
+
+### Const parameters
+
+A function, a struct, an impl and a method of one may take `const N:
+usize`: one implementation for each width, such as the limbs of a
+modulus or the words of a block, which the compiler builds once for
+each N it is given, as fast as a copy written by hand and smaller than
+the copies a script would write. Nothing else: no type parameter, no
+default, no other type of constant, none on a trait, its methods, an
+enum or a type alias, and none of the features that compute with one
+(generic_const_exprs, adt_const_params and their kin).
+
+rr checks the code as it runs: from each function that is not generic,
+it follows every call, function value, closure, drop and coercion to
+dyn with the numbers put in, as the compiler does before it builds the
+program, and finds each instantiation. What depends on a size takes the
+size of each one: a move of more than 256 bytes on a hot path, for the
+N the path reaches (`a move of 512 bytes with N = 64`; through dyn or a
+function pointer, every N the crate makes); `Box::new` past 256 bytes;
+`impl Copy` past 64; and an array past 16 KiB or a frame past 512 kB on
+the stack, which Clippy's large_stack_arrays and large_stack_frames do
+not see in generic code. A size rr cannot know, such as that of a
+generic function nothing in the crate calls (a library's exported one),
+is reported as such and takes the same reason as the operation it would
+be. The call graph, recursion and repeated bodies are the
+definitions', whatever N is.
 
 Compiler builtin macros that do not require std are allowed: concat!, cfg!,
 format_args!, stringify!, env!/option_env!, file!/line!/column!/module_path!,
@@ -299,7 +343,7 @@ let snapshot = value.clone();
 
 A reason names the kinds of operation it answers, and answers only those:
 `unsafe`, `copy`, `shared`, `leak`, `alloc`, `cold`, `bound`, `recursion`, `panic`, `discard`,
-`wildcard`, `cast`, `move`, `stack`, `loop`, `bools`, `sentinel`, `tag`, `duplicate`, `dyn`; several are written
+`wildcard`, `cast`, `move`, `stack`, `loop`, `bools`, `sentinel`, `tag`, `duplicate`, `dyn`, `block`; several are written
 `// rr: escape(unsafe, cast): ...`. A reason for one kind does not cover an
 operation of another on the same line. The old `// rr: escape: ...` names no
 kind and answers nothing; a diagnostic points at an adjacent reason that does
@@ -402,6 +446,21 @@ the raw arguments the system hands it. A C function is declared with C's
 types (rr_c_signature): a pointer, not a reference, which would promise
 Rust's rules about the memory to code that does not keep them; lend a
 reference with `&raw` at the call.
+
+rustc reports a dropped Result, whose type is must_use, but not
+`set.insert(x);` that meant `if !set.insert(x)`, a count of bytes
+written never compared with what was meant, or a `pop` whose value is
+lost. A function that changes something, because it takes `&mut` (itself
+or a parameter) or calls foreign code, and that returns a bool, an
+integer or an Option, is `#[must_use]` (rr_must_use); so is a C
+function that returns one, as C says there how a call went. Dropping
+such a value is then unused_must_use, and `let _: T =`, through an
+`unsafe` block too, takes an `escape(discard)` reason. No reason answers
+the rule: the attribute is always possible. A trait's method takes it
+where the trait declares it, and a function C calls (`extern "C"`) and
+test code are not looked at. Clippy's must_use_candidate looks only at
+what a library exports, which a program has none of, and at functions
+that change nothing.
 
 ## Clippy lints rr enforces
 
@@ -572,6 +631,24 @@ own reason, lies beyond the call; otherwise rr_unused_escape reports it.
 The diagnostic shows the calls from the hot root down. A copy rr does not
 see by its form still shows in rr prof.
 
+## Event loops
+
+`#[rr::poll]` marks a function a poll loop runs for an event, as
+`#[rr::hot]` marks one that runs for every event: while it blocks, every
+other connection the loop serves waits. Rule rr_blocking follows the
+call graph from there and forbids a call to a C function that blocks
+whatever it is given, which rr knows by name (sleep and nanosleep,
+getaddrinfo and the other lookups, pthread_join, sem_wait, system,
+Windows' Sleep and GetAddrInfoW, and the systems' certificate chain
+checks, which may fetch from the network), and a call to a function of
+the crate marked `#[rr::blocking]`, such as a lookup that waits for its
+answer; what that function calls is its own. Whether a read, an accept
+or a connect blocks depends on how its descriptor was opened, which rr
+cannot see, and those are not looked at. A call that may block there,
+such as one before the first connection, takes `// rr: escape(block):
+<reason>`. rr knows its attributes by name: a misspelt one, which would
+mark nothing, is an error.
+
 ## Bounds
 
 A collection a value keeps in a field, a Vec, String, VecDeque, BinaryHeap or a
@@ -600,7 +677,9 @@ or within what an argument holds or points to, as `qsort` and a struct
 of callbacks are; a function or closure handed to other code, as `map(f)` does, may be called
 by it; and a value moved into a function of another crate, as `drop(v)`
 does, may be dropped there. A closure is part of the function it is
-written in.
+written in. A returned `impl Iterator` is its real type in MIR: a `for`
+over it calls that type's `next`, and its closures are the returning
+function's.
 
 ## Allocation and copy profiles
 

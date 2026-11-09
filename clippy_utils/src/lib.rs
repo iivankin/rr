@@ -1248,6 +1248,23 @@ pub fn peel_blocks<'a>(mut expr: &'a Expr<'a>) -> &'a Expr<'a> {
     expr
 }
 
+/// Removes blocks around an expression, unsafe ones too, only if the block contains
+/// just one expression and no statements: `unsafe { f() }` is what `f()` returns.
+pub fn peel_any_blocks<'a>(mut expr: &'a Expr<'a>) -> &'a Expr<'a> {
+    while let ExprKind::Block(
+        Block {
+            stmts: [],
+            expr: Some(inner),
+            ..
+        },
+        _,
+    ) = expr.kind
+    {
+        expr = inner;
+    }
+    expr
+}
+
 /// Removes blocks around an expression, only if the block contains just one expression
 /// or just one expression statement with a semicolon. Unsafe blocks are not removed.
 ///
