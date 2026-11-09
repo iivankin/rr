@@ -21,11 +21,13 @@ pub(super) fn verify(
     signature: &[u8],
     encoding: &Encoding<'_>,
 ) -> Result<(), Error> {
-    let modulus = Modulus::new(key).ok_or(Error::Key)?;
+    let Some(modulus) = Modulus::new(key) else {
+        return Err(Error::Key);
+    };
     let mut buffer = [0; 8 * LIMBS];
-    let em = modulus
-        .public(signature, &mut buffer)
-        .ok_or(Error::Encoding)?;
+    let Some(em) = modulus.public(signature, &mut buffer) else {
+        return Err(Error::Encoding);
+    };
     if !encoding.matches(em, key.bits) {
         return Err(Error::Signature);
     }
