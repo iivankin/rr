@@ -201,16 +201,34 @@ fn release(start: *mut Start) {
     }
 }
 
-/// Work spawn took, which cancel keeps from starting.
-pub struct Ticket(*mut Start);
+/// Work spawn took. Dropped, it cancels the work if no thread took it
+/// yet, as cancel does; detach lets it run whenever its turn comes.
+#[must_use]
+pub struct Ticket {
+    start: *mut Start,
+    /// The work runs in its turn whatever becomes of the ticket.
+    detached: bool,
+}
 
 impl Ticket {
     /// Keeps the work from starting, when it has not: then it never
     /// runs, and its argument is the caller's again. False when a
-    /// thread took it.
-    pub fn cancel(&self) -> bool {
+    /// thread took it, which runs it to its end.
+    #[must_use]
+    pub fn cancel(mut self) -> bool {
+        self.detached = true;
+        self.stop()
+    }
+
+    /// Lets the work run, in its turn, without a ticket to cancel it.
+    pub fn detach(mut self) {
+        self.detached = true;
+    }
+
+    /// Keeps the work from starting; whether it had not.
+    fn stop(&self) -> bool {
         // rr: escape(unsafe): the ticket holds its Start.
-        let state = unsafe { &(*self.0).state };
+        let state = unsafe { &(*self.start).state };
         state
             .compare_exchange(QUEUED, CANCELLED, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
@@ -219,7 +237,11 @@ impl Ticket {
 
 impl Drop for Ticket {
     fn drop(&mut self) {
-        release(self.0);
+        if !self.detached {
+            // Work still in line never runs: its argument is never touched.
+            let _cancelled: bool = self.stop();
+        }
+        release(self.start);
     }
 }
 
@@ -264,8 +286,22 @@ fn locked(f: impl FnOnce(&mut Line)) {
 
 /// Runs work(argument) on a thread: a new one while fewer than
 /// THREADS_MAX run, else the first to finish its work, in the order
-/// spawn was called. None when no thread could be started.
-pub fn spawn(work: fn(*mut c_void), argument: *mut c_void) -> Option<Ticket> {
+/// spawn was called. None when no thread could be started, and work
+/// never runs. The Ticket cancels the work when it is dropped before a
+/// thread took it, as cancel does; detach lets it run.
+///
+/// # Safety
+///
+/// work runs on another thread, with argument: whatever argument points
+/// to must stay valid, and be safe to reach from that thread, until work
+/// returns, or until cancel returns true or the Ticket is dropped while
+/// the work is still in line (then work never runs, and argument is the
+/// caller's again). A caller that cannot tell which happened holds what
+/// argument points to until work says it is done (resolve and trust
+/// count two holders: the caller and the thread).
+// rr: escape(unsafe): work reaches what argument points to from
+// another thread, which the caller keeps alive as Safety says.
+pub unsafe fn spawn(work: fn(*mut c_void), argument: *mut c_void) -> Option<Ticket> {
     let start = Box::new(Start {
         work,
         argument,
@@ -293,7 +329,10 @@ pub fn spawn(work: fn(*mut c_void), argument: *mut c_void) -> Option<Ticket> {
         queued = true;
     });
     if queued || os::thread(raw.cast()) {
-        return Some(Ticket(raw));
+        return Some(Ticket {
+            start: raw,
+            detached: false,
+        });
     }
     locked(|line| line.running -= 1);
     // Neither a thread nor a ticket holds it.
@@ -2174,8 +2213,8 @@ mod poller {
 
 #[cfg(test)]
 mod tests {
-    use super::{POLLIN, Signal, THREADS_MAX, Wait, ready, spawn};
-    use crate::base::wait::{Instant, Set, WOKEN, Waker};
+    use super::{POLLIN, Signal, THREADS_MAX, Ticket, Wait, ready, spawn};
+    use crate::base::wait::{Instant, Ready, Set, Waker};
     use alloc::boxed::Box;
     use alloc::vec::Vec;
     use core::ffi::c_void;
@@ -2221,27 +2260,40 @@ mod tests {
         DONE.fetch_add(1, Ordering::SeqCst);
     }
 
+    fn start(index: usize) -> Ticket {
+        // rr: escape(unsafe): the argument is a number, which job reads
+        // as one; it points to nothing.
+        unsafe { spawn(job, core::ptr::without_provenance_mut(index)) }.unwrap()
+    }
+
     /// More jobs than threads: THREADS_MAX run, the rest wait in line
-    /// and run as threads free; one cancelled in line never runs.
+    /// and run as threads free; one cancelled in line never runs, nor
+    /// one whose ticket is dropped there; one detached runs.
     #[test]
     fn queue() {
         let mut tickets = Vec::new();
-        for index in 0..JOBS {
-            tickets.push(spawn(job, core::ptr::without_provenance_mut(index)).unwrap());
+        for index in 0..JOBS - 3 {
+            tickets.push(start(index));
         }
+        let dropped = start(JOBS - 3);
+        let cancelled = start(JOBS - 2);
+        start(JOBS - 1).detach();
         assert!(until(|| NOW.load(Ordering::SeqCst) == THREADS_MAX));
         nap();
         assert_eq!(NOW.load(Ordering::SeqCst), THREADS_MAX);
-        assert!(tickets[JOBS - 1].cancel());
-        assert!(!tickets[0].cancel());
+        assert!(cancelled.cancel());
+        drop(dropped);
+        assert!(!tickets.swap_remove(0).cancel());
         OPEN.store(true, Ordering::SeqCst);
-        assert!(until(|| DONE.load(Ordering::SeqCst) == JOBS - 1));
+        assert!(until(|| DONE.load(Ordering::SeqCst) == JOBS - 2));
         for _ in 0..50 {
             nap();
         }
-        assert_eq!(DONE.load(Ordering::SeqCst), JOBS - 1);
+        assert_eq!(DONE.load(Ordering::SeqCst), JOBS - 2);
         assert_eq!(MOST.load(Ordering::SeqCst), THREADS_MAX);
-        assert!(!RAN[JOBS - 1].load(Ordering::SeqCst));
+        assert!(!RAN[JOBS - 3].load(Ordering::SeqCst));
+        assert!(!RAN[JOBS - 2].load(Ordering::SeqCst));
+        assert!(RAN[JOBS - 1].load(Ordering::SeqCst));
     }
 
     /// A signal's descriptor joins a poll beside one that stays quiet,
@@ -2289,8 +2341,10 @@ mod tests {
         let waker = set.waker(9);
         // rr: escape(leak): the thread takes it back.
         let argument = Box::into_raw(Box::new(waker));
-        let _ticket = spawn(wake, argument.cast()).unwrap();
+        // rr: escape(unsafe): the thread takes the Box back once, and the
+        // ticket lets it run.
+        unsafe { spawn(wake, argument.cast()) }.unwrap().detach();
         let events = set.wait(Some(Instant::now().after_ms(10_000)));
-        assert!(events.len() == 1 && events[0].key == 9 && events[0].ready == WOKEN);
+        assert!(events.len() == 1 && events[0].key == 9 && events[0].ready.woken());
     }
 }

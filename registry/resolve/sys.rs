@@ -1,18 +1,30 @@
 //! The system side of resolve: what mod.rs says it is, for each system.
 
 use alloc::vec::Vec;
-use core::net::IpAddr;
+use core::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 /// What a lookup waits on: the type every component's poll loop takes.
 pub use crate::base::wait::Wait;
 
-/// An address, and for a link-local IPv6 one the interface it is on.
+/// An address, and for a link-local IPv6 one the interface it is on:
+/// connect to socket_addr's, which keeps it, as a SocketAddr made of ip
+/// alone does not.
 #[derive(Clone, Copy)]
 #[cfg_attr(any(target_os = "macos", test), derive(PartialEq))]
 #[cfg_attr(test, derive(Debug))]
 pub struct Address {
     pub ip: IpAddr,
     pub scope: u32,
+}
+
+impl Address {
+    /// The address at port, an IPv6 one with its scope.
+    pub fn socket_addr(&self, port: u16) -> SocketAddr {
+        match self.ip {
+            IpAddr::V4(v4) => SocketAddr::V4(SocketAddrV4::new(v4, port)),
+            IpAddr::V6(v6) => SocketAddr::V6(SocketAddrV6::new(v6, port, 0, self.scope)),
+        }
+    }
 }
 
 /// Why a lookup gave no address.
@@ -29,7 +41,9 @@ pub enum Error {
     Failed,
 }
 
-/// One name's lookup. Dropping it cancels it.
+/// One name's lookup. Dropping it cancels it: one started and not kept
+/// is gone at once.
+#[must_use]
 pub struct Lookup {
     /// What answered sees without asking the system, or the system's
     /// lookup.
@@ -378,7 +392,9 @@ mod os {
             // release frees it.
             let raw = Box::into_raw(shared);
             state.shared = raw;
-            state.ticket = wait::spawn(run, raw.cast());
+            // rr: escape(unsafe): run takes shared as its holder, which it
+            // lets go; the ticket's cancel says when it never runs.
+            state.ticket = unsafe { wait::spawn(run, raw.cast()) };
             if state.ticket.is_none() {
                 // The thread never held it.
                 release(raw);
@@ -423,7 +439,7 @@ mod os {
                 return;
             }
             // Work still in line never runs: its holder is let go here.
-            if self.ticket.as_ref().is_some_and(wait::Ticket::cancel) {
+            if self.ticket.take().is_some_and(wait::Ticket::cancel) {
                 release(self.shared);
             }
             // The thread, when it runs on, frees what is left.
@@ -1382,11 +1398,26 @@ mod tests {
                 assert!(loopback(result.unwrap()));
                 break;
             }
-            assert!(set.follow(&mut watch, &lookup.wait(), 1));
+            set.follow(&mut watch, &lookup.wait(), 1).unwrap();
             set.wait(Some(end));
             assert!(!end.reached_by(Instant::now()), "localhost did not resolve");
         }
         set.unfollow(&mut watch);
+    }
+
+    /// A link-local address keeps its interface on the way to a socket.
+    #[test]
+    fn socket_addresses() {
+        let local = super::Address {
+            ip: core::net::IpAddr::from([0xfe80, 0, 0, 0, 0, 0, 0, 1]),
+            scope: 7,
+        };
+        let core::net::SocketAddr::V6(v6) = local.socket_addr(443) else {
+            panic!("an IPv6 address");
+        };
+        assert_eq!((v6.port(), v6.scope_id()), (443, 7));
+        let v4 = resolve(b"192.0.2.1").unwrap()[0].socket_addr(80);
+        assert_eq!(v4, core::net::SocketAddr::from(([192, 0, 2, 1], 80)));
     }
 
     /// Literal addresses are themselves.
