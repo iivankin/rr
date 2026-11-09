@@ -5,14 +5,14 @@
 use super::{
     AES_128_GCM_SHA256, AES_256_GCM_SHA384, ALERT, APPLICATION, CHANGE_CIPHER_SPEC, Client, Digest,
     Error, HANDSHAKE, HELLO_RETRY, IDLE_MAX, KEY_RECORDS_MAX, Keys, MESSAGE_MAX, PENDING_MAX,
-    RANDOM_BYTES, RECORD_MAX, RECORDS_PER_INPUT, Reader, SECP256R1, State, Transcript,
+    RANDOM_BYTES, RECORD_MAX, RECORDS_PER_INPUT, Reader, SECP256R1, State, Taken, Transcript,
     VERIFY_CONTEXT, Verify, X25519, X25519MLKEM768, derive, expand, handshake_secrets, mac,
 };
 use crate::base::ecdh;
 use crate::base::mlkem;
 use crate::base::sha256::{self, Sha256};
 use crate::base::sha384;
-use crate::base::x509::{self, Store, TEST_NOW, test_certificate};
+use crate::base::x509::{self, Approval, Store, TEST_NOW, test_certificate};
 use crate::base::x25519;
 use alloc::vec::Vec;
 use test::Bencher;
@@ -482,7 +482,7 @@ impl Identity {
 
     fn store(&self) -> Store {
         let mut store = Store::new();
-        assert!(store.add_der(&self.anchor));
+        assert_eq!(store.add_der(&self.anchor), Ok(()));
         store
     }
 
@@ -568,14 +568,13 @@ struct Server {
     read: Option<Keys>,
     write: Option<Keys>,
     master: Digest,
-    client_secret: Digest,
+    client_secret: Option<Digest>,
     retried: bool,
     input: Vec<u8>,
     /// Bytes for the client.
     // rr: escape(bound): a test's few records.
     output: Vec<u8>,
     /// The client's application data.
-    // rr: escape(bound): a test's few records.
     received: Vec<u8>,
     /// The descriptions of the client's alerts.
     // rr: escape(bound): a test's few records.
@@ -598,7 +597,7 @@ impl Server {
             read: None,
             write: None,
             master: Digest::Sha256([0; 32]),
-            client_secret: Digest::Sha256([0; 32]),
+            client_secret: None,
             retried: false,
             input: Vec::new(),
             output: Vec::new(),
@@ -668,7 +667,7 @@ impl Server {
             20 => {
                 let key = derive(&self.read.as_ref().unwrap().secret, b"finished", &[]);
                 assert_eq!(message[4..], *mac(&key, &self.hash()).bytes());
-                self.read = Some(Keys::new(&self.client_secret));
+                self.read = self.client_secret.take().map(Keys::new);
                 self.finished = true;
             }
             24 => {
@@ -839,8 +838,9 @@ impl Server {
                 .extend_from_slice(&[CHANGE_CIPHER_SPEC, 3, 3, 0, 1, 1]);
         }
         let secrets = handshake_secrets(&shared, &self.hash());
-        self.read = Some(Keys::new(&secrets.client));
-        self.write = Some(Keys::new(&secrets.server));
+        let finished = derive(&secrets.server, b"finished", &[]);
+        self.read = Some(Keys::new(secrets.client));
+        self.write = Some(Keys::new(secrets.server));
         self.master = secrets.master;
         if !self.script.flight {
             return;
@@ -884,16 +884,15 @@ impl Server {
         body.extend_from_slice(&self.script.identity.scheme.to_be_bytes());
         prefixed(&mut body, signature.len(), &signature);
         self.add(&mut flight, 15, &body);
-        let key = derive(&secrets.server, b"finished", &[]);
-        let verify = mac(&key, &self.hash());
+        let verify = mac(&finished, &self.hash());
         self.add(&mut flight, 20, verify.bytes());
         for piece in flight.chunks(self.script.piece) {
             self.send(HANDSHAKE, piece);
         }
         let hash = self.hash();
-        self.client_secret = derive(&self.master, b"c ap traffic", hash.bytes());
+        self.client_secret = Some(derive(&self.master, b"c ap traffic", hash.bytes()));
         let server = derive(&self.master, b"s ap traffic", hash.bytes());
-        self.write = Some(Keys::new(&server));
+        self.write = Some(Keys::new(server));
     }
 
     /// A message of kind into the flight and the transcript.
@@ -1028,7 +1027,7 @@ fn feed(
         let end = (at + split.next()).min(bytes.len());
         let mut piece = &bytes[at..end];
         while !piece.is_empty() || !client.read().is_empty() {
-            let taken = client.input(piece)?;
+            let taken = client.input(piece)?.count();
             piece = &piece[taken..];
             let data = client.read();
             let count = data.len();
@@ -1053,7 +1052,7 @@ fn exchange(
     for _ in 0..16 {
         let sent = client.pending().len();
         server.receive(client.pending());
-        client.sent(sent);
+        client.sent(sent)?;
         let back = server.take();
         if sent == 0 && back.is_empty() {
             return Ok(got);
@@ -1244,11 +1243,11 @@ fn rfc8448_simple_1rtt() {
     // compatibility.
     client.session = None;
     client.kem = None;
-    client.sent(client.pending().len());
+    client.sent(client.pending().len()).unwrap();
     client.transcript = Transcript::new();
     client.transcript.update(&hex(CLIENT_HELLO));
     let hello = hex(SERVER_HELLO_RECORD);
-    assert_eq!(client.input(&hello), Ok(hello.len()));
+    assert_eq!(client.input(&hello), Ok(Taken(hello.len())));
     let reading = client.input_keys.as_ref().unwrap();
     let writing = client.output_keys.as_ref().unwrap();
     assert_eq!(reading.secret.bytes(), hex(SERVER_HS));
@@ -1298,9 +1297,9 @@ fn rfc8448_simple_1rtt() {
     assert_eq!(app_reading.iv[..], hex(SERVER_AP_IV));
     assert_eq!(key_of(&app_writing.secret), hex(CLIENT_AP_KEY));
     assert_eq!(app_writing.iv[..], hex(CLIENT_AP_IV));
-    client.sent(client.pending().len());
+    client.sent(client.pending().len()).unwrap();
     let data = hex(CLIENT_DATA);
-    assert_eq!(client.write(&data), Ok(data.len()));
+    assert_eq!(client.write(&data), Ok(Taken(data.len())));
     assert_eq!(client.pending(), hex(CLIENT_DATA_RECORD));
 }
 
@@ -1378,7 +1377,7 @@ fn handshakes() {
         assert!(client.connected() && !client.closed());
         assert!(server.finished);
         assert_eq!(client.alpn(), None);
-        assert_eq!(client.write(b"ping"), Ok(4));
+        assert_eq!(client.write(b"ping"), Ok(Taken(4)));
         server.send(APPLICATION, b"pong");
         assert_eq!(
             exchange(&mut client, &mut server, &mut split),
@@ -1393,7 +1392,7 @@ fn handshakes() {
         );
         assert!(client.closed() && client.connected());
         // The write side stays open until close.
-        assert_eq!(client.write(b"late"), Ok(4));
+        assert_eq!(client.write(b"late"), Ok(Taken(4)));
         client.close();
         assert_eq!(client.write(b"x"), Err(Error::Closed));
         assert_eq!(
@@ -1411,7 +1410,7 @@ fn recorded(store: &Store) -> Vec<u8> {
     let mut server = Server::new(Script::new(Kind::P256));
     let mut client = Client::new(HOST, &[], Verify::Store(store), TEST_NOW, &RANDOM).unwrap();
     server.receive(client.pending());
-    client.sent(client.pending().len());
+    client.sent(client.pending().len()).unwrap();
     let mut bytes = server.take();
     feed(&mut client, &bytes, &mut whole(), &mut Vec::new()).unwrap();
     server.receive(client.pending());
@@ -1492,7 +1491,7 @@ fn groups() {
         assert_eq!(server.ccs, 1);
         assert_eq!(server.hello.session, SESSION);
         assert!(client.kem.is_none() && client.p256 == [0; 32]);
-        assert_eq!(client.write(b"x"), Ok(1));
+        assert_eq!(client.write(b"x"), Ok(Taken(1)));
         assert_eq!(
             exchange(&mut client, &mut server, &mut whole()),
             Ok(Vec::new())
@@ -1527,14 +1526,14 @@ fn server_hello_refused() {
     ] {
         let store = Store::new();
         let mut client = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
-        client.sent(client.pending().len());
+        client.sent(client.pending().len()).unwrap();
         if let Some(group) = asked {
             let mut all = hex("002b 0002 0304  0033 0002");
             all.extend(hex(group));
             let retry = hello_message(&HELLO_RETRY, &SESSION, AES_128_GCM_SHA256, &all);
             let mut record = Vec::from([22, 3, 3]);
             prefixed(&mut record, retry.len(), &retry);
-            assert_eq!(client.input(&record), Ok(record.len()));
+            assert_eq!(client.input(&record), Ok(Taken(record.len())));
         }
         let mut all = hex("002b 0002 0304  0033");
         let mut entry = hex(share);
@@ -1588,7 +1587,7 @@ fn hello_retry() {
     let mut client = connect(&store, &mut server, HOST, &[], &mut split).unwrap();
     assert!(client.connected());
     assert_eq!(server.hello.cookie.as_deref(), Some(&b"\xc0\x0c\xee"[..]));
-    assert_eq!(client.write(b"after retry"), Ok(11));
+    assert_eq!(client.write(b"after retry"), Ok(Taken(11)));
     assert_eq!(
         exchange(&mut client, &mut server, &mut split),
         Ok(Vec::new())
@@ -1606,7 +1605,7 @@ fn retried(extensions: Vec<u8>, twice: bool) -> Option<Error> {
     let mut record = Vec::from([22, 3, 3]);
     prefixed(&mut record, retry.len(), &retry);
     let mut client = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
-    client.sent(client.pending().len());
+    client.sent(client.pending().len()).unwrap();
     let first = client.input(&record).err();
     if first.is_some() || !twice {
         if first.is_some() {
@@ -1806,7 +1805,7 @@ fn key_update() {
     let mut got = Vec::new();
     feed(&mut client, &server.take(), &mut split, &mut got).unwrap();
     assert_eq!(got, b"onetwothree");
-    assert_eq!(client.write(b"four"), Ok(4));
+    assert_eq!(client.write(b"four"), Ok(Taken(4)));
     assert_eq!(
         exchange(&mut client, &mut server, &mut split),
         Ok(Vec::new())
@@ -1823,7 +1822,7 @@ fn key_update() {
     // The client's own, every 2^24 records.
     client.output_keys.as_mut().unwrap().seq = KEY_RECORDS_MAX;
     server.read.as_mut().unwrap().seq = KEY_RECORDS_MAX;
-    assert_eq!(client.write(b"five"), Ok(4));
+    assert_eq!(client.write(b"five"), Ok(Taken(4)));
     assert_eq!(
         exchange(&mut client, &mut server, &mut split),
         Ok(Vec::new())
@@ -1853,7 +1852,7 @@ fn alerts() {
     let store = Store::new();
     // Before ServerHello, in the clear; no alert answers the server's.
     let mut client = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
-    client.sent(client.pending().len());
+    client.sent(client.pending().len()).unwrap();
     assert_eq!(
         client.input(&[21, 3, 3, 0, 2, 2, 40]),
         Err(Error::Alert(40))
@@ -1926,12 +1925,12 @@ fn record_limits() {
     let (mut over, _) = connected(&store);
     assert_eq!(over.input(&[23, 3, 3, 0x41, 0x01]), Err(Error::Overflow));
     let (mut most, _) = connected(&store);
-    assert_eq!(most.input(&[23, 3, 3, 0x41, 0x00]), Ok(5));
+    assert_eq!(most.input(&[23, 3, 3, 0x41, 0x00]), Ok(Taken(5)));
     // Plaintext records over 2^14, before keys, and bytes that are not
     // TLS.
     for (bytes, result) in [
         (&[22, 3, 3, 0x40, 0x01][..], Err(Error::Overflow)),
-        (&[22, 3, 3, 0x40, 0x00], Ok(5)),
+        (&[22, 3, 3, 0x40, 0x00], Ok(Taken(5))),
         (b"HTTP/1.1 400", Err(Error::Unexpected)),
     ] {
         let mut client = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
@@ -2036,7 +2035,7 @@ fn record_boundaries() {
     let late = |server: &mut Server| server.output.extend_from_slice(&[20, 3, 3, 0, 1, 1]);
     assert_eq!(after(late, 1).0, Some(Error::Unexpected));
     let mut fresh = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
-    assert_eq!(fresh.input(&[20, 3, 3, 0, 1, 1]), Ok(6));
+    assert_eq!(fresh.input(&[20, 3, 3, 0, 1, 1]), Ok(Taken(6)));
     assert_eq!(fresh.input(&[20, 3, 3, 0, 1, 2]), Err(Error::Unexpected));
     // Data before the handshake is done; a handshake record in the clear
     // after ServerHello.
@@ -2054,7 +2053,7 @@ fn record_boundaries() {
 fn tls12(tail: [u8; 8], extensions: Option<&[u8]>) -> (Option<Error>, Vec<u8>) {
     let store = Store::new();
     let mut client = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
-    client.sent(client.pending().len());
+    client.sent(client.pending().len()).unwrap();
     let mut body = Vec::from([3, 3]);
     body.extend_from_slice(&[0x11; 24]);
     body.extend_from_slice(&tail);
@@ -2117,14 +2116,14 @@ fn aes_256_gcm_sha384() {
         let keys = client.output_keys.as_ref().unwrap();
         assert!(matches!(keys.secret, Digest::Sha384(_)));
         assert!(matches!(client.transcript, Transcript::Sha256(_)));
-        assert_eq!(client.write(b"ping"), Ok(4));
+        assert_eq!(client.write(b"ping"), Ok(Taken(4)));
         server.update(true);
         server.send(APPLICATION, b"pong");
         assert_eq!(
             exchange(&mut client, &mut server, &mut split),
             Ok(Vec::from(*b"pong"))
         );
-        assert_eq!(client.write(b"again"), Ok(5));
+        assert_eq!(client.write(b"again"), Ok(Taken(5)));
         client.close();
         assert_eq!(
             exchange(&mut client, &mut server, &mut split),
@@ -2219,7 +2218,7 @@ fn internal_errors() {
     assert_eq!(reading.input(&other.take()), Err(Error::Internal));
     other.receive(reading.pending());
     assert_eq!(other.alerts, [80]);
-    let mut keys = Keys::new(&Digest::Sha256([1; 32]));
+    let mut keys = Keys::new(Digest::Sha256([1; 32]));
     let mut tx = Vec::new();
     tx.resize(super::TX_MAX - 20, 0);
     assert_eq!(
@@ -2254,23 +2253,27 @@ fn input_backpressure() {
     }
     let empty = server.take();
     let size = (empty.len() - 1) / (RECORDS_PER_INPUT + 9);
-    assert_eq!(client.input(&empty), Ok(RECORDS_PER_INPUT * size));
+    assert_eq!(client.input(&empty), Ok(Taken(RECORDS_PER_INPUT * size)));
     let rest = &empty[RECORDS_PER_INPUT * size..];
-    assert_eq!(client.input(rest), Ok(size + 1));
+    assert_eq!(client.input(rest), Ok(Taken(size + 1)));
     assert_eq!(client.read(), b"!");
     client.consume(1);
-    assert_eq!(client.input(&rest[size + 1..]), Ok(8 * size));
+    assert_eq!(client.input(&rest[size + 1..]), Ok(Taken(8 * size)));
     server.send(APPLICATION, b"first");
     server.send(APPLICATION, b"second");
     let bytes = server.take();
     let first = 5 + 5 + 1 + 16;
-    assert_eq!(client.input(&bytes), Ok(first));
+    assert_eq!(client.input(&bytes), Ok(Taken(first)));
     assert_eq!(client.read(), b"first");
-    assert_eq!(client.input(&bytes[first..]), Ok(0));
+    // The next record waits until this one is read, and input says so.
+    assert_eq!(client.input(&bytes[first..]), Err(Error::Unconsumed));
     client.consume(2);
     assert_eq!(client.read(), b"rst");
     client.consume(10);
-    assert_eq!(client.input(&bytes[first..]), Ok(bytes.len() - first));
+    assert_eq!(
+        client.input(&bytes[first..]),
+        Ok(Taken(bytes.len() - first))
+    );
     assert_eq!(client.read(), b"second");
 }
 
@@ -2282,22 +2285,22 @@ fn write_backpressure() {
     let (mut client, mut server) = connected(&store);
     let mut data = Vec::new();
     data.resize(1 << 20, 7);
-    let mut total = client.write(&data).unwrap();
+    let mut total = client.write(&data).unwrap().count();
     assert_eq!(total, RECORD_MAX);
     assert_eq!(client.pending().len(), PENDING_MAX);
     assert!(client.pending().len() <= PENDING_MAX);
-    assert_eq!(client.write(&data), Ok(0));
+    assert_eq!(client.write(&data), Ok(Taken(0)));
     server.receive(&client.pending()[..1000]);
-    client.sent(1000);
-    assert_eq!(client.write(&data), Ok(0));
+    client.sent(1000).unwrap();
+    assert_eq!(client.write(&data), Ok(Taken(0)));
     while total < data.len() {
         server.receive(client.pending());
-        client.sent(client.pending().len());
-        total += client.write(&data[total..]).unwrap();
+        client.sent(client.pending().len()).unwrap();
+        total += client.write(&data[total..]).unwrap().count();
     }
     server.receive(client.pending());
     assert_eq!(server.received, data);
-    assert_eq!(client.write(&[]), Ok(0));
+    assert_eq!(client.write(&[]), Ok(Taken(0)));
     // Before the handshake nothing is written, and close_notify goes in
     // the clear.
     let mut fresh = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
@@ -2316,7 +2319,7 @@ fn failure_sticks() {
     let mut bytes = server.take();
     let first = bytes.len();
     bytes.extend_from_slice(&[99, 3, 3, 0, 0]);
-    assert_eq!(client.input(&bytes), Ok(first));
+    assert_eq!(client.input(&bytes), Ok(Taken(first)));
     client.consume(6);
     assert_eq!(client.input(&bytes[first..]), Err(Error::Unexpected));
     assert_eq!(client.input(&bytes), Err(Error::Unexpected));
@@ -2335,8 +2338,8 @@ fn write_record(b: &mut Bencher) {
     let mut data = Vec::new();
     data.resize(RECORD_MAX, 0x61);
     b.iter(|| {
-        assert_eq!(client.write(&data), Ok(RECORD_MAX));
-        client.sent(client.pending().len());
+        assert_eq!(client.write(&data), Ok(Taken(RECORD_MAX)));
+        client.sent(client.pending().len()).unwrap();
     });
 }
 
@@ -2352,7 +2355,7 @@ fn input_record(b: &mut Bencher) {
     let seq = client.input_keys.as_ref().unwrap().seq;
     b.iter(|| {
         client.input_keys.as_mut().unwrap().seq = seq;
-        assert_eq!(client.input(&record), Ok(record.len()));
+        assert_eq!(client.input(&record), Ok(Taken(record.len())));
         assert_eq!(client.read().len(), RECORD_MAX);
         client.consume(RECORD_MAX);
     });
@@ -2370,7 +2373,7 @@ fn handshake(b: &mut Bencher) {
     let flight = server.take();
     b.iter(|| {
         let mut fresh = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
-        assert_eq!(fresh.input(&flight), Ok(flight.len()));
+        assert_eq!(fresh.input(&flight), Ok(Taken(flight.len())));
         assert!(fresh.connected());
     });
 }
@@ -2388,7 +2391,7 @@ fn handshake_aes256(b: &mut Bencher) {
     let flight = server.take();
     b.iter(|| {
         let mut fresh = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
-        assert_eq!(fresh.input(&flight), Ok(flight.len()));
+        assert_eq!(fresh.input(&flight), Ok(Taken(flight.len())));
         assert!(fresh.connected());
     });
 }
@@ -2424,7 +2427,7 @@ fn memory() {
     let after = held(&client);
     server.update(true);
     server.send(APPLICATION, b"data");
-    assert_eq!(client.write(b"ping"), Ok(4));
+    assert_eq!(client.write(b"ping"), Ok(Taken(4)));
     assert_eq!(
         exchange(&mut client, &mut server, &mut split),
         Ok(Vec::from(*b"data"))
@@ -2449,17 +2452,17 @@ fn key_update_pending() {
     server.read.as_mut().unwrap().seq = KEY_RECORDS_MAX;
     let mut written = 0;
     for _ in 0..6 {
-        written += client.write(&data).unwrap();
+        written += client.write(&data).unwrap().count();
         server.update(true);
         feed(&mut client, &server.take(), &mut whole(), &mut Vec::new()).unwrap();
         assert!(client.tx.len() <= super::TX_MAX);
         // All but the last byte goes out: pending never drains.
         let ready = client.pending().len() - 1;
         server.receive(&client.pending()[..ready]);
-        client.sent(ready);
+        client.sent(ready).unwrap();
     }
     server.receive(client.pending());
-    client.sent(1);
+    client.sent(1).unwrap();
     assert_eq!(server.received.len(), written);
     // The client's own KeyUpdate, and one answer: the requests after it
     // came while its last byte was still pending.
@@ -2483,16 +2486,19 @@ struct Verdict {
 
 /// How the caller decides on a chain.
 enum Judge<'s> {
+    /// A system that approves any chain for the host, or none.
     Always(bool),
     /// x509 against the store, for the host.
     X509(&'s Store, &'static str),
 }
 
 impl Judge<'_> {
-    fn trusts(&self, chain: &[&[u8]]) -> bool {
+    /// The approval of chain for host, or none.
+    fn approval(&self, chain: &[&[u8]], host: &str) -> Option<Approval> {
         match self {
-            Judge::Always(verdict) => *verdict,
-            Judge::X509(store, host) => x509::verify(chain, store, host, TEST_NOW).is_ok(),
+            Judge::Always(true) => Some(Approval::system(chain[0], host)),
+            Judge::Always(false) => None,
+            Judge::X509(store, name) => x509::verify(chain, store, name, TEST_NOW).ok(),
         }
     }
 }
@@ -2504,7 +2510,7 @@ fn caller(script: Script, host: &str, piece: usize, judge: &Judge<'_>) -> Verdic
     let mut server = Server::new(script);
     let mut client = Client::new(host, &[], Verify::Caller, TEST_NOW, &RANDOM).unwrap();
     server.receive(client.pending());
-    client.sent(client.pending().len());
+    client.sent(client.pending().len()).unwrap();
     let mut bytes = server.take();
     let mut verdict = Verdict {
         error: None,
@@ -2518,24 +2524,31 @@ fn caller(script: Script, host: &str, piece: usize, judge: &Judge<'_>) -> Verdic
     while verdict.error.is_none() && (at < bytes.len() || !client.read().is_empty()) {
         let end = (at + piece).min(bytes.len());
         match client.input(&bytes[at..end]) {
-            Ok(taken) => at += taken,
+            Ok(taken) => at += taken.count(),
             Err(error) => verdict.error = Some(error),
         }
         if client.awaiting() {
             assert!(client.chain(&mut []).is_none());
-            let trusted = {
+            let approval = {
                 let mut slots = [&[][..]; x509::CHAIN_MAX];
                 let count = client.chain(&mut slots).unwrap();
                 assert_eq!(slots[..count], server.script.identity.chain[..]);
-                judge.trusts(&slots[..count])
+                judge.approval(&slots[..count], host)
             };
             if verdict.waits == 0 {
                 verdict.left = end - at;
             }
             verdict.waits += 1;
-            // Nothing more is taken until the verdict.
-            assert_eq!(client.input(&bytes[at..]), Ok(0));
-            client.verified(trusted);
+            // Nothing more is taken until the verdict, and loudly.
+            assert_eq!(client.input(&bytes[at..]), Err(Error::Awaiting));
+            match approval {
+                Some(approval) => {
+                    if let Err(error) = client.verified(approval) {
+                        verdict.error = Some(error);
+                    }
+                }
+                None => client.refused(),
+            }
             // A refusal ends the wait: a loop that asks awaiting before
             // input sees it fail, not wait again.
             assert!(!client.awaiting());
@@ -2549,7 +2562,7 @@ fn caller(script: Script, host: &str, piece: usize, judge: &Judge<'_>) -> Verdic
         verdict.got.extend_from_slice(client.read());
         client.consume(count);
         server.receive(client.pending());
-        client.sent(client.pending().len());
+        client.sent(client.pending().len()).unwrap();
         if at == bytes.len() && server.finished && verdict.got.is_empty() {
             server.send(APPLICATION, b"after");
             bytes.append(&mut server.output);
@@ -2557,7 +2570,7 @@ fn caller(script: Script, host: &str, piece: usize, judge: &Judge<'_>) -> Verdic
     }
     verdict.connected = client.connected();
     if verdict.connected {
-        assert_eq!(client.write(b"back"), Ok(4));
+        assert_eq!(client.write(b"back"), Ok(Taken(4)));
         server.receive(client.pending());
         assert_eq!(server.received, b"back");
     }
@@ -2608,16 +2621,18 @@ fn close_while_awaiting() {
     let mut server = Server::new(Script::new(Kind::P256));
     let mut client = Client::new(HOST, &[], Verify::Caller, TEST_NOW, &RANDOM).unwrap();
     server.receive(client.pending());
-    client.sent(client.pending().len());
+    client.sent(client.pending().len()).unwrap();
     let bytes = server.take();
     let mut at = 0;
     while !client.awaiting() {
-        at += client.input(&bytes[at..]).unwrap();
+        at += client.input(&bytes[at..]).unwrap().count();
     }
     client.close();
     let closing = client.pending().len();
     assert!(closing > 0);
-    client.verified(true);
+    let leaf = &server.script.identity.chain[0];
+    let late = client.verified(Approval::system(leaf, HOST));
+    assert_eq!(late, Err(Error::NotAwaiting));
     assert!(client.input(&bytes[at..]).is_ok());
     assert_eq!(client.pending().len(), closing);
 }
@@ -2663,7 +2678,7 @@ fn caller_with_x509() {
 /// A connected client with "queued" written and not sent, and its server.
 fn queued(store: &Store) -> (Client<'_>, Server) {
     let (mut client, server) = connected(store);
-    assert_eq!(client.write(b"queued"), Ok(6));
+    assert_eq!(client.write(b"queued"), Ok(Taken(6)));
     (client, server)
 }
 
@@ -2699,9 +2714,9 @@ fn failure_drops_pending() {
 fn failure_finishes_a_begun_record() {
     let store = Identity::new(Kind::P256).store();
     let (mut client, mut server) = queued(&store);
-    assert_eq!(client.write(b"dropped"), Ok(7));
+    assert_eq!(client.write(b"dropped"), Ok(Taken(7)));
     server.receive(&client.pending()[..10]);
-    client.sent(10);
+    client.sent(10).unwrap();
     server.output.extend_from_slice(&[99, 3, 3, 0, 0]);
     assert_eq!(client.input(&server.take()), Err(Error::Unexpected));
     server.receive(client.pending());
@@ -2711,7 +2726,7 @@ fn failure_finishes_a_begun_record() {
     let (mut closing, mut its_server) = connected(&store);
     closing.close();
     its_server.receive(&closing.pending()[..3]);
-    closing.sent(3);
+    closing.sent(3).unwrap();
     its_server.output.extend_from_slice(&[99, 3, 3, 0, 0]);
     assert_eq!(closing.input(&its_server.take()), Err(Error::Unexpected));
     its_server.receive(closing.pending());
@@ -2737,11 +2752,11 @@ fn failure_takes_the_keys_back() {
     let mut fresh = Server::new(Script::new(Kind::P256));
     let mut early = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
     fresh.receive(early.pending());
-    early.sent(early.pending().len());
+    early.sent(early.pending().len()).unwrap();
     let flight = fresh.take();
-    assert_eq!(early.input(&flight), Ok(flight.len()));
+    assert_eq!(early.input(&flight), Ok(Taken(flight.len())));
     assert!(early.connected());
-    assert_eq!(early.write(b"early"), Ok(5));
+    assert_eq!(early.write(b"early"), Ok(Taken(5)));
     assert_eq!(early.input(&[99, 3, 3, 0, 0]), Err(Error::Unexpected));
     fresh.receive(early.pending());
     assert!(!fresh.finished && fresh.received.is_empty());
@@ -2757,12 +2772,15 @@ fn close_during_handshake() {
     let mut server = Server::new(Script::new(Kind::P256));
     let mut client = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
     server.receive(client.pending());
-    client.sent(client.pending().len());
+    client.sent(client.pending().len()).unwrap();
     let flight = server.take();
     let hello = 5 + usize::from(u16::from_be_bytes([flight[3], flight[4]]));
-    assert_eq!(client.input(&flight[..hello]), Ok(hello));
+    assert_eq!(client.input(&flight[..hello]), Ok(Taken(hello)));
     client.close();
-    assert_eq!(client.input(&flight[hello..]), Ok(flight.len() - hello));
+    assert_eq!(
+        client.input(&flight[hello..]),
+        Ok(Taken(flight.len() - hello))
+    );
     assert!(!client.connected() && !client.awaiting() && !client.closed());
     assert_eq!(client.write(b"x"), Err(Error::Closed));
     server.receive(client.pending());
@@ -2780,4 +2798,287 @@ fn caller_needs_a_signing_key() {
     let verdict = caller(script, HOST, WHOLE, &Judge::Always(true));
     assert_eq!(verdict.error, Some(Error::Certificate));
     assert!(!verdict.connected);
+}
+
+/// A socket to a test server, as a program sees one: reads and writes
+/// of at most piece bytes, and a read of nothing once the server has no
+/// more to say. Once the whole request is in, the server answers with
+/// the response, then close_notify unless it hangs up without.
+struct Socket {
+    server: Server,
+    inbound: Vec<u8>,
+    at: usize,
+    piece: usize,
+    request: usize,
+    response: Vec<u8>,
+    closes: bool,
+    answered: bool,
+}
+
+impl Socket {
+    fn new(script: Script, piece: usize, request: usize, closes: bool) -> Socket {
+        let mut response = Vec::new();
+        for at in 0..20_000 {
+            response.push(u8::try_from(at % 251).unwrap());
+        }
+        Socket {
+            server: Server::new(script),
+            inbound: Vec::new(),
+            at: 0,
+            piece,
+            request,
+            response,
+            closes,
+            answered: false,
+        }
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> usize {
+        let count = bytes.len().min(self.piece);
+        self.server.receive(&bytes[..count]);
+        count
+    }
+
+    fn read(&mut self, buffer: &mut [u8]) -> usize {
+        if self.at == self.inbound.len() {
+            if !self.answered && self.server.received.len() == self.request {
+                for record in self.response.chunks(RECORD_MAX) {
+                    self.server.send(APPLICATION, record);
+                }
+                if self.closes {
+                    self.server.send(ALERT, &[1, 0]);
+                }
+                self.answered = true;
+            }
+            self.inbound = self.server.take();
+            self.at = 0;
+        }
+        let count = (self.inbound.len() - self.at)
+            .min(self.piece)
+            .min(buffer.len());
+        buffer[..count].copy_from_slice(&self.inbound[self.at..self.at + count]);
+        self.at += count;
+        count
+    }
+}
+
+/// The module's loop, as a program writes it: send what is pending, ask
+/// the verifier when the client awaits (x509 against store, standing for
+/// the system's), write the request, read until the socket ends. Every
+/// count is used and every error goes up, the alert sent first; what it
+/// read is in got.
+fn program(
+    client: &mut Client<'_>,
+    socket: &mut Socket,
+    request: &[u8],
+    store: &Store,
+    got: &mut Vec<u8>,
+) -> Result<(), Error> {
+    let result = converse(client, socket, request, store, got);
+    if result.is_err() {
+        while !client.pending().is_empty() {
+            let count = socket.write(client.pending());
+            client.sent(count)?;
+        }
+    }
+    result
+}
+
+/// program's loop, until it ends or fails.
+fn converse(
+    client: &mut Client<'_>,
+    socket: &mut Socket,
+    mut request: &[u8],
+    store: &Store,
+    got: &mut Vec<u8>,
+) -> Result<(), Error> {
+    let mut buffer = [0; 1024];
+    let (mut at, mut end) = (0, 0);
+    for _ in 0..200_000 {
+        while !client.pending().is_empty() {
+            let count = socket.write(client.pending());
+            client.sent(count)?;
+        }
+        if client.awaiting() {
+            let mut chain = [&[][..]; x509::CHAIN_MAX];
+            let count = client.chain(&mut chain).unwrap_or(0);
+            let verdict = x509::verify(&chain[..count], store, HOST, TEST_NOW);
+            match verdict {
+                Ok(approval) => client.verified(approval)?,
+                Err(_) => client.refused(),
+            }
+            continue;
+        }
+        if client.connected() && !request.is_empty() {
+            let taken = client.write(request)?.count();
+            request = &request[taken..];
+            continue;
+        }
+        if at == end {
+            (at, end) = (0, socket.read(&mut buffer));
+            if end == 0 {
+                return client.eof();
+            }
+        }
+        at += client.input(&buffer[at..end])?.count();
+        got.extend_from_slice(client.read());
+        let count = client.read().len();
+        client.consume(count);
+    }
+    panic!("the program does not end");
+}
+
+/// The loop of the module's doc, over short reads and writes: the
+/// whole response once close_notify ends it, Truncated when the socket
+/// ends without, and the chain's refusal or the server's error as they
+/// are, with their alerts.
+#[test]
+fn a_program() {
+    let store = Identity::new(Kind::P256).store();
+    let mut request = Vec::new();
+    request.resize(40_000, b'q');
+    let mut got = Vec::new();
+    for piece in [1, 7, 100, 5000, WHOLE] {
+        for closes in [true, false] {
+            let mut socket = Socket::new(Script::new(Kind::P256), piece, request.len(), closes);
+            let mut client = Client::new(HOST, &[], Verify::Caller, TEST_NOW, &RANDOM).unwrap();
+            got.clear();
+            let result = program(&mut client, &mut socket, &request, &store, &mut got);
+            let ending = if closes { None } else { Some(Error::Truncated) };
+            assert_eq!(result.err(), ending, "{piece}");
+            assert_eq!(got, socket.response, "{piece}");
+            assert_eq!(socket.server.received, request, "{piece}");
+            // A failure sticks, and the end of the socket says it again.
+            assert_eq!(client.eof().err(), ending);
+        }
+    }
+    // A chain the verifier refuses: unknown_ca, and nothing read.
+    let other = Identity::new(Kind::RsaSha256).store();
+    let mut socket = Socket::new(Script::new(Kind::P256), 9, 4, true);
+    let mut client = Client::new(HOST, &[], Verify::Caller, TEST_NOW, &RANDOM).unwrap();
+    got.clear();
+    let refused = program(&mut client, &mut socket, b"ping", &other, &mut got);
+    assert_eq!(refused, Err(Error::Untrusted));
+    assert_eq!((got.len(), socket.server.alerts.as_slice()), (0, &[48][..]));
+    // A server whose signature does not verify: decrypt_error.
+    let mut forged = Script::new(Kind::P256);
+    forged.identity.signer = Identity::new(Kind::P384).signer;
+    let mut signed = Socket::new(forged, 9, 4, true);
+    let mut checking = Client::new(HOST, &[], Verify::Caller, TEST_NOW, &RANDOM).unwrap();
+    let wrong = program(&mut checking, &mut signed, b"ping", &store, &mut got);
+    assert_eq!(wrong, Err(Error::Signature));
+    assert_eq!(signed.server.alerts, [51]);
+}
+
+/// A client of Verify::Caller with the server's first flight in, at
+/// the Certificate: the server, its bytes and how many the client took.
+fn awaiting() -> (Client<'static>, Server, Vec<u8>, usize) {
+    let mut server = Server::new(Script::new(Kind::P256));
+    let mut client = Client::new(HOST, &[], Verify::Caller, TEST_NOW, &RANDOM).unwrap();
+    server.receive(client.pending());
+    client.sent(client.pending().len()).unwrap();
+    let bytes = server.take();
+    let mut at = 0;
+    while !client.awaiting() {
+        at += client.input(&bytes[at..]).unwrap().count();
+    }
+    (client, server, bytes, at)
+}
+
+/// The caller's mistakes are loud: a count of more than pending, input
+/// that would take nothing while a verdict is awaited or plaintext is
+/// unread, a verdict with nothing to judge; and an approval of another
+/// leaf or host ends the connection with internal_error.
+#[test]
+fn mistakes_are_loud() {
+    let store = Identity::new(Kind::P256).store();
+    let (mut client, mut server, bytes, at) = awaiting();
+    assert_eq!(client.sent(1), Err(Error::Sent));
+    // Forgetting the verdict: input refuses, each time, and waits on.
+    for _ in 0..2 {
+        assert_eq!(client.input(&bytes[at..]), Err(Error::Awaiting));
+        assert!(client.awaiting());
+    }
+    let (leaf, inter) = (
+        test_certificate("test.leaf").unwrap(),
+        test_certificate("test.inter").unwrap(),
+    );
+    let approval = x509::verify(&[&leaf, &inter], &store, HOST, TEST_NOW).unwrap();
+    assert_eq!(client.verified(approval), Ok(()));
+    assert_eq!(client.input(&bytes[at..]), Ok(Taken(bytes.len() - at)));
+    assert!(client.connected());
+    let again = x509::verify(&[&leaf, &inter], &store, HOST, TEST_NOW).unwrap();
+    assert_eq!(client.verified(again), Err(Error::NotAwaiting));
+    server.receive(client.pending());
+    client.sent(client.pending().len()).unwrap();
+    // Plaintext unread: the next record waits, and input says so.
+    server.send(APPLICATION, b"one");
+    server.send(APPLICATION, b"two");
+    let records = server.take();
+    let first = client.input(&records).unwrap().count();
+    assert_eq!(client.input(&records[first..]), Err(Error::Unconsumed));
+    assert_eq!(client.read(), b"one");
+    client.consume(3);
+    assert_eq!(
+        client.input(&records[first..]),
+        Ok(Taken(records.len() - first))
+    );
+    assert_eq!(client.read(), b"two");
+    client.consume(3);
+    // The socket ends with no close_notify: Truncated, and it sticks.
+    assert_eq!(client.eof(), Err(Error::Truncated));
+    assert_eq!(client.write(b"x"), Err(Error::Truncated));
+    // Approvals of the leaf for another host, and of another leaf.
+    let elsewhere = Approval::system(&leaf, "other.example.test");
+    let other = test_certificate("test.leaf384").unwrap();
+    for wrong in [elsewhere, Approval::system(&other, HOST)] {
+        let (mut misled, mut its_server, flight, taken) = awaiting();
+        assert_eq!(misled.verified(wrong), Err(Error::Approval));
+        assert!(!misled.awaiting() && !misled.connected());
+        assert_eq!(misled.input(&flight[taken..]), Err(Error::Approval));
+        its_server.receive(misled.pending());
+        assert_eq!(its_server.alerts, [80]);
+    }
+    // The same host, as written another way, is the same.
+    let (mut written, _, _, _) = awaiting();
+    let dotted = Approval::system(&leaf, "API.example.test.");
+    assert_eq!(written.verified(dotted), Ok(()));
+}
+
+/// Secrets are not left behind: the marks the caller's sending let go,
+/// and a failure's, hold none, and a KeyUpdate's old secret is gone.
+#[test]
+fn secrets_let_go() {
+    let store = Identity::new(Kind::P256).store();
+    let (mut client, mut server) = connected(&store);
+    client.output_keys.as_mut().unwrap().seq = KEY_RECORDS_MAX;
+    server.read.as_mut().unwrap().seq = KEY_RECORDS_MAX;
+    let mut data = Vec::new();
+    data.resize(100, 1);
+    assert_eq!(client.write(&data), Ok(Taken(100)));
+    // The client's own KeyUpdate before the record: one mark.
+    assert_eq!(client.marked, 1);
+    assert!(client.marks[0].secret.is_some());
+    let ready = client.pending().len();
+    server.receive(client.pending());
+    client.sent(ready - 1).unwrap();
+    assert_eq!(client.marked, 0);
+    assert!(client.marks.iter().all(|mark| mark.secret.is_none()));
+    client.sent(1).unwrap();
+    assert_eq!(server.received, data);
+    // A failure with marks queued lets them go.
+    let (mut failing, mut its_server) = connected(&store);
+    its_server.update(true);
+    feed(
+        &mut failing,
+        &its_server.take(),
+        &mut whole(),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(failing.marked, 1);
+    let result = failing.input(&[99, 3, 3, 0, 0]);
+    assert_eq!(result, Err(Error::Unexpected));
+    assert_eq!(failing.marked, 0);
+    assert!(failing.marks.iter().all(|mark| mark.secret.is_none()));
 }

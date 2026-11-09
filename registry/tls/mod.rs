@@ -21,43 +21,71 @@
 //! buffer of one record, where an application record is opened in place
 //! and read from; the next record is taken only once it is consumed.
 //! Records go out sealed in place in a pending buffer the caller drains.
+//! input and write say how many bytes they took (Taken, which must be
+//! used): the rest goes in again. sent of more than pending holds,
+//! input while plaintext waits unread or a verdict is awaited, and a
+//! verdict with none awaited are refused with errors of their own, so
+//! that a loop that forgets a step fails rather than spin; when the
+//! socket ends, eof says whether close_notify came first (RFC 9846 6.1).
+//! Secrets are wiped where they go: the key shares' once used, each
+//! traffic and handshake secret when it is replaced or dropped (the AES
+//! key schedules and ML-KEM's key are aesgcm's and mlkem's to wipe).
 //!
 //! The server's chain is verified by x509 against a store, or by the
 //! caller (Verify::Caller), such as the operating system's verifier,
 //! which may fetch certificates over the network and so runs off the
 //! loop. The handshake then waits at the server's Certificate: input
-//! takes nothing, chain lends the certificates, and verified resumes.
-//! The caller's verifier matches the host; the client checks
-//! CertificateVerify with the leaf's key. A blocking loop:
+//! refuses with Awaiting, chain lends the certificates, and verified
+//! resumes with the verifier's x509::Approval, which only x509::verify
+//! and trust's check make, for that leaf and host: the client compares
+//! it with its own leaf and host, and fails on another's (internal_error).
+//! refused ends the handshake (unknown_ca). The client checks
+//! CertificateVerify with the approved leaf's key. A blocking loop, as
+//! tests.rs's program runs it:
 //!
 //! ```text
 //! let mut tls = Client::new(host, &[b"http/1.1"], Verify::Caller, now, &random)?;
+//! let (mut at, mut end) = (0, 0);
 //! loop {
-//!     while !tls.pending().is_empty() { let n = socket.write(tls.pending())?; tls.sent(n); }
+//!     while !tls.pending().is_empty() {
+//!         let n = socket.write(tls.pending())?;
+//!         tls.sent(n)?;
+//!     }
 //!     if tls.awaiting() {
 //!         let mut chain = [&[][..]; x509::CHAIN_MAX];
 //!         let n = tls.chain(&mut chain).unwrap_or(0);
-//!         let trusted = system_verify(&chain[..n], host);   // may block
-//!         tls.verified(trusted);
+//!         match trust.verify_blocking(&chain[..n], host, now) {
+//!             Ok(approval) => tls.verified(approval)?,
+//!             Err(_) => tls.refused(),       // input then says Untrusted
+//!         }
 //!         continue;
 //!     }
-//!     if tls.connected() && !request.is_empty() { request = &request[tls.write(request)?..]; continue; }
-//!     let n = socket.read(&mut buf)?;
-//!     let mut at = 0;
-//!     while (at < n || !tls.read().is_empty()) && !tls.awaiting() {
-//!         at += tls.input(&buf[at..n])?;
-//!         use_data(tls.read());
-//!         tls.consume(tls.read().len());
+//!     if tls.connected() && !request.is_empty() {
+//!         let taken = tls.write(request)?.count();
+//!         request = &request[taken..];
+//!         continue;
 //!     }
-//!     keep buf[at..n] for after the verdict
+//!     if at == end {
+//!         (at, end) = (0, socket.read(&mut buf)?);
+//!         if end == 0 {
+//!             tls.eof()?;                    // Truncated without close_notify
+//!             break;
+//!         }
+//!     }
+//!     at += tls.input(&buf[at..end])?.count();
+//!     use_data(tls.read());
+//!     tls.consume(tls.read().len());
 //! }
 //! ```
 //!
-//! A poll loop: watch the socket for writing while pending holds bytes.
-//! When the client awaits, copy the chain to the verifier's thread and
-//! stop reading the socket (input would take nothing); keep unread
-//! bytes. When the thread's answer comes, call verified, then go on with
-//! the kept bytes and the socket as before.
+//! On an error, send what pending still holds (the alert) before the
+//! socket closes. A poll loop: watch the socket for writing while
+//! pending holds bytes. When the client awaits, start trust's check on
+//! the chain (Trust::check, which never blocks) and stop reading the
+//! socket; keep unread bytes. When the check's poll answers, call
+//! verified with its approval or refused, then go on with the kept
+//! bytes and the socket as before. Never call verify_blocking on the
+//! loop's thread.
 
 use crate::base::aesgcm::{self, AesGcm};
 use crate::base::ecdh;
@@ -205,10 +233,12 @@ const DOWNGRADE_TLS11: [u8; 8] = *b"DOWNGRD\x00";
 const VERIFY_CONTEXT: &[u8; 34] = b"TLS 1.3, server CertificateVerify\0";
 
 /// Why the connection failed, or a call was refused. A failure sticks:
-/// each later input and write returns it, and pending holds only the
-/// rest of a record the caller began to send and the alert that tells
-/// the server, when there is one: records queued but not begun are
-/// dropped.
+/// each later input, write and eof returns it, and pending holds only
+/// the rest of a record the caller began to send and the alert that
+/// tells the server, when there is one: records queued but not begun
+/// are dropped. The caller's mistakes (NotConnected, Closed, Awaiting,
+/// Unconsumed, Sent, NotAwaiting) are refused calls instead: the
+/// connection goes on, and the call did nothing.
 #[derive(Clone, Copy)]
 #[cfg_attr(any(test, fuzzing), derive(Debug, PartialEq))]
 pub enum Error {
@@ -261,10 +291,25 @@ pub enum Error {
     /// The server sent this alert. close_notify (0) during the handshake
     /// is one too.
     Alert(u8),
+    /// The caller's approval is of another leaf or host than this
+    /// connection's (internal_error: the server is not at fault).
+    Approval,
+    /// The transport ended before the server's close_notify (eof): what
+    /// came may have been cut short (RFC 9846 6.1).
+    Truncated,
     /// write before the handshake is complete.
     NotConnected,
     /// write after close.
     Closed,
+    /// input while the handshake awaits the caller's verdict: call
+    /// verified or refused first.
+    Awaiting,
+    /// input while read holds plaintext: consume it first.
+    Unconsumed,
+    /// sent counted more bytes than pending holds.
+    Sent,
+    /// verified while no verdict is awaited.
+    NotAwaiting,
 }
 
 impl Error {
@@ -284,11 +329,18 @@ impl Error {
             Error::Decode | Error::TooLarge => Some(50),
             Error::Signature | Error::Finished => Some(51),
             Error::Version => Some(70),
-            Error::Internal => Some(80),
+            Error::Internal | Error::Approval => Some(80),
             Error::Extension => Some(110),
-            Error::Host | Error::Alpn | Error::Alert(_) | Error::NotConnected | Error::Closed => {
-                None
-            }
+            Error::Host
+            | Error::Alpn
+            | Error::Alert(_)
+            | Error::Truncated
+            | Error::NotConnected
+            | Error::Closed
+            | Error::Awaiting
+            | Error::Unconsumed
+            | Error::Sent
+            | Error::NotAwaiting => None,
         }
     }
 }
@@ -309,6 +361,7 @@ impl From<x509::Error> for Error {
             x509::Error::Host => Error::Name,
             x509::Error::Untrusted | x509::Error::Distrusted => Error::Untrusted,
             x509::Error::Revoked => Error::Revoked,
+            x509::Error::Approval => Error::Approval,
             x509::Error::Malformed
             | x509::Error::Unsupported
             | x509::Error::Critical
@@ -318,8 +371,23 @@ impl From<x509::Error> for Error {
             | x509::Error::PathLength
             | x509::Error::Constrained
             | x509::Error::Signature
-            | x509::Error::TooMany => Error::Certificate,
+            | x509::Error::TooMany
+            | x509::Error::Order => Error::Certificate,
         }
+    }
+}
+
+/// How many bytes input or write took: what is past them was not taken
+/// and goes in again. A count left unread is a warning, as dropping it
+/// would lose data.
+#[must_use = "the bytes past the count were not taken: pass them again"]
+#[cfg_attr(test, derive(Debug, PartialEq))]
+pub struct Taken(usize);
+
+impl Taken {
+    /// The bytes taken, from the front.
+    pub fn count(self) -> usize {
+        self.0
     }
 }
 
@@ -358,8 +426,9 @@ enum State {
 
 /// A secret or a transcript hash, of the suite's hash: SHA-256 for
 /// TLS_AES_128_GCM_SHA256, SHA-384 for TLS_AES_256_GCM_SHA384. A secret
-/// keeps its hash through the key schedule.
-#[derive(Clone, Copy)]
+/// keeps its hash through the key schedule. It is not Copy, so that a
+/// secret moves rather than leaves copies, and each is wiped when it
+/// goes.
 enum Digest {
     Sha256([u8; sha256::DIGEST_BYTES]),
     Sha384([u8; sha384::DIGEST_BYTES]),
@@ -405,6 +474,12 @@ impl Digest {
     }
 }
 
+impl Drop for Digest {
+    fn drop(&mut self) {
+        wipe(self.bytes_mut());
+    }
+}
+
 /// One direction's record protection: the traffic secret, for
 /// KeyUpdate, its key and IV, and the next record's sequence number.
 /// The secret's hash names the suite: AES-128-GCM after SHA-256's,
@@ -417,23 +492,28 @@ struct Keys {
 }
 
 impl Keys {
-    fn new(secret: &Digest) -> Keys {
+    /// The keys of secret, which they keep.
+    fn new(secret: Digest) -> Keys {
         let mut iv = [0; aesgcm::NONCE_LEN];
-        expand(secret, b"iv", &[], &mut iv);
+        expand(&secret, b"iv", &[], &mut iv);
         let aead = match secret {
             Digest::Sha256(_) => {
                 let mut key = [0; aesgcm::KEY_LEN];
-                expand(secret, b"key", &[], &mut key);
-                AesGcm::new(&key)
+                expand(&secret, b"key", &[], &mut key);
+                let aead = AesGcm::new(&key);
+                wipe(&mut key);
+                aead
             }
             Digest::Sha384(_) => {
                 let mut key = [0; aesgcm::KEY256_LEN];
-                expand(secret, b"key", &[], &mut key);
-                AesGcm::new256(&key)
+                expand(&secret, b"key", &[], &mut key);
+                let aead = AesGcm::new256(&key);
+                wipe(&mut key);
+                aead
             }
         };
         Keys {
-            secret: *secret,
+            secret,
             aead,
             iv,
             seq: 0,
@@ -442,7 +522,7 @@ impl Keys {
 
     /// The keys after a KeyUpdate (RFC 9846 7.2).
     fn next(&self) -> Keys {
-        Keys::new(&derive(&self.secret, b"traffic upd", &[]))
+        Keys::new(derive(&self.secret, b"traffic upd", &[]))
     }
 
     /// The next record's nonce: the sequence number XORed into the IV's
@@ -534,15 +614,20 @@ impl Transcript {
 /// Where the output keys changed in pending: the record at at is the
 /// first under the next keys, and the ones before end under secret
 /// (none: in the clear) at sequence number seq. A failure takes the
-/// keys back to the first record not yet begun, which it drops.
-// rr: escape(copy): a mark is copied when it is made, and when the
-// caller's sending moves the ones after it forward: a few a connection.
-#[derive(Clone, Copy)]
+/// keys back to the first record not yet begun, which it drops. A slot
+/// let go is set to UNMARKED, which wipes its secret.
 struct Mark {
     at: usize,
     secret: Option<Digest>,
     seq: u64,
 }
+
+/// A slot of marks that holds no change.
+const UNMARKED: Mark = Mark {
+    at: 0,
+    secret: None,
+    seq: 0,
+};
 
 /// Fields of a handshake message, front to back.
 struct Reader<'a> {
@@ -584,14 +669,15 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Who verifies the server's certificate chain.
+/// Who verifies the server's chain.
 pub enum Verify<'a> {
     /// x509 against these anchors, for the host at the time given.
     Store(&'a x509::Store),
-    /// The caller, such as the operating system's verifier on a thread:
-    /// the handshake waits at the server's Certificate until verified.
-    /// The caller matches the host too; the client only takes the leaf's
-    /// key, which checks CertificateVerify.
+    /// The caller, such as the operating system's verifier on a thread
+    /// (trust::Check): the handshake waits at the server's Certificate
+    /// until verified takes the x509::Approval of its leaf for the
+    /// client's host, or refused ends it. The client takes the leaf's key
+    /// from it, which checks CertificateVerify.
     Caller,
 }
 
@@ -634,6 +720,9 @@ pub struct Client<'a> {
     server_finished: Digest,
     /// The master secret, which the application keys come from.
     master: Digest,
+    /// The approval of the leaf, from x509 or the caller, until
+    /// CertificateVerify is checked with its key.
+    approval: Option<x509::Approval>,
     /// The leaf's DER, whose key checks CertificateVerify, the message
     /// after its own, once that message's buffer has moved on.
     // rr: escape(bound): x509 refuses a certificate over
@@ -714,6 +803,7 @@ impl<'a> Client<'a> {
         // rr: escape(move): once a connection, as it starts; boxed, so
         // that the client stays small after the handshake drops it.
         let kem = Box::new(mlkem::generate(&seed));
+        wipe(&mut seed);
         let mut client = Client {
             verify,
             now,
@@ -737,6 +827,7 @@ impl<'a> Client<'a> {
             transcript: Transcript::new(),
             server_finished: Digest::Sha256([0; sha256::DIGEST_BYTES]),
             master: Digest::Sha256([0; sha256::DIGEST_BYTES]),
+            approval: None,
             leaf: Vec::new(),
             requested: false,
             input_keys: None,
@@ -748,11 +839,7 @@ impl<'a> Client<'a> {
             tx: Vec::with_capacity(TX_MAX),
             tx_at: 0,
             reply_end: 0,
-            marks: [Mark {
-                at: 0,
-                secret: None,
-                seq: 0,
-            }; MARKS_MAX],
+            marks: [UNMARKED; MARKS_MAX],
             marked: 0,
             close_sent: false,
             failed: None,
@@ -766,17 +853,26 @@ impl<'a> Client<'a> {
 
     /// Takes bytes from the socket, in any split, and returns how many
     /// it took. It stops early when a record's plaintext waits to be
-    /// read, and after RECORDS_PER_INPUT records: what it did not take
-    /// goes in again, after read and consume, and after verified while
-    /// the client awaits a verdict. Bytes after the server's close_notify
-    /// are taken and ignored.
+    /// read, after RECORDS_PER_INPUT records, and at the server's
+    /// Certificate when the caller verifies it: what it did not take goes
+    /// in again, after read and consume, or after verified. While read
+    /// holds plaintext it refuses with Unconsumed, and while a verdict is
+    /// awaited with Awaiting: a loop that forgets either fails loudly
+    /// rather than spin. Bytes after the server's close_notify are taken
+    /// and ignored. When the socket ends, call eof.
     #[cfg_attr(rr, rr::hot)]
-    pub fn input(&mut self, bytes: &[u8]) -> Result<usize, Error> {
+    pub fn input(&mut self, bytes: &[u8]) -> Result<Taken, Error> {
         if let Some(error) = self.failed {
             return Err(error);
         }
+        if self.app_end != 0 {
+            return Err(Error::Unconsumed);
+        }
+        if matches!(self.state, State::Awaiting) {
+            return Err(Error::Awaiting);
+        }
         match self.take(bytes) {
-            Ok(taken) => Ok(taken),
+            Ok(taken) => Ok(Taken(taken)),
             Err(error) => {
                 // rr: escape(cold): a connection fails once.
                 self.fail(error);
@@ -790,9 +886,13 @@ impl<'a> Client<'a> {
         self.tx.get(self.tx_at..).unwrap_or_default()
     }
 
-    /// Marks n bytes of pending as written.
-    pub fn sent(&mut self, n: usize) {
-        self.tx_at = self.tx_at.saturating_add(n).min(self.tx.len());
+    /// Marks n bytes of pending as written; more than pending holds is
+    /// refused with Sent, and marks nothing.
+    pub fn sent(&mut self, n: usize) -> Result<(), Error> {
+        if n > self.pending().len() {
+            return Err(Error::Sent);
+        }
+        self.tx_at += n;
         // A key change whose first record has begun is past taking back.
         let begun = self
             .marks
@@ -800,16 +900,22 @@ impl<'a> Client<'a> {
             .take(self.marked)
             .take_while(|mark| mark.at <= self.tx_at)
             .count();
-        self.marks.copy_within(begun..self.marked, 0);
+        let live = self.marks.get_mut(..self.marked).unwrap_or_default();
+        live.rotate_left(begun);
+        for slot in live.iter_mut().skip(self.marked - begun) {
+            *slot = UNMARKED;
+        }
         self.marked -= begun;
         self.drained();
+        Ok(())
     }
 
     /// Seals application data into records of up to RECORD_MAX bytes and
     /// returns how much it took: less than all when pending would pass
-    /// PENDING_MAX, and none until pending is sent.
+    /// PENDING_MAX, and none until pending is sent. The rest goes in
+    /// again once pending is sent.
     #[cfg_attr(rr, rr::hot)]
-    pub fn write(&mut self, data: &[u8]) -> Result<usize, Error> {
+    pub fn write(&mut self, data: &[u8]) -> Result<Taken, Error> {
         if let Some(error) = self.failed {
             return Err(error);
         }
@@ -820,7 +926,7 @@ impl<'a> Client<'a> {
             return Err(Error::NotConnected);
         }
         match self.encrypt(data) {
-            Ok(taken) => Ok(taken),
+            Ok(taken) => Ok(Taken(taken)),
             Err(error) => {
                 // rr: escape(cold): a connection fails once.
                 self.fail(error);
@@ -860,6 +966,22 @@ impl<'a> Client<'a> {
         matches!(self.state, State::Closed)
     }
 
+    /// The socket ended (a read of nothing): fine once the server's
+    /// close_notify came, or after close ended the handshake. Otherwise
+    /// what came may have been cut short (RFC 9846 6.1): the connection
+    /// fails with Truncated, and what was read must not be taken as
+    /// whole.
+    pub fn eof(&mut self) -> Result<(), Error> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
+        if matches!(self.state, State::Closed | State::Abandoned) {
+            return Ok(());
+        }
+        self.fail(Error::Truncated);
+        Err(Error::Truncated)
+    }
+
     /// Queues close_notify; nothing is written after it. Before the
     /// handshake is complete it ends the handshake: the client's Finished
     /// is never sent, so the client never connects, and input takes and
@@ -873,6 +995,7 @@ impl<'a> Client<'a> {
             self.state = State::Abandoned;
             self.hs = Vec::new();
             self.leaf = Vec::new();
+            self.approval = None;
         }
         if let Err(error) = self.records(ALERT, &[1, 0], 3) {
             self.fail(error);
@@ -885,9 +1008,9 @@ impl<'a> Client<'a> {
         self.offer.get(at..at + length)
     }
 
-    /// Whether the handshake waits for verified: Verify::Caller, and the
-    /// server's Certificate is in. Not once the connection failed, as
-    /// verified(false) fails it: input then says why.
+    /// Whether the handshake waits for verified or refused:
+    /// Verify::Caller, and the server's Certificate is in. Not once the
+    /// connection failed, as refused fails it: input then says why.
     pub fn awaiting(&self) -> bool {
         matches!(self.state, State::Awaiting) && self.failed.is_none()
     }
@@ -905,24 +1028,46 @@ impl<'a> Client<'a> {
         certificates(self.hs.get(4..4 + length)?, out).ok()
     }
 
-    /// The caller's verdict on chain. False fails the connection with
-    /// Untrusted, whose alert is unknown_ca: the chain did not lead to an
-    /// anchor the caller trusts (RFC 9846 6.2). True goes on with the
-    /// messages already in, CertificateVerify first, which the client
-    /// checks with the leaf's key. A call while nothing is awaited does
-    /// nothing.
-    pub fn verified(&mut self, trusted: bool) {
+    /// The caller's yes to chain: approval, which x509::verify or
+    /// trust's check gave for chain's leaf and the client's host. The
+    /// handshake goes on with the messages already in, CertificateVerify
+    /// first, which the client checks with the leaf's key; their error,
+    /// if any, is returned and sticks. An approval of another leaf or
+    /// host fails the connection with Approval, whose alert is
+    /// internal_error. NotAwaiting while nothing is awaited.
+    pub fn verified(&mut self, approval: x509::Approval) -> Result<(), Error> {
+        if let Some(error) = self.failed {
+            return Err(error);
+        }
         if !self.awaiting() {
-            return;
+            return Err(Error::NotAwaiting);
         }
-        if !trusted {
-            self.fail(Error::Untrusted);
-            return;
+        let mut slots = [&[][..]; x509::CHAIN_MAX];
+        let matches = self.chain(&mut slots).is_some()
+            && slots
+                .first()
+                .is_some_and(|leaf| approval.approves(leaf, &self.host));
+        if !matches {
+            self.fail(Error::Approval);
+            return Err(Error::Approval);
         }
+        self.approval = Some(approval);
         self.state = State::Trusted;
         let buffer = core::mem::take(&mut self.hs);
         if let Err(error) = self.proceed(buffer) {
             self.fail(error);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// The caller's no: its verifier refused the chain, or failed to
+    /// answer. The connection fails with Untrusted, whose alert is
+    /// unknown_ca: the chain did not lead to an anchor the caller trusts
+    /// (RFC 9846 6.2). Once the connection failed it does nothing.
+    pub fn refused(&mut self) {
+        if self.failed.is_none() {
+            self.fail(Error::Untrusted);
         }
     }
 
@@ -932,6 +1077,7 @@ impl<'a> Client<'a> {
     /// unless close_notify began before it. Everything else stops.
     fn fail(&mut self, error: Error) {
         self.failed = Some(error);
+        self.approval = None;
         self.app_at = 0;
         self.app_end = 0;
         self.rx.clear();
@@ -973,16 +1119,21 @@ impl<'a> Client<'a> {
         if kept >= self.tx.len() {
             return;
         }
-        let mut secret = self.output_keys.as_ref().map(|keys| keys.secret);
-        let mut seq = self.output_keys.as_ref().map_or(0, |keys| keys.seq);
-        let mut end = self.tx.len();
-        let mut changed = false;
-        for mark in self.marks.iter().take(self.marked).rev() {
-            if mark.at <= kept {
-                break;
-            }
-            (secret, seq, end, changed) = (mark.secret, mark.seq, mark.at, true);
-        }
+        // The first change after kept: the keys before it sealed the
+        // first record dropped.
+        let first = self
+            .marks
+            .iter()
+            .take(self.marked)
+            .position(|mark| mark.at > kept);
+        let (sealed, mut seq, end) = match first.and_then(|index| self.marks.get(index)) {
+            Some(mark) => (mark.secret.is_some(), mark.seq, mark.at),
+            None => (
+                self.output_keys.is_some(),
+                self.output_keys.as_ref().map_or(0, |keys| keys.seq),
+                self.tx.len(),
+            ),
+        };
         // The sealed records dropped under those keys: each took a number.
         let mut at = kept;
         while at < end {
@@ -991,19 +1142,19 @@ impl<'a> Client<'a> {
             else {
                 break;
             };
-            if kind == APPLICATION && secret.is_some() {
+            if kind == APPLICATION && sealed {
                 seq = seq.saturating_sub(1);
             }
             at += HEADER + usize::from(u16::from_be_bytes([high, low]));
         }
-        if changed {
-            self.output_keys = secret.map(|secret| Keys::new(&secret));
+        if let Some(mark) = first.and_then(|index| self.marks.get_mut(index)) {
+            self.output_keys = mark.secret.take().map(Keys::new);
         }
         if let Some(keys) = &mut self.output_keys {
             keys.seq = seq;
         }
         self.tx.truncate(kept);
-        self.marked = 0;
+        self.unmark();
         self.reply_end = self.reply_end.min(kept);
     }
 
@@ -1011,17 +1162,28 @@ impl<'a> Client<'a> {
     /// in tx, are kept while what they sealed is not yet sent.
     fn rekey(&mut self, keys: Keys) -> Result<(), Error> {
         let at = self.tx.len();
-        if at > self.tx_at {
-            let slot = self.marks.get_mut(self.marked).ok_or(Error::Internal)?;
-            *slot = Mark {
-                at,
-                secret: self.output_keys.as_ref().map(|old| old.secret),
-                seq: self.output_keys.as_ref().map_or(0, |old| old.seq),
+        let marking = at > self.tx_at;
+        if marking && self.marked >= MARKS_MAX {
+            return Err(Error::Internal);
+        }
+        let old = self.output_keys.replace(keys);
+        if marking && let Some(slot) = self.marks.get_mut(self.marked) {
+            let (secret, seq) = match old {
+                Some(Keys { secret, seq, .. }) => (Some(secret), seq),
+                None => (None, 0),
             };
+            *slot = Mark { at, secret, seq };
             self.marked += 1;
         }
-        self.output_keys = Some(keys);
         Ok(())
+    }
+
+    /// Lets every mark go, wiping their secrets.
+    fn unmark(&mut self) {
+        for slot in self.marks.iter_mut().take(self.marked) {
+            *slot = UNMARKED;
+        }
+        self.marked = 0;
     }
 
     fn take(&mut self, bytes: &[u8]) -> Result<usize, Error> {
@@ -1345,16 +1507,29 @@ impl<'a> Client<'a> {
             return Err(Error::Parameter);
         };
         let mut shared = [0; 2 * 32];
-        let length = self.agree(group, key, &mut shared)?;
-        self.secret = [0; x25519::KEY_BYTES];
-        self.p256 = [0; ecdh::SECRET_BYTES];
+        let agreed = self.agree(group, key, &mut shared);
+        wipe(&mut self.secret);
+        wipe(&mut self.p256);
         self.kem = None;
+        let length = match agreed {
+            Ok(length) => length,
+            Err(error) => {
+                wipe(&mut shared);
+                return Err(error);
+            }
+        };
         self.transcript.update(message);
         let secrets = handshake_secrets(shared.get(..length).unwrap_or_default(), &self.hash());
+        wipe(&mut shared);
         self.server_finished = derive(&secrets.server, b"finished", &[]);
-        self.master = secrets.master;
-        self.input_keys = Some(Keys::new(&secrets.server));
-        self.rekey(Keys::new(&secrets.client))?;
+        let Secrets {
+            client,
+            server,
+            master,
+        } = secrets;
+        self.master = master;
+        self.input_keys = Some(Keys::new(server));
+        self.rekey(Keys::new(client))?;
         self.state = State::Extensions;
         Ok(true)
     }
@@ -1594,23 +1769,22 @@ impl<'a> Client<'a> {
         let mut slots: [&[u8]; x509::CHAIN_MAX] = [&[]; x509::CHAIN_MAX];
         let count = certificates(body, &mut slots)?;
         let chain = slots.get(..count).unwrap_or_default();
-        let leaf = match (&self.verify, self.state) {
-            (Verify::Store(store), _) => x509::verify(chain, store, &self.host, self.now)?.der,
-            (Verify::Caller, State::Trusted) => {
-                let leaf = chain.first().copied().unwrap_or_default();
-                // The key must be one CertificateVerify can be checked
-                // with, and allowed to sign it, whoever verified the chain,
-                // as BoringSSL has it (tls13_both.cc).
-                if !x509::parse(leaf)?.signs_handshake() {
-                    return Err(x509::Error::Usage.into());
-                }
-                leaf
+        let leaf = chain.first().copied().unwrap_or_default();
+        match (&self.verify, self.state) {
+            (Verify::Store(store), _) => {
+                self.approval = Some(x509::verify(chain, store, &self.host, self.now)?);
             }
+            (Verify::Caller, State::Trusted) => {}
             (Verify::Caller, _) => {
                 self.state = State::Awaiting;
                 return Ok(false);
             }
-        };
+        }
+        // The key must be one CertificateVerify can be checked with, and
+        // allowed to sign it, whoever verified the chain, as BoringSSL has
+        // it (tls13_both.cc): Leaf::approved checks.
+        let approval = self.approval.as_ref().ok_or(Error::Approval)?;
+        x509::Leaf::approved(leaf, approval)?;
         self.leaf.clear();
         self.leaf.extend_from_slice(leaf);
         // The name is matched; nothing sends it again.
@@ -1640,15 +1814,13 @@ impl<'a> Client<'a> {
         }
         let covered = 64 + VERIFY_CONTEXT.len() + hash.bytes().len();
         let content = space.get(..covered).unwrap_or_default();
-        let certificate = x509::parse(&self.leaf)?;
-        let leaf = x509::Leaf {
-            der: certificate.der,
-            key: certificate.key,
-        };
-        if !leaf.verify_tls13(scheme, content, signature) {
+        let approval = self.approval.as_ref().ok_or(Error::Approval)?;
+        let leaf = x509::Leaf::approved(&self.leaf, approval)?;
+        if leaf.verify_tls13(scheme, content, signature).is_err() {
             return Err(Error::Signature);
         }
         self.leaf = Vec::new();
+        self.approval = None;
         self.transcript.update(message);
         self.state = State::Finished;
         Ok(false)
@@ -1668,7 +1840,7 @@ impl<'a> Client<'a> {
         let hash = self.hash();
         let client = derive(&self.master, b"c ap traffic", hash.bytes());
         let server = derive(&self.master, b"s ap traffic", hash.bytes());
-        self.input_keys = Some(Keys::new(&server));
+        self.input_keys = Some(Keys::new(server));
         // Middlebox compatibility: change_cipher_spec before the client's
         // encrypted flight, unless it went before a second ClientHello.
         self.compatible();
@@ -1691,7 +1863,7 @@ impl<'a> Client<'a> {
             *byte = *value;
         }
         self.handshake_message(ours.get(..4 + size).unwrap_or_default(), 3)?;
-        self.rekey(Keys::new(&client))?;
+        self.rekey(Keys::new(client))?;
         // Of the ALPN offer, only the choice is kept, for alpn.
         if let Some((at, length)) = self.chosen {
             self.offer.drain(..at);
@@ -1765,7 +1937,7 @@ impl<'a> Client<'a> {
             self.tx.clear();
             self.tx_at = 0;
             self.reply_end = 0;
-            self.marked = 0;
+            self.unmark();
         }
     }
 
@@ -1875,6 +2047,15 @@ impl<'a> Client<'a> {
             slot.copy_from_slice(&header);
         }
         m
+    }
+}
+
+/// The key shares' secrets go with the client, wiped; the traffic and
+/// handshake secrets wipe themselves (Digest), as do the marks'.
+impl Drop for Client<'_> {
+    fn drop(&mut self) {
+        wipe(&mut self.secret);
+        wipe(&mut self.p256);
     }
 }
 
@@ -2073,6 +2254,14 @@ fn mac(key: &Digest, data: &Digest) -> Digest {
     key.extract(data.bytes())
 }
 
+/// Overwrites a secret with zeros. black_box makes the compiler take
+/// the bytes as read after, so it keeps the writes though nothing reads
+/// them; without unsafe code outside sys, as volatile writes would need.
+fn wipe(bytes: &mut [u8]) {
+    bytes.fill(0);
+    core::hint::black_box(bytes);
+}
+
 /// Whether a equals b, in time that does not depend on where they
 /// differ.
 fn same(a: &[u8], b: &[u8]) -> bool {
@@ -2115,7 +2304,11 @@ pub fn fuzz_server(input: &[u8]) {
         return;
     };
     let mut store = x509::Store::new();
-    assert!(store.add_der(&x509::test_certificate("test.root").unwrap()));
+    assert!(
+        store
+            .add_der(&x509::test_certificate("test.root").unwrap())
+            .is_ok()
+    );
     let mut client = Client::new(
         "api.example.test",
         &[b"h2"],
@@ -2137,7 +2330,11 @@ pub fn fuzz_flight(input: &[u8]) {
         return;
     };
     let mut store = x509::Store::new();
-    assert!(store.add_der(&x509::test_certificate("test.root").unwrap()));
+    assert!(
+        store
+            .add_der(&x509::test_certificate("test.root").unwrap())
+            .is_ok()
+    );
     let verify = if seed & 1 == 1 {
         Verify::Caller
     } else {
@@ -2151,15 +2348,23 @@ pub fn fuzz_flight(input: &[u8]) {
         &[0x5c; RANDOM_BYTES],
     )
     .unwrap();
-    client.sent(client.pending().len());
+    assert!(client.sent(client.pending().len()).is_ok());
     let mut hello = Vec::from([HANDSHAKE, 3, 3, 0, 90, SERVER_HELLO, 0, 0, 86, 3, 3]);
     hello.extend_from_slice(&[0x7e; 32]);
     hello.extend_from_slice(&[0, 0x13, 0x01, 0, 0, 46, 0, 43, 0, 2, 3, 4]);
     hello.extend_from_slice(&[0, 51, 0, 36, 0, 0x1d, 0, 32]);
     hello.extend_from_slice(&x25519::public_key(&[0x3a; 32]));
-    assert_eq!(client.input(&hello), Ok(hello.len()));
+    assert!(
+        client
+            .input(&hello)
+            .is_ok_and(|taken| taken.count() == hello.len())
+    );
     // The client's keys for reading are the server's for writing.
-    let mut keys = Keys::new(&client.input_keys.as_ref().unwrap().secret);
+    let secret = match &client.input_keys.as_ref().unwrap().secret {
+        Digest::Sha256(bytes) => Digest::Sha256(*bytes),
+        Digest::Sha384(bytes) => Digest::Sha384(*bytes),
+    };
+    let mut keys = Keys::new(secret);
     let mut bytes = Vec::new();
     for piece in rest.chunks(usize::from(seed >> 1) * 32 + 1) {
         if seal(&mut keys, &mut bytes, HANDSHAKE, piece).is_err() {
@@ -2170,31 +2375,35 @@ pub fn fuzz_flight(input: &[u8]) {
 }
 
 /// Feeds input to the client in pieces of piece bytes, reading and
-/// sending what it gives and trusting any chain it awaits a verdict on;
-/// a failure sticks.
+/// sending what it gives and approving any chain it awaits a verdict on,
+/// as the system would; a failure sticks.
 #[cfg(fuzzing)]
 fn fuzz_feed(client: &mut Client<'_>, input: &[u8], piece: usize) {
     for mut part in input.chunks(piece) {
         while !part.is_empty() {
             match client.input(part) {
                 Ok(taken) => {
+                    let taken = taken.count();
                     part = part.get(taken..).unwrap_or_default();
                     let count = client.read().len();
                     let waited = client.awaiting();
                     if waited {
                         let mut chain: [&[u8]; x509::CHAIN_MAX] = [&[]; x509::CHAIN_MAX];
                         assert!(client.chain(&mut chain).is_some_and(|n| n > 0));
-                        client.verified(true);
+                        let approval = x509::Approval::system(chain[0], "api.example.test");
+                        // rr: escape(discard): a refusal sticks, and the
+                        // next input says it.
+                        let _: Result<(), Error> = client.verified(approval);
                     }
                     assert!(taken > 0 || count > 0 || waited);
                     assert!(count <= RECORD_MAX);
                     client.consume(count);
-                    client.sent(client.pending().len());
+                    assert!(client.sent(client.pending().len()).is_ok());
                 }
                 Err(error) => {
-                    assert!(client.input(&[APPLICATION]) == Err(error));
+                    assert!(client.input(&[APPLICATION]).err() == Some(error));
                     assert!(!client.connected());
-                    assert!(client.write(b"x") == Err(error));
+                    assert!(client.write(b"x").err() == Some(error));
                     return;
                 }
             }

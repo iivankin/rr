@@ -38,6 +38,16 @@
 //! has no basicConstraints to say so, as in Firefox; any anchor, a
 //! self-signed server certificate among them, also verifies as the leaf
 //! itself, as in Go and Firefox.
+//!
+//! verify's yes is an Approval, SHA-256 of the leaf and of the host,
+//! with private fields: only verify makes one, and the trust component
+//! when the system's verifier said yes, so tls takes no verdict a
+//! program made up, nor one for another leaf or host. Leaf::approved
+//! gives the approved leaf's key for CertificateVerify. A Policy is
+//! distrust without trust (roots::policy): revocations, distrust dates
+//! and imposed constraints that Store::add_policy lays over anchors and
+//! screen over a path the system built, leaf first; it is no Store, so
+//! no verify trusts its anchors. Loading an anchor says why it failed.
 
 use crate::base::ecdsa;
 use crate::base::rsa;
@@ -84,6 +94,11 @@ pub enum Error {
     Revoked,
     /// More certificates, signatures or name comparisons than allowed.
     TooMany,
+    /// A path given to screen that is not leaf first, each certificate
+    /// issued by the next (by their names).
+    Order,
+    /// An approval of another certificate than the one given.
+    Approval,
 }
 
 /// A public key in the profile, borrowed from its certificate.
@@ -125,11 +140,30 @@ pub struct Certificate<'a> {
     version1: bool,
 }
 
-/// The server's certificate once its chain is verified: its key checks
-/// the handshake's CertificateVerify.
+/// A yes to a server's leaf for a host: SHA-256 of the leaf's DER and
+/// of the host, as approves compares them (without case, brackets or a
+/// dot at the end). Only verify makes one, when x509 verified the chain,
+/// and the trust component, when the system's verifier did: a program
+/// cannot make one up, nor take one for another leaf or host unseen, as
+/// tls::Client::verified compares it with its own.
+pub struct Approval {
+    leaf: [u8; sha256::DIGEST_BYTES],
+    host: [u8; sha256::DIGEST_BYTES],
+}
+
+/// The server's certificate once an approval vouches for it: its key
+/// checks the handshake's CertificateVerify.
 pub struct Leaf<'a> {
-    pub der: &'a [u8],
-    pub key: Key<'a>,
+    key: Key<'a>,
+}
+
+/// Mozilla's distrust without its trust, as roots::policy gives it:
+/// revocations, distrust dates of anchors and name constraints imposed
+/// on CAs' names. Its anchors are never trusted, so it is a type of its
+/// own, which no verify takes in place of a store: Store::add_policy
+/// lays it over anchors, screen over a path another verifier built.
+pub struct Policy {
+    store: Store,
 }
 
 /// Trust anchors. It owns their DER, and where each subject is in it,
@@ -932,7 +966,7 @@ impl Certificate<'_> {
     /// keyUsage, or one with digitalSignature, as BoringSSL requires of
     /// a TLS 1.3 server's certificate whoever verified it (RFC 5280
     /// 4.2.1.3; ssl/tls13_both.cc).
-    pub fn signs_handshake(&self) -> bool {
+    fn signs_handshake(&self) -> bool {
         self.ext
             .key_usage
             .is_none_or(|bits| bits & DIGITAL_SIGNATURE != 0)
@@ -981,13 +1015,80 @@ fn signed(
     }
 }
 
-impl Leaf<'_> {
-    /// Whether signature is the server's CertificateVerify of message,
-    /// the TLS 1.3 content it signs (RFC 9846 4.5.2), under scheme:
-    /// ecdsa_secp256r1_sha256, _secp384r1_sha384 or _secp521r1_sha512, or
-    /// rsa_pss_rsae_sha256, _sha384 or _sha512. The scheme's curve must be
-    /// the key's.
-    pub fn verify_tls13(&self, scheme: u16, message: &[u8], signature: &[u8]) -> bool {
+impl Approval {
+    fn new(leaf: &[u8], host: &str) -> Approval {
+        Approval {
+            leaf: sha256::digest(leaf),
+            host: host_digest(host),
+        }
+    }
+
+    /// The system's verifier approved leaf (DER) for host: for the trust
+    /// component, which asked it. Seen by the components of base alone,
+    /// not by the program.
+    pub(in crate::base) fn system(leaf: &[u8], host: &str) -> Approval {
+        Approval::new(leaf, host)
+    }
+
+    /// Whether this approves leaf (DER) for host.
+    #[must_use]
+    pub fn approves(&self, leaf: &[u8], host: &str) -> bool {
+        same_digest(&sha256::digest(leaf), &self.leaf)
+            && same_digest(&host_digest(host), &self.host)
+    }
+}
+
+/// Whether two digests are equal, in time that does not depend on where
+/// they differ.
+fn same_digest(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    a.iter().zip(b).fold(0, |differ, (x, y)| differ | (x ^ y)) == 0
+}
+
+/// SHA-256 of host as approvals compare it: an IPv6 literal without its
+/// brackets, a name without the dot after it, letters in lower case.
+fn host_digest(host: &str) -> [u8; 32] {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host);
+    let bare = bare.strip_suffix('.').unwrap_or(bare);
+    let mut hash = sha256::Sha256::new();
+    for chunk in bare.as_bytes().chunks(64) {
+        let mut lower = [0; 64];
+        for (out, byte) in lower.iter_mut().zip(chunk) {
+            *out = byte.to_ascii_lowercase();
+        }
+        hash.update(lower.get(..chunk.len()).unwrap_or_default());
+    }
+    hash.finish()
+}
+
+impl<'a> Leaf<'a> {
+    /// The leaf in der, which approval approved: its key, once it is in
+    /// the profile and allowed to sign a handshake, as BoringSSL has it of
+    /// a TLS 1.3 server's certificate whoever verified it
+    /// (tls13_both.cc). Error::Approval when approval is another leaf's.
+    pub fn approved(der: &'a [u8], approval: &Approval) -> Result<Leaf<'a>, Error> {
+        if !same_digest(&sha256::digest(der), &approval.leaf) {
+            return Err(Error::Approval);
+        }
+        let certificate = parse(der)?;
+        if !certificate.signs_handshake() {
+            return Err(Error::Usage);
+        }
+        Ok(Leaf {
+            key: certificate.key,
+        })
+    }
+
+    /// Checks that signature is the server's CertificateVerify of
+    /// message, the TLS 1.3 content it signs (RFC 9846 4.5.2), under
+    /// scheme: ecdsa_secp256r1_sha256, _secp384r1_sha384 or
+    /// _secp521r1_sha512, or rsa_pss_rsae_sha256, _sha384 or _sha512. The
+    /// scheme's curve must be the key's: another scheme is
+    /// Error::Unsupported, a signature that does not verify
+    /// Error::Signature.
+    pub fn verify_tls13(&self, scheme: u16, message: &[u8], signature: &[u8]) -> Result<(), Error> {
         let (method, hash) = match (scheme, &self.key) {
             (0x0403, Key::P256(_)) => (Scheme::Ecdsa, rsa::Hash::Sha256),
             (0x0503, Key::P384(_)) => (Scheme::Ecdsa, rsa::Hash::Sha384),
@@ -995,9 +1096,13 @@ impl Leaf<'_> {
             (0x0804, Key::Rsa { .. }) => (Scheme::Pss, rsa::Hash::Sha256),
             (0x0805, Key::Rsa { .. }) => (Scheme::Pss, rsa::Hash::Sha384),
             (0x0806, Key::Rsa { .. }) => (Scheme::Pss, rsa::Hash::Sha512),
-            _ => return false,
+            _ => return Err(Error::Unsupported),
         };
-        signed(&self.key, &method, &hash, message, signature)
+        if signed(&self.key, &method, &hash, message, signature) {
+            Ok(())
+        } else {
+            Err(Error::Signature)
+        }
     }
 }
 
@@ -1098,6 +1203,12 @@ impl Store {
         let (blocks, size) = pem_size(text);
         self.bytes.reserve_exact(size);
         self.anchors.reserve_exact(blocks);
+        self.add_blocks(text, false)
+    }
+
+    /// The blocks of add_pem's text; with distrust alone, those with a
+    /// distrust date or imposed name constraints, as a policy keeps.
+    fn add_blocks(&mut self, text: &[u8], distrust_alone: bool) -> usize {
         let mut rest = text;
         let mut added = 0;
         while let Some((before, body, after)) = pem_block(rest) {
@@ -1109,9 +1220,12 @@ impl Store {
                 self.skipped += 1;
                 continue;
             };
+            if distrust_alone && distrust.is_none() && imposed.is_none() {
+                continue;
+            }
             if self.bytes.len() >= STORE_BYTES_MAX
                 || !base64(body, &mut self.bytes)
-                || !self.keep(start, distrust)
+                || self.keep(start, distrust).is_err()
             {
                 self.bytes.truncate(start);
                 self.skipped += 1;
@@ -1131,10 +1245,11 @@ impl Store {
         added
     }
 
-    /// Adds one anchor: a certificate in the profile. Whether it did.
-    /// Each call grows the store by what it adds; add_ders grows it once
-    /// for many.
-    pub fn add_der(&mut self, der: &[u8]) -> bool {
+    /// Adds one anchor: a certificate in the profile; else why not,
+    /// TooMany when the store or the certificate is over its limit. Each
+    /// call grows the store by what it adds; add_ders grows it once for
+    /// many.
+    pub fn add_der(&mut self, der: &[u8]) -> Result<(), Error> {
         self.bytes.reserve_exact(der.len());
         self.anchors.reserve_exact(1);
         self.append(der, None)
@@ -1144,7 +1259,7 @@ impl Store {
     /// certificates issued after a time: a path ending at it fails when
     /// the leaf's notBefore is later than after (Unix seconds), as in
     /// Firefox.
-    pub fn add_der_distrust_after(&mut self, der: &[u8], after: i64) -> bool {
+    pub fn add_der_distrust_after(&mut self, der: &[u8], after: i64) -> Result<(), Error> {
         self.bytes.reserve_exact(der.len());
         self.anchors.reserve_exact(1);
         self.append(der, Some(after))
@@ -1156,36 +1271,34 @@ impl Store {
         self.bytes
             .reserve_exact(ders.iter().map(|der| der.len()).sum());
         self.anchors.reserve_exact(ders.len());
-        ders.iter().filter(|der| self.append(der, None)).count()
+        ders.iter()
+            .filter(|der| self.append(der, None).is_ok())
+            .count()
     }
 
-    fn append(&mut self, der: &[u8], distrust: Option<i64>) -> bool {
+    fn append(&mut self, der: &[u8], distrust: Option<i64>) -> Result<(), Error> {
         let start = self.bytes.len();
         // A certificate is at most CERTIFICATE_BYTES_MAX past the limit.
-        if self.bytes.len() < STORE_BYTES_MAX && der.len() <= CERTIFICATE_BYTES_MAX {
+        let kept = if self.bytes.len() < STORE_BYTES_MAX && der.len() <= CERTIFICATE_BYTES_MAX {
             self.bytes.extend_from_slice(der);
-            if self.keep(start, distrust) {
-                return true;
-            }
+            self.keep(start, distrust)
+        } else {
+            Err(Error::TooMany)
+        };
+        if kept.is_err() {
+            self.bytes.truncate(start);
+            self.skipped += 1;
         }
-        self.bytes.truncate(start);
-        self.skipped += 1;
-        false
+        kept
     }
 
     /// Keeps the bytes from start as an anchor when they are one: a
     /// certificate in the profile. Its subject is found in its DER; any
     /// place with the same bytes will do, as only the bytes are compared.
-    fn keep(&mut self, start: usize, distrust: Option<i64>) -> bool {
-        let Some(der) = self.bytes.get(start..) else {
-            return false;
-        };
-        let Ok(anchor) = parse(der) else {
-            return false;
-        };
-        let Some(at) = find(der, anchor.subject) else {
-            return false;
-        };
+    fn keep(&mut self, start: usize, distrust: Option<i64>) -> Result<(), Error> {
+        let der = self.bytes.get(start..).ok_or(Error::Malformed)?;
+        let anchor = parse(der)?;
+        let at = find(der, anchor.subject).ok_or(Error::Malformed)?;
         let subject = start + at;
         let (end, length) = (self.bytes.len(), anchor.subject.len());
         self.anchors.push(Anchor {
@@ -1193,7 +1306,7 @@ impl Store {
             subject: (subject, subject + length),
             distrust,
         });
-        true
+        Ok(())
     }
 
     /// Anchor index, parsed; it parsed when it was added.
@@ -1259,7 +1372,8 @@ impl Store {
     /// and the distrust date of each of its anchors for an anchor here
     /// with the same subject and key (the earlier date winning). Returns
     /// how many anchors here took a date.
-    pub fn add_policy(&mut self, policy: &Store) -> usize {
+    pub fn add_policy(&mut self, policy: &Policy) -> usize {
+        let policy = &policy.store;
         let room = REVOKED_MAX.saturating_sub(self.revoked.len());
         self.revoked
             .extend(policy.revoked.iter().take(room).copied());
@@ -1303,6 +1417,52 @@ impl Store {
             }
         }
         dated
+    }
+}
+
+impl Policy {
+    pub fn new() -> Policy {
+        Policy {
+            store: Store::new(),
+        }
+    }
+
+    /// Adds the blocks of PEM text that carry a "# distrust-after:" or a
+    /// "# name-constraints:" line, as Store::add_pem reads them; a block
+    /// without either means nothing here, and is passed over. Returns how
+    /// many it added.
+    pub fn add_pem(&mut self, text: &[u8]) -> usize {
+        self.store.add_blocks(text, true)
+    }
+
+    /// Distrusts the anchor of der's subject and key for certificates
+    /// issued after a time, as Store::add_der_distrust_after does.
+    pub fn add_der_distrust_after(&mut self, der: &[u8], after: i64) -> Result<(), Error> {
+        self.store.add_der_distrust_after(der, after)
+    }
+
+    /// Revokes certificates, as Store::add_revoked does.
+    pub fn add_revoked(&mut self, text: &[u8]) -> usize {
+        self.store.add_revoked(text)
+    }
+
+    /// The anchors it distrusts after a date or constrains.
+    pub fn len(&self) -> usize {
+        self.store.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.store.is_empty()
+    }
+
+    /// The entries refused.
+    pub fn skipped(&self) -> usize {
+        self.store.skipped()
+    }
+
+    /// The revocations held.
+    pub fn revocations(&self) -> usize {
+        self.store.revocations()
     }
 }
 
@@ -1533,13 +1693,9 @@ fn base64(text: &[u8], out: &mut Vec<u8>) -> bool {
 /// now (Unix seconds): the leaf for a TLS server and the host, then a
 /// path through the other certificates, in any order and with any
 /// extras, to an anchor of store, unless the leaf is an anchor itself.
-/// Returns the leaf, whose key checks the handshake's signature.
-pub fn verify<'a>(
-    chain: &[&'a [u8]],
-    store: &Store,
-    host: &str,
-    now: i64,
-) -> Result<Leaf<'a>, Error> {
+/// Returns the approval of the leaf for host, which Leaf::approved takes
+/// to check the handshake's signature with the leaf's key.
+pub fn verify(chain: &[&[u8]], store: &Store, host: &str, now: i64) -> Result<Approval, Error> {
     if chain.len() > CHAIN_MAX {
         return Err(Error::TooMany);
     }
@@ -1561,10 +1717,7 @@ pub fn verify<'a>(
     if store.revokes(&leaf) {
         return Err(Error::Revoked);
     }
-    let found = Leaf {
-        der: leaf.der,
-        key: leaf.key,
-    };
+    let found = Approval::new(leaf.der, host);
     // An anchor is trusted as it is, as the leaf too: Go's Verify takes
     // a leaf that its roots hold as the whole chain, as Firefox takes an
     // end entity it trusts as an anchor.
@@ -1789,21 +1942,34 @@ impl Search<'_, '_> {
 }
 
 /// Checks a path that another verifier built, such as the system's,
-/// leaf first and its anchor last, against policy, a store such as
-/// roots::policy gives with Mozilla's distrust: a certificate on it that
+/// leaf first and its anchor last, against policy, such as
+/// roots::policy gives with Mozilla's distrust: a path in another order,
+/// each certificate not issued by the next by their names, is
+/// Error::Order, as the anchor would be taken from the wrong end and its
+/// distrust missed; then a certificate on it that
 /// policy revokes, an anchor of policy with the last one's subject and
 /// key that distrusts the leaf (issued after its date), or constraints
 /// policy imposes on the name of a CA on it that a name below breaks.
 /// A certificate outside the profile is looked up by its names alone.
-pub fn screen(path: &[&[u8]], policy: &Store) -> Result<(), Error> {
+pub fn screen(path: &[&[u8]], policy: &Policy) -> Result<(), Error> {
+    let policy = &policy.store;
     if path.len() > CHAIN_MAX {
         return Err(Error::TooMany);
     }
     let leaf = parse(path.first().ok_or(Error::Malformed)?)?;
+    let mut child: Option<Names<'_>> = None;
     for der in path {
-        if policy.revokes_names(&names_of(der).ok_or(Error::Malformed)?) {
+        let names = names_of(der).ok_or(Error::Malformed)?;
+        if child
+            .as_ref()
+            .is_some_and(|issued| issued.issuer != names.subject)
+        {
+            return Err(Error::Order);
+        }
+        if policy.revokes_names(&names) {
             return Err(Error::Revoked);
         }
+        child = Some(names);
     }
     let top = path.last().and_then(|der| names_of(der));
     for index in 0..policy.anchors.len() {
@@ -2294,7 +2460,7 @@ pub fn fuzz_parse(input: &[u8]) {
         Ok(()) | Err(Error::Constrained | Error::TooMany | Error::Malformed)
     ));
     let mut store = Store::new();
-    assert!(store.add_der(input));
+    assert!(store.add_der(input).is_ok());
 }
 
 /// Test certificates and the input's as a chain, for paths deeper than
@@ -2339,7 +2505,11 @@ pub fn fuzz_verify(input: &[u8]) {
     }
     chain.push(rest);
     let mut store = Store::new();
-    assert!(store.add_der(&test_certificate("test.root").unwrap()));
+    assert!(
+        store
+            .add_der(&test_certificate("test.root").unwrap())
+            .is_ok()
+    );
     for host in ["api.example.test", "good.example.test"] {
         if verify(&chain, &store, host, TEST_NOW).is_ok() {
             assert!(parse(chain[0]).is_ok_and(|leaf| covers(leaf.ext.names, host)));
@@ -2395,9 +2565,9 @@ pub fn test_revocation(der: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Error, ISSUER_SERIAL, PEM_END, Reader, SUBJECT_KEY, Store, TEST_NOW as NOW, TESTS,
-        address_within, attribute_matches, directory_within, domain_within, extensions, find,
-        host_matches, key_usage, parse, revocation_digest, screen, test_certificate, time,
+        Error, ISSUER_SERIAL, Leaf, PEM_END, Policy, Reader, SUBJECT_KEY, Store, TEST_NOW as NOW,
+        TESTS, address_within, attribute_matches, directory_within, domain_within, extensions,
+        find, host_matches, key_usage, parse, revocation_digest, screen, test_certificate, time,
         unsigned, verify,
     };
     use crate::base::sha256;
@@ -2428,7 +2598,7 @@ mod tests {
             "test.v1root",
             "test.rsa8192root",
         ] {
-            assert!(store.add_der(&der(name)));
+            assert_eq!(store.add_der(&der(name)), Ok(()));
         }
         store
     }
@@ -2878,22 +3048,28 @@ mod tests {
     #[test]
     fn imposed() {
         let lines = ["# name-constraints: ", TR, "\n"].concat();
+        let text = block(&lines, "test.imposedroot");
         let mut constrained = Store::new();
-        assert_eq!(constrained.add_pem(&block(&lines, "test.imposedroot")), 1);
+        assert_eq!(constrained.add_pem(&text), 1);
+        let mut policy = Policy::new();
+        assert_eq!(policy.add_pem(&text), 1);
+        // A block without the line means nothing to a policy.
+        assert_eq!(policy.add_pem(&block("", "test.root")), 0);
+        assert_eq!((policy.len(), policy.skipped()), (1, 0));
         let mut plain = Store::new();
-        assert!(plain.add_der(&der("test.imposedroot")));
+        assert_eq!(plain.add_der(&der("test.imposedroot")), Ok(()));
         let (tr, test) = (der("test.imposedtr"), der("test.imposedtest"));
         assert!(verify(&[&test], &plain, "api.example.test", NOW).is_ok());
-        assert_eq!(plain.add_policy(&constrained), 0);
+        assert_eq!(plain.add_policy(&policy), 0);
         for store in [&constrained, &plain] {
             assert!(verify(&[&tr], store, "api.example.tr", NOW).is_ok());
             let refused = verify(&[&test], store, "api.example.test", NOW);
             assert_eq!(refused.map(|_| ()), Err(Error::Constrained));
-            // And over a path another verifier built.
-            let root = der("test.imposedroot");
-            assert_eq!(screen(&[&tr, &root], store), Ok(()));
-            assert_eq!(screen(&[&test, &root], store), Err(Error::Constrained));
         }
+        // And over a path another verifier built.
+        let root = der("test.imposedroot");
+        assert_eq!(screen(&[&tr, &root], &policy), Ok(()));
+        assert_eq!(screen(&[&test, &root], &policy), Err(Error::Constrained));
         // A line that is not NameConstraints in hex leaves the root out.
         for odd in ["# name-constraints: 30\n", "# name-constraints: zz\n"] {
             let mut refused = Store::new();
@@ -2912,7 +3088,7 @@ mod tests {
         );
         let (own, under) = (der("test.selfleaf"), der("test.underself"));
         let mut store = Store::new();
-        assert!(store.add_der(&own));
+        assert_eq!(store.add_der(&own), Ok(()));
         assert!(verify(&[&own], &store, "api.example.test", NOW).is_ok());
         assert_eq!(
             verify(&[&under], &store, "api.example.test", NOW).map(|_| ()),
@@ -2925,7 +3101,7 @@ mod tests {
         );
         // Distrusted for what it was issued after: no path at all.
         let mut dated = Store::new();
-        assert!(dated.add_der_distrust_after(&own, 0));
+        assert_eq!(dated.add_der_distrust_after(&own, 0), Ok(()));
         assert_eq!(
             verify(&[&own], &dated, "api.example.test", NOW).map(|_| ()),
             Err(Error::Distrusted)
@@ -2955,19 +3131,24 @@ mod tests {
             der("test.leaf"),
             der("test.late"),
         );
-        let mut policy = Store::new();
-        assert!(policy.add_der_distrust_after(&root, 1_772_323_200));
+        let mut policy = Policy::new();
+        assert_eq!(policy.add_der_distrust_after(&root, 1_772_323_200), Ok(()));
         let path = [&leaf[..], &inter, &root];
         let late_path = [&late[..], &inter, &root];
         assert_eq!(screen(&path, &policy), Ok(()));
         assert_eq!(screen(&late_path, &policy), Err(Error::Distrusted));
+        // Backwards, the anchor would be the leaf: refused, not passed.
+        let backwards = [&root[..], &inter, &late];
+        assert_eq!(screen(&backwards, &policy), Err(Error::Order));
+        let skipping = [&late[..], &root];
+        assert_eq!(screen(&skipping, &policy), Err(Error::Order));
         let mut lines = Vec::new();
         revocation_line(&inter, true, &mut lines);
         policy.add_revoked(&lines);
         assert_eq!(screen(&path, &policy), Err(Error::Revoked));
         assert_eq!(screen(&[], &policy), Err(Error::Malformed));
         let mut system = Store::new();
-        assert!(system.add_der(&root));
+        assert_eq!(system.add_der(&root), Ok(()));
         assert!(verify(&[&late, &inter], &system, "api.example.test", NOW).is_ok());
         assert_eq!(system.add_policy(&policy), 1);
         assert_eq!(system.revocations(), 1);
@@ -3062,11 +3243,26 @@ mod tests {
             ),
         ] {
             let (leaf, issuer) = (der(leaf), der(issuer));
-            let verified = verify(&[&leaf, &issuer], &store, "api.example.test", NOW).unwrap();
-            assert!(verified.verify_tls13(scheme, &message, signature));
-            assert!(!verified.verify_tls13(scheme, &changed, signature));
-            assert!(!verified.verify_tls13(wrong, &message, signature));
-            assert!(!verified.verify_tls13(0x0401, &message, signature));
+            let approval = verify(&[&leaf, &issuer], &store, "api.example.test", NOW).unwrap();
+            let verified = Leaf::approved(&leaf, &approval).unwrap();
+            assert_eq!(verified.verify_tls13(scheme, &message, signature), Ok(()));
+            let refused = verified.verify_tls13(scheme, &changed, signature);
+            assert_eq!(refused, Err(Error::Signature));
+            // Another curve's scheme is no scheme of the key; another
+            // hash's does not verify.
+            let another = verified.verify_tls13(wrong, &message, signature);
+            assert!(matches!(
+                another,
+                Err(Error::Unsupported | Error::Signature)
+            ));
+            let pkcs = verified.verify_tls13(0x0401, &message, signature);
+            assert_eq!(pkcs, Err(Error::Unsupported));
+            // The approval is of this leaf, for this host alone.
+            assert!(approval.approves(&leaf, "API.example.test."));
+            assert!(!approval.approves(&leaf, "x.example.test"));
+            assert!(!approval.approves(&issuer, "api.example.test"));
+            let other = Leaf::approved(&issuer, &approval).map(|_| ());
+            assert_eq!(other, Err(Error::Approval));
         }
         // A changed byte of the subject's common name, in the signed
         // part, or of the signature.
@@ -3092,7 +3288,7 @@ mod tests {
         let (root, inter) = (der("test.root"), der("test.inter"));
         let (leaf, late) = (der("test.leaf"), der("test.late"));
         let mut store = Store::new();
-        assert!(store.add_der_distrust_after(&root, 1_772_323_200));
+        assert_eq!(store.add_der_distrust_after(&root, 1_772_323_200), Ok(()));
         let mut text = Vec::new();
         text.extend_from_slice(b"Root\r\n# distrust-after: 2026-03-01T00:00:00Z\r\n");
         let tests = TESTS.as_bytes();
@@ -3108,7 +3304,7 @@ mod tests {
             assert_eq!(refused.map(|_| ()), Err(Error::Distrusted));
         }
         let mut open = Store::new();
-        assert!(open.add_der(&root));
+        assert_eq!(open.add_der(&root), Ok(()));
         assert!(verify(&[&late, &inter], &open, "api.example.test", NOW).is_ok());
         // A date in another form leaves the anchor out.
         let mut odd = Vec::new();
@@ -3162,7 +3358,7 @@ mod tests {
             lines.extend_from_slice(b"# OneCRL\n\n");
             revocation_line(revoked, by_key, &mut lines);
             let mut store = Store::new();
-            assert!(store.add_der(&root));
+            assert_eq!(store.add_der(&root), Ok(()));
             assert_eq!(store.add_revoked(&lines), 1);
             let refused = verify(&chain, &store, "api.example.test", NOW);
             assert_eq!(refused.map(|_| ()), Err(Error::Revoked));
@@ -3171,7 +3367,7 @@ mod tests {
         revocation_line(&der("github.leaf"), false, &mut lines);
         lines.extend_from_slice(b"not hex\n");
         let mut store = Store::new();
-        assert!(store.add_der(&root));
+        assert_eq!(store.add_der(&root), Ok(()));
         assert_eq!(store.add_revoked(&lines), 1);
         assert_eq!((store.revocations(), store.skipped()), (1, 1));
         assert!(verify(&chain, &store, "api.example.test", NOW).is_ok());
@@ -3190,7 +3386,7 @@ mod tests {
                     -----BEGIN CERTIFICATE-----\nAAAA";
         assert_eq!(store.add_pem(bad), 0);
         assert_eq!((store.len(), store.skipped()), (77, 3));
-        assert!(!store.add_der(&[0x30, 0]));
+        assert_eq!(store.add_der(&[0x30, 0]), Err(Error::Malformed));
         assert_eq!((store.len(), store.skipped()), (77, 4));
         // A list of DER loads as the same blocks do, and verifies alike.
         let (root, inter, leaf) = (der("test.root"), der("test.inter"), der("test.leaf"));
