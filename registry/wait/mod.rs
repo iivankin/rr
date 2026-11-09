@@ -8,11 +8,16 @@
 //! getaddrinfo, on a thread: spawn runs it on one of at most THREADS_MAX,
 //! and a Signal says it is done: a pipe on Linux and macOS; on Windows,
 //! where WSAPoll takes only sockets, a connected pair of loopback
-//! sockets, as Python's asyncio does there.
+//! sockets, as Python's asyncio does there. spawn is unsafe: the work
+//! reaches its argument from another thread, which its Safety says how
+//! to keep alive. Its Ticket cancels work still in line when dropped;
+//! detach lets it run.
 //!
 //! A loop that serves many connections waits on a Set (set.rs): any
-//! number of descriptors, each with what the loop wants of it and a key,
-//! and deadlines on the monotonic clock. It takes what scales on each
+//! number of descriptors, each with what the loop wants of it (an
+//! Interest) and a key, and deadlines on the monotonic clock; what is
+//! ready comes as Ready, the same on every system, and a call the Set
+//! refuses says why (SetError). It takes what scales on each
 //! system: epoll on Linux, kqueue on macOS, socket notifications on
 //! Windows 11 and Server 2022 and WSAPoll on the Windows before them.
 //! follow keeps a component's Wait in a Set.
