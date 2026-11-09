@@ -1,6 +1,6 @@
 use clippy_utils::diagnostics::{span_lint_and_help, span_lint_and_then};
 use rustc_ast::ast;
-use rustc_ast::visit::FnKind;
+use rustc_ast::visit::{AssocCtxt, FnCtxt, FnKind};
 use rustc_data_structures::fx::{FxBuildHasher, FxHashSet};
 use rustc_feature::is_builtin_attr_name;
 use rustc_lint::{EarlyContext, EarlyLintPass, LintContext as _};
@@ -29,9 +29,11 @@ pub struct RestrictedSyntax {
     /// `#[unsafe(no_mangle)]` on that entry, a symbol the program must define
     /// under its C name and nothing else defines: no reason.
     entry: Option<ast::AttrId>,
-    /// Where a function's parameter is `impl Fn`, `FnMut` or `FnOnce`: a
-    /// closure handed in, which the function calls.
-    closures: FxHashSet<BytePos>,
+    /// Where `impl Trait` is allowed: a function's parameter that is `impl
+    /// Fn`, `FnMut` or `FnOnce`, a closure handed in, which the function
+    /// calls; and the whole return type of a free function or an inherent
+    /// method that is `impl Iterator<Item = T>`.
+    allowed: FxHashSet<BytePos>,
 }
 impl_lint_pass!(RestrictedSyntax => [RR_NO_STD, RR_NO_GENERICS, RR_NO_MACROS, RR_SIMPLE_TRAITS, RR_UNEXPLAINED_ESCAPE]);
 
@@ -201,7 +203,7 @@ impl EarlyLintPass for RestrictedSyntax {
     fn check_ty(&mut self, cx: &EarlyContext<'_>, ty: &ast::Ty) {
         // dyn is checked after resolution, which knows whose trait it is.
         if let ast::TyKind::ImplTrait(..) = ty.kind
-            && !self.closures.contains(&ty.span.lo())
+            && !self.allowed.contains(&ty.span.lo())
         {
             report(
                 cx,
@@ -209,7 +211,8 @@ impl EarlyLintPass for RestrictedSyntax {
                 ty.span,
                 "impl Trait is forbidden by rr",
                 "use a concrete type, an enum of the types the crate knows, or `&mut dyn` of a trait of the crate; \
-                 a parameter may be `impl Fn`, `impl FnMut` or `impl FnOnce`",
+                 a parameter may be `impl Fn`, `impl FnMut` or `impl FnOnce`, and a function or an inherent \
+                 method may return `impl Iterator<Item = T>`",
             );
         }
     }
@@ -241,13 +244,23 @@ impl EarlyLintPass for RestrictedSyntax {
     }
 
     fn check_fn(&mut self, cx: &EarlyContext<'_>, kind: FnKind<'_>, span: Span, _: ast::NodeId) {
-        if let FnKind::Fn(_, _, f) = kind {
+        if let FnKind::Fn(ctxt, _, f) = kind {
+            // An iterator returned: the compiler knows its type, and so do
+            // rr's checks, which run after it is revealed. Not in a trait,
+            // where it would be an associated type.
+            if matches!(ctxt, FnCtxt::Free | FnCtxt::Assoc(AssocCtxt::Impl { of_trait: false }))
+                && let ast::FnRetTy::Ty(output) = &f.sig.decl.output
+                && let ast::TyKind::ImplTrait(_, bounds) = &output.kind
+                && iterator_bounds(bounds)
+            {
+                self.allowed.insert(output.span.lo());
+            }
             let mut takes = None;
             for param in &f.sig.decl.inputs {
                 if let ast::TyKind::ImplTrait(_, bounds) = &param.ty.kind
                     && closure_bounds(bounds)
                 {
-                    self.closures.insert(param.ty.span.lo());
+                    self.allowed.insert(param.ty.span.lo());
                     takes = Some(param.ty.span);
                 }
             }
@@ -389,6 +402,63 @@ fn closure_bounds(bounds: &[ast::GenericBound]) -> bool {
         }
     }
     closures == 1
+}
+
+/// The traits an iterator returned as `impl Trait` may name besides
+/// `Iterator<Item = T>`: they add `next_back` and `len`, which the
+/// compiler resolves on the type it reveals as it does `next`, and no type
+/// of their own.
+pub(super) const ITERATOR_EXTRAS: &[&str] = &["DoubleEndedIterator", "ExactSizeIterator"];
+
+/// Whether the bounds of a returned `impl Trait` say only that it is an
+/// iterator: one `Iterator<Item = T>`, perhaps `DoubleEndedIterator` and
+/// `ExactSizeIterator`, lifetimes and `use<..>` of lifetimes. The type of
+/// the items is checked as any type is.
+fn iterator_bounds(bounds: &[ast::GenericBound]) -> bool {
+    let mut iterators = 0;
+    for bound in bounds {
+        match bound {
+            ast::GenericBound::Trait(poly) => {
+                if !poly.bound_generic_params.is_empty() || poly.modifiers != ast::TraitBoundModifiers::NONE {
+                    return false;
+                }
+                let Some(last) = poly.trait_ref.path.segments.last() else {
+                    return false;
+                };
+                let name = last.ident.name.as_str();
+                match last.args.as_deref() {
+                    None if ITERATOR_EXTRAS.contains(&name) => {},
+                    Some(ast::GenericArgs::AngleBracketed(args)) if name == "Iterator" && item_only(args) => {
+                        iterators += 1;
+                    },
+                    _ => return false,
+                }
+            },
+            ast::GenericBound::Outlives(_) => {},
+            ast::GenericBound::Use(args, _) => {
+                if !args
+                    .iter()
+                    .all(|arg| matches!(arg, ast::PreciseCapturingArg::Lifetime(_)))
+                {
+                    return false;
+                }
+            },
+        }
+    }
+    iterators == 1
+}
+
+/// Whether the arguments of `Iterator<..>` are `Item = T` alone.
+fn item_only(args: &ast::AngleBracketedArgs) -> bool {
+    let [ast::AngleBracketedArg::Constraint(c)] = args.args.as_slice() else {
+        return false;
+    };
+    c.ident.name.as_str() == "Item"
+        && c.gen_args.is_none()
+        && matches!(
+            c.kind,
+            ast::AssocItemConstraintKind::Equality { term: ast::Term::Ty(_) }
+        )
 }
 
 fn allowed_macro_path(path: &ast::Path) -> bool {

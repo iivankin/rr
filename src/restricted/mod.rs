@@ -25,7 +25,7 @@ mod stale;
 mod syntax;
 
 declare_lint! { pub RR_NO_STD, Deny, "rr requires a no_std crate without explicit std imports" }
-declare_lint! { pub RR_NO_GENERICS, Deny, "rr forbids user-defined type and const generics, impl Trait and async fn" }
+declare_lint! { pub RR_NO_GENERICS, Deny, "rr forbids user-defined type and const generics, impl Trait other than a closure parameter or a returned iterator, and async fn" }
 declare_lint! { pub RR_NO_MACROS, Deny, "rr forbids macro definitions, derives and calls except no_std compiler builtins and core panic/assert macros" }
 declare_lint! { pub RR_SIMPLE_TRAITS, Deny, "rr forbids associated types, supertraits and where clauses" }
 declare_lint! { pub RR_UNEXPLAINED_ESCAPE, Deny, "rr requires a reason for ownership and borrow-checker escape hatches" }

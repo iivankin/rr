@@ -1370,6 +1370,56 @@ fn a_closure_parameter_and_dyn_of_a_crate_trait_are_allowed() {
 }
 
 #[test]
+fn a_function_may_return_an_iterator() {
+    accepted(
+        "#![no_std]\npub fn evens(v: &[u32]) -> impl Iterator<Item = u32> + '_ { v.iter().copied().filter(|x| x % 2 == 0) }\n\
+         pub struct S { v: [u8; 4] }\nimpl S {\n pub fn new() -> Self { Self { v: [1, 2, 3, 4] } }\n\
+         pub fn bytes(&self) -> impl Iterator<Item = u8> + DoubleEndedIterator + ExactSizeIterator + use<'_> { self.v.iter().copied() }\n}\n\
+         pub fn sum(v: &[u32], s: &S) -> u64 {\n let mut n = u64::try_from(s.bytes().len()).unwrap_or(0);\n for x in evens(v) {\n n += u64::from(x);\n }\n for b in s.bytes().rev() {\n n += u64::from(b);\n }\n n\n}",
+    );
+    for source in [
+        // Not an iterator returned whole by a function of the crate.
+        "pub fn take(v: impl Iterator<Item = u8>) -> usize { v.count() }",
+        "pub fn none() -> Option<impl Iterator<Item = u8>> { Some(core::iter::empty()) }",
+        "pub fn any() -> impl Iterator { core::iter::empty::<u8>() }",
+        "pub fn back() -> impl DoubleEndedIterator<Item = u8> { core::iter::empty() }",
+        "pub fn again() -> impl Iterator<Item = u8> + Clone { core::iter::empty() }",
+        "pub fn hidden() -> impl Iterator<Item = impl Copy> { core::iter::empty::<u8>() }",
+        // In a trait it is an associated type.
+        "pub trait Bytes { fn bytes(&self) -> impl Iterator<Item = u8>; }",
+    ] {
+        rejected(&format!("#![no_std]\n{source}"), "rr_no_generics");
+    }
+    // What the iterator's closures do, the function that writes them does:
+    // the hot path, the call graph and recursion see it.
+    rejected(
+        &alloc_fixture(
+            "pub struct S { v: Vec<u32> }\nimpl S {\n fn grown(&self) -> impl Iterator<Item = usize> + '_ {\n self.v.iter().map(|&x| {\n let mut b = Vec::with_capacity(4);\n b.push(x);\n b.len()\n })\n }\n}\n\
+             #[rr::hot]\npub fn hot(s: &S) -> usize {\n let mut n = 0;\n for k in s.grown() {\n n += k;\n }\n n\n}",
+        ),
+        "rr_hot_path",
+    );
+    rejected(
+        "#![no_std]\npub struct Big { pub a: [u64; 64] }\nfn firsts(v: &[Big]) -> impl Iterator<Item = u64> + '_ {\n v.iter().map(|b| {\n let keep = b.a;\n keep[0]\n })\n}\n\
+         #[rr::hot]\npub fn hot(v: &[Big]) -> u64 {\n let mut n = 0;\n for x in firsts(v) {\n n += x;\n }\n n\n}",
+        "rr_hot_path",
+    );
+    rejected(
+        "#![no_std]\n#[derive(Clone, Copy)]\npub struct Item { pub pos: u32, pub w: u32 }\nfn items(v: &[Item]) -> impl Iterator<Item = &Item> { v.iter() }\n\
+         #[rr::hot]\npub fn hot(input: &[Item], out: &mut [Item]) {\n for (o, it) in out.iter_mut().zip(items(input)) {\n *o = Item { pos: it.pos, w: it.w };\n }\n}",
+        "rr_hot_path",
+    );
+    rejected(
+        "#![no_std]\npub fn walk(n: u8) -> impl Iterator<Item = u8> {\n (0..n).map(total)\n}\npub fn total(n: u8) -> u8 {\n let mut t = 0u8;\n for x in walk(n) {\n t = t.wrapping_add(x);\n }\n t\n}",
+        "rr_no_recursion",
+    );
+    rejected(
+        "#![no_std]\npub fn walk(n: u8) -> impl Iterator<Item = u8> {\n (0..n).map(|i| total(i))\n}\npub fn total(n: u8) -> u8 {\n let mut t = 0u8;\n for x in walk(n) {\n t = t.wrapping_add(x);\n }\n t\n}",
+        "rr_no_recursion",
+    );
+}
+
+#[test]
 fn a_hot_path_grows_a_lent_buffer_only_up_to_a_limit() {
     rejected(
         &alloc_fixture("#[rr::hot]\npub fn put(out: &mut Vec<u8>, b: u8) { out.push(b); }"),

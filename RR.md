@@ -173,7 +173,7 @@ Rules are compiler errors and cannot be lowered with `allow`, `-A rr`,
 | Rule | Restriction |
 | --- | --- |
 | rr_no_std | Require #![no_std]; forbid explicit std imports |
-| rr_no_generics | Forbid own type/const generic parameters, impl Trait other than a closure parameter, async fn/blocks/closures and await |
+| rr_no_generics | Forbid own type/const generic parameters, impl Trait other than a closure parameter or an iterator returned, async fn/blocks/closures and await |
 | rr_simple_traits | Forbid associated types/GATs, supertraits, where clauses, trait aliases and dyn of a trait from another crate |
 | rr_no_macros | Allow no_std compiler builtins, core panic/assert, matches! and seven of the compiler's own derives; forbid own/library macros, other derives and external procedural attributes, including nested calls and cfg_attr derives |
 | rr_unexplained_escape | Require a nearby real comment with a nonempty explanation for the operations below |
@@ -201,7 +201,22 @@ calls the rest as an ordinary function. A closure is part of the function that
 writes it: what it calls, that function calls. `dyn` may name a trait of the
 crate: every implementation is then in the crate, and a call through it
 reaches each in the call graph, as a hot path and recursion see it; a
-trait of another crate behind dyn hides what runs. This policy restricts user-defined
+trait of another crate behind dyn hides what runs.
+
+A function or an inherent method may return `impl Iterator<Item = T>`,
+the whole of its return type, with `+ 'a`, `+ use<'a>`, and
+`DoubleEndedIterator` and `ExactSizeIterator`, which add `next_back` and
+`len` and no type of their own. Chained adaptors with closures compile
+to the loop one would write; a struct whose `next` filters, run by
+`sum` or `map`, measured up to twenty times slower, and its remedy, an
+own `fold`, would be generic. The compiler knows the type behind the
+`impl`, and rr's checks read MIR after it is revealed: a `for` over the
+iterator calls what the type's `next` calls, and the iterator's closures
+are part of the function that writes them, so the call graph, a hot
+path and recursion see what they do. Any other `impl Trait` in return
+position (`impl Fn`, `Option<impl Iterator>`, `+ Clone`, `Item = impl
+Copy`), an iterator taken as a parameter, and one returned by a trait's
+method, which is an associated type, stay forbidden. This policy restricts user-defined
 generics, not every generic inside core/alloc. It checks the current crate and
 its local modules, not previously compiled dependencies.
 
@@ -600,7 +615,9 @@ or within what an argument holds or points to, as `qsort` and a struct
 of callbacks are; a function or closure handed to other code, as `map(f)` does, may be called
 by it; and a value moved into a function of another crate, as `drop(v)`
 does, may be dropped there. A closure is part of the function it is
-written in.
+written in. A returned `impl Iterator` is its real type in MIR: a `for`
+over it calls that type's `next`, and its closures are the returning
+function's.
 
 ## Allocation and copy profiles
 

@@ -107,7 +107,9 @@ impl<'tcx> LateLintPass<'tcx> for ExpandedSyntax {
                     );
                 }
             },
-            hir::TyKind::OpaqueDef(..) => reject(cx, RR_NO_GENERICS, ty.span, "impl Trait"),
+            hir::TyKind::OpaqueDef(opaque) if !returned_iterator(cx, ty.hir_id, opaque) => {
+                reject(cx, RR_NO_GENERICS, ty.span, "impl Trait");
+            },
             _ => {},
         }
     }
@@ -151,6 +153,73 @@ fn closure_param(cx: &LateContext<'_>, generics: &hir::Generics<'_>, param: &hir
         }
     }
     count == 1
+}
+
+/// Whether an opaque type is the whole return type of a function or an
+/// inherent method, not of a trait's, bound by core's `Iterator<Item = T>`
+/// alone, perhaps with `DoubleEndedIterator`, `ExactSizeIterator`,
+/// lifetimes and `use<..>` of lifetimes. MIR after analysis has the type
+/// it hides, so the call graph and the hot path follow what it runs.
+fn returned_iterator(cx: &LateContext<'_>, id: hir::HirId, opaque: &hir::OpaqueTy<'_>) -> bool {
+    let hir::OpaqueTyOrigin::FnReturn {
+        parent,
+        in_trait_or_impl: None,
+    } = opaque.origin
+    else {
+        return false;
+    };
+    let whole = cx
+        .tcx
+        .hir_fn_decl_by_hir_id(cx.tcx.local_def_id_to_hir_id(parent))
+        .is_some_and(|decl| matches!(decl.output, hir::FnRetTy::Return(out) if out.hir_id == id));
+    if !whole {
+        return false;
+    }
+    let iterator = cx.tcx.get_diagnostic_item(rustc_span::sym::Iterator);
+    let mut iterators = 0;
+    for bound in opaque.bounds {
+        match bound {
+            hir::GenericBound::Trait(poly) => {
+                let Some(def) = poly.trait_ref.trait_def_id() else {
+                    return false;
+                };
+                if !poly.bound_generic_params.is_empty() {
+                    return false;
+                }
+                let args = poly.trait_ref.path.segments.last().map(hir::PathSegment::args);
+                let bare = args.is_none_or(|a| a.args.is_empty() && a.constraints.is_empty());
+                let path = cx.tcx.def_path_str(def);
+                if Some(def) == iterator
+                    && let Some(args) = args
+                    && args.args.is_empty()
+                    && let [item] = args.constraints
+                    && item.ident.name.as_str() == "Item"
+                    && matches!(
+                        item.kind,
+                        hir::AssocItemConstraintKind::Equality { term: hir::Term::Ty(_) }
+                    )
+                {
+                    iterators += 1;
+                } else if !(bare
+                    && path
+                        .strip_prefix("core::iter::")
+                        .is_some_and(|name| super::syntax::ITERATOR_EXTRAS.contains(&name)))
+                {
+                    return false;
+                }
+            },
+            hir::GenericBound::Outlives(_) => {},
+            hir::GenericBound::Use(args, _) => {
+                if !args
+                    .iter()
+                    .all(|arg| matches!(arg, hir::PreciseCapturingArgKind::Lifetime(_)))
+                {
+                    return false;
+                }
+            },
+        }
+    }
+    iterators == 1
 }
 
 fn require_included_unsafe_reason(cx: &LateContext<'_>, span: Span) {
