@@ -136,7 +136,7 @@ impl Stream {
             self.link = Link::Failed(error);
             return Err(error);
         }
-        if self.peer().is_none() {
+        if !os::established(self.socket.fd) {
             return Ok(false);
         }
         self.link = Link::Connected;
@@ -778,6 +778,11 @@ mod os {
         decode(address.get(..usize::try_from(size).ok()?)?)
     }
 
+    /// Whether the connection is made: its peer has a name once it is.
+    pub fn established(fd: c_int) -> bool {
+        peer(fd).is_some()
+    }
+
     pub fn peer(fd: c_int) -> Option<SocketAddr> {
         let mut address = [0u8; ADDRESS_BYTES];
         let mut size = length(&address);
@@ -951,6 +956,8 @@ mod os {
     const IPV6_V6ONLY: i32 = 27;
     const TCP_NODELAY: i32 = 1;
     const SD_SEND: i32 = 1;
+    /// mswsock.h: the seconds a socket has been connected.
+    const SO_CONNECT_TIME: i32 = 0x700C;
     const WSAEINTR: i32 = 10004;
     const WSAEACCES: i32 = 10013;
     const WSAEWOULDBLOCK: i32 = 10035;
@@ -1162,6 +1169,29 @@ mod os {
             0 => Ok(()),
             code => Err(error(code)),
         }
+    }
+
+    /// Whether the connection is made. getpeername names the peer while
+    /// the connection is still being made, and a write then fails with
+    /// WSAENOTCONN; SO_CONNECT_TIME says it: the seconds since it was
+    /// made, and before that 0xFFFFFFFF or an error, as its two pages
+    /// in Microsoft's documentation tell it differently.
+    pub fn established(socket: usize) -> bool {
+        let mut seconds = [0u8; 4];
+        let mut size = length(&seconds);
+        // rr: escape(unsafe): seconds holds size bytes.
+        let done = unsafe {
+            c::getsockopt(
+                socket,
+                SOL_SOCKET,
+                SO_CONNECT_TIME,
+                seconds.as_mut_ptr(),
+                &raw mut size,
+            )
+        };
+        // rr: escape(sentinel): 0xFFFFFFFF is Windows's own word for not
+        // connected in SO_CONNECT_TIME.
+        done == 0 && u32::from_le_bytes(seconds) != u32::MAX
     }
 
     pub fn local(socket: usize) -> Option<SocketAddr> {
