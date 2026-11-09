@@ -923,17 +923,30 @@ fn not_connected_yet() {
     let Ok(mut stream) = Stream::connect(address) else {
         return;
     };
-    match stream.connected() {
-        Ok(false) => {
-            assert_eq!(stream.read(&mut [0; 8]), Err(Error::NotConnected));
-            assert_eq!(stream.write(b"x"), Err(Error::NotConnected));
-            assert_eq!(stream.finish(), Err(Error::NotConnected));
-        }
+    // The attempt may fail at any moment, as Windows says at once that
+    // the network is unreachable: until then each call is NotConnected,
+    // and from then on each is that failure, the same every time.
+    let mut failed = match stream.connected() {
+        Ok(false) => None,
         Ok(true) => panic!("TEST-NET-1 answered"),
-        Err(error) => {
-            assert_eq!(stream.read(&mut [0; 8]), Err(error));
-            assert_eq!(stream.write(b"x"), Err(error));
+        Err(error) => Some(error),
+    };
+    let mut buf = [0; 8];
+    for step in 0..6 {
+        let result = match step % 3 {
+            0 => stream.read(&mut buf).map(|_| ()),
+            1 => stream.write(b"x").map(|_| ()),
+            _ => stream.finish(),
+        };
+        match (failed, result) {
+            (None, Err(Error::NotConnected)) => {}
+            (None, Err(error)) => failed = Some(error),
+            (Some(first), Err(error)) => assert_eq!(error, first),
+            (_, Ok(())) => panic!("TEST-NET-1 took data"),
         }
+    }
+    if let Some(error) = failed {
+        assert_eq!(stream.connected(), Err(error));
     }
 }
 
