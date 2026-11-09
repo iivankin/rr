@@ -1,11 +1,49 @@
 //! X25519 key agreement (RFC 7748). The field is five 51-bit limbs in
 //! 64-bit words, multiplied through u128. The ladder is constant time:
 //! the secret picks masks, never a branch, a loop count or an address.
+//!
+//! A Secret is made from random's seed, a PublicKey from the peer's
+//! bytes, and agree gives a SharedSecret, which is only input to a key
+//! derivation (HKDF-Extract), never a key. Secret and SharedSecret are
+//! not Copy, Clone or Debug, and are wiped when dropped; P-256's are
+//! ecdh's own types, so one cannot stand for the other.
+//!
+//! ```text
+//! let secret = x25519::Secret::new(random::seed32());
+//! send(secret.public_key().bytes());
+//! let shared = secret.agree(&x25519::PublicKey::from_bytes(peer))?;  // Err(LowOrder)
+//! let prk = sha256::hkdf_extract(salt, shared.kdf_input());
+//! ```
 
+use crate::base::random;
 use core::num::Wrapping;
 
 /// Bytes of a secret, a public key and a shared secret.
 pub const KEY_BYTES: usize = 32;
+
+/// What went wrong.
+#[cfg_attr(test, derive(Debug, PartialEq))]
+pub enum Error {
+    /// The peer's key is a point of small order, whose shared secret is
+    /// zero whatever the secret: TLS must abort (RFC 9846 7.4.2).
+    LowOrder,
+}
+
+/// A secret scalar, from the system's randomness.
+pub struct Secret {
+    bytes: [u8; KEY_BYTES],
+}
+
+/// A public key: the u-coordinate of a point, as the peer sent it or
+/// public_key made it. Every 32 bytes are one (RFC 7748 5).
+pub struct PublicKey {
+    bytes: [u8; KEY_BYTES],
+}
+
+/// The secret two keys agree on: input to a key derivation, not a key.
+pub struct SharedSecret {
+    bytes: [u8; KEY_BYTES],
+}
 
 /// A field element mod 2^255 - 19; limbs may run a few bits past 51.
 type Fe = [u64; 5];
@@ -15,21 +53,68 @@ const ONE: Fe = [1, 0, 0, 0, 0];
 /// (486662 - 2) / 4, the curve constant of the doubling.
 const A24: u64 = 121_665;
 
-/// The public key of secret: secret times the base point 9.
-pub fn public_key(secret: &[u8; KEY_BYTES]) -> [u8; KEY_BYTES] {
-    let mut base = [0; KEY_BYTES];
-    base[0] = 9;
-    ladder(secret, &base)
+impl Secret {
+    /// A secret from 32 random bytes; the ladder clamps them.
+    pub fn new(seed: random::Seed32) -> Secret {
+        Secret {
+            bytes: seed.into_bytes(),
+        }
+    }
+
+    /// The public key: the secret times the base point 9.
+    #[must_use]
+    pub fn public_key(&self) -> PublicKey {
+        let mut base = [0; KEY_BYTES];
+        base[0] = 9;
+        PublicKey {
+            bytes: ladder(&self.bytes, &base),
+        }
+    }
+
+    /// The secret shared with peer; LowOrder when it is all zero, peer
+    /// being a point of small order.
+    #[cfg_attr(rr, rr::hot)]
+    pub fn agree(&self, peer: &PublicKey) -> Result<SharedSecret, Error> {
+        let mut out = ladder(&self.bytes, &peer.bytes);
+        // Fold every byte so the time does not depend on where one is set.
+        let any = out.iter().fold(0, |acc, byte| acc | byte);
+        if core::hint::black_box(any) == 0 {
+            random::wipe(&mut out);
+            return Err(Error::LowOrder);
+        }
+        Ok(SharedSecret { bytes: out })
+    }
 }
 
-/// The secret shared with peer. None when it is all zero: peer is a point
-/// of small order, and TLS (RFC 9846 7.4.2) must abort then.
-#[cfg_attr(rr, rr::hot)]
-pub fn shared(secret: &[u8; KEY_BYTES], peer: &[u8; KEY_BYTES]) -> Option<[u8; KEY_BYTES]> {
-    let out = ladder(secret, peer);
-    // Fold every byte so the time does not depend on where one is set.
-    let any = out.iter().fold(0, |acc, byte| acc | byte);
-    if any == 0 { None } else { Some(out) }
+impl PublicKey {
+    /// The peer's key as it came.
+    pub fn from_bytes(bytes: &[u8; KEY_BYTES]) -> PublicKey {
+        PublicKey { bytes: *bytes }
+    }
+
+    /// The key's bytes, to send.
+    pub fn bytes(&self) -> &[u8; KEY_BYTES] {
+        &self.bytes
+    }
+}
+
+impl SharedSecret {
+    /// The secret as a key derivation's input keying material.
+    pub fn kdf_input(&self) -> &[u8; KEY_BYTES] {
+        &self.bytes
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        random::wipe(&mut self.bytes);
+    }
+}
+
+impl Drop for SharedSecret {
+    fn drop(&mut self) {
+        random::wipe(&mut self.bytes);
+    }
 }
 
 /// RFC 7748 section 5: the clamped scalar times the u-coordinate.
@@ -277,8 +362,19 @@ fn invert(z: &Fe) -> Fe {
 
 #[cfg(test)]
 mod tests {
-    use super::{KEY_BYTES, ladder, public_key, shared};
+    use super::{Error, KEY_BYTES, PublicKey, Secret, ladder};
+    use crate::base::random::Seed32;
     use test::Bencher;
+
+    fn secret(bytes: [u8; KEY_BYTES]) -> Secret {
+        Secret::new(Seed32::for_tests(bytes))
+    }
+
+    /// The shared secret of a secret and a peer's key, as bytes.
+    fn shared(k: [u8; KEY_BYTES], peer: &[u8; KEY_BYTES]) -> Result<[u8; KEY_BYTES], Error> {
+        let agreed = secret(k).agree(&PublicKey::from_bytes(peer))?;
+        Ok(*agreed.kdf_input())
+    }
 
     fn hex(s: &str) -> [u8; KEY_BYTES] {
         let mut out = [0; KEY_BYTES];
@@ -309,7 +405,7 @@ mod tests {
             ),
         ];
         for (k, u, out) in cases {
-            assert_eq!(shared(&hex(k), &hex(u)), Some(hex(out)));
+            assert_eq!(shared(hex(k), &hex(u)), Ok(hex(out)));
         }
     }
 
@@ -353,19 +449,19 @@ mod tests {
     fn alice_and_bob() {
         let alice = hex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
         let bob = hex("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb");
-        let alice_public = public_key(&alice);
-        let bob_public = public_key(&bob);
+        let alice_public = secret(alice).public_key();
+        let bob_public = secret(bob).public_key();
         assert_eq!(
-            alice_public,
+            *alice_public.bytes(),
             hex("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a")
         );
         assert_eq!(
-            bob_public,
+            *bob_public.bytes(),
             hex("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f")
         );
-        let secret = hex("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
-        assert_eq!(shared(&alice, &bob_public), Some(secret));
-        assert_eq!(shared(&bob, &alice_public), Some(secret));
+        let agreed = hex("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742");
+        assert_eq!(shared(alice, bob_public.bytes()), Ok(agreed));
+        assert_eq!(shared(bob, alice_public.bytes()), Ok(agreed));
     }
 
     /// Points of small order give the all-zero secret, which is refused.
@@ -375,9 +471,9 @@ mod tests {
         let mut one = [0; KEY_BYTES];
         one[0] = 1;
         let order8 = hex("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800");
-        assert_eq!(shared(&alice, &[0; KEY_BYTES]), None);
-        assert_eq!(shared(&alice, &one), None);
-        assert_eq!(shared(&alice, &order8), None);
+        assert_eq!(shared(alice, &[0; KEY_BYTES]), Err(Error::LowOrder));
+        assert_eq!(shared(alice, &one), Err(Error::LowOrder));
+        assert_eq!(shared(alice, &order8), Err(Error::LowOrder));
     }
 
     /// The 4 fields of a case's line, split at spaces.
@@ -401,24 +497,45 @@ mod tests {
             if line.starts_with('#') {
                 continue;
             }
-            let [id, secret, peer, out] = fields(line);
+            let [id, key, peer, out] = fields(line);
             let out = hex(out);
             let expected = if out == [0; KEY_BYTES] {
-                None
+                Err(Error::LowOrder)
             } else {
-                Some(out)
+                Ok(out)
             };
-            assert_eq!(shared(&hex(secret), &hex(peer)), expected, "tcId {id}");
+            assert_eq!(shared(hex(key), &hex(peer)), expected, "tcId {id}");
             cases += 1;
         }
         assert_eq!(cases, 518);
     }
 
+    /// As TLS uses it: each side's secret from the system, the public
+    /// keys exchanged, one secret agreed on; a new secret agrees on
+    /// another; the same secret agrees again on the same.
+    #[test]
+    fn exchange() {
+        let (alice, bob) = (Secret::new(crate::base::random::seed32()), secret([7; 32]));
+        let (to_bob, to_alice) = (alice.public_key(), bob.public_key());
+        let ours = alice.agree(&to_alice).unwrap();
+        let theirs = bob.agree(&to_bob).unwrap();
+        assert_eq!(ours.kdf_input(), theirs.kdf_input());
+        assert_eq!(
+            alice.agree(&to_alice).unwrap().kdf_input(),
+            ours.kdf_input()
+        );
+        let other = Secret::new(crate::base::random::seed32());
+        assert_ne!(
+            other.agree(&to_alice).unwrap().kdf_input(),
+            ours.kdf_input()
+        );
+    }
+
     /// One key agreement.
     #[bench]
     fn one_shared(b: &mut Bencher) {
-        let secret = [42; KEY_BYTES];
-        let peer = public_key(&[3; KEY_BYTES]);
-        b.iter(|| shared(core::hint::black_box(&secret), &peer));
+        let key = secret([42; KEY_BYTES]);
+        let peer = secret([3; KEY_BYTES]).public_key();
+        b.iter(|| core::hint::black_box(&key).agree(&peer));
     }
 }

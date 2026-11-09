@@ -49,6 +49,7 @@
 //! screen over a path the system built, leaf first; it is no Store, so
 //! no verify trusts its anchors. Loading an anchor says why it failed.
 
+use crate::base::digest::Digest;
 use crate::base::ecdsa;
 use crate::base::rsa;
 use crate::base::sha256;
@@ -216,6 +217,13 @@ enum Scheme {
     Ecdsa,
     Pkcs1,
     Pss,
+}
+
+/// The hash a signature algorithm names, which the message is hashed by.
+enum Hash {
+    Sha256,
+    Sha384,
+    Sha512,
 }
 
 /// The extensions this processes.
@@ -619,17 +627,17 @@ fn algorithm(body: &[u8]) -> Result<Algorithm, Error> {
 }
 
 impl Algorithm {
-    fn scheme(&self) -> Option<(Scheme, rsa::Hash)> {
+    fn scheme(&self) -> Option<(Scheme, Hash)> {
         match self {
-            Algorithm::EcdsaSha256 => Some((Scheme::Ecdsa, rsa::Hash::Sha256)),
-            Algorithm::EcdsaSha384 => Some((Scheme::Ecdsa, rsa::Hash::Sha384)),
-            Algorithm::EcdsaSha512 => Some((Scheme::Ecdsa, rsa::Hash::Sha512)),
-            Algorithm::Pkcs1Sha256 => Some((Scheme::Pkcs1, rsa::Hash::Sha256)),
-            Algorithm::Pkcs1Sha384 => Some((Scheme::Pkcs1, rsa::Hash::Sha384)),
-            Algorithm::Pkcs1Sha512 => Some((Scheme::Pkcs1, rsa::Hash::Sha512)),
-            Algorithm::PssSha256 => Some((Scheme::Pss, rsa::Hash::Sha256)),
-            Algorithm::PssSha384 => Some((Scheme::Pss, rsa::Hash::Sha384)),
-            Algorithm::PssSha512 => Some((Scheme::Pss, rsa::Hash::Sha512)),
+            Algorithm::EcdsaSha256 => Some((Scheme::Ecdsa, Hash::Sha256)),
+            Algorithm::EcdsaSha384 => Some((Scheme::Ecdsa, Hash::Sha384)),
+            Algorithm::EcdsaSha512 => Some((Scheme::Ecdsa, Hash::Sha512)),
+            Algorithm::Pkcs1Sha256 => Some((Scheme::Pkcs1, Hash::Sha256)),
+            Algorithm::Pkcs1Sha384 => Some((Scheme::Pkcs1, Hash::Sha384)),
+            Algorithm::Pkcs1Sha512 => Some((Scheme::Pkcs1, Hash::Sha512)),
+            Algorithm::PssSha256 => Some((Scheme::Pss, Hash::Sha256)),
+            Algorithm::PssSha384 => Some((Scheme::Pss, Hash::Sha384)),
+            Algorithm::PssSha512 => Some((Scheme::Pss, Hash::Sha512)),
             Algorithm::Other => None,
         }
     }
@@ -982,36 +990,30 @@ impl Certificate<'_> {
 }
 
 /// Whether signature, made by scheme with hash, signs message under key.
-fn signed(
-    key: &Key<'_>,
-    scheme: &Scheme,
-    hash: &rsa::Hash,
-    message: &[u8],
-    signature: &[u8],
-) -> bool {
-    let check = |digest: &[u8]| match (scheme, key) {
+fn signed(key: &Key<'_>, scheme: &Scheme, hash: &Hash, message: &[u8], signature: &[u8]) -> bool {
+    let check = |digest: &Digest<'_>| match (scheme, key) {
         (Scheme::Ecdsa, Key::P256(point)) => {
-            ecdsa::verify(&ecdsa::Curve::P256, point, digest, signature)
+            ecdsa::verify(&ecdsa::Curve::P256, point, digest, signature).is_ok()
         }
         (Scheme::Ecdsa, Key::P384(point)) => {
-            ecdsa::verify(&ecdsa::Curve::P384, point, digest, signature)
+            ecdsa::verify(&ecdsa::Curve::P384, point, digest, signature).is_ok()
         }
         (Scheme::Ecdsa, Key::P521(point)) => {
-            ecdsa::verify(&ecdsa::Curve::P521, point, digest, signature)
+            ecdsa::verify(&ecdsa::Curve::P521, point, digest, signature).is_ok()
         }
         (Scheme::Pkcs1, Key::Rsa { modulus, exponent }) => {
-            rsa::verify_pkcs1(modulus, exponent, hash, digest, signature)
+            rsa::verify_pkcs1(modulus, exponent, digest, signature).is_ok()
         }
         (Scheme::Pss, Key::Rsa { modulus, exponent }) => {
-            rsa::verify_pss(modulus, exponent, hash, digest, signature)
+            rsa::verify_pss(modulus, exponent, digest, signature).is_ok()
         }
         (Scheme::Ecdsa, Key::Rsa { .. })
         | (Scheme::Pkcs1 | Scheme::Pss, Key::P256(_) | Key::P384(_) | Key::P521(_)) => false,
     };
     match hash {
-        rsa::Hash::Sha256 => check(&sha256::digest(message)),
-        rsa::Hash::Sha384 => check(&sha384::digest(message)),
-        rsa::Hash::Sha512 => check(&sha384::digest512(message)),
+        Hash::Sha256 => check(&Digest::Sha256(&sha256::digest(message))),
+        Hash::Sha384 => check(&Digest::Sha384(&sha384::digest384(message))),
+        Hash::Sha512 => check(&Digest::Sha512(&sha384::digest512(message))),
     }
 }
 
@@ -1041,7 +1043,7 @@ impl Approval {
 /// Whether two digests are equal, in time that does not depend on where
 /// they differ.
 fn same_digest(a: &[u8; 32], b: &[u8; 32]) -> bool {
-    a.iter().zip(b).fold(0, |differ, (x, y)| differ | (x ^ y)) == 0
+    core::hint::black_box(a.iter().zip(b).fold(0, |differ, (x, y)| differ | (x ^ y))) == 0
 }
 
 /// SHA-256 of host as approvals compare it: an IPv6 literal without its
@@ -1090,12 +1092,12 @@ impl<'a> Leaf<'a> {
     /// Error::Signature.
     pub fn verify_tls13(&self, scheme: u16, message: &[u8], signature: &[u8]) -> Result<(), Error> {
         let (method, hash) = match (scheme, &self.key) {
-            (0x0403, Key::P256(_)) => (Scheme::Ecdsa, rsa::Hash::Sha256),
-            (0x0503, Key::P384(_)) => (Scheme::Ecdsa, rsa::Hash::Sha384),
-            (0x0603, Key::P521(_)) => (Scheme::Ecdsa, rsa::Hash::Sha512),
-            (0x0804, Key::Rsa { .. }) => (Scheme::Pss, rsa::Hash::Sha256),
-            (0x0805, Key::Rsa { .. }) => (Scheme::Pss, rsa::Hash::Sha384),
-            (0x0806, Key::Rsa { .. }) => (Scheme::Pss, rsa::Hash::Sha512),
+            (0x0403, Key::P256(_)) => (Scheme::Ecdsa, Hash::Sha256),
+            (0x0503, Key::P384(_)) => (Scheme::Ecdsa, Hash::Sha384),
+            (0x0603, Key::P521(_)) => (Scheme::Ecdsa, Hash::Sha512),
+            (0x0804, Key::Rsa { .. }) => (Scheme::Pss, Hash::Sha256),
+            (0x0805, Key::Rsa { .. }) => (Scheme::Pss, Hash::Sha384),
+            (0x0806, Key::Rsa { .. }) => (Scheme::Pss, Hash::Sha512),
             _ => return Err(Error::Unsupported),
         };
         if signed(&self.key, &method, &hash, message, signature) {

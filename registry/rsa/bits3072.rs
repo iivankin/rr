@@ -5,7 +5,7 @@
 //! from modulus.rs.in beside it, which is where to change it.
 
 use super::{
-    Column, Encoding, Key, MODULUS_BITS_MIN, below, load, low, negative_inverse, shift_left,
+    Column, Encoding, Error, Key, MODULUS_BITS_MIN, below, load, low, negative_inverse, shift_left,
     shift_right, subtract,
 };
 
@@ -26,17 +26,26 @@ struct Modulus {
     e: u64,
 }
 
-/// Whether signature^e mod m under the key, whose modulus has at most
-/// LIMBS limbs, is the encoded message the encoding wants.
-pub(super) fn verify(key: &Key<'_>, signature: &[u8], encoding: &Encoding<'_>) -> bool {
+/// Ok when signature^e mod m under the key, whose modulus has at most
+/// LIMBS limbs, is the encoded message the encoding wants: Key for a
+/// wider modulus, Encoding for a signature not below m of its length,
+/// Signature for another message.
+pub(super) fn verify(
+    key: &Key<'_>,
+    signature: &[u8],
+    encoding: &Encoding<'_>,
+) -> Result<(), Error> {
     let Some(modulus) = Modulus::new(key) else {
-        return false;
+        return Err(Error::Key);
     };
     let mut buffer = [0; 8 * LIMBS];
     let Some(em) = modulus.public(signature, &mut buffer) else {
-        return false;
+        return Err(Error::Encoding);
     };
-    encoding.matches(em, key.bits)
+    if !encoding.matches(em, key.bits) {
+        return Err(Error::Signature);
+    }
+    Ok(())
 }
 
 impl Modulus {

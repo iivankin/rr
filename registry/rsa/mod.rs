@@ -20,7 +20,17 @@
 //! than its file's width, as one of 2049 bits in bits3072.rs, works on
 //! the limbs it has, with R = 2^(64 limbs). registry/rsa/rsa-gen.py in
 //! rr's repository writes the four from one template.
+//!
+//! What is verified is a digest that names its hash (digest::Digest),
+//! never bytes of any length, and PSS's MGF1 takes the same hash. The
+//! answer is a Result that says which part is wrong:
+//!
+//! ```text
+//! let digest = sha256::digest(message);
+//! rsa::verify_pss(modulus, exponent, &Digest::Sha256(&digest), signature)?;
+//! ```
 
+use crate::base::digest::Digest;
 use crate::base::sha256;
 use crate::base::sha384;
 
@@ -29,8 +39,20 @@ mod bits3072;
 mod bits4096;
 mod bits8192;
 
+/// Why a signature does not verify.
+#[cfg_attr(test, derive(Debug, PartialEq))]
+pub enum Error {
+    /// The key is out of bounds: a modulus of 2048 to 8192 bits, odd, and
+    /// an odd exponent from 3 to 2^33 - 1.
+    Key,
+    /// The signature is not a number below the modulus, of its length.
+    Encoding,
+    /// The signature is not one of the digest under the key.
+    Signature,
+}
+
 /// The hash a signature covers; PSS's MGF1 uses the same.
-pub enum Hash {
+enum Hash {
     Sha256,
     Sha384,
     Sha512,
@@ -72,10 +94,19 @@ enum Encoding<'a> {
 }
 
 impl Hash {
+    /// The hash a digest names, and its bytes.
+    fn of<'a>(digest: &Digest<'a>) -> (Hash, &'a [u8]) {
+        match *digest {
+            Digest::Sha256(bytes) => (Hash::Sha256, bytes),
+            Digest::Sha384(bytes) => (Hash::Sha384, bytes),
+            Digest::Sha512(bytes) => (Hash::Sha512, bytes),
+        }
+    }
+
     fn len(&self) -> usize {
         match self {
             Hash::Sha256 => sha256::DIGEST_BYTES,
-            Hash::Sha384 => sha384::DIGEST_BYTES,
+            Hash::Sha384 => sha384::SHA384_BYTES,
             Hash::Sha512 => sha384::SHA512_BYTES,
         }
     }
@@ -115,42 +146,32 @@ impl Hash {
     }
 }
 
-/// Whether signature is an RSASSA-PKCS1-v1_5 signature of digest under
+/// Ok when signature is an RSASSA-PKCS1-v1_5 signature of digest under
 /// the key (modulus, exponent), both big-endian. The whole encoded
 /// message is compared: 00 01 FF..FF 00 DigestInfo digest.
 pub fn verify_pkcs1(
     modulus: &[u8],
     exponent: &[u8],
-    hash: &Hash,
-    digest: &[u8],
+    digest: &Digest<'_>,
     signature: &[u8],
-) -> bool {
-    if digest.len() != hash.len() {
-        return false;
-    }
-    let Some(key) = Key::new(modulus, exponent) else {
-        return false;
-    };
-    key.verify(signature, &Encoding::Pkcs1(hash, digest))
+) -> Result<(), Error> {
+    let key = Key::new(modulus, exponent).ok_or(Error::Key)?;
+    let (hash, bytes) = Hash::of(digest);
+    key.verify(signature, &Encoding::Pkcs1(&hash, bytes))
 }
 
-/// Whether signature is an RSASSA-PSS signature of digest under the key
-/// (modulus, exponent), with MGF1 of hash and a salt of the hash's
+/// Ok when signature is an RSASSA-PSS signature of digest under the key
+/// (modulus, exponent), with MGF1 of the digest's hash and a salt of its
 /// length (RFC 8017 9.1.2).
 pub fn verify_pss(
     modulus: &[u8],
     exponent: &[u8],
-    hash: &Hash,
-    digest: &[u8],
+    digest: &Digest<'_>,
     signature: &[u8],
-) -> bool {
-    if digest.len() != hash.len() {
-        return false;
-    }
-    let Some(key) = Key::new(modulus, exponent) else {
-        return false;
-    };
-    key.verify(signature, &Encoding::Pss(hash, digest))
+) -> Result<(), Error> {
+    let key = Key::new(modulus, exponent).ok_or(Error::Key)?;
+    let (hash, bytes) = Hash::of(digest);
+    key.verify(signature, &Encoding::Pss(&hash, bytes))
 }
 
 impl Encoding<'_> {
@@ -271,9 +292,9 @@ impl<'a> Key<'a> {
         Some(Key { modulus, bits, e })
     }
 
-    /// Whether signature^e mod m is the encoding, in the arithmetic of
+    /// Ok when signature^e mod m is the encoding, in the arithmetic of
     /// the narrowest width that holds the modulus.
-    fn verify(&self, signature: &[u8], encoding: &Encoding<'_>) -> bool {
+    fn verify(&self, signature: &[u8], encoding: &Encoding<'_>) -> Result<(), Error> {
         let limbs = self.modulus.len().div_ceil(8);
         if limbs <= bits2048::LIMBS {
             bits2048::verify(self, signature, encoding)
@@ -433,8 +454,23 @@ pub fn fuzz_verify(input: &[u8]) {
     let (digest, rest) = rest.split_at(hash.len().min(rest.len()));
     let modulus_length = rest.len() / 2 + usize::from(split % 3);
     let (modulus, signature) = rest.split_at(modulus_length.min(rest.len()));
-    verify_pkcs1(modulus, exponent, &hash, digest, signature);
-    verify_pss(modulus, exponent, &hash, digest, signature);
+    let Some(digest) = fuzz_digest(&hash, digest) else {
+        return;
+    };
+    // rr: escape(discard): any answer will do; a panic is the failure.
+    let _: Result<(), Error> = verify_pkcs1(modulus, exponent, &digest, signature);
+    // rr: escape(discard): as above.
+    let _: Result<(), Error> = verify_pss(modulus, exponent, &digest, signature);
+}
+
+/// bytes as a digest of hash, if they are its length.
+#[cfg(fuzzing)]
+fn fuzz_digest<'a>(hash: &Hash, bytes: &'a [u8]) -> Option<Digest<'a>> {
+    Some(match hash {
+        Hash::Sha256 => Digest::Sha256(bytes.try_into().ok()?),
+        Hash::Sha384 => Digest::Sha384(bytes.try_into().ok()?),
+        Hash::Sha512 => Digest::Sha512(bytes.try_into().ok()?),
+    })
 }
 
 /// Any bytes as a signature under one 2048-bit key: the decoding of
@@ -447,24 +483,49 @@ pub fn fuzz_signature(input: &[u8]) {
     for (byte, given) in signature.iter_mut().skip(1).zip(input) {
         *byte = *given;
     }
+    let bytes = [0x5a; 64];
     for hash in [Hash::Sha256, Hash::Sha384, Hash::Sha512] {
-        let digest = [0x5a; 64];
-        let digest = &digest[..hash.len()];
+        let Some(digest) = fuzz_digest(&hash, bytes.get(..hash.len()).unwrap_or_default()) else {
+            return;
+        };
         for exponent in [&[3][..], &[1, 0, 1]] {
-            verify_pkcs1(&modulus, exponent, &hash, digest, &signature);
-            verify_pss(&modulus, exponent, &hash, digest, &signature);
-            verify_pss(&modulus, exponent, &hash, digest, input);
+            // rr: escape(discard): any answer will do; a panic is the
+            // failure.
+            let _: Result<(), Error> = verify_pkcs1(&modulus, exponent, &digest, &signature);
+            // rr: escape(discard): as above.
+            let _: Result<(), Error> = verify_pss(&modulus, exponent, &digest, &signature);
+            // rr: escape(discard): as above.
+            let _: Result<(), Error> = verify_pss(&modulus, exponent, &digest, input);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Encoding, Hash, Key, bits2048, bits3072, bits4096, bits8192, verify_pkcs1, verify_pss,
-    };
+    use super::{Encoding, Error, Hash, Key, bits2048, bits3072, bits4096, bits8192};
+    use crate::base::digest::Digest;
     use alloc::vec::Vec;
     use test::Bencher;
+
+    /// bytes as a digest of hash, or None when they are not its length.
+    fn digest<'a>(hash: &Hash, bytes: &'a [u8]) -> Option<Digest<'a>> {
+        Some(match hash {
+            Hash::Sha256 => Digest::Sha256(bytes.try_into().ok()?),
+            Hash::Sha384 => Digest::Sha384(bytes.try_into().ok()?),
+            Hash::Sha512 => Digest::Sha512(bytes.try_into().ok()?),
+        })
+    }
+
+    /// Whether signature verifies under PKCS #1 for the digest of hash in
+    /// bytes, which a length not the hash's never does.
+    fn verify_pkcs1(m: &[u8], e: &[u8], hash: &Hash, bytes: &[u8], signature: &[u8]) -> bool {
+        digest(hash, bytes).is_some_and(|d| super::verify_pkcs1(m, e, &d, signature).is_ok())
+    }
+
+    /// verify_pkcs1 for PSS.
+    fn verify_pss(m: &[u8], e: &[u8], hash: &Hash, bytes: &[u8], signature: &[u8]) -> bool {
+        digest(hash, bytes).is_some_and(|d| super::verify_pss(m, e, &d, signature).is_ok())
+    }
 
     fn hex(text: &str) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -788,7 +849,7 @@ mod tests {
         let key = Key::new(&modulus, &[1, 0, 1]).unwrap();
         let encoding = Encoding::Pkcs1(&Hash::Sha256, &empty);
         for (width, verify) in verifies.iter().enumerate() {
-            assert!(verify(&key, &signature, &encoding), "{width}");
+            assert_eq!(verify(&key, &signature, &encoding), Ok(()), "{width}");
         }
         let (modulus_8192, digest_8192) = (hex(MODULUS_8192), hex(SHA256_8192));
         let (key_8192, signature_8192) = (
@@ -798,8 +859,44 @@ mod tests {
         let encoding_8192 = Encoding::Pkcs1(&Hash::Sha256, &digest_8192);
         for (width, verify) in verifies.iter().enumerate() {
             let verified = verify(&key_8192, &signature_8192, &encoding_8192);
-            assert_eq!(verified, width == 3, "{width}");
+            assert_eq!(verified.is_ok(), width == 3, "{width}");
         }
+    }
+
+    /// Each failure says which part is wrong.
+    #[test]
+    fn errors() {
+        let (modulus, empty, signature) = (hex(MODULUS), hex(EMPTY), hex(PSS));
+        let digest: [u8; 32] = empty.try_into().unwrap();
+        let good = Digest::Sha256(&digest);
+        assert_eq!(
+            super::verify_pss(&modulus, &[1, 0, 1], &good, &signature),
+            Ok(())
+        );
+        let short = &modulus[..200];
+        assert_eq!(
+            super::verify_pss(short, &[1, 0, 1], &good, &signature),
+            Err(Error::Key)
+        );
+        assert_eq!(
+            super::verify_pss(&modulus, &[2], &good, &signature),
+            Err(Error::Key)
+        );
+        let cut = &signature[1..];
+        assert_eq!(
+            super::verify_pss(&modulus, &[1, 0, 1], &good, cut),
+            Err(Error::Encoding)
+        );
+        let above = [0xff; 256];
+        assert_eq!(
+            super::verify_pss(&modulus, &[1, 0, 1], &good, &above),
+            Err(Error::Encoding)
+        );
+        let other = Digest::Sha256(&[0; 32]);
+        let refused = super::verify_pss(&modulus, &[1, 0, 1], &other, &signature);
+        assert_eq!(refused, Err(Error::Signature));
+        let pkcs1 = super::verify_pkcs1(&modulus, &[1, 0, 1], &good, &signature);
+        assert_eq!(pkcs1, Err(Error::Signature));
     }
 
     /// Moduli of 2048 to 8192 bits, odd; exponents odd, from 3 to 2^33 -

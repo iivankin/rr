@@ -2,25 +2,34 @@
   "components": [
     {
       "name": "aesgcm",
-      "description": "AES-128-GCM and AES-256-GCM (NIST SP 800-38D, TLS 1.3's 12-byte nonce and 16-byte tag), sealed and opened in place, on AES and carry-less multiply instructions where the CPU has them and constant-time portable code elsewhere.",
+      "description": "AES-128-GCM and AES-256-GCM (NIST SP 800-38D, TLS 1.3's 12-byte nonce and 16-byte tag), sealed and opened in place, on AES and carry-less multiply instructions where the CPU has them and constant-time portable code elsewhere; a SealingKey and an OpeningKey that number their own nonces (IV XOR the record's number, as TLS 1.3) and refuse past 2^64 - 1, seal_with_nonce and open_with_nonce for a nonce of the caller's, a tag that must be used, key schedules wiped when dropped.",
       "dependencies": [
         "cpu"
       ]
     },
     {
       "name": "cpu",
-      "description": "What the CPU has of the instructions the components use (AES, carry-less multiply, SHA-256, SHA-512, VAES), asked once for the process.",
+      "description": "What the CPU has of the instructions the components use (AES, carry-less multiply, SHA-256, SHA-512, VAES), asked once for the process, as Features only it names.",
+      "dependencies": []
+    },
+    {
+      "name": "digest",
+      "description": "A digest that names its hash, SHA-256, SHA-384 or SHA-512, at its length: what a signature verifier (ecdsa, rsa) takes instead of bytes of any length.",
       "dependencies": []
     },
     {
       "name": "ecdh",
-      "description": "P-256 Diffie-Hellman for TLS 1.3's key share (SEC 1, NIST SP 800-56A): a secret's uncompressed public point and the x-coordinate shared with a peer's, peers off the curve refused; constant time over the secret, with complete addition formulas and masked table reads.",
-      "dependencies": []
+      "description": "P-256 Diffie-Hellman for TLS 1.3's key share (SEC 1, NIST SP 800-56A): a secret's uncompressed public point and the x-coordinate shared with a peer's, peers off the curve refused; constant time over the secret, with complete addition formulas and masked table reads; a Secret made from random's seed, a PublicKey checked as a point, and a SharedSecret only a key derivation takes.",
+      "dependencies": [
+        "random"
+      ]
     },
     {
       "name": "ecdsa",
-      "description": "ECDSA signature verification on P-256, P-384 and P-521 (FIPS 186-4, SEC 1): strict DER signatures, uncompressed keys checked on the curve, Montgomery field arithmetic with P-256's special reduction and NAF double-scalar multiplies.",
-      "dependencies": []
+      "description": "ECDSA signature verification on P-256, P-384 and P-521 (FIPS 186-4, SEC 1) of a digest that names its hash, answering which part is wrong (key, encoding, signature): strict DER signatures, uncompressed keys checked on the curve, Montgomery field arithmetic with P-256's special reduction and NAF double-scalar multiplies.",
+      "dependencies": [
+        "digest"
+      ]
     },
     {
       "name": "http1",
@@ -29,8 +38,10 @@
     },
     {
       "name": "mlkem",
-      "description": "ML-KEM-768 (FIPS 203) for TLS's X25519MLKEM768: key generation from a 64-byte seed, encapsulation with the modulus check, decapsulation with implicit rejection, constant time over secrets; its own Keccak (SHA3-256, SHA3-512, SHAKE128, SHAKE256).",
-      "dependencies": []
+      "description": "ML-KEM-768 (FIPS 203) for TLS's X25519MLKEM768: key generation from a 64-byte seed, encapsulation with the modulus check, decapsulation with implicit rejection, constant time over secrets; its own Keccak (SHA3-256, SHA3-512, SHAKE128, SHAKE256); keys generated in place from random's seed, encapsulation from random's seed, a SharedSecret only a key derivation takes, secrets wiped.",
+      "dependencies": [
+        "random"
+      ]
     },
     {
       "name": "net",
@@ -38,6 +49,11 @@
       "dependencies": [
         "wait"
       ]
+    },
+    {
+      "name": "random",
+      "description": "The system's randomness: arc4random_buf on macOS, getrandom(2) on Linux (/dev/urandom before 3.17), ProcessPrng on Windows; seeds of 32 and 64 bytes that only it makes, which keys are made from, wiped when dropped.",
+      "dependencies": []
     },
     {
       "name": "resolve",
@@ -55,30 +71,32 @@
     },
     {
       "name": "rsa",
-      "description": "RSA signature verification (RFC 8017): RSASSA-PKCS1-v1_5 and RSASSA-PSS with MGF1 and a salt of the hash's length, SHA-256, SHA-384 or SHA-512, for moduli of 2048 to 8192 bits and exponents of at most 33 bits.",
+      "description": "RSA signature verification (RFC 8017): RSASSA-PKCS1-v1_5 and RSASSA-PSS with MGF1 and a salt of the hash's length, SHA-256, SHA-384 or SHA-512, for moduli of 2048 to 8192 bits and exponents of at most 33 bits, of a digest that names its hash, answering which part is wrong (key, encoding, signature).",
       "dependencies": [
+        "digest",
         "sha256",
         "sha384"
       ]
     },
     {
       "name": "sha256",
-      "description": "SHA-256 (FIPS 180-4), HMAC-SHA256 (RFC 2104) and HKDF-SHA256 (RFC 5869), with SHA instructions where the CPU has them.",
+      "description": "SHA-256 (FIPS 180-4), HMAC-SHA256 (RFC 2104) with a constant-time verify, and HKDF-SHA256 (RFC 5869) whose Expand takes only the Prk Extract makes, wiped when dropped; with SHA instructions where the CPU has them.",
       "dependencies": [
         "cpu"
       ]
     },
     {
       "name": "sha384",
-      "description": "SHA-384 and SHA-512 (FIPS 180-4), HMAC-SHA384 and HMAC-SHA512 (RFC 2104) and HKDF-SHA384 (RFC 5869), with SHA512 instructions where the CPU has them.",
+      "description": "SHA-384 and SHA-512 (FIPS 180-4) as digest384 and digest512, HMAC-SHA384 and HMAC-SHA512 (RFC 2104) with a constant-time verify, and HKDF-SHA384 (RFC 5869) whose Expand takes only its Prk; with SHA512 instructions where the CPU has them.",
       "dependencies": [
         "cpu"
       ]
     },
     {
       "name": "tls",
-      "description": "A TLS 1.3 client (RFC 9846) without I/O: TLS_AES_128_GCM_SHA256 and TLS_AES_256_GCM_SHA384 with X25519MLKEM768 and X25519 key shares and P-256 on a retry, ECDSA and RSA-PSS server signatures, SNI, ALPN, middlebox compatibility, HelloRetryRequest, KeyUpdate and close_notify; bytes in any split, application records opened in place in the receive buffer and sealed in place in the pending one; counts that must be used, loud errors for a step a loop forgets, eof that refuses a truncation, a caller's verdict as an x509::Approval bound to the leaf and host, and secrets wiped.",
+      "description": "A TLS 1.3 client (RFC 9846) without I/O: TLS_AES_128_GCM_SHA256 and TLS_AES_256_GCM_SHA384 with X25519MLKEM768 and X25519 key shares and P-256 on a retry, ECDSA and RSA-PSS server signatures, SNI, ALPN, middlebox compatibility, HelloRetryRequest, KeyUpdate and close_notify; bytes in any split, application records opened in place in the receive buffer and sealed in place in the pending one; counts that must be used, loud errors for a step a loop forgets, eof that refuses a truncation, a caller's verdict as an x509::Approval bound to the leaf and host, and secrets wiped; its randomness drawn from random, records numbered by aesgcm's keys.",
       "dependencies": [
+        "random",
         "sha256",
         "sha384",
         "aesgcm",
@@ -115,13 +133,16 @@
     },
     {
       "name": "x25519",
-      "description": "X25519 key agreement (RFC 7748): a constant-time Montgomery ladder over five 51-bit limbs.",
-      "dependencies": []
+      "description": "X25519 key agreement (RFC 7748): a constant-time Montgomery ladder over five 51-bit limbs; a Secret made from random's seed, a PublicKey, and a SharedSecret only a key derivation takes, refused for a peer of small order.",
+      "dependencies": [
+        "random"
+      ]
     },
     {
       "name": "x509",
       "description": "X.509 (RFC 5280) for TLS server authentication without I/O: a strict DER parser that borrows the certificate, a store of trust anchors from PEM or DER, and chain verification for a host at a given time, with paths built through intermediates in any order, name constraints as Go enforces them, bounded depth and signature checks (ECDSA P-256, P-384, P-521; RSA of 2048 to 8192 bits, PKCS #1 and PSS; SHA-256, SHA-384, SHA-512), serverAuth required where ExtKeyUsage is present (anyExtendedKeyUsage counts nowhere, as in Firefox and webpki), a CA refused as a leaf, directoryName constraints as Chrome compares them and other forms failing closed, Mozilla's name constraints imposed on a CA's name, v1 and self-signed anchors as Go and Firefox take them, a policy of revocations and distrust dates to lay over other anchors or screen a path another verifier built, and the leaf's key for TLS 1.3's CertificateVerify; verification yields an Approval of the leaf for the host that only x509 and trust make, and a Policy, distrust without trust, is a type of its own.",
       "dependencies": [
+        "digest",
         "sha256",
         "sha384",
         "ecdsa",

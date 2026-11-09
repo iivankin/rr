@@ -2,6 +2,19 @@
 //! 5869). Whole blocks are compressed straight from the caller's input;
 //! only a part block waits in the state. The CPU's SHA instructions run
 //! where sys finds them, the portable rounds elsewhere.
+//!
+//! A MAC received is checked by Hmac::verify, in constant time, never
+//! compared by the caller. HKDF-Extract gives a Prk, the only key
+//! HKDF-Expand takes; a Prk is not Copy, Clone or Debug and is wiped
+//! when dropped:
+//!
+//! ```text
+//! let prk = sha256::hkdf_extract(salt, secret);
+//! prk.expand(b"info", &mut key)?;
+//! let mut mac = sha256::Hmac::new(&key);
+//! mac.update(message);
+//! mac.verify(tag)?;                      // Err(Mismatch) when forged
+//! ```
 
 mod sys;
 
@@ -9,10 +22,19 @@ mod sys;
 pub const DIGEST_BYTES: usize = 32;
 /// The bytes of one block the compression takes.
 pub const BLOCK_BYTES: usize = 64;
-/// The most bytes hkdf_expand writes: its counter is one byte.
+/// The most bytes Prk::expand writes: its counter is one byte.
 pub const EXPAND_BYTES_MAX: usize = 255 * DIGEST_BYTES;
 /// The bytes the padding gives the message's length in bits.
 const LENGTH_BYTES: usize = 8;
+
+/// What went wrong; nothing is left changed by either.
+#[cfg_attr(test, derive(Debug, PartialEq))]
+pub enum Error {
+    /// The tag is not the MAC of the message.
+    Mismatch,
+    /// More than EXPAND_BYTES_MAX asked of HKDF-Expand.
+    TooLong,
+}
 
 const INITIAL: [u32; 8] = [
     0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
@@ -153,6 +175,7 @@ impl Hmac {
         }
         let mut outer = Sha256::new();
         outer.update(&pad);
+        wipe(&mut pad);
         Self { inner, outer }
     }
 
@@ -160,44 +183,95 @@ impl Hmac {
         self.inner.update(data);
     }
 
+    /// The MAC, to send.
     pub fn finish(mut self) -> [u8; DIGEST_BYTES] {
         let inner = self.inner.finish();
         self.outer.update(&inner);
         self.outer.finish()
     }
+
+    /// Whether tag, received, is the MAC: every byte is compared, so the
+    /// time does not say where they differ.
+    pub fn verify(self, tag: &[u8; DIGEST_BYTES]) -> Result<(), Error> {
+        let mac = self.finish();
+        let differ = mac.iter().zip(tag).fold(0, |acc, (x, y)| acc | (x ^ y));
+        if core::hint::black_box(differ) == 0 {
+            Ok(())
+        } else {
+            Err(Error::Mismatch)
+        }
+    }
+}
+
+/// A pseudorandom key (RFC 5869 2.2), which HKDF-Expand takes:
+/// hkdf_extract makes one. Not Copy, Clone or Debug; wiped when
+/// dropped.
+pub struct Prk {
+    bytes: [u8; DIGEST_BYTES],
 }
 
 /// HKDF-Extract: the pseudorandom key from salt and input keying
 /// material. An empty salt stands for a block of zeros, as HMAC pads it.
-pub fn hkdf_extract(salt: &[u8], input: &[u8]) -> [u8; DIGEST_BYTES] {
+pub fn hkdf_extract(salt: &[u8], input: &[u8]) -> Prk {
     let mut hmac = Hmac::new(salt);
     hmac.update(input);
-    hmac.finish()
+    Prk {
+        bytes: hmac.finish(),
+    }
 }
 
-/// HKDF-Expand: fills out from the pseudorandom key and info. False,
-/// and out untouched, when out is longer than EXPAND_BYTES_MAX.
-#[must_use]
-pub fn hkdf_expand(key: &[u8; DIGEST_BYTES], info: &[u8], out: &mut [u8]) -> bool {
-    if out.len() > EXPAND_BYTES_MAX {
-        return false;
+impl Prk {
+    /// A secret that is already a pseudorandom key of the hash's length,
+    /// as a protocol's key schedule makes one by HKDF-Expand (TLS 1.3's
+    /// Derive-Secret). Less safe than hkdf_extract: bytes of a password
+    /// or of a shared secret would be taken as they are, not extracted.
+    pub fn new_less_safe(secret: &[u8; DIGEST_BYTES]) -> Prk {
+        Prk { bytes: *secret }
     }
-    let keyed = Hmac::new(key);
-    let mut previous = [0; DIGEST_BYTES];
-    for (counter, chunk) in (1..=u8::MAX).zip(out.chunks_mut(DIGEST_BYTES)) {
-        // rr: escape(copy): each block starts from the keyed hashes, which
-        // spares compressing the two key blocks again.
-        let mut hmac = keyed.clone();
-        if counter > 1 {
-            hmac.update(&previous);
+
+    /// HKDF-Expand: fills out from the key and info; TooLong, and out
+    /// untouched, when out is longer than EXPAND_BYTES_MAX.
+    pub fn expand(&self, info: &[u8], out: &mut [u8]) -> Result<(), Error> {
+        if out.len() > EXPAND_BYTES_MAX {
+            return Err(Error::TooLong);
         }
-        hmac.update(info);
-        hmac.update(&[counter]);
-        previous = hmac.finish();
-        // rr: escape(panic): chunks_mut gives at most DIGEST_BYTES.
-        chunk.copy_from_slice(&previous[..chunk.len()]);
+        let keyed = Hmac::new(&self.bytes);
+        let mut previous = [0; DIGEST_BYTES];
+        for (counter, chunk) in (1..=u8::MAX).zip(out.chunks_mut(DIGEST_BYTES)) {
+            // rr: escape(copy): each block starts from the keyed hashes,
+            // which spares compressing the two key blocks again.
+            let mut hmac = keyed.clone();
+            if counter > 1 {
+                hmac.update(&previous);
+            }
+            hmac.update(info);
+            hmac.update(&[counter]);
+            previous = hmac.finish();
+            // rr: escape(panic): chunks_mut gives at most DIGEST_BYTES.
+            chunk.copy_from_slice(&previous[..chunk.len()]);
+        }
+        wipe(&mut previous);
+        Ok(())
     }
-    true
+
+    /// The key's bytes: a salt for the next HKDF-Extract, or an HMAC key.
+    pub fn bytes(&self) -> &[u8; DIGEST_BYTES] {
+        &self.bytes
+    }
+}
+
+impl Drop for Prk {
+    fn drop(&mut self) {
+        wipe(&mut self.bytes);
+    }
+}
+
+/// Overwrites a secret with zeros. black_box makes the compiler take
+/// the bytes as read after, so it keeps the writes though nothing reads
+/// them.
+fn wipe(bytes: &mut [u8]) {
+    bytes.fill(0);
+    core::hint::black_box(bytes);
 }
 
 /// The hardware's compression, or the portable rounds without it.
@@ -255,8 +329,8 @@ fn compress_portable(state: &mut [u32; 8], blocks: &[[u8; BLOCK_BYTES]]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        BLOCK_BYTES, DIGEST_BYTES, EXPAND_BYTES_MAX, Hmac, Sha256, compress_portable, digest,
-        hkdf_expand, hkdf_extract,
+        BLOCK_BYTES, DIGEST_BYTES, EXPAND_BYTES_MAX, Error, Hmac, Prk, Sha256, compress_portable,
+        digest, hkdf_extract,
     };
     use alloc::vec::Vec;
     use test::Bencher;
@@ -479,7 +553,14 @@ mod tests {
                     let size: usize = size.parse().unwrap();
                     let mut hmac = Hmac::new(&field(key));
                     hmac.update(&field(message));
-                    let matches = hmac.finish()[..size] == field(tag)[..];
+                    let tag = field(tag);
+                    if let Ok(full) = <&[u8; DIGEST_BYTES]>::try_from(&tag[..]) {
+                        // rr: escape(copy): the MAC is verified, and then
+                        // compared as the case's prefix.
+                        let verified = hmac.clone().verify(full).is_ok();
+                        assert_eq!(verified, valid == "1", "hmac tcId {id}");
+                    }
+                    let matches = hmac.finish()[..size] == tag[..];
                     assert_eq!(matches, valid == "1", "hmac tcId {id}");
                     macs += 1;
                 }
@@ -488,9 +569,9 @@ mod tests {
                     out.clear();
                     out.resize(size.parse().unwrap(), 0);
                     let expected = field(okm);
-                    let done = hkdf_expand(&key, &field(info), &mut out);
-                    assert_eq!(done, !expected.is_empty(), "hkdf tcId {id}");
-                    if done {
+                    let done = key.expand(&field(info), &mut out);
+                    assert_eq!(done.is_ok(), !expected.is_empty(), "hkdf tcId {id}");
+                    if done.is_ok() {
                         assert_eq!(out, expected, "hkdf tcId {id}");
                     }
                     keys += 1;
@@ -535,11 +616,11 @@ mod tests {
             ),
         ] {
             let derived = hkdf_extract(salt, input);
-            assert_eq!(derived[..], hex(key)[..]);
+            assert_eq!(derived.bytes()[..], hex(key)[..]);
             let expected = hex(expected);
             let mut out = [0; 82];
             let out = &mut out[..expected.len()];
-            assert!(hkdf_expand(&derived, info, out));
+            assert_eq!(derived.expand(info, out), Ok(()));
             assert_eq!(out[..], expected[..]);
         }
     }
@@ -548,15 +629,46 @@ mod tests {
     /// one at the limit is filled.
     #[test]
     fn hkdf_expand_limit() {
-        let key = [0x42; DIGEST_BYTES];
+        let key = Prk::new_less_safe(&[0x42; DIGEST_BYTES]);
         let mut out = [0xa5; EXPAND_BYTES_MAX + 1];
-        assert!(!hkdf_expand(&key, b"", &mut out));
+        assert_eq!(key.expand(b"", &mut out), Err(Error::TooLong));
         assert!(out.iter().all(|byte| *byte == 0xa5));
-        assert!(hkdf_expand(&key, b"", &mut out[..EXPAND_BYTES_MAX]));
+        assert_eq!(key.expand(b"", &mut out[..EXPAND_BYTES_MAX]), Ok(()));
         assert_eq!(out[EXPAND_BYTES_MAX], 0xa5);
         let mut first = [0; DIGEST_BYTES];
-        assert!(hkdf_expand(&key, b"", &mut first));
+        assert_eq!(key.expand(b"", &mut first), Ok(()));
         assert_eq!(out[..DIGEST_BYTES], first);
+    }
+
+    /// As a protocol uses it: a key extracted, expanded into a MAC key, a
+    /// MAC sent and the peer's checked. Any changed byte of the tag, or
+    /// of the message, is a Mismatch; the same tag verifies again.
+    #[test]
+    fn mac_loop() {
+        let prk = hkdf_extract(b"salt", b"shared secret");
+        let mut key = [0; DIGEST_BYTES];
+        assert_eq!(prk.expand(b"mac key", &mut key), Ok(()));
+        let mut sender = Hmac::new(&key);
+        sender.update(b"a message");
+        let tag = sender.finish();
+        let check = |message: &[u8], received: &[u8; DIGEST_BYTES]| {
+            let mut receiver = Hmac::new(&key);
+            receiver.update(message);
+            receiver.verify(received)
+        };
+        assert_eq!(check(b"a message", &tag), Ok(()));
+        assert_eq!(check(b"a message", &tag), Ok(()));
+        assert_eq!(check(b"a messagE", &tag), Err(Error::Mismatch));
+        for at in 0..DIGEST_BYTES {
+            let mut forged = tag;
+            forged[at] ^= 1;
+            assert_eq!(check(b"a message", &forged), Err(Error::Mismatch));
+        }
+        // A key the schedule made by Expand is taken as one again.
+        let next = Prk::new_less_safe(&key);
+        let mut out = [0; 16];
+        assert_eq!(next.expand(b"next", &mut out), Ok(()));
+        assert_ne!(out, [0; 16]);
     }
 
     /// One 16 KiB buffer, as a file or a record is hashed.

@@ -43,7 +43,7 @@ def render(bits, body):
             "//! from modulus.rs.in beside it, which is where to change it.",
             "",
             "use super::{",
-            "    Column, Encoding, Key, MODULUS_BITS_MIN, below, load, low, negative_inverse, shift_left,",
+            "    Column, Encoding, Error, Key, MODULUS_BITS_MIN, below, load, low, negative_inverse, shift_left,",
             "    shift_right, subtract,",
             "};",
             "",

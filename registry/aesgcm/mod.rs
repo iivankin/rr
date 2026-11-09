@@ -2,6 +2,27 @@
 //! uses them: a 16- or 32-byte key, a 12-byte nonce and a 16-byte tag,
 //! sealed and opened in place.
 //!
+//! A SealingKey and an OpeningKey number their own nonces, as TLS 1.3
+//! does (RFC 9846 5.3): the n-th record's nonce is the IV XOR n, n
+//! big-endian in its last eight bytes, so that no nonce seals twice
+//! under the key; after 2^64 - 1 records the key is Exhausted. A
+//! direction of a connection has one of each, both sides from the same
+//! key and IV:
+//!
+//! ```text
+//! let mut sealing = SealingKey::new(&key, &iv);
+//! let tag = sealing.seal(&header, &mut record)?;      // number 0, 1, ...
+//! send(&header, &record, tag.bytes());
+//! let mut opening = OpeningKey::new(&key, &iv);       // the peer's
+//! opening.open(&header, &mut record, &tag)?;          // Err(Forged)
+//! ```
+//!
+//! AesGcm, the key alone, takes a nonce of the caller's, by
+//! seal_with_nonce and open_with_nonce: a nonce sealed twice under one
+//! key gives away the XOR of both plaintexts and lets anyone forge a
+//! tag, which is why their names say so. Each key's schedule and hash
+//! key are wiped when it is dropped.
+//!
 //! CTR and GHASH run on the CPU's instructions through sys::aes where it
 //! has them. The portable code is constant-time: AES is bitsliced, four
 //! blocks at once in eight 64-bit words with the S-box as a circuit, and
@@ -28,12 +49,55 @@ const M0: u64 = 0x1111_1111_1111_1111;
 /// AES-256's round keys; AES-128's 11 are the last of as many places.
 const ROUND_KEYS: usize = 15;
 
+/// What went wrong. Only Exhausted ends a key; after TooLong a shorter
+/// record goes on, and after Forged the next record (a stream that had a
+/// forgery in it is broken, and its owner ends it).
 #[cfg_attr(any(test, fuzzing), derive(Debug))]
+#[cfg_attr(test, derive(PartialEq))]
 pub enum Error {
-    /// The data or the AAD is past GCM's limit; nothing was changed.
+    /// The data or the AAD is past GCM's limit; nothing was changed and
+    /// no number taken.
     TooLong,
-    /// The tag does not match; data is still the ciphertext.
+    /// The tag does not match; data is still the ciphertext. An
+    /// OpeningKey took the record's number.
     Forged,
+    /// The key numbered 2^64 - 1 records: it takes no more, and nothing
+    /// was changed.
+    Exhausted,
+}
+
+/// A tag that authenticates a sealed record: to be sent beside it.
+#[must_use]
+#[cfg_attr(any(test, fuzzing), derive(Debug, PartialEq))]
+pub struct Tag([u8; TAG_LEN]);
+
+impl Tag {
+    /// The tag's bytes, to send.
+    pub fn bytes(&self) -> &[u8; TAG_LEN] {
+        &self.0
+    }
+
+    /// The tag's bytes, by value: a record's buffer takes them where it
+    /// would take a copy.
+    pub fn into_bytes(self) -> [u8; TAG_LEN] {
+        self.0
+    }
+}
+
+/// A key and IV that seal records numbered 0, 1, ... in turn, each
+/// under the IV XOR its number: the sending half of a direction.
+pub struct SealingKey {
+    key: AesGcm,
+    iv: [u8; NONCE_LEN],
+    next: u64,
+}
+
+/// A key and IV that open records numbered 0, 1, ... in turn, as the
+/// peer's SealingKey sealed them: the receiving half.
+pub struct OpeningKey {
+    key: AesGcm,
+    iv: [u8; NONCE_LEN],
+    next: u64,
 }
 
 /// One key, expanded once: round keys and the hash key H in both forms.
@@ -88,6 +152,7 @@ impl AesGcm {
             *rk = block_bytes(k);
             *sk = bitslice_key(k);
         }
+        hw::wipe_u32(w.as_flattened_mut());
         let mut h = [0; 16];
         g.ctr(&[0; 16], 0, &mut h);
         let (hi, lo) = words(&h);
@@ -95,28 +160,32 @@ impl AesGcm {
         if !hw::ghash_key(&h, &mut g.htbl) {
             g.hw = false;
         }
+        hw::wipe(&mut h);
         g
     }
 
     /// Encrypts data in place; the tag that authenticates it and aad.
-    /// A nonce must never seal twice under one key.
-    pub fn seal(
+    /// Dangerous: a nonce must never seal twice under one key, which
+    /// SealingKey makes sure of; this does not.
+    pub fn seal_with_nonce(
         &self,
         nonce: &[u8; NONCE_LEN],
         aad: &[u8],
         data: &mut [u8],
-    ) -> Result<[u8; TAG_LEN], Error> {
+    ) -> Result<Tag, Error> {
         check(aad, data)?;
         let block = iv(nonce);
         let mut y = [0; 16];
         self.ghash(&mut y, aad);
         self.encrypt(&block, data, &mut y);
-        Ok(self.finish(&block, y, aad.len(), data.len()))
+        Ok(Tag(self.finish(&block, y, aad.len(), data.len())))
     }
 
     /// Decrypts data in place when tag authenticates it and aad; a
-    /// forgery leaves the ciphertext, and no plaintext, in data.
-    pub fn open(
+    /// forgery leaves the ciphertext, and no plaintext, in data. The
+    /// nonce is the caller's, to match seal_with_nonce's: OpeningKey
+    /// numbers them.
+    pub fn open_with_nonce(
         &self,
         nonce: &[u8; NONCE_LEN],
         aad: &[u8],
@@ -274,6 +343,112 @@ impl AesGcm {
         }
         out
     }
+}
+
+impl Drop for AesGcm {
+    fn drop(&mut self) {
+        hw::wipe(self.rk.keys.as_flattened_mut());
+        hw::wipe_u64(self.sk.as_flattened_mut());
+        hw::wipe_u64(&mut self.h);
+        hw::wipe(self.htbl.as_flattened_mut());
+    }
+}
+
+impl SealingKey {
+    /// AES-128-GCM under key, nonces from iv.
+    pub fn new(key: &[u8; KEY_LEN], iv: &[u8; NONCE_LEN]) -> SealingKey {
+        SealingKey {
+            key: AesGcm::new(key),
+            iv: *iv,
+            next: 0,
+        }
+    }
+
+    /// AES-256-GCM under key, nonces from iv.
+    pub fn new256(key: &[u8; KEY256_LEN], iv: &[u8; NONCE_LEN]) -> SealingKey {
+        SealingKey {
+            key: AesGcm::new256(key),
+            iv: *iv,
+            next: 0,
+        }
+    }
+
+    /// Encrypts data in place under the next number; the tag that
+    /// authenticates it and aad. An error takes no number.
+    pub fn seal(&mut self, aad: &[u8], data: &mut [u8]) -> Result<Tag, Error> {
+        let (nonce, after) = numbered(&self.iv, self.next)?;
+        let tag = self.key.seal_with_nonce(&nonce, aad, data)?;
+        self.next = after;
+        Ok(tag)
+    }
+
+    /// The number the next record takes: how many were sealed.
+    pub fn sequence(&self) -> u64 {
+        self.next
+    }
+
+    /// Sets the number the next record takes. Less safe: a number sealed
+    /// again seals two records under one nonce. Only for records that
+    /// were sealed and then dropped before any byte of them left, whose
+    /// numbers the next records take instead, as TLS does when it fails
+    /// with records still unsent.
+    pub fn set_sequence_less_safe(&mut self, next: u64) {
+        self.next = next;
+    }
+}
+
+impl OpeningKey {
+    /// AES-128-GCM under key, nonces from iv.
+    pub fn new(key: &[u8; KEY_LEN], iv: &[u8; NONCE_LEN]) -> OpeningKey {
+        OpeningKey {
+            key: AesGcm::new(key),
+            iv: *iv,
+            next: 0,
+        }
+    }
+
+    /// AES-256-GCM under key, nonces from iv.
+    pub fn new256(key: &[u8; KEY256_LEN], iv: &[u8; NONCE_LEN]) -> OpeningKey {
+        OpeningKey {
+            key: AesGcm::new256(key),
+            iv: *iv,
+            next: 0,
+        }
+    }
+
+    /// Decrypts data in place, under the next number, when tag
+    /// authenticates it and aad. Forged takes the number and leaves the
+    /// ciphertext; TooLong and Exhausted take none.
+    pub fn open(&mut self, aad: &[u8], data: &mut [u8], tag: &[u8; TAG_LEN]) -> Result<(), Error> {
+        let (nonce, after) = numbered(&self.iv, self.next)?;
+        check(aad, data)?;
+        self.next = after;
+        self.key.open_with_nonce(&nonce, aad, data, tag)
+    }
+
+    /// The number the next record takes: how many were opened.
+    pub fn sequence(&self) -> u64 {
+        self.next
+    }
+
+    /// Sets the number the next record takes, as a test reaches the
+    /// limit without 2^64 records.
+    #[cfg(any(test, fuzzing))]
+    pub fn set_sequence_for_tests(&mut self, next: u64) {
+        self.next = next;
+    }
+}
+
+/// The nonce of record number n, the IV XOR n big-endian in its last
+/// eight bytes (RFC 9846 5.3), and the number after it; Exhausted at
+/// the last, which is never used, so that the count never wraps.
+fn numbered(iv: &[u8; NONCE_LEN], n: u64) -> Result<([u8; NONCE_LEN], u64), Error> {
+    let after = n.checked_add(1).ok_or(Error::Exhausted)?;
+    let mut nonce = *iv;
+    for (byte, number) in nonce.iter_mut().skip(4).zip(n.to_be_bytes()) {
+        *byte ^= number;
+    }
+    Ok((nonce, after))
 }
 
 /// GCM's limits on one record.
@@ -680,22 +855,23 @@ pub fn fuzz_seal_open(input: &[u8]) {
     let mut a = msg.to_vec();
     // rr: escape(copy): the record is sealed in place, twice.
     let mut b = msg.to_vec();
-    let ta = fast.seal(&nonce, aad, &mut a).unwrap();
-    let tb = slow.seal(&nonce, aad, &mut b).unwrap();
+    let ta = fast.seal_with_nonce(&nonce, aad, &mut a).unwrap();
+    let tb = slow.seal_with_nonce(&nonce, aad, &mut b).unwrap();
     assert_eq!(a, b);
     assert_eq!(ta, tb);
     if let Some(x) = b.first_mut() {
         *x ^= 1;
-        let forged = slow.open(&nonce, aad, &mut b, &ta);
+        let forged = slow.open_with_nonce(&nonce, aad, &mut b, ta.bytes());
         assert!(matches!(forged, Err(Error::Forged)));
     }
-    fast.open(&nonce, aad, &mut a, &ta).unwrap();
+    fast.open_with_nonce(&nonce, aad, &mut a, ta.bytes())
+        .unwrap();
     assert_eq!(a, msg);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AesGcm, Error, hw};
+    use super::{AesGcm, Error, OpeningKey, SealingKey, hw};
     use alloc::vec::Vec;
     use test::Bencher;
 
@@ -727,10 +903,11 @@ mod tests {
         let nonce: [u8; 12] = unhex(nonce).try_into().unwrap();
         let aad = unhex(aad);
         let mut data = unhex(pt);
-        let t = g.seal(&nonce, &aad, &mut data).unwrap();
+        let t = g.seal_with_nonce(&nonce, &aad, &mut data).unwrap();
         assert_eq!(data, unhex(ct));
-        assert_eq!(t[..], unhex(tag)[..]);
-        g.open(&nonce, &aad, &mut data, &t).unwrap();
+        assert_eq!(t.bytes()[..], unhex(tag)[..]);
+        g.open_with_nonce(&nonce, &aad, &mut data, t.bytes())
+            .unwrap();
         assert_eq!(data, unhex(pt));
     }
 
@@ -909,11 +1086,11 @@ mod tests {
             for g in both(k) {
                 if valid == "1" {
                     let mut data = field(pt);
-                    let sealed = g.seal(&nonce, &aad, &mut data).unwrap();
-                    assert_eq!((data, sealed), (field(ct), tag), "tcId {id}");
+                    let sealed = g.seal_with_nonce(&nonce, &aad, &mut data).unwrap();
+                    assert_eq!((data, *sealed.bytes()), (field(ct), tag), "tcId {id}");
                 }
                 let mut data = field(ct);
-                let opened = g.open(&nonce, &aad, &mut data, &tag);
+                let opened = g.open_with_nonce(&nonce, &aad, &mut data, &tag);
                 assert_eq!(opened.is_ok(), valid == "1", "tcId {id}");
                 let expected = if valid == "1" { field(pt) } else { field(ct) };
                 assert_eq!(data, expected, "tcId {id}");
@@ -931,25 +1108,25 @@ mod tests {
         let mut aad = [0xfe, 0xed, 0xfa, 0xce];
         for g in both("feffe9928665731c6d6a8f9467308308") {
             let mut data = [0x5a; 300];
-            let mut tag = g.seal(&nonce, &aad, &mut data).unwrap();
+            let mut tag = *g.seal_with_nonce(&nonce, &aad, &mut data).unwrap().bytes();
             let ct = data;
             tag[3] ^= 1;
-            let bad_tag = g.open(&nonce, &aad, &mut data, &tag);
+            let bad_tag = g.open_with_nonce(&nonce, &aad, &mut data, &tag);
             assert!(matches!(bad_tag, Err(Error::Forged)));
             tag[3] ^= 1;
             data[57] ^= 0x80;
-            let bad_ct = g.open(&nonce, &aad, &mut data, &tag);
+            let bad_ct = g.open_with_nonce(&nonce, &aad, &mut data, &tag);
             assert!(matches!(bad_ct, Err(Error::Forged)));
             data[57] ^= 0x80;
             assert_eq!(data, ct);
             aad[0] ^= 1;
-            let bad_aad = g.open(&nonce, &aad, &mut data, &tag);
+            let bad_aad = g.open_with_nonce(&nonce, &aad, &mut data, &tag);
             assert!(matches!(bad_aad, Err(Error::Forged)));
             aad[0] ^= 1;
-            let bad_nonce = g.open(&[8; 12], &aad, &mut data, &tag);
+            let bad_nonce = g.open_with_nonce(&[8; 12], &aad, &mut data, &tag);
             assert!(matches!(bad_nonce, Err(Error::Forged)));
             assert_eq!(data, ct);
-            g.open(&nonce, &aad, &mut data, &tag).unwrap();
+            g.open_with_nonce(&nonce, &aad, &mut data, &tag).unwrap();
             assert_eq!(data, [0x5a; 300]);
         }
     }
@@ -983,12 +1160,12 @@ mod tests {
             let a = &mut buf[at..at + n];
             let b = &mut other[at + 1..at + 1 + n];
             b.copy_from_slice(a);
-            let ta = fast.seal(&nonce, aad, a).unwrap();
-            let tb = slow.seal(&nonce, aad, b).unwrap();
+            let ta = fast.seal_with_nonce(&nonce, aad, a).unwrap();
+            let tb = slow.seal_with_nonce(&nonce, aad, b).unwrap();
             assert_eq!(a, b, "length {n}");
             assert_eq!(ta, tb, "length {n}");
-            slow.open(&nonce, aad, a, &ta).unwrap();
-            fast.open(&nonce, aad, b, &tb).unwrap();
+            slow.open_with_nonce(&nonce, aad, a, ta.bytes()).unwrap();
+            fast.open_with_nonce(&nonce, aad, b, tb.bytes()).unwrap();
             assert_eq!(a, b);
         }
     }
@@ -1080,10 +1257,77 @@ mod tests {
         // rr: escape(copy): the same record, sealed by the other path.
         let mut b = a.clone();
         let aad = [0x17; 13];
-        let ta = fast.seal(&[1; 12], &aad, &mut a).unwrap();
-        let tb = slow.seal(&[1; 12], &aad, &mut b).unwrap();
+        let ta = fast.seal_with_nonce(&[1; 12], &aad, &mut a).unwrap();
+        let tb = slow.seal_with_nonce(&[1; 12], &aad, &mut b).unwrap();
         assert_eq!(a, b);
         assert_eq!(ta, tb);
+    }
+
+    /// As TLS uses the keys: one side seals records in turn and the other
+    /// opens them, each under the next number; a record opened out of
+    /// turn, or twice, is Forged; TooLong takes no number; Exhausted at
+    /// the last number, on both sides.
+    #[test]
+    fn numbered_loop() {
+        let iv = [0xa0; 12];
+        numbered(
+            SealingKey::new(&[0x3c; 16], &iv),
+            OpeningKey::new(&[0x3c; 16], &iv),
+            &iv,
+        );
+        numbered(
+            SealingKey::new256(&[0x3c; 32], &iv),
+            OpeningKey::new256(&[0x3c; 32], &iv),
+            &iv,
+        );
+        let mut sealing = SealingKey::new(&[1; 16], &[2; 12]);
+        let mut opening = OpeningKey::new(&[1; 16], &[2; 12]);
+        sealing.set_sequence_less_safe(u64::MAX - 1);
+        opening.set_sequence_for_tests(u64::MAX - 1);
+        let mut data = [9; 20];
+        let tag = sealing.seal(&[], &mut data).unwrap();
+        assert_eq!(opening.open(&[], &mut data, tag.bytes()), Ok(()));
+        assert_eq!(data, [9; 20]);
+        assert_eq!(sealing.seal(&[], &mut data), Err(Error::Exhausted));
+        assert_eq!(data, [9; 20]);
+        assert_eq!(
+            opening.open(&[], &mut data, tag.bytes()),
+            Err(Error::Exhausted)
+        );
+        assert_eq!(sealing.sequence(), u64::MAX);
+        assert_eq!(opening.sequence(), u64::MAX);
+    }
+
+    /// Five records sealed in turn, and opened by the other side.
+    fn numbered(mut sealing: SealingKey, mut opening: OpeningKey, iv: &[u8; 12]) {
+        let mut records = Vec::new();
+        for n in 0..5_u8 {
+            let mut data = [n; 33];
+            let tag = sealing.seal(&[n], &mut data).unwrap();
+            records.push((data, tag));
+        }
+        assert_eq!(sealing.sequence(), 5);
+        // Number n is the IV XOR n: what seal_with_nonce gives.
+        let mut nonce = *iv;
+        nonce[11] ^= 3;
+        let mut third = [3; 33];
+        let again = sealing
+            .key
+            .seal_with_nonce(&nonce, &[3], &mut third)
+            .unwrap();
+        assert_eq!((third, &again), (records[3].0, &records[3].1));
+        // Out of turn: record 1 under number 0.
+        let mut early = records[1].0;
+        let forged = opening.open(&[1], &mut early, records[1].1.bytes());
+        assert_eq!(forged, Err(Error::Forged));
+        assert_eq!(early, records[1].0);
+        assert_eq!(opening.sequence(), 1);
+        for (n, (data, tag)) in records.iter_mut().enumerate().skip(1) {
+            let n = u8::try_from(n).unwrap();
+            assert_eq!(opening.open(&[n], data, tag.bytes()), Ok(()));
+            assert_eq!(*data, [n; 33]);
+        }
+        assert_eq!(opening.sequence(), 5);
     }
 
     /// One TLS record of 16 KiB with its 5-byte header as AAD.
@@ -1091,7 +1335,7 @@ mod tests {
         let mut record = Vec::new();
         record.resize(16384, 0x17);
         let aad = [0x17, 3, 3, 0x40, 0x11];
-        b.iter(|| g.seal(&[9; 12], &aad, &mut record).unwrap());
+        b.iter(|| g.seal_with_nonce(&[9; 12], &aad, &mut record).unwrap());
     }
 
     #[bench]
@@ -1108,5 +1352,20 @@ mod tests {
     #[bench]
     fn seal_16k_portable(b: &mut Bencher) {
         seal_record(b, &AesGcm::with(&[7; 16], false));
+    }
+
+    /// A record sealed and opened again, as one side of a connection
+    /// sends and the other receives it, each key numbering its nonces.
+    #[bench]
+    fn seal_open_16k(b: &mut Bencher) {
+        let mut sealing = SealingKey::new(&[7; 16], &[9; 12]);
+        let mut opening = OpeningKey::new(&[7; 16], &[9; 12]);
+        let mut record = Vec::new();
+        record.resize(16384, 0x17);
+        let aad = [0x17, 3, 3, 0x40, 0x11];
+        b.iter(|| {
+            let tag = sealing.seal(&aad, &mut record).unwrap();
+            opening.open(&aad, &mut record, tag.bytes()).unwrap();
+        });
     }
 }

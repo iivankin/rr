@@ -1,6 +1,6 @@
 {
   "name": "sha384",
-  "description": "SHA-384 and SHA-512 (FIPS 180-4), HMAC-SHA384 and HMAC-SHA512 (RFC 2104) and HKDF-SHA384 (RFC 5869), with SHA512 instructions where the CPU has them.",
+  "description": "SHA-384 and SHA-512 (FIPS 180-4) as digest384 and digest512, HMAC-SHA384 and HMAC-SHA512 (RFC 2104) with a constant-time verify, and HKDF-SHA384 (RFC 5869) whose Expand takes only its Prk; with SHA512 instructions where the CPU has them.",
   "rr": "0.5.2",
   "dependencies": [
     "cpu"

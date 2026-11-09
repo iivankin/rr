@@ -14,6 +14,19 @@
 //! P-521's p = 2^521 - 1 reduces by adding the bits past 521 to those
 //! below, with R = 1. Points are Jacobian; u1 G + u2 Q is one run of
 //! doublings over both scalars in NAF, G's multiples a constant table.
+//!
+//! What is verified is a digest that names its hash (digest::Digest),
+//! never bytes of any length: a signature of a digest h verifies for any
+//! hash that begins with h's leftmost bits, so a message, or a digest of
+//! another hash, must not pass for one. The answer is a Result that says
+//! which part is wrong:
+//!
+//! ```text
+//! let digest = sha256::digest(message);
+//! ecdsa::verify(&Curve::P256, key, &Digest::Sha256(&digest), signature)?;
+//! ```
+
+use crate::base::digest::Digest;
 
 mod p256;
 mod p384;
@@ -22,6 +35,19 @@ mod p521;
 /// The odd multiples P, 3P, ..., 15P of the key that a width-5 NAF
 /// picks from.
 const TABLE: usize = 8;
+
+/// Why a signature does not verify.
+#[cfg_attr(test, derive(Debug, PartialEq))]
+pub enum Error {
+    /// The key is not an uncompressed point of the curve.
+    Key,
+    /// The signature is not DER's one encoding of two integers no longer
+    /// than the order.
+    Encoding,
+    /// r or s is not in [1, n - 1], or they do not sign the digest under
+    /// the key.
+    Signature,
+}
 
 /// The curves this verifies on.
 pub enum Curve {
@@ -41,13 +67,22 @@ impl Curve {
     }
 }
 
-/// Whether signature, DER's Ecdsa-Sig-Value, signs hash under public,
-/// an uncompressed point 04 || X || Y. The hash is cut to the order's
-/// bits when longer (SEC 1 4.1.4 step 5), and may be of any length.
-pub fn verify(curve: &Curve, public: &[u8], hash: &[u8], signature: &[u8]) -> bool {
-    let Some((r, s)) = parse(signature, curve.bytes()) else {
-        return false;
-    };
+/// Ok when signature, DER's Ecdsa-Sig-Value, signs digest under public,
+/// an uncompressed point 04 || X || Y. A digest longer than the order is
+/// cut to its bits (SEC 1 4.1.4 step 5): P-256 takes SHA-384's and
+/// SHA-512's leftmost 256 bits.
+pub fn verify(
+    curve: &Curve,
+    public: &[u8],
+    digest: &Digest<'_>,
+    signature: &[u8],
+) -> Result<(), Error> {
+    verify_hash(curve, public, digest.bytes(), signature)
+}
+
+/// verify of a hash of any length, for the tests and the fuzz target.
+fn verify_hash(curve: &Curve, public: &[u8], hash: &[u8], signature: &[u8]) -> Result<(), Error> {
+    let (r, s) = parse(signature, curve.bytes()).ok_or(Error::Encoding)?;
     match curve {
         Curve::P256 => p256::verify(public, hash, r, s),
         Curve::P384 => p384::verify(public, hash, r, s),
@@ -133,8 +168,10 @@ pub fn fuzz_verify(input: &[u8]) {
     let (hash, rest) = rest.split_at(split);
     let half = rest.len() / 2;
     let (public, signature) = rest.split_at(half);
-    verify(&curve, public, hash, signature);
-    verify(&curve, &[], hash, rest);
+    // rr: escape(discard): any answer will do; a panic is the failure.
+    let _: Result<(), Error> = verify_hash(&curve, public, hash, signature);
+    // rr: escape(discard): as above.
+    let _: Result<(), Error> = verify_hash(&curve, &[], hash, rest);
     if let Some((r, s)) = parse(rest, curve.bytes()) {
         let mut encoded = alloc::vec::Vec::new();
         for integer in [r, s] {
@@ -174,9 +211,24 @@ fn hex(text: &str) -> alloc::vec::Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Curve, hex, verify};
+    use super::{Curve, Error, hex, verify, verify_hash};
+    use crate::base::digest::Digest;
     use alloc::vec::Vec;
     use test::Bencher;
+
+    /// verify with the digest of hash's length, or verify_hash for a
+    /// length no hash has.
+    fn check(curve: &Curve, key: &[u8], hash: &[u8], signature: &[u8]) -> Result<(), Error> {
+        if let Ok(digest) = <&[u8; 32]>::try_from(hash) {
+            verify(curve, key, &Digest::Sha256(digest), signature)
+        } else if let Ok(digest) = <&[u8; 48]>::try_from(hash) {
+            verify(curve, key, &Digest::Sha384(digest), signature)
+        } else if let Ok(digest) = <&[u8; 64]>::try_from(hash) {
+            verify(curve, key, &Digest::Sha512(digest), signature)
+        } else {
+            verify_hash(curve, key, hash, signature)
+        }
+    }
 
     /// Wycheproof's P-256 key of its first ECDSA cases, and its first
     /// signature: SHA-256 of the empty message.
@@ -220,8 +272,9 @@ mod tests {
                     } else {
                         hex(signature)
                     };
-                    let verified = verify(&curve, key, hash, &signature);
-                    assert_eq!(verified, valid == "1", "{bits} tcId {id}");
+                    assert!(matches!(hash.len(), 32 | 48 | 64), "{bits} tcId {id}");
+                    let verified = check(&curve, key, hash, &signature);
+                    assert_eq!(verified.is_ok(), valid == "1", "{bits} tcId {id}");
                 }
                 _ => panic!("{line}"),
             }
@@ -250,15 +303,15 @@ mod tests {
     #[test]
     fn p521() {
         let (key, hash, signature) = (hex(KEY521), hex(EMPTY512), hex(SIG521));
-        assert!(verify(&Curve::P521, &key, &hash, &signature));
-        assert!(!verify(&Curve::P384, &key, &hash, &signature));
+        assert!(yes(&Curve::P521, &key, &hash, &signature));
+        assert!(not(&Curve::P384, &key, &hash, &signature));
         let body = &signature[3..];
         for bad in [
             der(&[0x30, 0x82, 0, 0x88], &[body]),
             der(&[0x30, 0x88], &[body]),
             der(&[0x30, 0x81, 0x89], &[body, &[0]]),
         ] {
-            assert!(!verify(&Curve::P521, &key, &hash, &bad));
+            assert!(not(&Curve::P521, &key, &hash, &bad));
         }
         let mut moved = Vec::new();
         for length in [66, 67, 80] {
@@ -274,9 +327,9 @@ mod tests {
                 *byte = u8::try_from(wide & 0xff).unwrap();
                 carry = wide >> 8;
             }
-            assert!(verify(&Curve::P521, &key, &moved, &signature));
+            assert!(yes(&Curve::P521, &key, &moved, &signature));
             moved[0] ^= 0x80;
-            assert!(!verify(&Curve::P521, &key, &moved, &signature));
+            assert!(not(&Curve::P521, &key, &moved, &signature));
         }
     }
 
@@ -284,12 +337,29 @@ mod tests {
     #[test]
     fn rejects() {
         let (key, hash, signature) = (hex(KEY256), hex(EMPTY256), hex(SIG256));
-        assert!(verify(&Curve::P256, &key, &hash, &signature));
-        assert!(!verify(&Curve::P384, &key, &hash, &signature));
+        assert!(yes(&Curve::P256, &key, &hash, &signature));
+        assert!(not(&Curve::P384, &key, &hash, &signature));
         let mut wrong = hex(EMPTY256);
         wrong[31] ^= 1;
-        assert!(!verify(&Curve::P256, &key, &wrong, &signature));
-        assert!(!verify(&Curve::P256, &key, &hash[..31], &signature));
+        assert_eq!(
+            check(&Curve::P256, &key, &wrong, &signature),
+            Err(Error::Signature)
+        );
+        assert!(not(&Curve::P256, &key, &hash[..31], &signature));
+        // A SHA-384 digest is cut to P-256's leftmost 256 bits (SEC 1
+        // 4.1.4 step 5): one that begins with this digest verifies, and a
+        // bit changed there does not.
+        let mut longer = [0; 48];
+        longer[..32].copy_from_slice(&hash);
+        let padded = Digest::Sha384(&longer);
+        assert_eq!(verify(&Curve::P256, &key, &padded, &signature), Ok(()));
+        longer[0] ^= 1;
+        let changed = Digest::Sha384(&longer);
+        assert_eq!(
+            verify(&Curve::P256, &key, &changed, &signature),
+            Err(Error::Signature)
+        );
+        assert_eq!(check(&Curve::P256, &key, &hash, &[]), Err(Error::Encoding));
         // Keys: off the curve, X = p, compressed, infinity, cut short.
         let mut off = hex(KEY256);
         off[64] ^= 1;
@@ -300,7 +370,7 @@ mod tests {
         let mut compressed = hex(KEY256);
         compressed[0] = 3;
         for bad in [&off[..], &big, &compressed[..33], &[0], &key[..64], &[]] {
-            assert!(!verify(&Curve::P256, bad, &hash, &signature));
+            assert_eq!(check(&Curve::P256, bad, &hash, &signature), Err(Error::Key));
         }
         // Signatures: r and s swapped; the same numbers in other BER
         // encodings; r or s of 0 or n; truncated and extended.
@@ -324,14 +394,22 @@ mod tests {
             der(&[0x30, 0x45], &[&[2, 0x21], r, &[2, 0x20], &s[..30]]),
             Vec::new(),
         ] {
-            assert!(!verify(&Curve::P256, &key, &hash, &bad));
+            assert!(not(&Curve::P256, &key, &hash, &bad));
         }
-        assert!(verify(
+        assert!(yes(
             &Curve::P256,
             &key,
             &hash,
             &der(&[0x30, 0x45], &[&[2, 0x21], r, &[2, 0x20], s])
         ));
+    }
+
+    fn yes(curve: &Curve, key: &[u8], hash: &[u8], signature: &[u8]) -> bool {
+        check(curve, key, hash, signature).is_ok()
+    }
+
+    fn not(curve: &Curve, key: &[u8], hash: &[u8], signature: &[u8]) -> bool {
+        check(curve, key, hash, signature).is_err()
     }
 
     fn der(head: &[u8], parts: &[&[u8]]) -> Vec<u8> {
@@ -347,14 +425,16 @@ mod tests {
     #[bench]
     fn verify_p256(b: &mut Bencher) {
         let (key, hash, signature) = (hex(KEY256), hex(EMPTY256), hex(SIG256));
-        b.iter(|| verify(&Curve::P256, &key, &hash, &signature));
+        let digest: [u8; 32] = hash.try_into().unwrap();
+        b.iter(|| verify(&Curve::P256, &key, &Digest::Sha256(&digest), &signature));
     }
 
     /// One P-521 verification.
     #[bench]
     fn verify_p521(b: &mut Bencher) {
         let (key, hash, signature) = (hex(KEY521), hex(EMPTY512), hex(SIG521));
-        b.iter(|| verify(&Curve::P521, &key, &hash, &signature));
+        let digest: [u8; 64] = hash.try_into().unwrap();
+        b.iter(|| verify(&Curve::P521, &key, &Digest::Sha512(&digest), &signature));
     }
 
     /// One P-384 verification.
@@ -374,6 +454,7 @@ mod tests {
              5dee29238afbd3b103c1e40ee5c9144aee0f02304326756fb2c4fd726360dd6479b5\
              849478c7a9d054a833a58c1631c33b63c3441336ddf2c7fe0ed129aae6d4ddfeb753",
         );
-        b.iter(|| verify(&Curve::P384, &key, &hash, &signature));
+        let digest: [u8; 48] = hash.try_into().unwrap();
+        b.iter(|| verify(&Curve::P384, &key, &Digest::Sha384(&digest), &signature));
     }
 }

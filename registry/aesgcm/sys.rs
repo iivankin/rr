@@ -50,13 +50,13 @@ pub const AES128_FIRST: usize = 4;
 /// What the faster loop of seal and open runs on besides: SHA3's EOR3
 /// on aarch64, VAES and VPCLMULQDQ on x86_64.
 #[cfg(target_arch = "aarch64")]
-const FASTER: u32 = cpu::AES | cpu::SHA512;
+const FASTER: cpu::Features = cpu::AES.and(&cpu::SHA512);
 #[cfg(not(target_arch = "aarch64"))]
-const FASTER: u32 = cpu::WIDE_AES;
+const FASTER: cpu::Features = cpu::WIDE_AES;
 
 /// Whether the CPU has the instructions the functions below need.
 pub fn available() -> bool {
-    cpu::has(cpu::AES)
+    cpu::has(&cpu::AES)
 }
 
 /// CTR in place over data with round keys rk: the counter blocks are
@@ -105,7 +105,7 @@ pub fn seal(
         return false;
     }
     // rr: escape(unsafe): available() found the instructions it runs on.
-    unsafe { arch::seal(rk, tbl, block, ctr, blocks, y, cpu::has(FASTER)) };
+    unsafe { arch::seal(rk, tbl, block, ctr, blocks, y, cpu::has(&FASTER)) };
     true
 }
 
@@ -122,8 +122,40 @@ pub fn open(
         return false;
     }
     // rr: escape(unsafe): available() found the instructions it runs on.
-    unsafe { arch::open(rk, tbl, block, ctr, blocks, y, cpu::has(FASTER)) };
+    unsafe { arch::open(rk, tbl, block, ctr, blocks, y, cpu::has(&FASTER)) };
     true
+}
+
+/// Zeros over a key's bytes, each a volatile store, which the compiler
+/// keeps though nothing reads them after; the fence keeps later code
+/// from moving above them.
+pub fn wipe(bytes: &mut [u8]) {
+    for byte in bytes.iter_mut() {
+        // rr: escape(unsafe): byte is a place of its own, aligned and
+        // borrowed mutably.
+        unsafe { core::ptr::write_volatile(byte, 0) };
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+/// wipe for 32-bit words.
+pub fn wipe_u32(words: &mut [u32]) {
+    for word in words.iter_mut() {
+        // rr: escape(unsafe): word is a place of its own, aligned and
+        // borrowed mutably.
+        unsafe { core::ptr::write_volatile(word, 0) };
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+/// wipe for 64-bit words.
+pub fn wipe_u64(words: &mut [u64]) {
+    for word in words.iter_mut() {
+        // rr: escape(unsafe): word is a place of its own, aligned and
+        // borrowed mutably.
+        unsafe { core::ptr::write_volatile(word, 0) };
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -2100,7 +2132,7 @@ mod tests {
     /// with the instructions takes: where the CPU has both, both run, so
     /// it shows which is faster on it.
     fn bench_loop(b: &mut Bencher, first: usize, faster: bool) {
-        if !available() || (faster && !cpu::has(FASTER)) {
+        if !available() || (faster && !cpu::has(&FASTER)) {
             return;
         }
         let (rk, tbl) = keys(first);
@@ -2146,7 +2178,7 @@ mod tests {
     }
 
     fn loops_agree(first: usize) {
-        if !cpu::has(FASTER) {
+        if !cpu::has(&FASTER) {
             return;
         }
         let (rk, tbl) = keys(first);

@@ -9,7 +9,7 @@ use crate::base::cpu;
 /// and state untouched, on a CPU without them.
 #[cfg(target_arch = "aarch64")]
 pub fn compress(state: &mut [u32; 8], blocks: &[[u8; 64]]) -> bool {
-    if !cpu::has(cpu::SHA256) {
+    if !cpu::has(&cpu::SHA256) {
         return false;
     }
     // rr: escape(unsafe): the CPU has the SHA2 extension.
@@ -21,7 +21,7 @@ pub fn compress(state: &mut [u32; 8], blocks: &[[u8; 64]]) -> bool {
 /// and state untouched, on a CPU without them.
 #[cfg(target_arch = "x86_64")]
 pub fn compress(state: &mut [u32; 8], blocks: &[[u8; 64]]) -> bool {
-    if !cpu::has(cpu::SHA256) {
+    if !cpu::has(&cpu::SHA256) {
         return false;
     }
     // rr: escape(unsafe): the CPU has SHA-NI, SSSE3 and SSE4.1.

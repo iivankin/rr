@@ -4,12 +4,14 @@
 
 use super::{
     AES_128_GCM_SHA256, AES_256_GCM_SHA384, ALERT, APPLICATION, CHANGE_CIPHER_SPEC, Client, Digest,
-    Error, HANDSHAKE, HELLO_RETRY, IDLE_MAX, KEY_RECORDS_MAX, Keys, MESSAGE_MAX, PENDING_MAX,
-    RANDOM_BYTES, RECORD_MAX, RECORDS_PER_INPUT, Reader, SECP256R1, State, Taken, Transcript,
-    VERIFY_CONTEXT, Verify, X25519, X25519MLKEM768, derive, expand, handshake_secrets, mac,
+    Error, HANDSHAKE, HELLO_RETRY, IDLE_MAX, KEY_RECORDS_MAX, Keys, MESSAGE_MAX, Opening,
+    PENDING_MAX, RECORD_MAX, RECORDS_PER_INPUT, Random, Reader, SECP256R1, State, Taken,
+    Transcript, VERIFY_CONTEXT, Verify, X25519, X25519MLKEM768, derive, expand, handshake_secrets,
+    mac,
 };
 use crate::base::ecdh;
 use crate::base::mlkem;
+use crate::base::random::{Seed32, Seed64};
 use crate::base::sha256::{self, Sha256};
 use crate::base::sha384;
 use crate::base::x509::{self, Approval, Store, TEST_NOW, test_certificate};
@@ -17,13 +19,16 @@ use crate::base::x25519;
 use alloc::vec::Vec;
 use test::Bencher;
 
-/// The client's randomness in every test.
-const RANDOM: [u8; RANDOM_BYTES] = [0x5c; RANDOM_BYTES];
-/// The session ID the client sends, from RANDOM.
+/// The session ID the client sends, from random().
 const SESSION: [u8; 32] = [0x5c; 32];
 const HOST: &str = "api.example.test";
 /// A split that brings everything at once.
 const WHOLE: usize = 1 << 24;
+
+/// The client's randomness in every test: the bytes 0x5c.
+fn random() -> Random {
+    Random::fixed([0x5c; 32])
+}
 
 /// Bytes from hex digits; anything between them is skipped.
 fn hex(text: &str) -> Vec<u8> {
@@ -358,7 +363,7 @@ fn integer(out: &mut Vec<u8>, value: &[u8]) {
 
 fn hashed(wide: bool, data: &[u8]) -> Vec<u8> {
     if wide {
-        Vec::from(sha384::digest(data))
+        Vec::from(sha384::digest384(data))
     } else {
         Vec::from(sha256::digest(data))
     }
@@ -489,7 +494,7 @@ impl Identity {
     fn sign(&self, content: &[u8]) -> Vec<u8> {
         match &self.signer {
             Signer::P256(key) => Curve::p256().sign(key, &sha256::digest(content)),
-            Signer::P384(key) => Curve::p384().sign(key, &sha384::digest(content)),
+            Signer::P384(key) => Curve::p384().sign(key, &sha384::digest384(content)),
             Signer::Rsa(modulus, exponent) => {
                 pss(modulus, exponent, self.scheme == 0x0805, content)
             }
@@ -565,7 +570,7 @@ struct Hello {
 struct Server {
     script: Script,
     transcript: Transcript,
-    read: Option<Keys>,
+    read: Option<Opening>,
     write: Option<Keys>,
     master: Digest,
     client_secret: Option<Digest>,
@@ -667,7 +672,7 @@ impl Server {
             20 => {
                 let key = derive(&self.read.as_ref().unwrap().secret, b"finished", &[]);
                 assert_eq!(message[4..], *mac(&key, &self.hash()).bytes());
-                self.read = self.client_secret.take().map(Keys::new);
+                self.read = self.client_secret.take().map(Opening::new);
                 self.finished = true;
             }
             24 => {
@@ -792,27 +797,32 @@ impl Server {
             .iter()
             .find(|(offered, _)| *offered == group)
             .expect("no key share for the group");
-        let secret = [0x3a; 32];
+        let secret = x25519::Secret::new(Seed32::for_tests([0x3a; 32]));
+        let x25519 = |peer: &[u8]| {
+            let peer = x25519::PublicKey::from_bytes(peer.try_into().unwrap());
+            secret.agree(&peer).unwrap()
+        };
         let (mut key, mut shared) = (Vec::new(), Vec::new());
         match group {
             X25519 => {
-                key.extend_from_slice(&x25519::public_key(&secret));
-                let peer: [u8; 32] = share[..].try_into().unwrap();
-                shared.extend_from_slice(&x25519::shared(&secret, &peer).unwrap());
+                key.extend_from_slice(secret.public_key().bytes());
+                shared.extend_from_slice(x25519(share).kdf_input());
             }
             X25519MLKEM768 => {
                 let (encapsulation, peer) = share.split_at(mlkem::ENCAPSULATION_KEY_BYTES);
                 let encapsulation = encapsulation.try_into().unwrap();
-                let (ciphertext, kem) = mlkem::encapsulate(encapsulation, &[0x4d; 32]).unwrap();
+                let seed = Seed32::for_tests([0x4d; 32]);
+                let (ciphertext, kem) = mlkem::encapsulate(encapsulation, seed).unwrap();
                 key.extend_from_slice(&ciphertext);
-                key.extend_from_slice(&x25519::public_key(&secret));
-                shared.extend_from_slice(&kem);
-                let peer: [u8; 32] = peer.try_into().unwrap();
-                shared.extend_from_slice(&x25519::shared(&secret, &peer).unwrap());
+                key.extend_from_slice(secret.public_key().bytes());
+                shared.extend_from_slice(kem.kdf_input());
+                shared.extend_from_slice(x25519(peer).kdf_input());
             }
             _ => {
-                key.extend_from_slice(&ecdh::public_key(&secret).unwrap());
-                shared.extend_from_slice(&ecdh::shared(&secret, share).unwrap());
+                let p256 = ecdh::Secret::new(Seed64::for_tests([0x3a; 64]));
+                key.extend_from_slice(p256.public_key().bytes());
+                let peer = ecdh::PublicKey::parse(share).unwrap();
+                shared.extend_from_slice(p256.agree(&peer).kdf_input());
             }
         }
         (key, shared)
@@ -839,7 +849,7 @@ impl Server {
         }
         let secrets = handshake_secrets(&shared, &self.hash());
         let finished = derive(&secrets.server, b"finished", &[]);
-        self.read = Some(Keys::new(secrets.client));
+        self.read = Some(Opening::new(secrets.client));
         self.write = Some(Keys::new(secrets.server));
         self.master = secrets.master;
         if !self.script.flight {
@@ -926,11 +936,10 @@ impl Server {
         let keys = self.write.as_mut().unwrap();
         let length = u16::try_from(inner.len() + 16).unwrap().to_be_bytes();
         let header = [APPLICATION, 3, 3, length[0], length[1]];
-        let nonce = keys.nonce().unwrap();
-        let tag = keys.aead.seal(&nonce, &header, &mut inner).unwrap();
+        let tag = keys.key.seal(&header, &mut inner).unwrap();
         self.output.extend_from_slice(&header);
         self.output.extend_from_slice(&inner);
-        self.output.extend_from_slice(&tag);
+        self.output.extend_from_slice(tag.bytes());
     }
 
     /// A KeyUpdate, then records under the next keys.
@@ -962,13 +971,12 @@ fn hello_message(random: &[u8; 32], session: &[u8], suite: u16, extensions: &[u8
 
 /// Opens a record in place with the server's keys: its type, and the
 /// record cut to its plaintext.
-fn opened(keys: &mut Keys, record: &mut Vec<u8>) -> u8 {
+fn opened(keys: &mut Opening, record: &mut Vec<u8>) -> u8 {
     let (header, body) = record.split_at_mut(5);
     let at = body.len() - 16;
     let (data, tag) = body.split_at_mut(at);
     let tag: &[u8; 16] = (&*tag).try_into().unwrap();
-    let nonce = keys.nonce().unwrap();
-    keys.aead.open(&nonce, header, data, tag).unwrap();
+    keys.key.open(header, data, tag).unwrap();
     let end = data.iter().rposition(|byte| *byte != 0).unwrap();
     let kind = data[end];
     record.truncate(5 + end);
@@ -1074,7 +1082,7 @@ fn connect<'a>(
     alpn: &[&[u8]],
     split: &mut Split,
 ) -> Result<Client<'a>, Error> {
-    let mut client = Client::new(host, alpn, Verify::Store(store), TEST_NOW, &RANDOM)?;
+    let mut client = Client::with(host, alpn, Verify::Store(store), TEST_NOW, random())?;
     let got = exchange(&mut client, server, split)?;
     assert!(got.is_empty());
     Ok(client)
@@ -1084,7 +1092,7 @@ fn connect<'a>(
 fn outcome(script: Script, host: &str, alpn: &[&[u8]], now: i64) -> (Option<Error>, Vec<u8>) {
     let store = script.identity.store();
     let mut server = Server::new(script);
-    let mut client = Client::new(host, alpn, Verify::Store(&store), now, &RANDOM).unwrap();
+    let mut client = Client::with(host, alpn, Verify::Store(&store), now, random()).unwrap();
     let result = exchange(&mut client, &mut server, &mut whole());
     (result.err(), server.alerts)
 }
@@ -1117,7 +1125,7 @@ fn after_hello(kind: Option<u8>, bytes: &[u8]) -> Option<Error> {
     script.flight = false;
     let store = script.identity.store();
     let mut server = Server::new(script);
-    let mut client = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
+    let mut client = Client::with(HOST, &[], Verify::Store(&store), TEST_NOW, random()).unwrap();
     server.receive(client.pending());
     match kind {
         Some(sealed) => server.send(sealed, bytes),
@@ -1224,6 +1232,13 @@ fn key_of(secret: &Digest) -> Vec<u8> {
     Vec::from(key)
 }
 
+/// The IV of a traffic secret, which aesgcm's keys keep to themselves.
+fn iv_of(secret: &Digest) -> Vec<u8> {
+    let mut iv = [0; 12];
+    expand(secret, b"iv", &[], &mut iv);
+    Vec::from(iv)
+}
+
 /// The trace's key schedule and records through the client. Its
 /// ClientHello is not this client's, so the trace's takes our own's
 /// place in the transcript, and its EncryptedExtensions, an answer to
@@ -1236,9 +1251,14 @@ fn key_of(secret: &Digest) -> Vec<u8> {
 #[test]
 fn rfc8448_simple_1rtt() {
     let store = Store::new();
-    let mut random = [0; RANDOM_BYTES];
-    random[64..96].copy_from_slice(&hex(CLIENT_PRIVATE));
-    let mut client = Client::new("server", &[], Verify::Store(&store), 0, &random).unwrap();
+    let random = Random {
+        client: [0; 32],
+        session: [0; 32],
+        x25519: Seed32::for_tests(hex(CLIENT_PRIVATE).try_into().unwrap()),
+        mlkem: Seed64::for_tests([0; 64]),
+        p256: Seed64::for_tests([0; 64]),
+    };
+    let mut client = Client::with("server", &[], Verify::Store(&store), 0, random).unwrap();
     // RFC 8448's client offers X25519 alone, without middlebox
     // compatibility.
     client.session = None;
@@ -1254,9 +1274,9 @@ fn rfc8448_simple_1rtt() {
     assert_eq!(writing.secret.bytes(), hex(CLIENT_HS));
     assert_eq!(client.master.bytes(), hex(MASTER));
     assert_eq!(key_of(&reading.secret), hex(SERVER_HS_KEY));
-    assert_eq!(reading.iv[..], hex(SERVER_HS_IV));
+    assert_eq!(iv_of(&reading.secret), hex(SERVER_HS_IV));
     assert_eq!(key_of(&writing.secret), hex(CLIENT_HS_KEY));
-    assert_eq!(writing.iv[..], hex(CLIENT_HS_IV));
+    assert_eq!(iv_of(&writing.secret), hex(CLIENT_HS_IV));
     assert_eq!(client.server_finished.bytes(), hex(SERVER_FINISHED_KEY));
     let mut flight = hex(SERVER_FLIGHT);
     let keys = client.input_keys.as_mut().unwrap();
@@ -1294,9 +1314,9 @@ fn rfc8448_simple_1rtt() {
     assert_eq!(app_reading.secret.bytes(), hex(SERVER_AP));
     assert_eq!(app_writing.secret.bytes(), hex(CLIENT_AP));
     assert_eq!(key_of(&app_reading.secret), hex(SERVER_AP_KEY));
-    assert_eq!(app_reading.iv[..], hex(SERVER_AP_IV));
+    assert_eq!(iv_of(&app_reading.secret), hex(SERVER_AP_IV));
     assert_eq!(key_of(&app_writing.secret), hex(CLIENT_AP_KEY));
-    assert_eq!(app_writing.iv[..], hex(CLIENT_AP_IV));
+    assert_eq!(iv_of(&app_writing.secret), hex(CLIENT_AP_IV));
     client.sent(client.pending().len()).unwrap();
     let data = hex(CLIENT_DATA);
     assert_eq!(client.write(&data), Ok(Taken(data.len())));
@@ -1309,12 +1329,12 @@ fn rfc8448_simple_1rtt() {
 fn client_hello() {
     let store = Identity::new(Kind::P256).store();
     let mut server = Server::new(Script::new(Kind::P256));
-    let named = Client::new(
+    let named = Client::with(
         "api.example.test.",
         &[b"h2", b"http/1.1"],
         Verify::Store(&store),
         0,
-        &RANDOM,
+        random(),
     );
     let client = named.unwrap();
     assert_eq!(client.pending()[..3], [22, 3, 1]);
@@ -1331,7 +1351,7 @@ fn client_hello() {
     );
     assert_eq!(hello.cookie, None);
     let mut other = Server::new(Script::new(Kind::P256));
-    let literal = Client::new("192.0.2.1", &[], Verify::Store(&store), 0, &RANDOM).unwrap();
+    let literal = Client::with("192.0.2.1", &[], Verify::Store(&store), 0, random()).unwrap();
     other.receive(literal.pending());
     assert_eq!(other.hello.name, None);
     assert!(other.hello.alpn.is_empty());
@@ -1342,7 +1362,7 @@ fn refuses_bad_arguments() {
     let store = Store::new();
     let long = "a".repeat(254);
     for host in ["", "a..b", ".a", "a b", "\u{e9}.test", "a/b", &long] {
-        let made = Client::new(host, &[], Verify::Store(&store), 0, &RANDOM);
+        let made = Client::with(host, &[], Verify::Store(&store), 0, random());
         assert_eq!(made.err(), Some(Error::Host), "{host}");
     }
     for host in [
@@ -1353,14 +1373,14 @@ fn refuses_bad_arguments() {
         "10.0.0.1",
     ] {
         assert!(
-            Client::new(host, &[], Verify::Store(&store), 0, &RANDOM).is_ok(),
+            Client::with(host, &[], Verify::Store(&store), 0, random()).is_ok(),
             "{host}"
         );
     }
     let name = [b'x'; 256];
     let many = [&name[..200]; 8];
     for alpn in [&[&b""[..]][..], &[&name[..]], &many] {
-        let made = Client::new(HOST, alpn, Verify::Store(&store), 0, &RANDOM);
+        let made = Client::with(HOST, alpn, Verify::Store(&store), 0, random());
         assert_eq!(made.err(), Some(Error::Alpn));
     }
 }
@@ -1408,7 +1428,7 @@ fn handshakes() {
 /// close_notify.
 fn recorded(store: &Store) -> Vec<u8> {
     let mut server = Server::new(Script::new(Kind::P256));
-    let mut client = Client::new(HOST, &[], Verify::Store(store), TEST_NOW, &RANDOM).unwrap();
+    let mut client = Client::with(HOST, &[], Verify::Store(store), TEST_NOW, random()).unwrap();
     server.receive(client.pending());
     client.sent(client.pending().len()).unwrap();
     let mut bytes = server.take();
@@ -1424,7 +1444,7 @@ fn recorded(store: &Store) -> Vec<u8> {
 
 /// bytes into a fresh client in parts, each in the split's pieces.
 fn replay(store: &Store, parts: &[&[u8]], split: &mut Split) -> Vec<u8> {
-    let mut client = Client::new(HOST, &[], Verify::Store(store), TEST_NOW, &RANDOM).unwrap();
+    let mut client = Client::with(HOST, &[], Verify::Store(store), TEST_NOW, random()).unwrap();
     let mut got = Vec::new();
     for part in parts {
         feed(&mut client, part, split, &mut got).unwrap();
@@ -1490,7 +1510,7 @@ fn groups() {
         assert!(client.connected() && server.finished);
         assert_eq!(server.ccs, 1);
         assert_eq!(server.hello.session, SESSION);
-        assert!(client.kem.is_none() && client.p256 == [0; 32]);
+        assert!(client.kem.is_none() && client.p256.is_none() && client.secret.is_none());
         assert_eq!(client.write(b"x"), Ok(Taken(1)));
         assert_eq!(
             exchange(&mut client, &mut server, &mut whole()),
@@ -1501,7 +1521,7 @@ fn groups() {
     // The first ClientHello shares X25519MLKEM768's key and X25519's.
     let store = Store::new();
     let mut server = Server::new(Script::new(Kind::P256));
-    let client = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
+    let client = Client::with(HOST, &[], Verify::Store(&store), TEST_NOW, random()).unwrap();
     server.receive(client.pending());
     let shares = &server.hello.shares;
     assert_eq!(shares.len(), 2);
@@ -1525,7 +1545,8 @@ fn server_hello_refused() {
         ("001d 0020", None, false),
     ] {
         let store = Store::new();
-        let mut client = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
+        let mut client =
+            Client::with(HOST, &[], Verify::Store(&store), TEST_NOW, random()).unwrap();
         client.sent(client.pending().len()).unwrap();
         if let Some(group) = asked {
             let mut all = hex("002b 0002 0304  0033 0002");
@@ -1604,7 +1625,7 @@ fn retried(extensions: Vec<u8>, twice: bool) -> Option<Error> {
     let retry = hello_message(&HELLO_RETRY, &SESSION, AES_128_GCM_SHA256, &all);
     let mut record = Vec::from([22, 3, 3]);
     prefixed(&mut record, retry.len(), &retry);
-    let mut client = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
+    let mut client = Client::with(HOST, &[], Verify::Store(&store), TEST_NOW, random()).unwrap();
     client.sent(client.pending().len()).unwrap();
     let first = client.input(&record).err();
     if first.is_some() || !twice {
@@ -1820,8 +1841,18 @@ fn key_update() {
     );
     assert_eq!(server.updates, 2);
     // The client's own, every 2^24 records.
-    client.output_keys.as_mut().unwrap().seq = KEY_RECORDS_MAX;
-    server.read.as_mut().unwrap().seq = KEY_RECORDS_MAX;
+    client
+        .output_keys
+        .as_mut()
+        .unwrap()
+        .key
+        .set_sequence_less_safe(KEY_RECORDS_MAX);
+    server
+        .read
+        .as_mut()
+        .unwrap()
+        .key
+        .set_sequence_for_tests(KEY_RECORDS_MAX);
     assert_eq!(client.write(b"five"), Ok(Taken(4)));
     assert_eq!(
         exchange(&mut client, &mut server, &mut split),
@@ -1829,7 +1860,7 @@ fn key_update() {
     );
     assert_eq!(server.updates, 3);
     assert_eq!(server.received, b"fourfive");
-    assert_eq!(client.output_keys.as_ref().unwrap().seq, 1);
+    assert_eq!(client.output_keys.as_ref().unwrap().key.sequence(), 1);
 }
 
 /// A request value other than 0 or 1, a KeyUpdate of two bytes, and one
@@ -1851,7 +1882,7 @@ fn key_update_refused() {
 fn alerts() {
     let store = Store::new();
     // Before ServerHello, in the clear; no alert answers the server's.
-    let mut client = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
+    let mut client = Client::with(HOST, &[], Verify::Store(&store), TEST_NOW, random()).unwrap();
     client.sent(client.pending().len()).unwrap();
     assert_eq!(
         client.input(&[21, 3, 3, 0, 2, 2, 40]),
@@ -1933,7 +1964,8 @@ fn record_limits() {
         (&[22, 3, 3, 0x40, 0x00], Ok(Taken(5))),
         (b"HTTP/1.1 400", Err(Error::Unexpected)),
     ] {
-        let mut client = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
+        let mut client =
+            Client::with(HOST, &[], Verify::Store(&store), TEST_NOW, random()).unwrap();
         assert_eq!(client.input(bytes), result);
     }
     // 2^14 bytes and the content type pass: TLSInnerPlaintext is 2^14 + 1
@@ -2013,7 +2045,7 @@ fn record_boundaries() {
     script.flight = false;
     let store = script.identity.store();
     let mut first = Server::new(script);
-    let mut client = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
+    let mut client = Client::with(HOST, &[], Verify::Store(&store), TEST_NOW, random()).unwrap();
     first.receive(client.pending());
     let mut bytes = first.take();
     bytes[4] += 1;
@@ -2034,7 +2066,7 @@ fn record_boundaries() {
     // A change_cipher_spec after the handshake, or of another value.
     let late = |server: &mut Server| server.output.extend_from_slice(&[20, 3, 3, 0, 1, 1]);
     assert_eq!(after(late, 1).0, Some(Error::Unexpected));
-    let mut fresh = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
+    let mut fresh = Client::with(HOST, &[], Verify::Store(&store), TEST_NOW, random()).unwrap();
     assert_eq!(fresh.input(&[20, 3, 3, 0, 1, 1]), Ok(Taken(6)));
     assert_eq!(fresh.input(&[20, 3, 3, 0, 1, 2]), Err(Error::Unexpected));
     // Data before the handshake is done; a handshake record in the clear
@@ -2052,7 +2084,7 @@ fn record_boundaries() {
 /// or none; and the alert it sends back.
 fn tls12(tail: [u8; 8], extensions: Option<&[u8]>) -> (Option<Error>, Vec<u8>) {
     let store = Store::new();
-    let mut client = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
+    let mut client = Client::with(HOST, &[], Verify::Store(&store), TEST_NOW, random()).unwrap();
     client.sent(client.pending().len()).unwrap();
     let mut body = Vec::from([3, 3]);
     body.extend_from_slice(&[0x11; 24]);
@@ -2153,7 +2185,8 @@ fn suites_refused() {
             &hex("002b 0002 0304 0033 0002 0017"),
         );
         let store = Store::new();
-        let mut client = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
+        let mut client =
+            Client::with(HOST, &[], Verify::Store(&store), TEST_NOW, random()).unwrap();
         let mut record = Vec::from([22, 3, 3]);
         prefixed(&mut record, retry.len(), &retry);
         assert_eq!(client.input(&record), Err(Error::Parameter));
@@ -2206,14 +2239,25 @@ fn certificate_entry_extensions() {
 fn internal_errors() {
     let store = Identity::new(Kind::P256).store();
     let (mut client, mut server) = connected(&store);
-    client.output_keys.as_mut().unwrap().seq = u64::MAX;
+    let last = u64::MAX;
+    client
+        .output_keys
+        .as_mut()
+        .unwrap()
+        .key
+        .set_sequence_less_safe(last);
     assert_eq!(client.write(b"x"), Err(Error::Internal));
     // No number is left for the alert either.
     assert!(client.pending().is_empty());
     server.receive(client.pending());
     assert!(server.received.is_empty() && server.alerts.is_empty());
     let (mut reading, mut other) = connected(&store);
-    reading.input_keys.as_mut().unwrap().seq = u64::MAX;
+    reading
+        .input_keys
+        .as_mut()
+        .unwrap()
+        .key
+        .set_sequence_for_tests(last);
     other.send(APPLICATION, b"x");
     assert_eq!(reading.input(&other.take()), Err(Error::Internal));
     other.receive(reading.pending());
@@ -2232,7 +2276,7 @@ fn internal_errors() {
         super::seal(&mut keys, &mut tx, APPLICATION, &large),
         Err(Error::Internal)
     );
-    assert_eq!((tx.len(), keys.seq), (0, 0));
+    assert_eq!((tx.len(), keys.key.sequence()), (0, 0));
     assert_eq!(Error::Internal.alert(), Some(80));
 }
 
@@ -2303,7 +2347,7 @@ fn write_backpressure() {
     assert_eq!(client.write(&[]), Ok(Taken(0)));
     // Before the handshake nothing is written, and close_notify goes in
     // the clear.
-    let mut fresh = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
+    let mut fresh = Client::with(HOST, &[], Verify::Store(&store), TEST_NOW, random()).unwrap();
     assert_eq!(fresh.write(b"x"), Err(Error::NotConnected));
     fresh.close();
     let pending = fresh.pending();
@@ -2352,9 +2396,14 @@ fn input_record(b: &mut Bencher) {
     data.resize(RECORD_MAX, 0x62);
     server.send(APPLICATION, &data);
     let record = server.take();
-    let seq = client.input_keys.as_ref().unwrap().seq;
+    let seq = client.input_keys.as_ref().unwrap().key.sequence();
     b.iter(|| {
-        client.input_keys.as_mut().unwrap().seq = seq;
+        client
+            .input_keys
+            .as_mut()
+            .unwrap()
+            .key
+            .set_sequence_for_tests(seq);
         assert_eq!(client.input(&record), Ok(Taken(record.len())));
         assert_eq!(client.read().len(), RECORD_MAX);
         client.consume(RECORD_MAX);
@@ -2368,11 +2417,11 @@ fn input_record(b: &mut Bencher) {
 fn handshake(b: &mut Bencher) {
     let store = Identity::new(Kind::P256).store();
     let mut server = Server::new(Script::new(Kind::P256));
-    let client = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
+    let client = Client::with(HOST, &[], Verify::Store(&store), TEST_NOW, random()).unwrap();
     server.receive(client.pending());
     let flight = server.take();
     b.iter(|| {
-        let mut fresh = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
+        let mut fresh = Client::with(HOST, &[], Verify::Store(&store), TEST_NOW, random()).unwrap();
         assert_eq!(fresh.input(&flight), Ok(Taken(flight.len())));
         assert!(fresh.connected());
     });
@@ -2386,11 +2435,11 @@ fn handshake_aes256(b: &mut Bencher) {
     script.suite = AES_256_GCM_SHA384;
     let store = script.identity.store();
     let mut server = Server::new(script);
-    let client = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
+    let client = Client::with(HOST, &[], Verify::Store(&store), TEST_NOW, random()).unwrap();
     server.receive(client.pending());
     let flight = server.take();
     b.iter(|| {
-        let mut fresh = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
+        let mut fresh = Client::with(HOST, &[], Verify::Store(&store), TEST_NOW, random()).unwrap();
         assert_eq!(fresh.input(&flight), Ok(Taken(flight.len())));
         assert!(fresh.connected());
     });
@@ -2448,8 +2497,18 @@ fn key_update_pending() {
     let (mut client, mut server) = connected(&store);
     let mut data = Vec::new();
     data.resize(RECORD_MAX, 3);
-    client.output_keys.as_mut().unwrap().seq = KEY_RECORDS_MAX;
-    server.read.as_mut().unwrap().seq = KEY_RECORDS_MAX;
+    client
+        .output_keys
+        .as_mut()
+        .unwrap()
+        .key
+        .set_sequence_less_safe(KEY_RECORDS_MAX);
+    server
+        .read
+        .as_mut()
+        .unwrap()
+        .key
+        .set_sequence_for_tests(KEY_RECORDS_MAX);
     let mut written = 0;
     for _ in 0..6 {
         written += client.write(&data).unwrap().count();
@@ -2508,7 +2567,7 @@ impl Judge<'_> {
 /// server and back.
 fn caller(script: Script, host: &str, piece: usize, judge: &Judge<'_>) -> Verdict {
     let mut server = Server::new(script);
-    let mut client = Client::new(host, &[], Verify::Caller, TEST_NOW, &RANDOM).unwrap();
+    let mut client = Client::with(host, &[], Verify::Caller, TEST_NOW, random()).unwrap();
     server.receive(client.pending());
     client.sent(client.pending().len()).unwrap();
     let mut bytes = server.take();
@@ -2619,7 +2678,7 @@ fn caller_trusts() {
 #[test]
 fn close_while_awaiting() {
     let mut server = Server::new(Script::new(Kind::P256));
-    let mut client = Client::new(HOST, &[], Verify::Caller, TEST_NOW, &RANDOM).unwrap();
+    let mut client = Client::with(HOST, &[], Verify::Caller, TEST_NOW, random()).unwrap();
     server.receive(client.pending());
     client.sent(client.pending().len()).unwrap();
     let bytes = server.take();
@@ -2750,7 +2809,7 @@ fn failure_takes_the_keys_back() {
     assert_eq!((server.updates, server.alerts.as_slice()), (0, &[10][..]));
     // The whole flight in, the client's own not yet sent.
     let mut fresh = Server::new(Script::new(Kind::P256));
-    let mut early = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
+    let mut early = Client::with(HOST, &[], Verify::Store(&store), TEST_NOW, random()).unwrap();
     fresh.receive(early.pending());
     early.sent(early.pending().len()).unwrap();
     let flight = fresh.take();
@@ -2770,7 +2829,7 @@ fn failure_takes_the_keys_back() {
 fn close_during_handshake() {
     let store = Identity::new(Kind::P256).store();
     let mut server = Server::new(Script::new(Kind::P256));
-    let mut client = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW, &RANDOM).unwrap();
+    let mut client = Client::with(HOST, &[], Verify::Store(&store), TEST_NOW, random()).unwrap();
     server.receive(client.pending());
     client.sent(client.pending().len()).unwrap();
     let flight = server.take();
@@ -2941,7 +3000,7 @@ fn a_program() {
     for piece in [1, 7, 100, 5000, WHOLE] {
         for closes in [true, false] {
             let mut socket = Socket::new(Script::new(Kind::P256), piece, request.len(), closes);
-            let mut client = Client::new(HOST, &[], Verify::Caller, TEST_NOW, &RANDOM).unwrap();
+            let mut client = Client::with(HOST, &[], Verify::Caller, TEST_NOW, random()).unwrap();
             got.clear();
             let result = program(&mut client, &mut socket, &request, &store, &mut got);
             let ending = if closes { None } else { Some(Error::Truncated) };
@@ -2955,7 +3014,7 @@ fn a_program() {
     // A chain the verifier refuses: unknown_ca, and nothing read.
     let other = Identity::new(Kind::RsaSha256).store();
     let mut socket = Socket::new(Script::new(Kind::P256), 9, 4, true);
-    let mut client = Client::new(HOST, &[], Verify::Caller, TEST_NOW, &RANDOM).unwrap();
+    let mut client = Client::with(HOST, &[], Verify::Caller, TEST_NOW, random()).unwrap();
     got.clear();
     let refused = program(&mut client, &mut socket, b"ping", &other, &mut got);
     assert_eq!(refused, Err(Error::Untrusted));
@@ -2964,7 +3023,7 @@ fn a_program() {
     let mut forged = Script::new(Kind::P256);
     forged.identity.signer = Identity::new(Kind::P384).signer;
     let mut signed = Socket::new(forged, 9, 4, true);
-    let mut checking = Client::new(HOST, &[], Verify::Caller, TEST_NOW, &RANDOM).unwrap();
+    let mut checking = Client::with(HOST, &[], Verify::Caller, TEST_NOW, random()).unwrap();
     let wrong = program(&mut checking, &mut signed, b"ping", &store, &mut got);
     assert_eq!(wrong, Err(Error::Signature));
     assert_eq!(signed.server.alerts, [51]);
@@ -2974,7 +3033,7 @@ fn a_program() {
 /// the Certificate: the server, its bytes and how many the client took.
 fn awaiting() -> (Client<'static>, Server, Vec<u8>, usize) {
     let mut server = Server::new(Script::new(Kind::P256));
-    let mut client = Client::new(HOST, &[], Verify::Caller, TEST_NOW, &RANDOM).unwrap();
+    let mut client = Client::with(HOST, &[], Verify::Caller, TEST_NOW, random()).unwrap();
     server.receive(client.pending());
     client.sent(client.pending().len()).unwrap();
     let bytes = server.take();
@@ -3051,8 +3110,18 @@ fn mistakes_are_loud() {
 fn secrets_let_go() {
     let store = Identity::new(Kind::P256).store();
     let (mut client, mut server) = connected(&store);
-    client.output_keys.as_mut().unwrap().seq = KEY_RECORDS_MAX;
-    server.read.as_mut().unwrap().seq = KEY_RECORDS_MAX;
+    client
+        .output_keys
+        .as_mut()
+        .unwrap()
+        .key
+        .set_sequence_less_safe(KEY_RECORDS_MAX);
+    server
+        .read
+        .as_mut()
+        .unwrap()
+        .key
+        .set_sequence_for_tests(KEY_RECORDS_MAX);
     let mut data = Vec::new();
     data.resize(100, 1);
     assert_eq!(client.write(&data), Ok(Taken(100)));
@@ -3081,4 +3150,18 @@ fn secrets_let_go() {
     assert_eq!(result, Err(Error::Unexpected));
     assert_eq!(failing.marked, 0);
     assert!(failing.marks.iter().all(|mark| mark.secret.is_none()));
+}
+
+/// Client::new draws from the system: two clients' ClientHellos are
+/// as long, and differ in their random, session ID and key shares.
+#[test]
+fn system_randomness() {
+    let store = Store::new();
+    let a = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW).unwrap();
+    let b = Client::new(HOST, &[], Verify::Store(&store), TEST_NOW).unwrap();
+    assert_eq!(a.pending().len(), b.pending().len());
+    assert_eq!(a.pending()[..11], b.pending()[..11]);
+    assert_ne!(a.pending()[11..43], b.pending()[11..43]);
+    assert_ne!((a.random, a.session), (b.random, b.session));
+    assert_ne!(a.public, b.public);
 }

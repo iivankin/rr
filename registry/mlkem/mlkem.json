@@ -1,8 +1,10 @@
 {
   "name": "mlkem",
-  "description": "ML-KEM-768 (FIPS 203) for TLS's X25519MLKEM768: key generation from a 64-byte seed, encapsulation with the modulus check, decapsulation with implicit rejection, constant time over secrets; its own Keccak (SHA3-256, SHA3-512, SHAKE128, SHAKE256).",
+  "description": "ML-KEM-768 (FIPS 203) for TLS's X25519MLKEM768: key generation from a 64-byte seed, encapsulation with the modulus check, decapsulation with implicit rejection, constant time over secrets; its own Keccak (SHA3-256, SHA3-512, SHAKE128, SHAKE256); keys generated in place from random's seed, encapsulation from random's seed, a SharedSecret only a key derivation takes, secrets wiped.",
   "rr": "0.5.2",
-  "dependencies": [],
+  "dependencies": [
+    "random"
+  ],
   "files": [
     {
       "path": "mod.rs"

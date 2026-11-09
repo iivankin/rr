@@ -3,17 +3,29 @@
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use core::sync::atomic::{AtomicU32, Ordering};
 
+/// Features of the CPU, one or more of the constants below. Only cpu
+/// makes one, so a bit it keeps for itself cannot be asked.
+pub struct Features(u32);
+
 /// AES with the carry-less multiply GHASH takes: AES and PMULL on
 /// aarch64; AES-NI, PCLMULQDQ and SSSE3 on x86_64.
-pub const AES: u32 = 1 << 0;
+pub const AES: Features = Features(1 << 0);
 /// SHA-256's rounds: SHA2 on aarch64; SHA-NI, SSSE3 and SSE4.1 on x86_64.
-pub const SHA256: u32 = 1 << 1;
+pub const SHA256: Features = Features(1 << 1);
 /// SHA-512's rounds and SHA3's EOR3 on aarch64, which Rust enables as one
 /// feature, "sha3".
-pub const SHA512: u32 = 1 << 2;
+pub const SHA512: Features = Features(1 << 2);
 /// AES and carry-less multiply on 256-bit vectors on x86_64: VAES,
 /// VPCLMULQDQ and AVX2, with the YMM registers the OS saves.
-pub const WIDE_AES: u32 = 1 << 3;
+pub const WIDE_AES: Features = Features(1 << 3);
+
+impl Features {
+    /// These and other, for one has().
+    #[must_use]
+    pub const fn and(&self, other: &Features) -> Features {
+        Features(self.0 | other.0)
+    }
+}
 
 /// Set in FOUND once the CPU was asked.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -26,19 +38,19 @@ static FOUND: AtomicU32 = AtomicU32::new(0);
 
 /// Whether the CPU has every feature in want.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-pub fn has(want: u32) -> bool {
+pub fn has(want: &Features) -> bool {
     let mut found = FOUND.load(Ordering::Relaxed);
     if found & ASKED == 0 {
         found = detect() | ASKED;
         FOUND.store(found, Ordering::Relaxed);
     }
-    found & want == want
+    found & want.0 == want.0
 }
 
 /// No instructions this code knows on this architecture.
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-pub fn has(want: u32) -> bool {
-    want == 0
+pub fn has(want: &Features) -> bool {
+    want.0 == 0
 }
 
 /// What the target promises: on macOS every one of them, as every Mac
@@ -47,13 +59,13 @@ pub fn has(want: u32) -> bool {
 fn promised() -> u32 {
     let mut found = 0;
     if cfg!(target_feature = "aes") {
-        found |= AES;
+        found |= AES.0;
     }
     if cfg!(target_feature = "sha2") {
-        found |= SHA256;
+        found |= SHA256.0;
     }
     if cfg!(target_feature = "sha3") {
-        found |= SHA512;
+        found |= SHA512.0;
     }
     found
 }
@@ -79,13 +91,13 @@ fn detect() -> u32 {
     let has = |bits: core::ffi::c_ulong| hwcap & bits == bits;
     let mut found = promised();
     if has(HWCAP_AES | HWCAP_PMULL) {
-        found |= AES;
+        found |= AES.0;
     }
     if has(HWCAP_SHA2) {
-        found |= SHA256;
+        found |= SHA256.0;
     }
     if has(HWCAP_SHA512 | HWCAP_SHA3) {
-        found |= SHA512;
+        found |= SHA512.0;
     }
     found
 }
@@ -110,10 +122,10 @@ fn detect() -> u32 {
     const SHA512: u32 = 65;
     let mut found = promised();
     if IsProcessorFeaturePresent(CRYPTO) != 0 {
-        found |= AES | SHA256;
+        found |= AES.0 | SHA256.0;
     }
     if IsProcessorFeaturePresent(SHA3) != 0 && IsProcessorFeaturePresent(SHA512) != 0 {
-        found |= self::SHA512;
+        found |= self::SHA512.0;
     }
     found
 }
@@ -155,15 +167,15 @@ fn detect() -> u32 {
     let all = |bits: u32, of: u32| of & bits == bits;
     let mut found = 0;
     if all(AESNI | PCLMULQDQ | SSSE3, leaf1) {
-        found |= AES;
+        found |= AES.0;
     }
     if all(SSSE3 | SSE41, leaf1) && all(SHA, leaf7_ebx) {
-        found |= SHA256;
+        found |= SHA256.0;
     }
     // rr: escape(unsafe): OSXSAVE says XGETBV runs and reads XCR0.
     let ymm = all(OSXSAVE | AVX, leaf1) && unsafe { xcr0() } & XCR0_SSE_AVX == XCR0_SSE_AVX;
-    if found & AES != 0 && ymm && all(AVX2, leaf7_ebx) && all(VAES | VPCLMULQDQ, leaf7_ecx) {
-        found |= WIDE_AES;
+    if found & AES.0 != 0 && ymm && all(AVX2, leaf7_ebx) && all(VAES | VPCLMULQDQ, leaf7_ecx) {
+        found |= WIDE_AES.0;
     }
     found
 }
