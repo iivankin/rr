@@ -1,11 +1,22 @@
-//! HTTP/1.1 client side (RFC 9112) without I/O: a request written into
-//! the caller's buffer, and a response parsed from whatever pieces the
-//! caller reads, down to one byte at a time. The head is copied once into
-//! the parser, which keeps it until the next response; body bytes come
-//! back as slices of the caller's input and are never copied. Each byte
-//! is looked at once: a piece that ends inside a line or a chunk's
-//! framing resumes where it stopped.
+//! HTTP/1.1 client side (RFC 9112) without I/O, one Response for each
+//! connection: request writes a request into the caller's buffer and
+//! notes it, the responses are parsed from whatever pieces the caller
+//! reads, down to one byte at a time, each for the request it answers,
+//! in the order they went. The head is copied once into the parser,
+//! which keeps it until the next response; body bytes come back as
+//! slices of the caller's input and are never copied. Each byte is
+//! looked at once: a piece that ends inside a line or a chunk's framing
+//! resumes where it stopped.
+//!
+//! What a caller could get wrong is refused, loudly: a request body
+//! longer or shorter than its Content-Length, an empty chunk that would
+//! end a chunked body, a chunk's bytes not all sent; a feed after the
+//! response ended, before restart; a restart on a connection that cannot
+//! carry another response; a close that may be an attacker's taken as
+//! the end of a body. The head is read only once it is final (head), and
+//! says the body's length only where there is a body.
 
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 /// The most bytes of heads one response may carry: interim heads, the
@@ -14,6 +25,9 @@ pub const HEAD_MAX: usize = 64 * 1024;
 /// The most header fields of one head, twice what servers commonly send
 /// at most (Apache's LimitRequestFields is 100).
 pub const HEADERS_MAX: usize = 256;
+/// The most requests a connection has in flight, pipelined, the one
+/// being answered among them.
+pub const PIPELINE_MAX: usize = 32;
 /// The most bytes of a chunk-size line with its extensions.
 const CHUNK_LINE_MAX: usize = 4096;
 /// The most bytes of chunk extensions in one body, all its chunks
@@ -31,6 +45,14 @@ pub enum Error {
     /// is not of a form its method takes, or Host is not the authority
     /// the target names.
     Field,
+    /// A request body that does not fit its framing: bytes past its
+    /// Content-Length or short of it at finish, bytes of no body, an
+    /// empty chunk (which would end a chunked body), a chunk begun before
+    /// the last one's bytes were all sent, or a chunk of a body that is
+    /// not chunked.
+    Body,
+    /// PIPELINE_MAX requests are in flight already.
+    Pipeline,
     /// The status line is not HTTP/1.x with a code of 100 to 599; a minor
     /// version past 1 reads as 1.1.
     Status,
@@ -54,16 +76,25 @@ pub enum Error {
     /// or of the trailers that does not end in CRLF, a chunk-size line
     /// past 4096 bytes or extensions past EXTENSIONS_MAX.
     Chunk,
-    /// The connection closed inside the response.
+    /// The connection closed inside the response, or ended abruptly
+    /// (Close::Abrupt) where only its close would end the body.
     Truncated,
     /// The connection closed before any byte of the response: on a reused
     /// connection the server had dropped it, and a request that may be
-    /// repeated goes again on a new one.
+    /// repeated (Sent::repeatable) goes again on a new one.
     Closed,
+    /// The server sent bytes with no request in flight.
+    Unrequested,
+    /// feed after the response ended: restart first.
+    Ended,
+    /// restart before the response ended, or after one that leaves the
+    /// connection unable to carry another (reusable is false): the
+    /// requests in flight go again on a new connection.
+    NotReusable,
 }
 
 /// How the request's body is framed. The caller sends the body after
-/// the head; chunks are written by chunk and last_chunk.
+/// the head, through the Upload request returns.
 pub enum Body {
     /// No body. POST, PUT and PATCH, whose methods give a body a meaning,
     /// say so with Content-Length: 0 (RFC 9110 section 8.6); other
@@ -73,23 +104,26 @@ pub enum Body {
     Chunked,
 }
 
-/// The method of a request as its response's framing sees it.
+/// The method of a request as its response's framing and a retry see it.
 #[derive(Clone, Copy)]
 enum Method {
     /// The response has no body whatever its headers say.
     Head,
     /// A 2xx response turns the connection into a tunnel.
     Connect,
+    /// Idempotent (RFC 9110 section 9.2.2): GET, OPTIONS, TRACE, PUT and
+    /// DELETE.
+    Idempotent,
     Other,
 }
 
 /// What the response to a request takes from it: the method, for HEAD
 /// and CONNECT, and whether the request asked to close the connection,
 /// after which the client sends nothing more on it (RFC 9112 section
-/// 9.6). request returns it; Response::new and restart take it for that
-/// request's response, the responses of pipelined requests in the order
-/// the requests went.
-#[derive(Clone, Copy)]
+/// 9.6). Response::request notes it for that request's response; one
+/// written by other means is noted with expect. Neither Copy nor Clone:
+/// each answers one request.
+#[must_use]
 pub struct Sent {
     method: Method,
     close: bool,
@@ -97,7 +131,7 @@ pub struct Sent {
 
 impl Sent {
     /// What a request of method with headers leaves its response, for a
-    /// request written by other means than request.
+    /// request written by other means than Response::request.
     pub fn new(method: &[u8], headers: &[(&[u8], &[u8])]) -> Sent {
         let close = headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case(b"connection")
@@ -108,10 +142,30 @@ impl Sent {
         let method = match method {
             b"HEAD" => Method::Head,
             b"CONNECT" => Method::Connect,
+            b"GET" | b"OPTIONS" | b"TRACE" | b"PUT" | b"DELETE" => Method::Idempotent,
             _ => Method::Other,
         };
         Sent { method, close }
     }
+
+    /// Whether the request may go again, unanswered, on a new connection:
+    /// its method is idempotent (RFC 9110 section 9.2.2), as Go and
+    /// browsers retry. Its body, if any, is the caller's to send again.
+    pub fn repeatable(&self) -> bool {
+        matches!(self.method, Method::Head | Method::Idempotent)
+    }
+}
+
+/// How the connection ended, which eof is told: only a clean end ends a
+/// body that runs to the close.
+#[derive(Clone, Copy)]
+pub enum Close {
+    /// The peer finished: a TCP read of 0 over plain TCP; over TLS, only
+    /// a close_notify (tls's Client::closed).
+    Clean,
+    /// Anything else: a reset, a TCP close over TLS without close_notify,
+    /// which may be an attacker's (RFC 9846 6.1), an error.
+    Abrupt,
 }
 
 /// What a call to Response::feed found.
@@ -119,32 +173,127 @@ impl Sent {
 pub enum Event<'a> {
     /// All the input was taken; read more and feed again.
     Need,
-    /// The final head is complete: status and headers can be read.
+    /// The final head is complete: head() reads it.
     Head,
     /// Body bytes, a slice of the input.
     Body(&'a [u8]),
     /// The response is complete. Input past the count consumed belongs
-    /// to the next response on the connection, or to the tunnel when
-    /// Response::tunnel says the connection became one.
+    /// to the next response on the connection, after restart, or to the
+    /// tunnel when Response::tunnel says the connection became one.
     End,
 }
 
+/// What a request's body owes, as request framed it: what is left of a
+/// Content-Length, or of the chunk being sent and whether one was begun.
+enum Owed {
+    Nothing,
+    Length(u64),
+    Chunked { chunk: u64, begun: bool },
+}
+
+/// A request's body on its way: it counts what the caller sends, writes
+/// the chunked framing and refuses what would not fit (Error::Body).
+/// finish ends the body; an Upload dropped unfinished leaves the request
+/// incomplete, and the connection with it.
+#[must_use]
+pub struct Upload {
+    owed: Owed,
+}
+
+impl Upload {
+    /// Writes data into out as part of the body: a Content-Length body's
+    /// next bytes, or one whole chunk of a chunked body (nothing for no
+    /// data). The bytes are copied; chunk_head and sent spare the copy.
+    pub fn data(&mut self, out: &mut Vec<u8>, data: &[u8]) -> Result<(), Error> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        if matches!(self.owed, Owed::Chunked { .. }) {
+            self.chunk_head(out, data.len())?;
+        }
+        self.sent(data.len())?;
+        out.extend_from_slice(data);
+        Ok(())
+    }
+
+    /// Begins a chunk of size bytes, more than 0, of a chunked body,
+    /// after the last one's bytes were all sent: writes its line, and the
+    /// CRLF that ends the chunk before it. The caller then sends the
+    /// bytes, and says so with sent.
+    pub fn chunk_head(&mut self, out: &mut Vec<u8>, size: usize) -> Result<(), Error> {
+        let Owed::Chunked { chunk: 0, begun } = self.owed else {
+            return Err(Error::Body);
+        };
+        if size == 0 {
+            return Err(Error::Body);
+        }
+        if begun {
+            out.extend_from_slice(b"\r\n");
+        }
+        number(out, size as u64, 16);
+        out.extend_from_slice(b"\r\n");
+        self.owed = Owed::Chunked {
+            chunk: size as u64,
+            begun: true,
+        };
+        Ok(())
+    }
+
+    /// Counts count bytes of the body the caller sent itself: of its
+    /// Content-Length, or of the chunk chunk_head began.
+    pub fn sent(&mut self, count: usize) -> Result<(), Error> {
+        let count = count as u64;
+        let left = match &mut self.owed {
+            Owed::Length(left) | Owed::Chunked { chunk: left, .. } => left,
+            Owed::Nothing if count == 0 => return Ok(()),
+            Owed::Nothing => return Err(Error::Body),
+        };
+        *left = left.checked_sub(count).ok_or(Error::Body)?;
+        Ok(())
+    }
+
+    /// The bytes of the body still owed: of its Content-Length, or of
+    /// the chunk being sent.
+    pub fn left(&self) -> u64 {
+        match self.owed {
+            Owed::Nothing => 0,
+            Owed::Length(left) | Owed::Chunked { chunk: left, .. } => left,
+        }
+    }
+
+    /// Ends the body: all of a Content-Length sent, or the last chunk's
+    /// bytes and then the last chunk, with no trailers, written to out.
+    pub fn finish(self, out: &mut Vec<u8>) -> Result<(), Error> {
+        match self.owed {
+            Owed::Nothing | Owed::Length(0) => Ok(()),
+            Owed::Chunked { chunk: 0, begun } => {
+                if begun {
+                    out.extend_from_slice(b"\r\n");
+                }
+                out.extend_from_slice(b"0\r\n\r\n");
+                Ok(())
+            }
+            Owed::Length(_) | Owed::Chunked { .. } => Err(Error::Body),
+        }
+    }
+}
+
 /// Writes a request head into out: the request line, Host, the caller's
-/// headers and the body's framing header, and returns what the response
-/// takes from the request. A field that could end a line or forge
-/// another header is refused, and out is then left as it was; so are
-/// Host, Content-Length and Transfer-Encoding among the headers, which
-/// this writes itself, and Expect. The target is checked against the
-/// forms of RFC 9112 section 3.2 (target_fits); host is the target URI's
-/// authority without userinfo, empty when the URI has none.
-pub fn request(
+/// headers and the body's framing header, and what the body owes. A field
+/// that could end a line or forge another header is refused, and out is
+/// then left as it was; so are Host, Content-Length and
+/// Transfer-Encoding among the headers, which this writes itself, and
+/// Expect. The target is checked against the forms of RFC 9112 section
+/// 3.2 (target_fits); host is the target URI's authority without
+/// userinfo, empty when the URI has none.
+fn write_request(
     out: &mut Vec<u8>,
     method: &[u8],
     target: &[u8],
     host: &[u8],
     headers: &[(&[u8], &[u8])],
     body: &Body,
-) -> Result<Sent, Error> {
+) -> Result<Owed, Error> {
     if !is_token(method) || !target_fits(method, target, host) {
         return Err(Error::Field);
     }
@@ -176,46 +325,29 @@ pub fn request(
         out.extend_from_slice(value);
         out.extend_from_slice(b"\r\n");
     }
-    match body {
+    let owed = match body {
         // As Go does, and servers that want a length for these expect.
         Body::None if matches!(method, b"POST" | b"PUT" | b"PATCH") => {
             out.extend_from_slice(b"Content-Length: 0\r\n");
+            Owed::Nothing
         }
-        Body::None => {}
+        Body::None => Owed::Nothing,
         Body::Length(length) => {
             out.extend_from_slice(b"Content-Length: ");
             number(out, *length, 10);
             out.extend_from_slice(b"\r\n");
+            Owed::Length(*length)
         }
-        Body::Chunked => out.extend_from_slice(b"Transfer-Encoding: chunked\r\n"),
-    }
+        Body::Chunked => {
+            out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
+            Owed::Chunked {
+                chunk: 0,
+                begun: false,
+            }
+        }
+    };
     out.extend_from_slice(b"\r\n");
-    Ok(Sent::new(method, headers))
-}
-
-/// Writes the line that starts a chunk of size bytes: the caller sends
-/// the bytes and then CRLF. A size of 0 would end the body: last_chunk.
-pub fn chunk_head(out: &mut Vec<u8>, size: usize) {
-    number(out, size as u64, 16);
-    out.extend_from_slice(b"\r\n");
-}
-
-/// Writes data as one chunk, copied; nothing when it is empty, since an
-/// empty chunk ends the body.
-pub fn chunk(out: &mut Vec<u8>, data: &[u8]) {
-    if data.is_empty() {
-        return;
-    }
-    chunk_head(out, data.len());
-    // The chunk is written whole for a caller that sends one buffer;
-    // chunk_head spares the copy.
-    out.extend_from_slice(data);
-    out.extend_from_slice(b"\r\n");
-}
-
-/// Writes the last chunk, which ends a chunked body, with no trailers.
-pub fn last_chunk(out: &mut Vec<u8>) {
-    out.extend_from_slice(b"0\r\n\r\n");
+    Ok(owed)
 }
 
 /// value in the radix given, 10 or 16, without leading zeros.
@@ -357,6 +489,9 @@ fn field_byte(byte: u8) -> bool {
 
 #[derive(Clone, Copy)]
 enum State {
+    /// No request is being answered: the next noted one is, at the next
+    /// feed.
+    Idle,
     Head,
     /// Body bytes left of a Content-Length.
     Length(u64),
@@ -366,7 +501,10 @@ enum State {
     Chunk(Frame),
     /// Bytes left of a chunk's data.
     Data(u64),
+    /// The response is complete; the next feed says End.
     Done,
+    /// End was said: restart readies the next response.
+    Over,
     Failed(Error),
 }
 
@@ -426,10 +564,76 @@ struct Field {
     value: (usize, usize),
 }
 
-/// An HTTP/1.1 response being parsed. One serves every response of a
-/// connection: restart between them keeps its buffers.
+/// The final head of a response, which Response::head lends once
+/// Event::Head came, until restart.
+pub struct Head<'a> {
+    head: &'a [u8],
+    fields: &'a [Field],
+    status: u16,
+    minor: u8,
+    length: Option<u64>,
+    body: Option<u64>,
+}
+
+impl<'a> Head<'a> {
+    /// The final status code.
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    /// The response's minor version: 1 for HTTP/1.1, 0 for 1.0.
+    pub fn minor(&self) -> u8 {
+        self.minor
+    }
+
+    /// Content-Length, as the head gave it, whether or not a body follows.
+    pub fn length(&self) -> Option<u64> {
+        self.length
+    }
+
+    /// The bytes of the body that follows, when the head says how many:
+    /// Content-Length's, but none for a response with no body (to HEAD,
+    /// 204, 304, a 101 or a 2xx to CONNECT), nor for a chunked one or one
+    /// that runs to the close.
+    pub fn body_length(&self) -> Option<u64> {
+        self.body
+    }
+
+    /// The value of the first header named name, in any case, trimmed.
+    pub fn header(&self, name: &[u8]) -> Option<&'a [u8]> {
+        let mut at = 0;
+        while let Some((field, value)) = self.header_at(at) {
+            if field.eq_ignore_ascii_case(name) {
+                return Some(value);
+            }
+            at += 1;
+        }
+        None
+    }
+
+    /// The number of header fields of the head.
+    pub fn header_count(&self) -> usize {
+        self.fields.len()
+    }
+
+    /// The name and value of the field at index at.
+    pub fn header_at(&self, at: usize) -> Option<(&'a [u8], &'a [u8])> {
+        let field = self.fields.get(at)?;
+        let name = self.head.get(field.name.0..field.name.1)?;
+        let value = self.head.get(field.value.0..field.value.1)?;
+        Some((name, value))
+    }
+}
+
+/// A connection's requests and their responses, in order. One serves
+/// every response of a connection: restart between them keeps its
+/// buffers.
 pub struct Response {
     state: State,
+    /// The request being answered, once one is.
+    current: Option<Sent>,
+    /// The requests in flight after it, oldest first.
+    queue: VecDeque<Sent>,
     /// The head's bytes so far; the line being read starts at line.
     head: Vec<u8>,
     line: usize,
@@ -447,15 +651,18 @@ pub struct Response {
     /// The minor version: 0 or 1.
     minor: u8,
     framing: Framing,
-    sent: Sent,
+    /// The body's length, where the head gives one and a body follows.
+    body: Option<u64>,
     reusable: bool,
 }
 
 impl Response {
-    /// A parser for the response to the request sent.
-    pub fn new(sent: Sent) -> Response {
+    /// A connection with no request yet.
+    pub fn new() -> Response {
         Response {
-            state: State::Head,
+            state: State::Idle,
+            current: None,
+            queue: VecDeque::new(),
             head: Vec::new(),
             line: 0,
             fields: Vec::new(),
@@ -470,39 +677,118 @@ impl Response {
                 coding: Coding::None,
                 connection: Connection::Default,
             },
-            sent,
+            body: None,
             reusable: false,
         }
     }
 
-    /// Readies the parser for the next response on the connection, to the
-    /// request sent.
-    pub fn restart(&mut self, sent: Sent) {
-        self.state = State::Head;
-        self.head.clear();
-        self.line = 0;
-        self.fields.clear();
-        self.settled = 0;
-        self.seen = 0;
-        self.chunk_line = 0;
-        self.extensions = 0;
-        self.status = 0;
-        self.minor = 0;
-        self.framing = Framing {
-            length: None,
-            coding: Coding::None,
-            connection: Connection::Default,
-        };
-        self.sent = sent;
-        self.reusable = false;
+    /// Writes a request into out, as write_request says, and notes it:
+    /// its response is parsed after those of the requests before it. The
+    /// Upload sends its body. Refused, out as it was, when a field is
+    /// (Field) or PIPELINE_MAX requests are in flight (Pipeline).
+    pub fn request(
+        &mut self,
+        out: &mut Vec<u8>,
+        method: &[u8],
+        target: &[u8],
+        host: &[u8],
+        headers: &[(&[u8], &[u8])],
+        body: &Body,
+    ) -> Result<Upload, Error> {
+        if self.in_flight() >= PIPELINE_MAX {
+            return Err(Error::Pipeline);
+        }
+        let owed = write_request(out, method, target, host, headers, body)?;
+        self.expect(Sent::new(method, headers))?;
+        Ok(Upload { owed })
     }
 
-    /// Parses the start of input: how many bytes it took and what they
-    /// held. Need takes all of it; the other events may leave a rest,
-    /// which the caller feeds again. After End it returns End taking
-    /// nothing, after an error the same error, until restart.
+    /// Notes a request written by other means, after the ones in flight.
+    pub fn expect(&mut self, sent: Sent) -> Result<(), Error> {
+        if self.in_flight() >= PIPELINE_MAX {
+            return Err(Error::Pipeline);
+        }
+        // rr: escape(bound): PIPELINE_MAX in flight at most, just above.
+        self.queue.push_back(sent);
+        Ok(())
+    }
+
+    /// The requests in flight, not yet answered whole: the one being
+    /// answered now, then the ones waiting their turn.
+    pub fn in_flight(&self) -> usize {
+        self.queue.len() + usize::from(self.answering().is_some())
+    }
+
+    /// The request in flight at index at, oldest first: for which may go
+    /// again (repeatable) once the connection fails.
+    pub fn sent(&self, at: usize) -> Option<&Sent> {
+        match (self.answering(), at) {
+            (Some(current), 0) => Some(current),
+            (Some(_), _) => self.queue.get(at - 1),
+            (None, _) => self.queue.get(at),
+        }
+    }
+
+    /// The request whose response is being parsed, until it ended.
+    fn answering(&self) -> Option<&Sent> {
+        match self.state {
+            State::Done | State::Over => None,
+            State::Idle
+            | State::Head
+            | State::Length(_)
+            | State::Close
+            | State::Chunk(_)
+            | State::Data(_)
+            | State::Failed(_) => self.current.as_ref(),
+        }
+    }
+
+    /// Readies the parser for the next response on the connection, once
+    /// the last ended and the connection may carry another (reusable);
+    /// else NotReusable, or the error the last failed with.
+    pub fn restart(&mut self) -> Result<(), Error> {
+        match self.state {
+            State::Idle => return Ok(()),
+            State::Done | State::Over if self.reusable => {}
+            State::Failed(error) => return Err(error),
+            State::Done
+            | State::Over
+            | State::Head
+            | State::Length(_)
+            | State::Close
+            | State::Chunk(_)
+            | State::Data(_) => return Err(Error::NotReusable),
+        }
+        self.clear();
+        Ok(())
+    }
+
+    /// Readies the parser for a new connection, with no request in flight.
+    pub fn reset(&mut self) {
+        self.clear();
+        self.queue.clear();
+    }
+
+    /// Parses the start of input as the response to the oldest request in
+    /// flight: how many bytes it took and what they held. Need takes all
+    /// of it; the other events may leave a rest, which the caller feeds
+    /// again after Head and Body, and after End only once restart readied
+    /// the next response: until then Ended. After an error the same
+    /// error, until reset.
     #[cfg_attr(rr, rr::hot)]
     pub fn feed<'a>(&mut self, input: &'a [u8]) -> Result<(usize, Event<'a>), Error> {
+        if matches!(self.state, State::Idle) {
+            if self.queue.is_empty() {
+                return if input.is_empty() {
+                    Ok((0, Event::Need))
+                } else {
+                    self.state = State::Failed(Error::Unrequested);
+                    Err(Error::Unrequested)
+                };
+            }
+            self.current = self.queue.pop_front();
+            self.state = State::Head;
+        }
         let result = match self.state {
             State::Head => self.head_lines(input),
             State::Length(left) => {
@@ -518,8 +804,14 @@ impl Response {
             State::Close => Ok(body(input.len(), input)),
             State::Data(left) => Ok(self.data(input, left)),
             State::Chunk(frame) => self.framing_bytes(input, frame),
-            State::Done => Ok((0, Event::End)),
+            State::Done => {
+                self.state = State::Over;
+                return Ok((0, Event::End));
+            }
+            State::Over => return Err(Error::Ended),
             State::Failed(error) => Err(error),
+            // A request was taken just above.
+            State::Idle => Ok((0, Event::Need)),
         };
         if let Err(error) = result {
             self.state = State::Failed(error);
@@ -527,84 +819,100 @@ impl Response {
         result
     }
 
-    /// The connection closed: Ok when that ends the response, as it ends
-    /// a body without a length. Over TLS the connection closed only with
-    /// the server's close_notify (tls's Client::closed): a TCP close
-    /// without it may be an attacker's, which cuts such a body short
-    /// (RFC 9846 6.1), so it is Truncated, not eof.
-    pub fn eof(&mut self) -> Result<(), Error> {
-        match self.state {
-            State::Close | State::Done => {
+    /// The connection ended, as how says: Ok when that ends the response
+    /// in flight, or none is. A body without a length ends only with a
+    /// clean close; an abrupt one, as a TCP close over TLS without the
+    /// server's close_notify may be an attacker's, cuts it short (RFC 9846
+    /// 6.1): Truncated. Closed when a request in flight got no byte of
+    /// its response, the ones after a response that ended among them. The
+    /// connection carries nothing more after.
+    pub fn eof(&mut self, how: Close) -> Result<(), Error> {
+        self.reusable = false;
+        let result = match (self.state, how) {
+            (State::Failed(error), _) => return Err(error),
+            (State::Done | State::Over | State::Idle, _) if self.queue.is_empty() => {
+                return Ok(());
+            }
+            (State::Done | State::Over | State::Idle, _) => return Err(Error::Closed),
+            (State::Close, Close::Clean) => {
                 self.state = State::Done;
-                Ok(())
+                return Ok(());
             }
-            State::Failed(error) => Err(error),
-            State::Head if self.seen == 0 => Err(Error::Closed),
-            State::Head | State::Length(_) | State::Chunk(_) | State::Data(_) => {
-                self.state = State::Failed(Error::Truncated);
-                Err(Error::Truncated)
-            }
+            (State::Head, _) if self.seen == 0 => Error::Closed,
+            (
+                State::Head | State::Length(_) | State::Close | State::Chunk(_) | State::Data(_),
+                _,
+            ) => Error::Truncated,
+        };
+        self.state = State::Failed(result);
+        Err(result)
+    }
+
+    /// The final head, once Event::Head came, until restart; None before
+    /// it, while only interim (1xx) heads came, and after an error.
+    pub fn head(&self) -> Option<Head<'_>> {
+        match self.state {
+            State::Length(_)
+            | State::Close
+            | State::Chunk(_)
+            | State::Data(_)
+            | State::Done
+            | State::Over => Some(Head {
+                head: &self.head,
+                fields: &self.fields,
+                status: self.status,
+                minor: self.minor,
+                length: self.framing.length,
+                body: self.body,
+            }),
+            State::Idle | State::Head | State::Failed(_) => None,
         }
-    }
-
-    /// The final status code; 0 before the head.
-    pub fn status(&self) -> u16 {
-        self.status
-    }
-
-    /// The response's minor version: 1 for HTTP/1.1, 0 for 1.0.
-    pub fn minor(&self) -> u8 {
-        self.minor
-    }
-
-    /// The body's Content-Length, if the head gave one.
-    pub fn length(&self) -> Option<u64> {
-        self.framing.length
-    }
-
-    /// The value of the first header named name, in any case, trimmed.
-    pub fn header(&self, name: &[u8]) -> Option<&[u8]> {
-        let mut at = 0;
-        while let Some((field, value)) = self.header_at(at) {
-            if field.eq_ignore_ascii_case(name) {
-                return Some(value);
-            }
-            at += 1;
-        }
-        None
-    }
-
-    /// The number of header fields of the head.
-    pub fn header_count(&self) -> usize {
-        self.fields.len()
-    }
-
-    /// The name and value of the field at index at.
-    pub fn header_at(&self, at: usize) -> Option<(&[u8], &[u8])> {
-        let field = self.fields.get(at)?;
-        let name = self.head.get(field.name.0..field.name.1)?;
-        let value = self.head.get(field.value.0..field.value.1)?;
-        Some((name, value))
     }
 
     /// Whether the connection may carry the next request: the response
     /// is complete, framed by its own length, and neither side asked to
     /// close it, the request with Connection: close among them.
     pub fn reusable(&self) -> bool {
-        matches!(self.state, State::Done) && self.reusable
+        matches!(self.state, State::Done | State::Over) && self.reusable
     }
 
     /// Whether the connection became a tunnel for another protocol, from
     /// the byte after the head: after a 101, or a 2xx to CONNECT (RFC 9110
     /// section 9.3.6). Neither has a body; End follows the head.
     pub fn tunnel(&self) -> bool {
-        matches!(self.state, State::Done) && (self.status == 101 || self.connected())
+        matches!(self.state, State::Done | State::Over) && (self.status == 101 || self.connected())
+    }
+
+    /// Forgets the response: the next feed parses the next one in flight.
+    fn clear(&mut self) {
+        self.state = State::Idle;
+        self.current = None;
+        self.head.clear();
+        self.line = 0;
+        self.fields.clear();
+        self.settled = 0;
+        self.seen = 0;
+        self.chunk_line = 0;
+        self.extensions = 0;
+        self.status = 0;
+        self.minor = 0;
+        self.framing = Framing {
+            length: None,
+            coding: Coding::None,
+            connection: Connection::Default,
+        };
+        self.body = None;
+        self.reusable = false;
     }
 
     /// A 2xx to CONNECT, whose Content-Length and Transfer-Encoding the
     /// client ignores (RFC 9112 section 6.3).
     fn connected(&self) -> bool {
-        matches!(self.sent.method, Method::Connect) && (200..300).contains(&self.status)
+        let connect = self
+            .current
+            .as_ref()
+            .is_some_and(|sent| matches!(sent.method, Method::Connect));
+        connect && (200..300).contains(&self.status)
     }
 
     /// Collects head lines up to the blank line that ends the final head.
@@ -736,7 +1044,10 @@ impl Response {
             };
             return Ok(false);
         }
-        self.reusable = !self.sent.close
+        let (head, close) = self.current.as_ref().map_or((false, false), |sent| {
+            (matches!(sent.method, Method::Head), sent.close)
+        });
+        self.reusable = !close
             && match self.framing.connection {
                 Connection::Default => self.minor == 1,
                 Connection::Close => false,
@@ -749,7 +1060,7 @@ impl Response {
             self.state = State::Done;
             return Ok(true);
         }
-        if matches!(self.sent.method, Method::Head) || matches!(self.status, 204 | 304) {
+        if head || matches!(self.status, 204 | 304) {
             self.state = State::Done;
             return Ok(true);
         }
@@ -765,8 +1076,14 @@ impl Response {
             // still coded, and handed on as if it were the content.
             Coding::Other => return Err(Error::Coding),
             Coding::None => match self.framing.length {
-                Some(0) => State::Done,
-                Some(length) => State::Length(length),
+                Some(0) => {
+                    self.body = Some(0);
+                    State::Done
+                }
+                Some(length) => {
+                    self.body = Some(length);
+                    State::Length(length)
+                }
                 None => {
                     self.reusable = false;
                     State::Close
@@ -805,7 +1122,7 @@ impl Response {
                     return Ok((at + 1 + taken, event));
                 }
                 Step::Done => {
-                    self.state = State::Done;
+                    self.state = State::Over;
                     return Ok((at + 1, Event::End));
                 }
             }
@@ -1053,19 +1370,50 @@ pub fn fuzz_response(input: &[u8]) {
         2 => b"CONNECT",
         _ => b"GET",
     };
-    let sent = Sent::new(method, &[]);
-    let whole = tests::run(message, sent, message.len().max(1));
+    let ask = tests::Ask {
+        method,
+        close: false,
+    };
+    let whole = tests::run(message, ask, message.len().max(1));
     let piece = usize::from(seed >> 2) % 17 + 1;
-    let split = tests::run(message, sent, piece);
+    let split = tests::run(message, ask, piece);
     assert_eq!(whole, split);
-    let bytes = tests::run(message, sent, 1);
+    let bytes = tests::run(message, ask, 1);
     assert_eq!(whole, bytes);
 }
 
 #[cfg(any(test, fuzzing))]
 mod tests {
-    use super::{Error, Event, Response, Sent};
+    use super::{Close, Error, Event, Response, Sent};
     use alloc::vec::Vec;
+
+    /// A request as the tests ask it: its method, and whether it asks to
+    /// close the connection.
+    #[derive(Clone, Copy)]
+    pub struct Ask {
+        pub method: &'static [u8],
+        pub close: bool,
+    }
+
+    impl Ask {
+        pub fn sent(self) -> Sent {
+            let close: [(&[u8], &[u8]); 1] = [(b"Connection", b"close")];
+            Sent::new(self.method, if self.close { &close } else { &[] })
+        }
+    }
+
+    /// A connection with ask in flight.
+    pub fn connection(ask: Ask) -> Response {
+        let mut parser = Response::new();
+        // A new connection has room for one request.
+        assert!(parser.expect(ask.sent()).is_ok());
+        parser
+    }
+
+    /// The final status, 0 before it.
+    fn status(parser: &Response) -> u16 {
+        parser.head().map_or(0, |head| head.status())
+    }
 
     /// What a response gave: status, body, the bytes consumed, whether
     /// the connection may be reused or became a tunnel, or the error.
@@ -1081,8 +1429,8 @@ mod tests {
     /// Feeds message in pieces of piece bytes, as reads would bring it,
     /// up to the response's end or the message's, which is then the
     /// connection's close.
-    pub fn run(message: &[u8], sent: Sent, piece: usize) -> Result<Outcome, Error> {
-        let mut parser = Response::new(sent);
+    pub fn run(message: &[u8], ask: Ask, piece: usize) -> Result<Outcome, Error> {
+        let mut parser = connection(ask);
         let mut body = Vec::new();
         let mut used = 0;
         for read in message.chunks(piece) {
@@ -1097,7 +1445,7 @@ mod tests {
                         assert_eq!(at, read.len());
                         break;
                     }
-                    Event::Head => assert!(parser.status() >= 200 || parser.status() == 101),
+                    Event::Head => assert!(status(&parser) >= 200 || status(&parser) == 101),
                     Event::Body(bytes) => {
                         assert!(!bytes.is_empty());
                         // Borrowed from the read, not copied.
@@ -1107,7 +1455,7 @@ mod tests {
                     }
                     Event::End => {
                         return Ok(Outcome {
-                            status: parser.status(),
+                            status: status(&parser),
                             body,
                             used,
                             reusable: parser.reusable(),
@@ -1117,9 +1465,9 @@ mod tests {
                 }
             }
         }
-        parser.eof()?;
+        parser.eof(Close::Clean)?;
         Ok(Outcome {
-            status: parser.status(),
+            status: status(&parser),
             body,
             used,
             reusable: parser.reusable(),
@@ -1130,11 +1478,11 @@ mod tests {
     /// run at every split in two and a byte at a time: each gives what the
     /// whole message gives.
     #[cfg(test)]
-    fn every_split(message: &[u8], sent: Sent) -> Result<Outcome, Error> {
-        let whole = run(message, sent, message.len().max(1));
-        assert_eq!(run(message, sent, 1), whole);
+    fn every_split(message: &[u8], ask: Ask) -> Result<Outcome, Error> {
+        let whole = run(message, ask, message.len().max(1));
+        assert_eq!(run(message, ask, 1), whole);
         for cut in 1..message.len() {
-            let mut parser = Response::new(sent);
+            let mut parser = connection(ask);
             let (first, second) = message.split_at(cut);
             let mut outcome = Ok(Vec::new());
             let mut done = false;
@@ -1160,7 +1508,7 @@ mod tests {
                 }
             }
             if outcome.is_ok() && !done {
-                if let Err(error) = parser.eof() {
+                if let Err(error) = parser.eof(Close::Clean) {
                     outcome = Err(error);
                 }
             }
@@ -1176,20 +1524,55 @@ mod tests {
     #[cfg(test)]
     mod cases {
         use super::super::{
-            Body, EXTENSIONS_MAX, Error, Event, HEAD_MAX, HEADERS_MAX, Response, Sent, chunk,
-            chunk_head, last_chunk, request,
+            Body, Close, EXTENSIONS_MAX, Error, Event, HEAD_MAX, HEADERS_MAX, PIPELINE_MAX,
+            Response, Sent, Upload,
         };
-        use super::{every_split, run};
+        use super::{Ask, connection, every_split, run, status};
         use alloc::vec::Vec;
         use test::Bencher;
 
-        /// What a GET, the request of most tests, leaves its response.
-        fn get() -> Sent {
-            Sent::new(b"GET", &[])
+        /// A GET, the request of most tests.
+        fn get() -> Ask {
+            Ask {
+                method: b"GET",
+                close: false,
+            }
         }
 
-        fn ok(message: &[u8], method: &[u8]) -> super::Outcome {
-            every_split(message, Sent::new(method, &[])).unwrap()
+        fn ok(message: &[u8], method: &'static [u8]) -> super::Outcome {
+            every_split(
+                message,
+                Ask {
+                    method,
+                    close: false,
+                },
+            )
+            .unwrap()
+        }
+
+        /// A request written into out on a connection of its own, and
+        /// what sends its body.
+        fn upload(
+            out: &mut Vec<u8>,
+            method: &[u8],
+            target: &[u8],
+            host: &[u8],
+            headers: &[(&[u8], &[u8])],
+            body: &Body,
+        ) -> Result<Upload, Error> {
+            Response::new().request(out, method, target, host, headers, body)
+        }
+
+        /// A request written into out, its body left unsent.
+        fn request(
+            out: &mut Vec<u8>,
+            method: &[u8],
+            target: &[u8],
+            host: &[u8],
+            headers: &[(&[u8], &[u8])],
+            body: &Body,
+        ) -> Result<(), Error> {
+            upload(out, method, target, host, headers, body).map(|_unsent| ())
         }
 
         fn fails(message: &[u8], error: Error) {
@@ -1201,7 +1584,7 @@ mod tests {
             let mut out = Vec::new();
             let headers: [(&[u8], &[u8]); 2] =
                 [(b"Accept", b"*/*"), (b"User-Agent", b"rr\tx \x80")];
-            request(
+            let plain = upload(
                 &mut out,
                 b"GET",
                 b"/a?b=c",
@@ -1210,13 +1593,14 @@ mod tests {
                 &Body::None,
             )
             .unwrap();
+            plain.finish(&mut out).unwrap();
             assert_eq!(
                 out,
                 b"GET /a?b=c HTTP/1.1\r\nHost: example.com\r\nAccept: */*\r\n\
                   User-Agent: rr\tx \x80\r\n\r\n"
             );
             out.clear();
-            request(
+            let long = upload(
                 &mut out,
                 b"POST",
                 b"/",
@@ -1225,12 +1609,14 @@ mod tests {
                 &Body::Length(1234567890),
             )
             .unwrap();
+            assert_eq!(long.left(), 1234567890);
             assert_eq!(
                 out,
                 b"POST / HTTP/1.1\r\nHost: h:8080\r\nContent-Length: 1234567890\r\n\r\n"
             );
             out.clear();
-            request(&mut out, b"PUT", b"/", b"h", &[], &Body::Length(0)).unwrap();
+            let empty = upload(&mut out, b"PUT", b"/", b"h", &[], &Body::Length(0)).unwrap();
+            empty.finish(&mut out).unwrap();
             assert!(out.ends_with(b"Content-Length: 0\r\n\r\n"));
             out.clear();
             // POST, PUT and PATCH say they have no body; GET and DELETE,
@@ -1242,18 +1628,70 @@ mod tests {
                 (b"GET", false),
                 (b"DELETE", false),
             ] {
-                request(&mut out, method, b"/", b"h", &[], &Body::None).unwrap();
+                let none = upload(&mut out, method, b"/", b"h", &[], &Body::None).unwrap();
+                none.finish(&mut out).unwrap();
                 assert_eq!(out.ends_with(b"\r\nContent-Length: 0\r\n\r\n"), length);
                 out.clear();
             }
-            request(&mut out, b"PUT", b"/", b"h", &[], &Body::Chunked).unwrap();
-            chunk(&mut out, b"hello");
-            chunk(&mut out, b"");
-            chunk_head(&mut out, 0x1a2b);
-            last_chunk(&mut out);
+            let mut chunked = upload(&mut out, b"PUT", b"/", b"h", &[], &Body::Chunked).unwrap();
+            chunked.data(&mut out, b"hello").unwrap();
+            chunked.data(&mut out, b"").unwrap();
+            chunked.chunk_head(&mut out, 0x1a2b).unwrap();
+            out.resize(out.len() + 0x1a2b, b'x');
+            chunked.sent(0x1a2b).unwrap();
+            chunked.finish(&mut out).unwrap();
             assert!(
-                out.ends_with(b"Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n1a2b\r\n0\r\n\r\n")
+                out.starts_with(b"PUT / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n1a2b\r\n")
             );
+            assert!(out.ends_with(b"xx\r\n0\r\n\r\n"));
+        }
+
+        /// A body is what its framing says: a Content-Length's bytes, no
+        /// more and no fewer; chunks of at least a byte, each sent whole
+        /// before the next begins, and none in a body that is not chunked.
+        /// What is refused writes nothing.
+        #[test]
+        fn uploads() {
+            let mut out = Vec::new();
+            let mut length = upload(&mut out, b"POST", b"/", b"h", &[], &Body::Length(5)).unwrap();
+            let start = out.len();
+            length.data(&mut out, b"abc").unwrap();
+            assert_eq!(length.data(&mut out, b"def"), Err(Error::Body));
+            assert_eq!(length.chunk_head(&mut out, 2), Err(Error::Body));
+            assert_eq!(length.left(), 2);
+            length.sent(2).unwrap();
+            assert_eq!(length.sent(1), Err(Error::Body));
+            assert_eq!(&out[start..], b"abc");
+            length.finish(&mut out).unwrap();
+            let short = upload(&mut out, b"POST", b"/", b"h", &[], &Body::Length(5)).unwrap();
+            assert_eq!(short.finish(&mut out), Err(Error::Body));
+            out.clear();
+            let mut chunked = upload(&mut out, b"POST", b"/", b"h", &[], &Body::Chunked).unwrap();
+            let framed = out.len();
+            assert_eq!(chunked.chunk_head(&mut out, 0), Err(Error::Body));
+            chunked.chunk_head(&mut out, 3).unwrap();
+            assert_eq!(chunked.chunk_head(&mut out, 3), Err(Error::Body));
+            assert_eq!(chunked.data(&mut out, b"x"), Err(Error::Body));
+            out.extend_from_slice(b"ab");
+            chunked.sent(2).unwrap();
+            assert_eq!(chunked.sent(2), Err(Error::Body));
+            out.push(b'c');
+            chunked.sent(1).unwrap();
+            chunked.data(&mut out, b"de").unwrap();
+            chunked.finish(&mut out).unwrap();
+            assert_eq!(&out[framed..], b"3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n");
+            let mut open = upload(&mut out, b"POST", b"/", b"h", &[], &Body::Chunked).unwrap();
+            open.chunk_head(&mut out, 1).unwrap();
+            assert_eq!(open.finish(&mut out), Err(Error::Body));
+            let empty = upload(&mut out, b"POST", b"/", b"h", &[], &Body::Chunked).unwrap();
+            out.clear();
+            empty.finish(&mut out).unwrap();
+            assert_eq!(out, b"0\r\n\r\n");
+            let mut none = upload(&mut out, b"GET", b"/", b"h", &[], &Body::None).unwrap();
+            assert_eq!(none.data(&mut out, b"x"), Err(Error::Body));
+            assert_eq!(none.sent(1), Err(Error::Body));
+            none.sent(0).unwrap();
+            none.finish(&mut out).unwrap();
         }
 
         /// CR, LF and NUL anywhere, and the framing headers, are refused
@@ -1261,6 +1699,7 @@ mod tests {
         #[test]
         fn refuses_header_injection() {
             let mut out = b"kept".to_vec();
+
             let bad: [&[u8]; 4] = [b"a\rb", b"a\nb", b"a\0b", b""];
             for field in bad {
                 let valued: [(&[u8], &[u8]); 1] = [(b"X", field)];
@@ -1309,25 +1748,28 @@ mod tests {
             assert_eq!(outcome.body, b"hello");
             assert_eq!(outcome.used, message.len() - 4);
             assert!(outcome.reusable);
-            let mut parser = Response::new(get());
+            let mut parser = connection(get());
             let (taken, event) = parser.feed(message).unwrap();
             assert_eq!(event, Event::Head);
-            assert_eq!(parser.header(b"x-a"), Some(&b"b c"[..]));
-            assert_eq!(parser.header(b"content-length"), Some(&b"5"[..]));
-            assert_eq!(
-                parser.header_at(0),
-                Some((&b"Content-Length"[..], &b"5"[..]))
-            );
-            assert_eq!(parser.header_count(), 2);
-            assert_eq!(parser.length(), Some(5));
-            assert_eq!(parser.header(b"none"), None);
+            let head = parser.head().unwrap();
+            assert_eq!(head.header(b"x-a"), Some(&b"b c"[..]));
+            assert_eq!(head.header(b"content-length"), Some(&b"5"[..]));
+            assert_eq!(head.header_at(0), Some((&b"Content-Length"[..], &b"5"[..])));
+            assert_eq!(head.header_count(), 2);
+            assert_eq!((head.length(), head.body_length()), (Some(5), Some(5)));
+            assert_eq!((head.status(), head.minor()), (200, 1));
+            assert_eq!(head.header(b"none"), None);
             assert_eq!(
                 parser.feed(&message[taken..]).unwrap(),
                 (5, Event::Body(b"hello"))
             );
             assert_eq!(parser.feed(b"NEXT").unwrap(), (0, Event::End));
-            assert_eq!(parser.feed(b"NEXT").unwrap(), (0, Event::End));
-            assert_eq!(parser.eof(), Ok(()));
+            // The next response is the next request's, after restart.
+            assert_eq!(parser.feed(b"NEXT"), Err(Error::Ended));
+            assert_eq!(parser.feed(b""), Err(Error::Ended));
+            assert_eq!(parser.eof(Close::Clean), Ok(()));
+            assert!(!parser.reusable());
+            assert_eq!(parser.restart(), Err(Error::NotReusable));
             // A list of one length, and the same header twice, are one.
             ok(
                 b"HTTP/1.1 200 OK\r\nContent-Length: 3, 3\r\nContent-Length: 3\r\n\r\nabc",
@@ -1366,9 +1808,27 @@ mod tests {
             // HTTP/1.0 without a length, and a close after nothing.
             let old = ok(b"HTTP/1.0 200 OK\r\n\r\n", b"GET");
             assert!(old.body.is_empty());
-            let mut parser = Response::new(get());
+            let mut parser = connection(get());
             assert_eq!(parser.feed(b"").unwrap(), (0, Event::Need));
-            assert_eq!(parser.eof(), Err(Error::Closed));
+            assert_eq!(parser.eof(Close::Clean), Err(Error::Closed));
+            // Over TLS without close_notify, the close may be an
+            // attacker's: a body that runs to it is cut short.
+            for (how, result) in [
+                (Close::Clean, Ok(())),
+                (Close::Abrupt, Err(Error::Truncated)),
+            ] {
+                let mut closing = connection(get());
+                assert!(matches!(closing.feed(message), Ok((_, Event::Head))));
+                assert_eq!(closing.head().unwrap().body_length(), None);
+                assert_eq!(closing.eof(how), result);
+            }
+            // A body framed by its length is whole before the close.
+            let mut framed = connection(get());
+            let whole = b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nx";
+            assert_eq!(framed.feed(whole).unwrap().1, Event::Head);
+            assert_eq!(framed.feed(b"x").unwrap(), (1, Event::Body(b"x")));
+            assert_eq!(framed.feed(b"").unwrap(), (0, Event::End));
+            assert_eq!(framed.eof(Close::Abrupt), Ok(()));
         }
 
         /// 1xx heads are skipped; HEAD, 204 and 304 end at the head; 101
@@ -1381,15 +1841,42 @@ mod tests {
             let outcome = ok(message, b"GET");
             assert_eq!(outcome.status, 200);
             assert_eq!(outcome.body, b"hi");
-            let mut parser = Response::new(get());
-            let (taken, event) = parser.feed(message).unwrap();
-            assert_eq!((taken, event), (message.len() - 2, Event::Head));
-            assert_eq!(parser.header(b"link"), None);
-            assert_eq!(parser.header_count(), 1);
-            let head =
+            let mut parser = connection(get());
+            // The interim heads are not the head.
+            let (taken, interim) = parser.feed(&message[..message.len() - 40]).unwrap();
+            assert_eq!(interim, Event::Need);
+            assert!(parser.head().is_none());
+            let (rest, event) = parser.feed(&message[taken..]).unwrap();
+            assert_eq!((taken + rest, event), (message.len() - 2, Event::Head));
+            let last = parser.head().unwrap();
+            assert_eq!(last.header(b"link"), None);
+            assert_eq!(last.header_count(), 1);
+            // No body follows a HEAD's, a 204's or a 304's head, whatever
+            // its Content-Length.
+            for (method, bodiless) in [
+                (
+                    &b"HEAD"[..],
+                    &b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\n"[..],
+                ),
+                (
+                    b"GET",
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 7\r\n\r\n",
+                ),
+                (
+                    b"GET",
+                    b"HTTP/1.1 304 Not Modified\r\nContent-Length: 7\r\n\r\n",
+                ),
+            ] {
+                let mut none = Response::new();
+                none.expect(Sent::new(method, &[])).unwrap();
+                assert_eq!(none.feed(bodiless).unwrap().1, Event::Head);
+                let empty = none.head().unwrap();
+                assert_eq!((empty.length(), empty.body_length()), (Some(7), None));
+            }
+            let framed =
                 b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nTransfer-Encoding: chunked\r\n\r\nX";
-            let headed = ok(head, b"HEAD");
-            assert_eq!(headed.used, head.len() - 1);
+            let headed = ok(framed, b"HEAD");
+            assert_eq!(headed.used, framed.len() - 1);
             assert!(headed.body.is_empty());
             for empty in [
                 &b"HTTP/1.1 204 No Content\r\nContent-Length: 7\r\n\r\n"[..],
@@ -1421,13 +1908,20 @@ mod tests {
             }
         }
 
-        /// Two responses on one connection, fed from one buffer.
+        /// Two requests pipelined on one connection, their responses fed
+        /// from one buffer: each is parsed for its own request, in the
+        /// order they went, a HEAD's without the body a GET's would have.
         #[test]
         fn pipelined() {
-            let message =
-                b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\naHTTP/1.1 404 Not Found\r\n\
+            let mut out = Vec::new();
+            let mut parser = Response::new();
+            for method in [&b"HEAD"[..], b"GET"] {
+                let unsent = parser.request(&mut out, method, b"/", b"h", &[], &Body::None);
+                unsent.unwrap().finish(&mut out).unwrap();
+            }
+            assert_eq!(parser.in_flight(), 2);
+            let message = b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nHTTP/1.1 404 Not Found\r\n\
                 Transfer-Encoding: chunked\r\n\r\n1\r\nb\r\n0\r\n\r\n";
-            let mut parser = Response::new(get());
             let mut at = 0;
             let mut statuses = Vec::new();
             let mut body = Vec::new();
@@ -1436,36 +1930,58 @@ mod tests {
                 at += taken;
                 match event {
                     Event::Need => break,
-                    Event::Head => statuses.push(parser.status()),
+                    Event::Head => statuses.push(status(&parser)),
                     Event::Body(bytes) => body.extend_from_slice(bytes),
                     Event::End => {
                         assert!(parser.reusable());
-                        parser.restart(get());
+                        parser.restart().unwrap();
                     }
                 }
             }
             assert_eq!(statuses, [200, 404]);
-            assert_eq!(body, b"ab");
+            assert_eq!(body, b"b");
             assert_eq!(at, message.len());
+            assert_eq!(parser.in_flight(), 0);
+            // Bytes with no request in flight are no response.
+            assert_eq!(parser.feed(b"HTTP/1.1"), Err(Error::Unrequested));
+            assert_eq!(parser.restart(), Err(Error::Unrequested));
+            parser.reset();
+            assert_eq!(parser.eof(Close::Clean), Ok(()));
         }
 
         /// A request that asks to close leaves its response unable to
-        /// carry another, whatever the server says; the responses of the
-        /// requests pipelined before it are not touched.
+        /// carry another, whatever the server says, and a restart after
+        /// it is refused; the responses of the requests pipelined before
+        /// it are not touched. What went unanswered is there to go again,
+        /// as its method allows.
         #[test]
         fn request_close() {
             let mut out = Vec::new();
-            let first = request(&mut out, b"GET", b"/a", b"h", &[], &Body::None).unwrap();
+            let mut parser = Response::new();
             let close: [(&[u8], &[u8]); 1] = [(b"Connection", b"TE, Close")];
-            let last = request(&mut out, b"GET", b"/b", b"h", &close, &Body::None).unwrap();
-            assert!(out.ends_with(b"GET /b HTTP/1.1\r\nHost: h\r\nConnection: TE, Close\r\n\r\n"));
+            for (method, target, headers) in [
+                (&b"GET"[..], &b"/a"[..], &[][..]),
+                (b"GET", b"/b", &close[..]),
+                (b"POST", b"/c", &[][..]),
+                (b"PUT", b"/d", &[][..]),
+            ] {
+                let unsent = parser.request(&mut out, method, target, b"h", headers, &Body::None);
+                unsent.unwrap().finish(&mut out).unwrap();
+            }
+            assert!(out.ends_with(
+                b"GET /b HTTP/1.1\r\nHost: h\r\nConnection: TE, Close\r\n\r\n\
+                POST /c HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n\
+                PUT /d HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n"
+            ));
             let keep = b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Length: 1\r\n\r\na";
-            assert!(every_split(keep, first).unwrap().reusable);
-            assert!(!every_split(keep, last).unwrap().reusable);
+            let ask = |closing| Ask {
+                method: b"GET",
+                close: closing,
+            };
+            assert!(every_split(keep, ask(false)).unwrap().reusable);
+            assert!(!every_split(keep, ask(true)).unwrap().reusable);
             let message = b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\naHTTP/1.1 200 OK\r\n\
                 Transfer-Encoding: chunked\r\n\r\n1\r\nb\r\n0\r\n\r\n";
-            let sent = [first, last];
-            let mut parser = Response::new(first);
             let mut at = 0;
             let mut ends = Vec::new();
             loop {
@@ -1476,15 +1992,51 @@ mod tests {
                     Event::Head | Event::Body(_) => {}
                     Event::End => {
                         ends.push(parser.reusable());
-                        let Some(next) = sent.get(ends.len()) else {
+                        if parser.restart().is_err() {
                             break;
-                        };
-                        parser.restart(*next);
+                        }
                     }
                 }
             }
             assert_eq!(ends, [true, false]);
             assert_eq!(at, message.len());
+            assert_eq!(parser.in_flight(), 2);
+            assert!(!parser.sent(0).unwrap().repeatable());
+            assert!(parser.sent(1).unwrap().repeatable());
+            assert!(parser.sent(2).is_none());
+            assert_eq!(parser.eof(Close::Clean), Err(Error::Closed));
+        }
+
+        /// Idempotent methods may go again unanswered; others may not.
+        #[test]
+        fn repeatable() {
+            for (method, again) in [
+                (&b"GET"[..], true),
+                (b"HEAD", true),
+                (b"OPTIONS", true),
+                (b"TRACE", true),
+                (b"PUT", true),
+                (b"DELETE", true),
+                (b"POST", false),
+                (b"PATCH", false),
+                (b"CONNECT", false),
+            ] {
+                assert_eq!(Sent::new(method, &[]).repeatable(), again);
+            }
+        }
+
+        /// At most PIPELINE_MAX requests are in flight.
+        #[test]
+        fn pipeline_limit() {
+            let mut parser = Response::new();
+            for _ in 0..PIPELINE_MAX {
+                parser.expect(Sent::new(b"GET", &[])).unwrap();
+            }
+            assert_eq!(parser.expect(Sent::new(b"GET", &[])), Err(Error::Pipeline));
+            let mut out = Vec::new();
+            let refused = parser.request(&mut out, b"GET", b"/", b"h", &[], &Body::None);
+            assert!(matches!(refused, Err(Error::Pipeline)));
+            assert!(out.is_empty());
         }
 
         /// A 2xx to CONNECT ends at its head, whatever framing it names,
@@ -1493,7 +2045,7 @@ mod tests {
         #[test]
         fn connect() {
             let mut out = Vec::new();
-            let sent = request(
+            request(
                 &mut out,
                 b"CONNECT",
                 b"example.com:443",
@@ -1502,6 +2054,10 @@ mod tests {
                 &Body::None,
             )
             .unwrap();
+            let sent = Ask {
+                method: b"CONNECT",
+                close: false,
+            };
             assert_eq!(
                 out,
                 b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
@@ -1667,10 +2223,11 @@ mod tests {
         /// field, each fold a space (5.2); HTTP/1.2 reads as 1.1 (2.3).
         #[test]
         fn lenient_heads() {
-            let mut parser = Response::new(get());
+            let mut parser = connection(get());
             let message = b"HTTP/1.1 200 OK\r\nA: 1 \r\n \t folded\r\n\r\n";
             assert!(matches!(parser.feed(message), Ok((_, Event::Head))));
-            assert_eq!(parser.header(b"a"), Some(&b"1      folded"[..]));
+            let folded = parser.head().unwrap().header(b"a");
+            assert_eq!(folded, Some(&b"1      folded"[..]));
             // A HEAD response may name the codings a GET would have had
             // (RFC 9112 section 6.1): there is no body for them to code.
             let headed = ok(
@@ -1781,20 +2338,40 @@ mod tests {
             assert_eq!(run(&trailers, get(), 4096), Err(Error::TooLarge));
         }
 
-        /// An error stays until restart, which readies the next response.
+        /// An error stays, restart refuses to go past it, and reset
+        /// readies the parser for a new connection.
         #[test]
         fn error_sticks() {
-            let mut parser = Response::new(get());
+            let mut parser = connection(get());
             assert_eq!(parser.feed(b"HTTP/9"), Ok((6, Event::Need)));
             assert_eq!(parser.feed(b"\r\n"), Err(Error::Status));
             assert_eq!(parser.feed(b"HTTP/1.1 200 OK\r\n"), Err(Error::Status));
-            assert_eq!(parser.eof(), Err(Error::Status));
-            parser.restart(get());
+            assert!(parser.head().is_none());
+            assert_eq!(parser.eof(Close::Clean), Err(Error::Status));
+            assert_eq!(parser.restart(), Err(Error::Status));
+            parser.reset();
+            parser.expect(get().sent()).unwrap();
             assert_eq!(
                 parser.feed(b"HTTP/1.1 204 OK\r\n\r\n"),
                 Ok((19, Event::Head))
             );
             assert_eq!(parser.feed(b""), Ok((0, Event::End)));
+            assert_eq!(parser.feed(b""), Err(Error::Ended));
+        }
+
+        /// restart goes on to the next response only once the last ended.
+        #[test]
+        fn restart_waits_for_the_end() {
+            let mut parser = connection(get());
+            parser.expect(get().sent()).unwrap();
+            let message = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nab";
+            assert_eq!(parser.feed(&message[..40]).unwrap().1, Event::Head);
+            assert_eq!(parser.restart(), Err(Error::NotReusable));
+            assert_eq!(parser.feed(b"ab").unwrap(), (2, Event::Body(b"ab")));
+            // Whole: End is all that is left to say.
+            parser.restart().unwrap();
+            assert!(parser.head().is_none());
+            assert_eq!(parser.feed(message).unwrap().1, Event::Head);
         }
 
         /// A 1 MiB chunked body in 8000-byte chunks, fed in 16 KiB reads
@@ -1804,27 +2381,35 @@ mod tests {
             let mut message = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
             let data = [0x61_u8; 8000];
             let mut left = 1 << 20;
+            let mut body = Response::new()
+                .request(&mut Vec::new(), b"PUT", b"/", b"h", &[], &Body::Chunked)
+                .unwrap();
             while left > 0 {
                 let size = left.min(data.len());
-                chunk(&mut message, &data[..size]);
+                body.data(&mut message, &data[..size]).unwrap();
                 left -= size;
             }
-            last_chunk(&mut message);
-            let mut parser = Response::new(get());
+            body.finish(&mut message).unwrap();
+            let mut parser = Response::new();
             b.iter(|| {
-                parser.restart(get());
+                parser.reset();
+                parser.expect(get().sent()).unwrap();
                 let mut total = 0;
+                let mut ended = false;
                 for read in message.chunks(16 * 1024) {
                     let mut at = 0;
                     while at < read.len() {
                         let (taken, event) = parser.feed(&read[at..]).unwrap();
                         at += taken;
-                        if let Event::Body(bytes) = event {
-                            total += bytes.len();
+                        match event {
+                            Event::Body(bytes) => total += bytes.len(),
+                            Event::End => ended = true,
+                            Event::Head | Event::Need => {}
                         }
                     }
                 }
-                assert_eq!(parser.feed(b"").unwrap(), (0, Event::End));
+                assert!(ended);
+                assert_eq!(parser.feed(b""), Err(Error::Ended));
                 assert_eq!(total, 1 << 20);
             });
         }

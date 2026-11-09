@@ -9,24 +9,32 @@
 //!
 //! Readiness is level-triggered on every system: an entry is reported
 //! on each wait while its condition holds, so the loop may read or write
-//! a part and come back. Interest in writing is for when there is
-//! something to write: a socket is nearly always writable. With an
-//! interest, errors and the peer's hangup come with it; an entry with
-//! none is not watched at all, as when the loop stops reading to let a
-//! slow peer catch up, and what happened to it shows when it has one
-//! again, or at its next read or write. Only its deadline still counts.
-//! A report may be spurious: a read or write that would block is not an
-//! error.
+//! a part and come back. What is reported is what the entry's Interest
+//! asks, the same on every system (Ready says what each condition
+//! means): errors with any interest, the peer's hangup with reading; an
+//! entry with Interest::None is not watched at all, as when the loop
+//! stops reading to let a slow peer catch up, and what happened to it
+//! shows when it has one again, or at its next read or write. Only its
+//! deadline still counts. A report may be spurious: a read or write that
+//! would block is not an error.
+//!
+//! Every call that names an entry says when it is refused (SetError): a
+//! token is its own Set's, and names its entry until that is removed; a
+//! token of another Set, or of an entry gone, is refused, never read as
+//! another entry.
 //!
 //! One wait reports at most 256 descriptors (all on WSAPoll); the rest,
-//! still ready, the next. Deadlines are never reported early, and may be late by what the
-//! system's wait counts in: on Linux and Windows a timeout is whole
+//! still ready, the next. Deadlines are never reported early, and may be
+//! late by what the system's wait counts in: on Linux and Windows a timeout is whole
 //! milliseconds, rounded up, and Windows wakes on its timer's tick, 15.6
 //! ms unless the program asked for a finer one.
 //!
-//! A descriptor is in a Set once, and is removed before it is closed:
-//! close does both, so that nothing the system still holds of it is
-//! reported for the descriptor that takes its number next. add refuses
+//! A descriptor is in a Set once, and is removed before it is closed,
+//! so that nothing the system still holds of it is reported for the
+//! descriptor that takes its number next. A component that owns its
+//! descriptors (net) adds them with add_owned: its Owned entry is taken
+//! out by close alone, which closes the descriptor once, and remove
+//! refuses its token, which the component lends for deadlines. add refuses
 //! one the system still watches for its entry, as Linux's epoll refuses
 //! it, on every system: one added twice. One closed first is dropped by
 //! the system, and its entry stays, with its deadline, until it is
@@ -50,19 +58,152 @@ use super::{Fd, POLLIN, POLLOUT, Wait};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 
-/// Interest and readiness: the entry can be read without blocking (or
-/// a listener has a connection to accept), or written.
-pub const READ: u8 = 1;
-pub const WRITE: u8 = 2;
-/// Readiness only: the peer hung up, and reads end once what it sent is
-/// read; or an error is pending, which the next read or write returns.
-pub const HUP: u8 = 4;
-pub const ERROR: u8 = 8;
-/// The entry's deadline passed; it is cleared until set again.
-pub const EXPIRED: u8 = 16;
-/// A Waker woke the Set.
-pub const WOKEN: u8 = 32;
+/// What the system reports, as bits: the pollers' own, which Ready
+/// carries out of the Set.
+pub(super) const READ: u8 = 1;
+pub(super) const WRITE: u8 = 2;
+pub(super) const HUP: u8 = 4;
+pub(super) const ERROR: u8 = 8;
+const EXPIRED: u8 = 16;
+const WOKEN: u8 = 32;
+
+/// What the loop wants of an entry: to read (or, for a listener, to
+/// accept), to write, both, or nothing for now. Interest in writing is
+/// for when there is something to write: a socket is nearly always
+/// writable.
+#[derive(Clone, Copy)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
+pub enum Interest {
+    /// Not watched: only the entry's deadline counts.
+    None,
+    Read,
+    Write,
+    Both,
+}
+
+impl Interest {
+    /// Read, Write, Both or None, as read and write say.
+    pub fn new(read: bool, write: bool) -> Interest {
+        match (read, write) {
+            (false, false) => Interest::None,
+            (true, false) => Interest::Read,
+            (false, true) => Interest::Write,
+            (true, true) => Interest::Both,
+        }
+    }
+
+    pub fn reads(self) -> bool {
+        matches!(self, Interest::Read | Interest::Both)
+    }
+
+    pub fn writes(self) -> bool {
+        matches!(self, Interest::Write | Interest::Both)
+    }
+
+    /// As the pollers take it.
+    fn bits(self) -> u8 {
+        match self {
+            Interest::None => 0,
+            Interest::Read => READ,
+            Interest::Write => WRITE,
+            Interest::Both => READ | WRITE,
+        }
+    }
+}
+
+/// What wait found of an entry, the same on every system:
+///
+/// - readable: it can be read without blocking, or a listener has a
+///   connection to accept; reported with an interest in reading;
+/// - writable: reported with an interest in writing;
+/// - hangup: the peer finished or is gone, and reads end once what it
+///   sent is read; reported with an interest in reading only. With an
+///   interest in writing alone, a hangup the system reports shows as
+///   writable: the write says what became of the peer;
+/// - error: an error is pending, which the next read or write returns;
+///   reported with any interest;
+/// - expired: the entry's deadline passed; it is cleared until set again;
+/// - woken: a Waker woke the Set.
+#[derive(Clone, Copy)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
+pub struct Ready(u8);
+
+impl Ready {
+    pub const READABLE: Ready = Ready(READ);
+    pub const WRITABLE: Ready = Ready(WRITE);
+    pub const HANGUP: Ready = Ready(HUP);
+    pub const ERROR: Ready = Ready(ERROR);
+    pub const EXPIRED: Ready = Ready(EXPIRED);
+    pub const WOKEN: Ready = Ready(WOKEN);
+    /// Every condition: for a test of anything at all.
+    pub const ANY: Ready = Ready(READ | WRITE | HUP | ERROR | EXPIRED | WOKEN);
+
+    pub fn readable(self) -> bool {
+        self.0 & READ != 0
+    }
+
+    pub fn writable(self) -> bool {
+        self.0 & WRITE != 0
+    }
+
+    pub fn hangup(self) -> bool {
+        self.0 & HUP != 0
+    }
+
+    pub fn error(self) -> bool {
+        self.0 & ERROR != 0
+    }
+
+    pub fn expired(self) -> bool {
+        self.0 & EXPIRED != 0
+    }
+
+    pub fn woken(self) -> bool {
+        self.0 & WOKEN != 0
+    }
+
+    /// Something to read: readable, a hangup, or an error the read says.
+    pub fn to_read(self) -> bool {
+        self.0 & (READ | HUP | ERROR) != 0
+    }
+
+    /// self and other together.
+    #[must_use]
+    pub const fn with(self, other: Ready) -> Ready {
+        Ready(self.0 | other.0)
+    }
+
+    /// Whether self holds any of other.
+    pub fn any(self, other: Ready) -> bool {
+        self.0 & other.0 != 0
+    }
+}
+
+/// Why a Set refused a call. Nothing changed then.
+#[derive(Clone, Copy)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
+pub enum SetError {
+    /// The token is another Set's.
+    Foreign,
+    /// The token's entry is gone: removed, or its descriptor closed and
+    /// its number added again as a new entry.
+    Gone,
+    /// The descriptor is in the Set already: added before, open, and not
+    /// removed.
+    Twice,
+    /// The entry's descriptor is a component's (net's sockets): only its
+    /// owner, which closes it, takes it out, by close.
+    Owned,
+    /// The token names a timer or entry without a descriptor, which close
+    /// does not take.
+    NoDescriptor,
+    /// The system refused it.
+    System,
+    /// The Set holds as many entries as it can name.
+    Full,
+}
 
 /// A point on the system's monotonic clock, in nanoseconds since a start
 /// of the system's choosing: CLOCK_MONOTONIC on Linux, CLOCK_UPTIME_RAW
@@ -80,6 +221,7 @@ impl Instant {
     }
 
     /// ms milliseconds later.
+    #[must_use]
     pub fn after_ms(self, ms: u64) -> Instant {
         Instant {
             ns: self.ns.saturating_add(ms.saturating_mul(1_000_000)),
@@ -98,19 +240,35 @@ impl Instant {
 }
 
 /// An entry of a Set, until it is removed: a token of a removed entry
-/// names nothing, even once its place is taken again. A token is for the
-/// Set that gave it: another Set reads it as its own entry of that place,
-/// as an index into the wrong array would be.
+/// names nothing, even once its place is taken again, and a token is
+/// refused by every Set but the one that gave it (SetError::Foreign).
 #[derive(Clone, Copy)]
+#[must_use]
 pub struct Token {
+    set: u32,
     index: u32,
     generation: u32,
+}
+
+/// An entry whose descriptor its holder closes through the Set alone, as
+/// net's sockets are: Set::close takes it, and remove refuses its token,
+/// so the descriptor is closed once, by the one that owns it. Neither
+/// Copy nor Clone; token() names the entry for its deadline and interest.
+#[must_use]
+pub struct Owned {
+    token: Token,
+}
+
+impl Owned {
+    pub fn token(&self) -> Token {
+        self.token
+    }
 }
 
 /// What wait found of one entry: its key, and what is ready.
 pub struct Event {
     pub key: u64,
-    pub ready: u8,
+    pub ready: Ready,
 }
 
 /// An entry's place, kept while its entry lives and reused after.
@@ -123,7 +281,9 @@ struct Slot {
     /// The system watches fd for this entry: not once it was closed and
     /// another descriptor took its number.
     attached: bool,
-    interest: u8,
+    /// Added by add_owned: closed by close, never removed by remove.
+    owned: bool,
+    interest: Interest,
     key: u64,
     deadline: Option<Instant>,
     /// The wait that reported the entry last, and where in its events.
@@ -147,7 +307,7 @@ impl Clone for Waker {
 
 impl Waker {
     /// Wakes the Set: its next wait, or the one it is in, returns with
-    /// WOKEN. Wakes before that wait are one.
+    /// woken. Wakes before that wait are one.
     pub fn wake(&self) {
         self.wake.wake();
     }
@@ -167,8 +327,16 @@ impl Watch {
     };
 }
 
+/// The number the next Set takes, for its tokens: 2^32 Sets in one
+/// process before one shares the first's.
+// rr: escape(shared): one count for the process, whose threads each make
+// their Sets.
+static SETS: AtomicU32 = AtomicU32::new(1);
+
 pub struct Set {
     poller: Poller,
+    /// This Set's number, in each of its tokens.
+    id: u32,
     // rr: escape(bound): one place for each entry the loop keeps, which
     // the descriptors it may open bound.
     slots: Vec<Slot>,
@@ -215,6 +383,7 @@ impl Set {
     fn with(poller: Poller) -> Set {
         Set {
             poller,
+            id: SETS.fetch_add(1, Ordering::Relaxed),
             slots: Vec::new(),
             free: Vec::new(),
             owners: BTreeMap::new(),
@@ -226,80 +395,53 @@ impl Set {
         }
     }
 
-    /// Watches fd for interest (READ, WRITE, both or none), reported
-    /// with key. None when the system refuses it, or when fd is in the
-    /// Set already: added before, open, and not removed.
-    pub fn add(&mut self, fd: Raw, interest: u8, key: u64) -> Option<Token> {
-        // Whether the system still watches fd for the entry it has: then
-        // it is open, the one that entry was added with.
-        if let Some(&other) = self.owners.get(&fd)
-            && let Some(slot) = usize::try_from(other)
-                .ok()
-                .and_then(|at| self.slots.get(at))
-            && slot.attached
-        {
-            let held = token_key(Token {
-                index: other,
-                generation: slot.generation,
-            });
-            if self.poller.holds(fd, held, slot.interest) {
-                return None;
-            }
-        }
-        let token = self.place(Some(fd), interest, key)?;
-        if !self.poller.add(fd, token_key(token), interest) {
-            self.release(token.index);
-            return None;
-        }
-        if let Some(other) = self.owners.insert(fd, token.index) {
-            // Closed without being removed, its number taken by fd: the
-            // system dropped the old entry when it was closed, and only
-            // the poller's own record of it is left to forget. The entry
-            // goes, deadline and all; its token names nothing.
-            self.forget(other);
-        }
-        Some(token)
+    /// Watches fd for interest, reported with key. The caller keeps fd:
+    /// it removes the entry before it closes fd.
+    pub fn add(&mut self, fd: Raw, interest: Interest, key: u64) -> Result<Token, SetError> {
+        self.attach(fd, interest, key, false)
+    }
+
+    /// Watches fd for interest, reported with key, as an entry only close
+    /// takes out, closing fd with it: for a component that owns fd, as
+    /// net's sockets do, and hands the token out for deadlines.
+    pub fn add_owned(&mut self, fd: Raw, interest: Interest, key: u64) -> Result<Owned, SetError> {
+        let token = self.attach(fd, interest, key, true)?;
+        Ok(Owned { token })
     }
 
     /// A timer: an entry without a descriptor, for a deadline alone.
-    pub fn timer(&mut self, key: u64) -> Option<Token> {
-        self.place(None, 0, key)
+    pub fn timer(&mut self, key: u64) -> Result<Token, SetError> {
+        self.place(None, Interest::None, key, false)
     }
 
-    /// Changes what the entry waits for; false when the system refuses.
-    pub fn modify(&mut self, token: Token, interest: u8) -> bool {
-        let Some(slot) = self.slot_mut(token) else {
-            return false;
-        };
-        let (fd, old) = (slot.fd, slot.interest);
-        let changed = match fd {
-            Some(fd) if old != interest => self.poller.modify(fd, token_key(token), old, interest),
-            _ => true,
-        };
-        // What the system refused stays as it was, so that the next
-        // modify asks it again.
-        if let (true, Some(taken)) = (changed, self.slot_mut(token)) {
-            taken.interest = interest;
+    /// Changes what the entry waits for. What the system refused stays
+    /// as it was, so that the next modify asks it again.
+    pub fn modify(&mut self, token: Token, interest: Interest) -> Result<(), SetError> {
+        let slot = self.slot_mut(token)?;
+        let (fd, old) = (slot.fd, slot.interest.bits());
+        if let Some(fd) = fd
+            && old != interest.bits()
+            && !self
+                .poller
+                .modify(fd, token_key(token), old, interest.bits())
+        {
+            return Err(SetError::System);
         }
-        changed
+        self.slot_mut(token)?.interest = interest;
+        Ok(())
     }
 
     /// Reports the entry with key from now on: the system is not asked,
     /// as it names the entry by its token, which stays.
-    pub fn rekey(&mut self, token: Token, key: u64) -> bool {
-        let Some(slot) = self.slot_mut(token) else {
-            return false;
-        };
-        slot.key = key;
-        true
+    pub fn rekey(&mut self, token: Token, key: u64) -> Result<(), SetError> {
+        self.slot_mut(token)?.key = key;
+        Ok(())
     }
 
     /// Sets or clears the entry's deadline. Once it passes, wait reports
-    /// EXPIRED for the entry and clears it.
-    pub fn deadline(&mut self, token: Token, at: Option<Instant>) {
-        let Some(slot) = self.slot_mut(token) else {
-            return;
-        };
+    /// the entry expired and clears it.
+    pub fn deadline(&mut self, token: Token, at: Option<Instant>) -> Result<(), SetError> {
+        let slot = self.slot_mut(token)?;
         let old = slot.deadline;
         slot.deadline = at;
         if let Some(old) = old {
@@ -308,33 +450,31 @@ impl Set {
         if let Some(at) = at {
             self.deadlines.insert((at.ns, token.index));
         }
+        Ok(())
     }
 
-    /// Removes the entry, before its descriptor is closed; its token
-    /// then names nothing.
-    pub fn remove(&mut self, token: Token) {
-        if self.slot_mut(token).is_none() {
-            return;
+    /// Removes the entry, before the caller closes its descriptor; its
+    /// token then names nothing. An owned entry is refused: close takes
+    /// it.
+    pub fn remove(&mut self, token: Token) -> Result<(), SetError> {
+        if self.slot_mut(token)?.owned {
+            return Err(SetError::Owned);
         }
-        self.deadline(token, None);
-        self.detach(token.index, Detach::Remove);
-        self.release(token.index);
+        self.take(token, Detach::Remove);
+        Ok(())
     }
 
-    /// Removes the entry and closes its descriptor, which the caller
-    /// gives up. False, and nothing closed, when the token names no
-    /// entry with a descriptor.
-    pub fn close(&mut self, token: Token) -> bool {
-        let Some(slot) = self.slot_mut(token) else {
-            return false;
-        };
+    /// Removes the owned entry and closes its descriptor. Refused, and
+    /// nothing closed, when the entry is another Set's, gone or has no
+    /// descriptor the system still watches for it: the owner closes its
+    /// descriptor itself then.
+    pub fn close(&mut self, Owned { token }: Owned) -> Result<(), SetError> {
+        let slot = self.slot_mut(token)?;
         if slot.fd.is_none() || !slot.attached {
-            return false;
+            return Err(SetError::NoDescriptor);
         }
-        self.deadline(token, None);
-        self.detach(token.index, Detach::Close);
-        self.release(token.index);
-        true
+        self.take(token, Detach::Close);
+        Ok(())
     }
 
     /// What wakes this Set from another thread; its wakes are reported
@@ -348,7 +488,7 @@ impl Set {
 
     /// Waits until an entry is ready, a deadline passes, a Waker wakes
     /// the Set or until comes, and says what happened: one event for
-    /// each entry, its readiness and EXPIRED together. Empty when until
+    /// each entry, its readiness and expiry together. Empty when until
     /// came first, or on a spurious wake.
     pub fn wait(&mut self, until: Option<Instant>) -> &[Event] {
         self.events.clear();
@@ -375,7 +515,7 @@ impl Set {
                     woken = true;
                     self.events.push(Event {
                         key: self.woken,
-                        ready: WOKEN,
+                        ready: Ready::WOKEN,
                     });
                 }
                 _ => self.found_ready(key, ready),
@@ -385,11 +525,13 @@ impl Set {
         &self.events
     }
 
-    /// Keeps watch's entries as wait says: its descriptors, reported
-    /// with key, and its timeout as a deadline (READY's, none, is due
-    /// now). false when the system refused a descriptor. Its entries are
-    /// unfollowed before the component goes, which closes them.
-    pub fn follow(&mut self, watch: &mut Watch, wait: &Wait, key: u64) -> bool {
+    /// Keeps watch's entries as wait says: its descriptors and its
+    /// timeout as a deadline (READY's, none, is due now), all reported
+    /// with key, the one given last. Err when the system refused a
+    /// descriptor; the others are kept as wait says all the same. Its
+    /// entries are unfollowed before the component goes, which closes
+    /// them.
+    pub fn follow(&mut self, watch: &mut Watch, wait: &Wait, key: u64) -> Result<(), SetError> {
         let mut wanted = [None; 2];
         for ((at, fd), want) in wait.fds.iter().enumerate().zip(&mut wanted) {
             if at < wait.count && fd.fd != Fd::NONE.fd {
@@ -401,7 +543,8 @@ impl Set {
         if let [Some((first, one)), Some((second, other))] = wanted
             && first == second
         {
-            wanted = [Some((first, one | other)), None];
+            let both = Interest::new(one.reads() || other.reads(), one.writes() || other.writes());
+            wanted = [Some((first, both)), None];
         }
         // Entries go with their descriptor, wherever the Wait now names
         // it; the ones it no longer names are removed before any is
@@ -409,65 +552,131 @@ impl Set {
         let mut kept: [Option<Token>; 2] = [None; 2];
         for held in &mut watch.fds {
             if let Some(token) = held.take() {
-                let fd = self.slot_mut(token).and_then(|slot| slot.fd);
+                let fd = self.slot_mut(token).ok().and_then(|slot| slot.fd);
                 let at = wanted
                     .iter()
                     .position(|want| want.is_some_and(|(named, _)| Some(named) == fd));
                 match at.and_then(|at| kept.get_mut(at)) {
                     Some(place) => *place = Some(token),
-                    None => self.remove(token),
+                    // Gone already, when it is not this Set's own.
+                    None => self.remove(token).unwrap_or(()),
                 }
             }
         }
-        let mut added = true;
+        let mut result = Ok(());
         for ((place, want), held) in watch.fds.iter_mut().zip(wanted).zip(kept) {
-            *place = match (want, held) {
-                (Some((_, interest)), Some(token)) => {
-                    added &= self.modify(token, interest);
-                    Some(token)
+            let outcome = match (want, held) {
+                (Some((_, interest)), Some(token)) => self
+                    .modify(token, interest)
+                    .and_then(|()| self.rekey(token, key))
+                    .map(|()| Some(token)),
+                (Some((fd, interest)), None) => self.add(fd, interest, key).map(Some),
+                (None, _) => Ok(None),
+            };
+            *place = match outcome {
+                Ok(token) => token,
+                Err(error) => {
+                    result = result.and(Err(error));
+                    held
                 }
-                (Some((fd, interest)), None) => {
-                    let token = self.add(fd, interest, key);
-                    added &= token.is_some();
-                    token
-                }
-                (None, _) => None,
             };
         }
-        if watch.timer.is_none() {
-            watch.timer = self.timer(key);
+        let timer = match watch.timer {
+            Some(timer) => self.rekey(timer, key).map(|()| timer),
+            None => self.timer(key),
+        };
+        let at = wait.timeout_ms.map(|ms| Instant::now().after_ms(ms));
+        match timer.and_then(|timer| self.deadline(timer, at).map(|()| timer)) {
+            Ok(timer) => watch.timer = Some(timer),
+            Err(error) => {
+                watch.timer = None;
+                result = result.and(Err(error));
+            }
         }
-        if let Some(timer) = watch.timer {
-            let at = wait.timeout_ms.map(|ms| Instant::now().after_ms(ms));
-            self.deadline(timer, at);
-        }
-        added
+        result
     }
 
     /// Removes watch's entries, before the component closes them.
     pub fn unfollow(&mut self, watch: &mut Watch) {
         for place in &mut watch.fds {
             if let Some(token) = place.take() {
-                self.remove(token);
+                // Gone already, when it is not this Set's own.
+                self.remove(token).unwrap_or(());
             }
         }
         if let Some(timer) = watch.timer.take() {
-            self.remove(timer);
+            self.remove(timer).unwrap_or(());
         }
     }
 
+    /// Adds fd as a new entry, owned or not.
+    fn attach(
+        &mut self,
+        fd: Raw,
+        interest: Interest,
+        key: u64,
+        owned: bool,
+    ) -> Result<Token, SetError> {
+        // Whether the system still watches fd for the entry it has: then
+        // it is open, the one that entry was added with.
+        if let Some(&other) = self.owners.get(&fd)
+            && let Some(slot) = usize::try_from(other)
+                .ok()
+                .and_then(|at| self.slots.get(at))
+            && slot.attached
+        {
+            let held = token_key(Token {
+                set: self.id,
+                index: other,
+                generation: slot.generation,
+            });
+            if self.poller.holds(fd, held, slot.interest.bits()) {
+                return Err(SetError::Twice);
+            }
+        }
+        let token = self.place(Some(fd), interest, key, owned)?;
+        if !self.poller.add(fd, token_key(token), interest.bits()) {
+            self.release(token.index);
+            return Err(SetError::System);
+        }
+        if let Some(other) = self.owners.insert(fd, token.index) {
+            // Closed without being removed, its number taken by fd: the
+            // system dropped the old entry when it was closed, and only
+            // the poller's own record of it is left to forget. The entry
+            // goes, deadline and all; its token names nothing.
+            self.forget(other);
+        }
+        Ok(token)
+    }
+
+    /// Takes the entry out, as how says, deadline and all.
+    fn take(&mut self, token: Token, how: Detach) {
+        self.clear(token.index);
+        self.detach(token.index, how);
+        self.release(token.index);
+    }
+
     /// A place for a new entry.
-    fn place(&mut self, fd: Option<Raw>, interest: u8, key: u64) -> Option<Token> {
+    fn place(
+        &mut self,
+        fd: Option<Raw>,
+        interest: Interest,
+        key: u64,
+        owned: bool,
+    ) -> Result<Token, SetError> {
         let index = match self.free.pop() {
             Some(index) => index,
             None => {
-                let index = u32::try_from(self.slots.len()).ok()?;
+                // rr: escape(discard): past u32::MAX places is all the
+                // cause there is.
+                let index = u32::try_from(self.slots.len()).ok().ok_or(SetError::Full)?;
                 self.slots.push(Slot {
                     generation: 1,
                     live: false,
                     fd: None,
                     attached: false,
-                    interest: 0,
+                    owned: false,
+                    interest: Interest::None,
                     key: 0,
                     deadline: None,
                     batch: 0,
@@ -476,14 +685,19 @@ impl Set {
                 index
             }
         };
-        let slot = self.slots.get_mut(usize::try_from(index).ok()?)?;
+        let slot = usize::try_from(index)
+            .ok()
+            .and_then(|at| self.slots.get_mut(at))
+            .ok_or(SetError::Full)?;
         slot.live = true;
         slot.fd = fd;
         slot.attached = fd.is_some();
+        slot.owned = owned;
         slot.interest = interest;
         slot.key = key;
         slot.deadline = None;
-        Some(Token {
+        Ok(Token {
+            set: self.id,
             index,
             generation: slot.generation,
         })
@@ -520,6 +734,7 @@ impl Set {
         slot.live = false;
         slot.fd = None;
         slot.attached = false;
+        slot.owned = false;
         slot.generation = match slot.generation.wrapping_add(1) {
             0 => 1,
             next => next,
@@ -540,10 +755,11 @@ impl Set {
         };
         slot.attached = false;
         let key = token_key(Token {
+            set: self.id,
             index,
             generation: slot.generation,
         });
-        let interest = slot.interest;
+        let interest = slot.interest.bits();
         if self.owners.get(&fd) == Some(&index) {
             self.owners.remove(&fd);
         }
@@ -559,25 +775,41 @@ impl Set {
         }
     }
 
-    fn slot_mut(&mut self, token: Token) -> Option<&mut Slot> {
-        let slot = self.slots.get_mut(usize::try_from(token.index).ok()?)?;
-        (slot.live && slot.generation == token.generation).then_some(slot)
+    /// The token's entry: refused when the token is another Set's or
+    /// its entry is gone.
+    fn slot_mut(&mut self, token: Token) -> Result<&mut Slot, SetError> {
+        if token.set != self.id {
+            return Err(SetError::Foreign);
+        }
+        usize::try_from(token.index)
+            .ok()
+            .and_then(|at| self.slots.get_mut(at))
+            .filter(|slot| slot.live && slot.generation == token.generation)
+            .ok_or(SetError::Gone)
     }
 
     /// What the system reported for key, as the entry's interest asks:
     /// dropped when the entry is gone, no longer watched or has none, as
-    /// a notification sent before the interest changed may be.
+    /// a notification sent before the interest changed may be. A hangup
+    /// shows with reading alone, as each system reports it there; with
+    /// writing alone, where Linux reports a full one, WSAPoll any, and
+    /// macOS and socket notifications none, it shows as writable, which
+    /// the others report then too.
     fn found_ready(&mut self, key: u64, ready: u8) {
         let token = Token {
+            set: self.id,
             index: u32::try_from(key & u64::from(u32::MAX)).unwrap_or(u32::MAX),
             generation: u32::try_from(key >> 32).unwrap_or(0),
         };
-        let Some(slot) = self.slot_mut(token) else {
+        let Ok(slot) = self.slot_mut(token) else {
             return;
         };
         let shown = match (slot.attached, slot.interest) {
-            (false, _) | (_, 0) => 0,
-            (true, interest) => ready & (interest | HUP | ERROR),
+            (false, _) | (_, Interest::None) => 0,
+            (true, Interest::Read) => ready & (READ | HUP | ERROR),
+            (true, Interest::Both) => ready & (READ | WRITE | HUP | ERROR),
+            (true, Interest::Write) if ready & HUP != 0 => WRITE | (ready & ERROR),
+            (true, Interest::Write) => ready & (WRITE | ERROR),
         };
         if shown != 0 {
             self.report(token.index, shown);
@@ -611,7 +843,8 @@ impl Set {
         };
         if slot.batch == self.batch {
             if let Some(event) = self.events.get_mut(slot.event) {
-                event.ready |= ready;
+                let before = event.ready;
+                event.ready = before.with(Ready(ready));
             }
             return;
         }
@@ -619,7 +852,7 @@ impl Set {
         slot.event = self.events.len();
         self.events.push(Event {
             key: slot.key,
-            ready,
+            ready: Ready(ready),
         });
     }
 }
@@ -631,16 +864,14 @@ fn token_key(token: Token) -> u64 {
 }
 
 /// The interest a component's descriptor states in poll's events.
-fn interest(fd: &Fd) -> u8 {
-    let read = if fd.events & POLLIN != 0 { READ } else { 0 };
-    let write = if fd.events & POLLOUT != 0 { WRITE } else { 0 };
-    read | write
+fn interest(fd: &Fd) -> Interest {
+    Interest::new(fd.events & POLLIN != 0, fd.events & POLLOUT != 0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::{Fd, Signal, Wait};
-    use super::{EXPIRED, Instant, READ, Set, WOKEN, Watch};
+    use super::{Instant, Interest, Ready, Set, SetError, Watch};
     use alloc::vec::Vec;
 
     /// Every way the system has to wait: on Windows, socket notifications
@@ -653,7 +884,7 @@ mod tests {
     }
 
     /// The events of one wait, as (key, ready).
-    fn wait(set: &mut Set, until: Instant) -> Vec<(u64, u8)> {
+    fn wait(set: &mut Set, until: Instant) -> Vec<(u64, Ready)> {
         // rr: escape(copy): the test reads the events while it changes
         // the Set.
         set.wait(Some(until))
@@ -663,11 +894,11 @@ mod tests {
     }
 
     /// Waits up to ten seconds for key with any of want; its readiness.
-    fn until(set: &mut Set, key: u64, want: u8) -> u8 {
+    fn until(set: &mut Set, key: u64, want: Ready) -> Ready {
         let end = Instant::now().after_ms(10_000);
         loop {
             for (found, ready) in wait(set, end) {
-                if found == key && ready & want != 0 {
+                if found == key && ready.any(want) {
                     return ready;
                 }
             }
@@ -677,13 +908,13 @@ mod tests {
 
     /// Waits ms milliseconds, and checks that key was not reported with
     /// any of these.
-    fn quiet(set: &mut Set, key: u64, these: u8, ms: u64) {
+    fn quiet(set: &mut Set, key: u64, these: Ready, ms: u64) {
         let end = Instant::now().after_ms(ms);
         while !end.reached_by(Instant::now()) {
             for (found, ready) in wait(set, end) {
                 assert!(
-                    found != key || ready & these == 0,
-                    "key {key} reported {ready}"
+                    found != key || !ready.any(these),
+                    "key {key} reported {ready:?}"
                 );
             }
         }
@@ -702,28 +933,28 @@ mod tests {
         for key in 0..200u64 {
             let token = set.timer(key).unwrap();
             let at = start.after_ms(30 + key * 37 % 97);
-            set.deadline(token, Some(at));
+            set.deadline(token, Some(at)).unwrap();
             tokens.push(token);
             due.push(Some(at));
         }
         for key in (0..200).step_by(10) {
-            set.deadline(tokens[key], None);
+            set.deadline(tokens[key], None).unwrap();
             due[key] = None;
         }
         for key in (3..200).step_by(7) {
             let later = start.after_ms(150 + u64::try_from(key % 50).unwrap());
-            set.deadline(tokens[key], Some(later));
+            set.deadline(tokens[key], Some(later)).unwrap();
             due[key] = Some(later);
         }
         for key in (5..200).step_by(13) {
-            set.remove(tokens[key]);
+            set.remove(tokens[key]).unwrap();
             due[key] = None;
         }
         let mut fired: Vec<(usize, Instant)> = Vec::new();
         let end = start.after_ms(400);
         while !end.reached_by(Instant::now()) {
             for (key, ready) in wait(&mut set, end) {
-                assert_eq!(ready, EXPIRED);
+                assert_eq!(ready, Ready::EXPIRED);
                 fired.push((usize::try_from(key).unwrap(), Instant::now()));
             }
         }
@@ -750,19 +981,39 @@ mod tests {
     fn follows_a_wait() {
         for mut set in sets() {
             let mut watch = Watch::NONE;
-            assert!(set.follow(&mut watch, &Wait::READY, 5));
-            until(&mut set, 5, EXPIRED);
+            set.follow(&mut watch, &Wait::READY, 5).unwrap();
+            until(&mut set, 5, Ready::EXPIRED);
             let signal = Signal::new().unwrap();
-            assert!(set.follow(&mut watch, &signal.wait(), 5));
-            quiet(&mut set, 5, u8::MAX, 30);
+            set.follow(&mut watch, &signal.wait(), 5).unwrap();
+            quiet(&mut set, 5, Ready::ANY, 30);
             signal.set();
-            until(&mut set, 5, READ);
+            until(&mut set, 5, Ready::READABLE);
             let mut timed = Wait::READY;
             timed.timeout_ms = Some(20);
-            assert!(set.follow(&mut watch, &timed, 5));
-            assert_eq!(until(&mut set, 5, EXPIRED) & READ, 0);
+            set.follow(&mut watch, &timed, 5).unwrap();
+            assert!(!until(&mut set, 5, Ready::EXPIRED).readable());
             set.unfollow(&mut watch);
-            quiet(&mut set, 5, u8::MAX, 30);
+            quiet(&mut set, 5, Ready::ANY, 30);
+        }
+    }
+
+    /// A Wait followed under a new key is reported under it: its kept
+    /// descriptor and its timer both, and nothing under the old.
+    #[test]
+    fn follows_under_a_new_key() {
+        for mut set in sets() {
+            let mut watch = Watch::NONE;
+            let signal = Signal::new().unwrap();
+            let mut timed = signal.wait();
+            timed.timeout_ms = Some(10_000);
+            set.follow(&mut watch, &timed, 5).unwrap();
+            timed.timeout_ms = Some(20);
+            set.follow(&mut watch, &timed, 6).unwrap();
+            assert!(until(&mut set, 6, Ready::EXPIRED).expired());
+            signal.set();
+            until(&mut set, 6, Ready::READABLE);
+            quiet(&mut set, 5, Ready::ANY, 30);
+            set.unfollow(&mut watch);
         }
     }
 
@@ -775,8 +1026,8 @@ mod tests {
             waker.wake();
             waker.wake();
             let woken = wait(&mut set, Instant::now().after_ms(1000));
-            assert_eq!(woken, Vec::from([(9, WOKEN)]));
-            quiet(&mut set, 9, u8::MAX, 30);
+            assert_eq!(woken, Vec::from([(9, Ready::WOKEN)]));
+            quiet(&mut set, 9, Ready::ANY, 30);
         }
     }
 
@@ -794,19 +1045,72 @@ mod tests {
                 count: 2,
                 timeout_ms: None,
             };
-            assert!(set.follow(&mut watch, &both, 5));
+            set.follow(&mut watch, &both, 5).unwrap();
             let [moved, _] = second.wait().fds;
             let alone = Wait {
                 fds: [moved, Fd::NONE],
                 count: 1,
                 timeout_ms: None,
             };
-            assert!(set.follow(&mut watch, &alone, 5));
+            set.follow(&mut watch, &alone, 5).unwrap();
             first.set();
-            quiet(&mut set, 5, u8::MAX, 30);
+            quiet(&mut set, 5, Ready::ANY, 30);
             second.set();
-            until(&mut set, 5, READ);
+            until(&mut set, 5, Ready::READABLE);
             set.unfollow(&mut watch);
         }
+    }
+
+    /// A token is its own Set's: another Set, whose entries take the same
+    /// places and generations, refuses it, and its own entry is untouched.
+    /// A removed entry's token is gone, and an owned entry is only closed.
+    #[test]
+    fn tokens_name_their_own_set() {
+        let mut first = Set::new().unwrap();
+        let mut second = Set::new().unwrap();
+        let mine = first.timer(1).unwrap();
+        let theirs = second.timer(2).unwrap();
+        second
+            .deadline(theirs, Some(Instant::now().after_ms(10)))
+            .unwrap();
+        assert_eq!(second.remove(mine), Err(SetError::Foreign));
+        assert_eq!(second.rekey(mine, 3), Err(SetError::Foreign));
+        assert_eq!(second.deadline(mine, None), Err(SetError::Foreign));
+        assert_eq!(second.modify(mine, Interest::Read), Err(SetError::Foreign));
+        until(&mut second, 2, Ready::EXPIRED);
+        first.remove(mine).unwrap();
+        assert_eq!(first.remove(mine), Err(SetError::Gone));
+        assert_eq!(first.rekey(mine, 4), Err(SetError::Gone));
+        let signal = Signal::new().unwrap();
+        let [fd, _] = signal.wait().fds;
+        let token = first.add(fd.fd, Interest::Read, 7).unwrap();
+        assert_eq!(
+            first.add(fd.fd, Interest::Read, 8).err(),
+            Some(SetError::Twice)
+        );
+        first.remove(token).unwrap();
+        let owned = first.add_owned(fd.fd, Interest::None, 9).unwrap();
+        assert_eq!(first.remove(owned.token()), Err(SetError::Owned));
+        // close would close the signal's descriptor, which the signal
+        // closes itself: the entry stays until the Set goes.
+        assert!(owned.token().set == first.id);
+    }
+
+    /// Interest from the two wishes, and what each holds.
+    #[test]
+    fn interests() {
+        for (read, write, interest) in [
+            (false, false, Interest::None),
+            (true, false, Interest::Read),
+            (false, true, Interest::Write),
+            (true, true, Interest::Both),
+        ] {
+            assert_eq!(Interest::new(read, write), interest);
+            assert_eq!((interest.reads(), interest.writes()), (read, write));
+        }
+        let ready = Ready::READABLE.with(Ready::HANGUP);
+        assert!(ready.readable() && ready.hangup() && ready.to_read());
+        assert!(!ready.writable() && !ready.error() && !ready.expired() && !ready.woken());
+        assert!(Ready::ERROR.to_read() && !Ready::WRITABLE.to_read());
     }
 }

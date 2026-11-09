@@ -2280,7 +2280,9 @@ mod thread {
             // frees it.
             let raw = Box::into_raw(shared);
             check.shared = raw;
-            check.ticket = wait::spawn(run, raw.cast());
+            // rr: escape(unsafe): run takes shared as its holder, which it
+            // lets go; the ticket's cancel says when it never runs.
+            check.ticket = unsafe { wait::spawn(run, raw.cast()) };
             if check.ticket.is_none() {
                 // The thread never held it.
                 release(raw);
@@ -2321,7 +2323,7 @@ mod thread {
                 return;
             }
             // Work still in line never runs: its holder is let go here.
-            if self.ticket.as_ref().is_some_and(wait::Ticket::cancel) {
+            if self.ticket.take().is_some_and(wait::Ticket::cancel) {
                 release(self.shared);
             }
             // The thread, when it runs on, frees what is left.

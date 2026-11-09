@@ -2,13 +2,21 @@
 //! sockets: a Listener accepts Streams, a Stream connects out, and each
 //! reads and writes what the system takes now, without blocking. The
 //! loop waits for them in a wait Set: watch puts a socket in it with an
-//! interest and a key, close hands it to the Set, which takes it out and
+//! Interest and a key, close hands it to the Set, which takes it out and
 //! closes it, so that nothing the system still holds of it is reported
-//! for the socket that takes its number next. A
-//! socket dropped without close is closed all the same, and the system
-//! stops watching it; its entry in the Set stays until a new socket
-//! takes its number, so a loop closes with close. Small writes go at
-//! once (TCP_NODELAY), as in Go.
+//! for the socket that takes its number next. The entry is Owned: the
+//! token a stream lends for deadlines cannot remove or close it, so the
+//! socket is closed once, by close or by its drop. A socket dropped
+//! without close is closed all the same, and the system stops watching
+//! it; its entry in the Set stays until a new socket takes its number,
+//! so a loop closes with close. A socket watched in one Set is refused
+//! by another (SetError::Foreign). Small writes go at once
+//! (TCP_NODELAY), as in Go.
+//!
+//! A Stream that connects out remembers how the connection went:
+//! connected says it the same way every time, and a read or write before
+//! it is made is NotConnected on every system. A read into no room is
+//! refused (NoRoom): its Done(0) would read as the peer's end.
 //!
 //! Every socket is non-blocking and is not handed to child processes
 //! (close-on-exec on Linux and macOS, not inherited on Windows); a write
@@ -22,10 +30,11 @@
 //! SO_EXCLUSIVEADDRUSE would refuse it while old connections linger).
 //!
 //! Errors come as the kinds a loop acts on: refused, reset, timed out,
-//! unreachable, the address in use, and the system's code for the rest.
+//! unreachable, the address in use, not connected yet, and the system's
+//! code for the rest.
 //! A listener that runs out of descriptors keeps its connections waiting
 //! and stays readable: the loop stops watching it for a while (watch it
-//! with no interest), or it spins.
+//! with Interest::None), or it spins.
 
 mod sys;
 #[cfg(test)]

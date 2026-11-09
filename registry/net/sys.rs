@@ -1,6 +1,6 @@
 //! The system side of net: what mod.rs says it is, for each system.
 
-use crate::base::wait::{Raw, Set, Token};
+use crate::base::wait::{Interest, Owned, Raw, Set, SetError, Token};
 use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 /// Why a socket call failed, as a loop acts on it.
@@ -18,6 +18,12 @@ pub enum Error {
     Unreachable,
     /// The address is taken.
     InUse,
+    /// A read or write before the connection is made, on every system
+    /// alike: wait for the stream to be writable, then try again.
+    NotConnected,
+    /// A read into no room, whose Done(0) could not be told from the
+    /// peer's end.
+    NoRoom,
     /// Anything else: the system's code (errno, or WSAGetLastError's).
     Other(i32),
 }
@@ -35,89 +41,143 @@ pub enum Io {
 const ADDRESS_BYTES: usize = 28;
 
 /// A socket, and its entry in a Set with the key it was watched with;
-/// open until its Set or its drop closes it.
+/// open until its Set or its drop closes it, once: the entry is Owned,
+/// which only close takes out of the Set.
 struct Socket {
     fd: Raw,
-    entry: Option<(Token, u64)>,
-    open: bool,
+    entry: Option<(Owned, u64)>,
 }
 
 impl Socket {
+    fn new(fd: Raw) -> Socket {
+        Socket { fd, entry: None }
+    }
+
     /// The socket's entry: added once, then changed in place, its key as
     /// well, as the system holds a registration for each socket once
     /// (socket notifications take another only after the first is gone).
-    fn watch(&mut self, set: &mut Set, interest: u8, key: u64) -> bool {
-        let Some((token, old)) = self.entry else {
-            self.entry = set.add(self.fd, interest, key).map(|token| (token, key));
-            return self.entry.is_some();
+    /// Another Set than the first is refused.
+    fn watch(&mut self, set: &mut Set, interest: Interest, key: u64) -> Result<(), SetError> {
+        let Some((owned, old)) = &mut self.entry else {
+            let owned = set.add_owned(self.fd, interest, key)?;
+            self.entry = Some((owned, key));
+            return Ok(());
         };
-        if old != key && !set.rekey(token, key) {
-            return false;
+        if *old != key {
+            set.rekey(owned.token(), key)?;
+            *old = key;
         }
-        self.entry = Some((token, key));
-        set.modify(token, interest)
+        set.modify(owned.token(), interest)
     }
 
     fn token(&self) -> Option<Token> {
-        self.entry.map(|(token, _)| token)
+        self.entry.as_ref().map(|(owned, _)| owned.token())
     }
 
     /// Hands the socket to its Set, which takes it out and closes it; one
-    /// in no Set drop closes.
-    fn close(&mut self, set: &mut Set) {
-        if let Some((token, _)) = self.entry.take() {
-            self.open = !set.close(token);
-        }
+    /// in no Set, or one set does not hold, drop closes, and the Set's
+    /// refusal says why.
+    fn close(mut self, set: &mut Set) -> Result<(), SetError> {
+        let Some((owned, _)) = self.entry.take() else {
+            return Ok(());
+        };
+        set.close(owned)?;
+        // rr: escape(leak): the Set closed the socket, which drop would
+        // close again; the value holds nothing else.
+        core::mem::forget(self);
+        Ok(())
     }
 }
 
 impl Drop for Socket {
     fn drop(&mut self) {
-        if self.open {
-            os::close(self.fd);
-        }
+        os::close(self.fd);
     }
+}
+
+/// Where a connection is: still being made, made, or failed with the
+/// error the system said once.
+#[derive(Clone, Copy)]
+enum Link {
+    Connecting,
+    Connected,
+    Failed(Error),
 }
 
 /// A TCP connection.
 pub struct Stream {
     socket: Socket,
+    link: Link,
 }
 
 impl Stream {
     /// Begins a connection to address. It is made once the socket is
     /// writable, or has an error or a hangup, and connected says so.
     pub fn connect(address: SocketAddr) -> Result<Stream, Error> {
-        let socket = Socket {
-            fd: os::open(&address)?,
-            entry: None,
-            open: true,
-        };
+        let socket = Socket::new(os::open(&address)?);
         os::no_delay(socket.fd, true)?;
         let (bytes, length) = encode(&address);
         os::connect(socket.fd, bytes.get(..length).unwrap_or_default())?;
-        Ok(Stream { socket })
+        Ok(Stream {
+            socket,
+            link: Link::Connecting,
+        })
     }
 
     /// Whether the connection is made: false while it is still being
-    /// made, its error once it failed.
-    pub fn connected(&self) -> Result<bool, Error> {
-        os::pending(self.socket.fd)?;
-        Ok(self.peer().is_some())
+    /// made, its error once it failed, the same error every time.
+    pub fn connected(&mut self) -> Result<bool, Error> {
+        match self.link {
+            Link::Connected => return Ok(true),
+            Link::Failed(error) => return Err(error),
+            Link::Connecting => {}
+        }
+        if let Err(error) = os::pending(self.socket.fd) {
+            self.link = Link::Failed(error);
+            return Err(error);
+        }
+        if self.peer().is_none() {
+            return Ok(false);
+        }
+        self.link = Link::Connected;
+        Ok(true)
     }
 
-    /// Reads what has come, into into.
-    pub fn read(&self, into: &mut [u8]) -> Result<Io, Error> {
+    /// Ready for a read or write: made, or NotConnected while it is still
+    /// being made, or its error.
+    fn ready(&mut self) -> Result<(), Error> {
+        if self.connected()? {
+            Ok(())
+        } else {
+            Err(Error::NotConnected)
+        }
+    }
+
+    /// Reads what has come, into into, which has room: an empty one is
+    /// NoRoom.
+    #[cfg_attr(rr, rr::hot)]
+    pub fn read(&mut self, into: &mut [u8]) -> Result<Io, Error> {
+        if into.is_empty() {
+            return Err(Error::NoRoom);
+        }
+        if !matches!(self.link, Link::Connected) {
+            self.ready()?;
+        }
         os::read(self.socket.fd, into)
     }
 
     /// Writes what the system takes of from now.
-    pub fn write(&self, from: &[u8]) -> Result<Io, Error> {
+    #[cfg_attr(rr, rr::hot)]
+    pub fn write(&mut self, from: &[u8]) -> Result<Io, Error> {
+        if !matches!(self.link, Link::Connected) {
+            self.ready()?;
+        }
         os::write(self.socket.fd, from)
     }
 
     /// Ends the writing side: the peer reads its end, and may still send.
-    pub fn finish(&self) -> Result<(), Error> {
+    pub fn finish(&mut self) -> Result<(), Error> {
+        self.ready()?;
         os::finish(self.socket.fd)
     }
 
@@ -137,12 +197,13 @@ impl Stream {
     }
 
     /// Puts the stream in set with interest, reported with key, or
-    /// changes them.
-    pub fn watch(&mut self, set: &mut Set, interest: u8, key: u64) -> bool {
+    /// changes them. Refused for another Set than the first.
+    pub fn watch(&mut self, set: &mut Set, interest: Interest, key: u64) -> Result<(), SetError> {
         self.socket.watch(set, interest, key)
     }
 
-    /// The stream's entry in its Set, for a deadline.
+    /// The stream's entry in its Set, for a deadline: Set::remove refuses
+    /// it, and only the stream's close takes it out.
     pub fn token(&self) -> Option<Token> {
         self.socket.token()
     }
@@ -152,16 +213,18 @@ impl Stream {
         self.socket.fd
     }
 
-    /// Takes the stream out of set, and closes it.
-    pub fn close(mut self, set: &mut Set) {
-        self.socket.close(set);
+    /// Takes the stream out of set, and closes it. The socket is closed
+    /// whatever set says; Err when set is not the Set it was watched in,
+    /// whose entry then stays until that Set gets a socket of its number.
+    pub fn close(self, set: &mut Set) -> Result<(), SetError> {
+        self.socket.close(set)
     }
 
     /// Closes with a reset (SO_LINGER 0), as for a peer that misbehaved:
-    /// what was not sent is dropped.
-    pub fn abort(mut self, set: &mut Set) {
+    /// what was not sent is dropped. Err as close says.
+    pub fn abort(self, set: &mut Set) -> Result<(), SetError> {
         os::reset(self.socket.fd);
-        self.socket.close(set);
+        self.socket.close(set)
     }
 }
 
@@ -174,11 +237,7 @@ impl Listener {
     /// Listens on address, with a queue of backlog connections, which
     /// the system may cut (SOMAXCONN, 128 on macOS by default).
     pub fn bind(address: SocketAddr, backlog: u32) -> Result<Listener, Error> {
-        let socket = Socket {
-            fd: os::open(&address)?,
-            entry: None,
-            open: true,
-        };
+        let socket = Socket::new(os::open(&address)?);
         os::prepare(socket.fd, address.is_ipv6())?;
         let (bytes, length) = encode(&address);
         os::bind(socket.fd, bytes.get(..length).unwrap_or_default())?;
@@ -192,11 +251,8 @@ impl Listener {
             return Ok(None);
         };
         let stream = Stream {
-            socket: Socket {
-                fd,
-                entry: None,
-                open: true,
-            },
+            socket: Socket::new(fd),
+            link: Link::Connected,
         };
         if stream.no_delay(true).is_err() {
             // Only Nagle's algorithm stays, as Go leaves it then; a socket
@@ -216,14 +272,20 @@ impl Listener {
     }
 
     /// Puts the listener in set with interest, reported with key, or
-    /// changes them.
-    pub fn watch(&mut self, set: &mut Set, interest: u8, key: u64) -> bool {
+    /// changes them. Refused for another Set than the first.
+    pub fn watch(&mut self, set: &mut Set, interest: Interest, key: u64) -> Result<(), SetError> {
         self.socket.watch(set, interest, key)
     }
 
-    /// Takes the listener out of set, and closes it.
-    pub fn close(mut self, set: &mut Set) {
-        self.socket.close(set);
+    /// The listener's entry in its Set, for a deadline.
+    pub fn token(&self) -> Option<Token> {
+        self.socket.token()
+    }
+
+    /// Takes the listener out of set, and closes it; Err as Stream's
+    /// close says.
+    pub fn close(self, set: &mut Set) -> Result<(), SetError> {
+        self.socket.close(set)
     }
 }
 

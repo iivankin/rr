@@ -24,7 +24,7 @@
     },
     {
       "name": "http1",
-      "description": "HTTP/1.1 client side (RFC 9112) without I/O: requests written into a buffer, and an incremental response parser that takes any split of the input and hands body bytes back uncopied, for Content-Length, chunked and close-delimited bodies.",
+      "description": "HTTP/1.1 client side (RFC 9112) without I/O, one Response for each connection: requests written into a buffer and noted in order, pipelined or not, their bodies through an Upload that counts Content-Length and writes the chunked framing; an incremental response parser that takes any split of the input and hands body bytes back uncopied, for Content-Length, chunked and close-delimited bodies, the head readable once final, a close told clean or abrupt, and every misuse refused with a reason.",
       "dependencies": []
     },
     {
@@ -34,14 +34,14 @@
     },
     {
       "name": "net",
-      "description": "TCP over the system's sockets for a loop that serves many: a Listener and the Streams it accepts or that connect out, non-blocking, closed on exec or never inherited, no SIGPIPE; each owns its socket and its entry in a wait Set, which close removes before the socket is closed; errors by kind, IPv4 and IPv6.",
+      "description": "TCP over the system's sockets for a loop that serves many: a Listener and the Streams it accepts or that connect out, non-blocking, closed on exec or never inherited, no SIGPIPE; each owns its socket and its Owned entry in a wait Set, which close removes before the socket is closed, once; a Stream remembers how its connection went, and a read or write before it is made is NotConnected on every system; errors by kind, IPv4 and IPv6.",
       "dependencies": [
         "wait"
       ]
     },
     {
       "name": "resolve",
-      "description": "Host lookup that never blocks the caller's loop, one API on Linux, macOS and Windows: start, poll, take the addresses, drop to cancel. The system answers: mDNSResponder through DNSServiceGetAddrInfo on macOS, on a socket the caller's poll waits on, sorted by RFC 6724 as getaddrinfo sorts; GetAddrInfoExW on Windows, asynchronous and cancellable, its callback signalling the caller's poll; the C library's getaddrinfo on Linux, on a thread of wait's, where a lookup cancelled after it started runs on to the system's timeout.",
+      "description": "Host lookup that never blocks the caller's loop, one API on Linux, macOS and Windows: start, poll, take the addresses (socket_addr keeps a link-local one's interface), drop to cancel. The system answers: mDNSResponder through DNSServiceGetAddrInfo on macOS, on a socket the caller's poll waits on, sorted by RFC 6724 as getaddrinfo sorts; GetAddrInfoExW on Windows, asynchronous and cancellable, its callback signalling the caller's poll; the C library's getaddrinfo on Linux, on a thread of wait's, where a lookup cancelled after it started runs on to the system's timeout.",
       "dependencies": [
         "wait"
       ]
@@ -110,7 +110,7 @@
     },
     {
       "name": "wait",
-      "description": "What a program's loop waits on, for every component that works while it runs: a Set of any number of descriptors (sockets on Windows), each with its interest and a key, and deadlines on the monotonic clock, level-triggered on epoll (Linux), kqueue (macOS), socket notifications (Windows 11, Server 2022) or WSAPoll (earlier Windows), and a Waker for other threads; a component's Wait (up to two descriptors and a timeout), which a Set follows or block waits on alone; and a pool of at most 32 threads with a cancellable FIFO line, and the close-on-exec pipe (Linux and macOS) or non-inherited loopback socket pair (Windows) that says the work is done.",
+      "description": "What a program's loop waits on, for every component that works while it runs: a Set of any number of descriptors (sockets on Windows), each with its Interest and a key, and deadlines on the monotonic clock, level-triggered on epoll (Linux), kqueue (macOS), socket notifications (Windows 11, Server 2022) or WSAPoll (earlier Windows), what is ready reported as Ready, the same on every system, and every refusal as a SetError; tokens of one Set refused by another; Owned entries that only close takes out, closing the descriptor once; a Waker for other threads; a component's Wait (up to two descriptors and a timeout), which a Set follows or block waits on alone; and a pool of at most 32 threads with a cancellable FIFO line (unsafe spawn, a Ticket that cancels when dropped), and the close-on-exec pipe (Linux and macOS) or non-inherited loopback socket pair (Windows) that says the work is done.",
       "dependencies": []
     },
     {

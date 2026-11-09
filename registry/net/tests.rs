@@ -3,7 +3,7 @@
 //! wait (on Windows, socket notifications and WSAPoll both).
 
 use super::{Error, Io, Listener, Stream, descriptors, descriptors_before};
-use crate::base::wait::{ERROR, EXPIRED, HUP, Instant, READ, Set, WRITE};
+use crate::base::wait::{Instant, Interest, Ready, Set, SetError};
 use alloc::vec::Vec;
 use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use test::Bencher;
@@ -24,7 +24,7 @@ fn v6() -> SocketAddr {
 }
 
 /// The events of one wait, as (key, ready), into events.
-fn wait(set: &mut Set, until: Instant, events: &mut Vec<(u64, u8)>) {
+fn wait(set: &mut Set, until: Instant, events: &mut Vec<(u64, Ready)>) {
     events.clear();
     for event in set.wait(Some(until)) {
         events.push((event.key, event.ready));
@@ -32,11 +32,11 @@ fn wait(set: &mut Set, until: Instant, events: &mut Vec<(u64, u8)>) {
 }
 
 /// Waits up to ten seconds for key with any of want; its readiness.
-fn until(set: &mut Set, key: u64, want: u8) -> u8 {
+fn until(set: &mut Set, key: u64, want: Ready) -> Ready {
     let end = Instant::now().after_ms(10_000);
     loop {
         for event in set.wait(Some(end)) {
-            if event.key == key && event.ready & want != 0 {
+            if event.key == key && event.ready.any(want) {
                 return event.ready;
             }
         }
@@ -46,13 +46,13 @@ fn until(set: &mut Set, key: u64, want: u8) -> u8 {
 
 /// Waits ms milliseconds, and checks that key was not reported with any
 /// of these.
-fn quiet(set: &mut Set, key: u64, these: u8, ms: u64) {
+fn quiet(set: &mut Set, key: u64, these: Ready, ms: u64) {
     let end = Instant::now().after_ms(ms);
     while !end.reached_by(Instant::now()) {
         for event in set.wait(Some(end)) {
             assert!(
-                event.key != key || event.ready & these == 0,
-                "key {key} reported {}",
+                event.key != key || !event.ready.any(these),
+                "key {key} reported {:?}",
                 event.ready
             );
         }
@@ -80,20 +80,20 @@ const LISTENER: u64 = 1 << 40;
 fn pair(set: &mut Set, address: SocketAddr) -> (Stream, Stream) {
     let mut listener = Listener::bind(address, 16).unwrap();
     let mut client = Stream::connect(listener.local().unwrap()).unwrap();
-    assert!(listener.watch(set, READ, LISTENER));
-    assert!(client.watch(set, WRITE, LISTENER + 1));
-    until(set, LISTENER + 1, WRITE | ERROR | HUP);
+    listener.watch(set, Interest::Read, LISTENER).unwrap();
+    client.watch(set, Interest::Write, LISTENER + 1).unwrap();
+    until(set, LISTENER + 1, Ready::WRITABLE.with(Ready::ERROR));
     assert!(client.connected().unwrap());
     let server = loop {
         if let Some((server, from)) = listener.accept().unwrap() {
             assert_eq!(Some(from), client.local());
             break server;
         }
-        until(set, LISTENER, READ);
+        until(set, LISTENER, Ready::READABLE);
     };
     assert_eq!(client.peer(), listener.local());
-    listener.close(set);
-    assert!(client.watch(set, 0, LISTENER + 1));
+    listener.close(set).unwrap();
+    client.watch(set, Interest::None, LISTENER + 1).unwrap();
     (client, server)
 }
 
@@ -139,7 +139,7 @@ fn echo_many() {
 fn echo(set: &mut Set, count: usize) {
     let mut listener = Listener::bind(v4(), 1024).unwrap();
     let address = listener.local().unwrap();
-    assert!(listener.watch(set, READ, LISTENER));
+    listener.watch(set, Interest::Read, LISTENER).unwrap();
     let mut clients: Vec<Client> = Vec::new();
     let mut peers: Vec<Peer> = Vec::new();
     let (mut finished, mut closed) = (0, 0);
@@ -151,7 +151,7 @@ fn echo(set: &mut Set, count: usize) {
         while clients.len() < count && clients.len() - finished < 64 {
             let mut stream = Stream::connect(address).unwrap();
             let key = CLIENT | u64::try_from(clients.len()).unwrap();
-            assert!(stream.watch(set, READ | WRITE, key));
+            stream.watch(set, Interest::Both, key).unwrap();
             clients.push(Client {
                 stream: Some(stream),
                 sent: 0,
@@ -169,7 +169,7 @@ fn echo(set: &mut Set, count: usize) {
                 LISTENER => {
                     while let Some((mut stream, _)) = listener.accept().unwrap() {
                         let peer_key = SERVER | u64::try_from(peers.len()).unwrap();
-                        assert!(stream.watch(set, READ, peer_key));
+                        stream.watch(set, Interest::Read, peer_key).unwrap();
                         peers.push(Peer {
                             stream: Some(stream),
                             key: peer_key,
@@ -184,17 +184,17 @@ fn echo(set: &mut Set, count: usize) {
             }
         }
     }
-    listener.close(set);
+    listener.close(set).unwrap();
 }
 
 /// A client's turn: send what the system takes, check what came back; 1
 /// when it got all of it back, and closed.
-fn talk(set: &mut Set, client: &mut Client, seed: usize, ready: u8, buffer: &mut [u8]) -> usize {
+fn talk(set: &mut Set, client: &mut Client, seed: usize, ready: Ready, buffer: &mut [u8]) -> usize {
     let Some(stream) = client.stream.as_mut() else {
         return 0;
     };
-    assert_eq!(ready & ERROR, 0, "client {seed}: {:?}", stream.connected());
-    while ready & WRITE != 0 && client.sent < SIZE {
+    assert!(!ready.error(), "client {seed}: {:?}", stream.connected());
+    while ready.writable() && client.sent < SIZE {
         let piece = buffer.len().min(SIZE - client.sent);
         for (at, slot) in buffer[..piece].iter_mut().enumerate() {
             *slot = byte(seed, client.sent + at);
@@ -204,10 +204,12 @@ fn talk(set: &mut Set, client: &mut Client, seed: usize, ready: u8, buffer: &mut
             Io::Blocked => break,
         }
         if client.sent == SIZE {
-            assert!(stream.watch(set, READ, CLIENT | u64::try_from(seed).unwrap()));
+            stream
+                .watch(set, Interest::Read, CLIENT | u64::try_from(seed).unwrap())
+                .unwrap();
         }
     }
-    if ready & (READ | HUP) == 0 {
+    if !ready.to_read() {
         return 0;
     }
     loop {
@@ -222,7 +224,7 @@ fn talk(set: &mut Set, client: &mut Client, seed: usize, ready: u8, buffer: &mut
             Io::Blocked => return 0,
         }
         if client.got == SIZE {
-            client.stream.take().unwrap().close(set);
+            client.stream.take().unwrap().close(set).unwrap();
             return 1;
         }
     }
@@ -231,13 +233,13 @@ fn talk(set: &mut Set, client: &mut Client, seed: usize, ready: u8, buffer: &mut
 /// The server's turn for one client: read while there is room, send back
 /// what it can, watch for what is left; 1 when the client ended and all
 /// went back, and closed.
-fn serve(set: &mut Set, peer: &mut Peer, ready: u8, buffer: &mut [u8]) -> usize {
+fn serve(set: &mut Set, peer: &mut Peer, ready: Ready, buffer: &mut [u8]) -> usize {
     let key = peer.key;
     let Some(stream) = peer.stream.as_mut() else {
         return 0;
     };
-    assert_eq!(ready & ERROR, 0, "server: {:?}", stream.connected());
-    while ready & (READ | HUP) != 0 && !peer.ended && peer.pending.len() < 256 * 1024 {
+    assert!(!ready.error(), "server: {:?}", stream.connected());
+    while ready.to_read() && !peer.ended && peer.pending.len() < 256 * 1024 {
         match stream.read(buffer).unwrap() {
             Io::Done(0) => peer.ended = true,
             Io::Done(got) => peer.pending.extend_from_slice(&buffer[..got]),
@@ -251,12 +253,11 @@ fn serve(set: &mut Set, peer: &mut Peer, ready: u8, buffer: &mut [u8]) -> usize 
         }
     }
     if peer.ended && peer.pending.is_empty() {
-        peer.stream.take().unwrap().close(set);
+        peer.stream.take().unwrap().close(set).unwrap();
         return 1;
     }
-    let read = if peer.ended { 0 } else { READ };
-    let write = if peer.pending.is_empty() { 0 } else { WRITE };
-    assert!(stream.watch(set, read | write, key));
+    let (read, write) = (!peer.ended, !peer.pending.is_empty());
+    stream.watch(set, Interest::new(read, write), key).unwrap();
     0
 }
 
@@ -283,14 +284,14 @@ fn backpressure() {
         }
         assert!(blocked, "sent {sent} without blocking");
         let total = (8 << 20usize).max(sent + 1);
-        assert!(client.watch(&mut set, WRITE, 1));
-        assert!(server.watch(&mut set, READ, 2));
+        client.watch(&mut set, Interest::Write, 1).unwrap();
+        server.watch(&mut set, Interest::Read, 2).unwrap();
         let end = Instant::now().after_ms(30_000);
         while got < total {
             assert!(!end.reached_by(Instant::now()), "got {got} of {total}");
             wait(&mut set, end, &mut events);
             for &(key, ready) in &events {
-                if key == 2 && ready & READ != 0 {
+                if key == 2 && ready.readable() {
                     while let Io::Done(count) = server.read(&mut chunk).unwrap() {
                         assert!(count > 0, "ended at {got}");
                         for (at, &found) in chunk[..count].iter().enumerate() {
@@ -299,7 +300,7 @@ fn backpressure() {
                         got += count;
                     }
                 }
-                if key == 1 && ready & WRITE != 0 && sent < total {
+                if key == 1 && ready.writable() && sent < total {
                     let piece = chunk.len().min(total - sent);
                     for (at, slot) in chunk[..piece].iter_mut().enumerate() {
                         *slot = byte(1, sent + at);
@@ -308,13 +309,13 @@ fn backpressure() {
                         sent += count;
                     }
                     if sent == total {
-                        assert!(client.watch(&mut set, 0, 1));
+                        client.watch(&mut set, Interest::None, 1).unwrap();
                     }
                 }
             }
         }
-        client.close(&mut set);
-        server.close(&mut set);
+        client.close(&mut set).unwrap();
+        server.close(&mut set).unwrap();
     }
 }
 
@@ -332,8 +333,8 @@ fn echo_both_families() {
         // On by default; Nagle's algorithm and back.
         client.no_delay(false).unwrap();
         client.no_delay(true).unwrap();
-        assert!(client.watch(&mut set, READ | WRITE, 1));
-        assert!(server.watch(&mut set, READ, 2));
+        client.watch(&mut set, Interest::Both, 1).unwrap();
+        server.watch(&mut set, Interest::Read, 2).unwrap();
         let total = 4 << 20;
         let (mut sent, mut got) = (0, 0);
         pending.clear();
@@ -343,8 +344,8 @@ fn echo_both_families() {
             assert!(!end.reached_by(Instant::now()), "sent {sent}, got {got}");
             wait(&mut set, end, &mut events);
             for &(key, ready) in &events {
-                assert_eq!(ready & ERROR, 0);
-                if key == 1 && ready & WRITE != 0 && sent < total {
+                assert!(!ready.error());
+                if key == 1 && ready.writable() && sent < total {
                     let piece = buffer.len().min(total - sent);
                     for (at, slot) in buffer[..piece].iter_mut().enumerate() {
                         *slot = byte(2, sent + at);
@@ -354,15 +355,15 @@ fn echo_both_families() {
                     }
                     if sent == total {
                         client.finish().unwrap();
-                        assert!(client.watch(&mut set, READ, 1));
+                        client.watch(&mut set, Interest::Read, 1).unwrap();
                     }
                 }
-                if key == 1 && ready & (READ | HUP) != 0 {
+                if key == 1 && ready.to_read() {
                     while let Io::Done(count) = client.read(&mut buffer).unwrap() {
                         if count == 0 {
                             assert_eq!(got, total);
                             client_ended = true;
-                            assert!(client.watch(&mut set, 0, 1));
+                            client.watch(&mut set, Interest::None, 1).unwrap();
                             break;
                         }
                         for (at, &found) in buffer[..count].iter().enumerate() {
@@ -385,17 +386,18 @@ fn echo_both_families() {
                             Io::Blocked => break,
                         }
                     }
-                    let read = if server_ended { 0 } else { READ };
-                    let write = if pending.is_empty() { 0 } else { WRITE };
+                    let (read, write) = (!server_ended, !pending.is_empty());
                     if server_ended && pending.is_empty() {
                         server.finish().unwrap();
                     }
-                    assert!(server.watch(&mut set, read | write, 2));
+                    server
+                        .watch(&mut set, Interest::new(read, write), 2)
+                        .unwrap();
                 }
             }
         }
-        client.close(&mut set);
-        server.close(&mut set);
+        client.close(&mut set).unwrap();
+        server.close(&mut set).unwrap();
     }
 }
 
@@ -406,14 +408,19 @@ fn refused() {
     for mut set in sets() {
         let listener = Listener::bind(v4(), 1).unwrap();
         let address = listener.local().unwrap();
-        listener.close(&mut set);
+        listener.close(&mut set).unwrap();
         match Stream::connect(address) {
             Err(error) => assert_eq!(error, Error::Refused),
             Ok(mut stream) => {
-                assert!(stream.watch(&mut set, READ | WRITE, 1));
-                until(&mut set, 1, ERROR | HUP);
+                stream.watch(&mut set, Interest::Both, 1).unwrap();
+                until(&mut set, 1, Ready::ERROR.with(Ready::HANGUP));
+                // The same error every time, and for reads and writes:
+                // the system says it once.
                 assert_eq!(stream.connected(), Err(Error::Refused));
-                stream.close(&mut set);
+                assert_eq!(stream.connected(), Err(Error::Refused));
+                assert_eq!(stream.read(&mut [0; 8]), Err(Error::Refused));
+                assert_eq!(stream.write(b"x"), Err(Error::Refused));
+                stream.close(&mut set).unwrap();
             }
         }
     }
@@ -426,22 +433,26 @@ fn refused() {
 fn hangup_reset_and_gone() {
     for mut set in sets() {
         let (mut closing, closer) = pair(&mut set, v4());
-        assert!(closing.watch(&mut set, READ, 1));
-        closer.close(&mut set);
-        until(&mut set, 1, READ | HUP);
+        closing.watch(&mut set, Interest::Read, 1).unwrap();
+        closer.close(&mut set).unwrap();
+        until(&mut set, 1, Ready::READABLE.with(Ready::HANGUP));
         assert_eq!(closing.read(&mut [0; 8]), Ok(Io::Done(0)));
-        closing.close(&mut set);
+        closing.close(&mut set).unwrap();
 
         let (mut resetting, resetter) = pair(&mut set, v4());
-        assert!(resetting.watch(&mut set, READ, 2));
-        resetter.abort(&mut set);
-        until(&mut set, 2, READ | HUP | ERROR);
+        resetting.watch(&mut set, Interest::Read, 2).unwrap();
+        resetter.abort(&mut set).unwrap();
+        until(
+            &mut set,
+            2,
+            Ready::READABLE.with(Ready::HANGUP).with(Ready::ERROR),
+        );
         assert_eq!(resetting.read(&mut [0; 8]), Err(Error::Reset));
-        resetting.close(&mut set);
+        resetting.close(&mut set).unwrap();
 
         let (mut writer, gone) = pair(&mut set, v4());
-        gone.close(&mut set);
-        assert!(writer.watch(&mut set, WRITE, 3));
+        gone.close(&mut set).unwrap();
+        writer.watch(&mut set, Interest::Write, 3).unwrap();
         let end = Instant::now().after_ms(10_000);
         let failed = loop {
             assert!(
@@ -456,7 +467,7 @@ fn hangup_reset_and_gone() {
             }
         };
         assert_eq!(failed, Error::Reset);
-        writer.close(&mut set);
+        writer.close(&mut set).unwrap();
     }
 }
 
@@ -467,22 +478,22 @@ fn hangup_reset_and_gone() {
 #[test]
 fn interest() {
     for mut set in sets() {
-        let (mut client, server) = pair(&mut set, v4());
-        assert!(client.watch(&mut set, 0, 1));
+        let (mut client, mut server) = pair(&mut set, v4());
+        client.watch(&mut set, Interest::None, 1).unwrap();
         assert_eq!(server.write(b"x"), Ok(Io::Done(1)));
-        quiet(&mut set, 1, READ | WRITE, 50);
-        assert!(client.watch(&mut set, WRITE, 1));
-        assert_eq!(until(&mut set, 1, WRITE) & READ, 0);
-        assert!(client.watch(&mut set, READ, 1));
-        until(&mut set, 1, READ);
+        quiet(&mut set, 1, Ready::READABLE.with(Ready::WRITABLE), 50);
+        client.watch(&mut set, Interest::Write, 1).unwrap();
+        assert!(!until(&mut set, 1, Ready::WRITABLE).readable());
+        client.watch(&mut set, Interest::Read, 1).unwrap();
+        until(&mut set, 1, Ready::READABLE);
         assert_eq!(client.read(&mut [0; 8]), Ok(Io::Done(1)));
-        quiet(&mut set, 1, READ | WRITE, 50);
+        quiet(&mut set, 1, Ready::READABLE.with(Ready::WRITABLE), 50);
         assert!(
             wakeups(&mut set, 100) <= 3,
             "a narrowed interest woke the Set"
         );
-        client.close(&mut set);
-        server.close(&mut set);
+        client.close(&mut set).unwrap();
+        server.close(&mut set).unwrap();
     }
 }
 
@@ -492,21 +503,27 @@ fn interest() {
 fn paused() {
     for mut set in sets() {
         let (mut client, server) = pair(&mut set, v4());
-        assert!(client.watch(&mut set, 0, 1));
-        server.abort(&mut set);
-        quiet(&mut set, 1, u8::MAX, 50);
+        client.watch(&mut set, Interest::None, 1).unwrap();
+        server.abort(&mut set).unwrap();
+        quiet(&mut set, 1, Ready::ANY, 50);
         let token = client.token().unwrap();
-        set.deadline(token, Some(Instant::now().after_ms(10)));
-        until(&mut set, 1, EXPIRED);
-        assert!(client.watch(&mut set, READ, 1));
-        assert_ne!(until(&mut set, 1, READ | HUP | ERROR), 0);
-        assert!(client.watch(&mut set, 0, 1));
-        quiet(&mut set, 1, u8::MAX, 50);
+        set.deadline(token, Some(Instant::now().after_ms(10)))
+            .unwrap();
+        assert_eq!(set.remove(token), Err(SetError::Owned));
+        until(&mut set, 1, Ready::EXPIRED);
+        client.watch(&mut set, Interest::Read, 1).unwrap();
+        until(
+            &mut set,
+            1,
+            Ready::READABLE.with(Ready::HANGUP).with(Ready::ERROR),
+        );
+        client.watch(&mut set, Interest::None, 1).unwrap();
+        quiet(&mut set, 1, Ready::ANY, 50);
         assert!(
             wakeups(&mut set, 100) <= 3,
             "a socket with no interest woke the Set"
         );
-        client.close(&mut set);
+        client.close(&mut set).unwrap();
     }
 }
 
@@ -517,23 +534,23 @@ fn paused() {
 #[test]
 fn stale_token() {
     for mut set in sets() {
-        let (client, server) = pair(&mut set, v4());
-        let old = set.add(server.raw(), READ, 1).unwrap();
+        let (mut client, server) = pair(&mut set, v4());
+        let old = set.add(server.raw(), Interest::Read, 1).unwrap();
         assert_eq!(client.write(b"x"), Ok(Io::Done(1)));
-        until(&mut set, 1, READ);
-        set.remove(old);
-        client.close(&mut set);
+        until(&mut set, 1, Ready::READABLE);
+        set.remove(old).unwrap();
+        client.close(&mut set).unwrap();
         drop(server);
-        let (new_client, new_server) = pair(&mut set, v4());
-        let new = set.add(new_server.raw(), READ, 2).unwrap();
-        assert!(!set.modify(old, READ | WRITE));
-        set.deadline(old, Some(Instant::now()));
-        set.remove(old);
+        let (mut new_client, new_server) = pair(&mut set, v4());
+        let new = set.add(new_server.raw(), Interest::Read, 2).unwrap();
+        assert_eq!(set.modify(old, Interest::Both), Err(SetError::Gone));
+        assert_eq!(set.deadline(old, Some(Instant::now())), Err(SetError::Gone));
+        assert_eq!(set.remove(old), Err(SetError::Gone));
         assert_eq!(new_client.write(b"y"), Ok(Io::Done(1)));
-        until(&mut set, 2, READ);
-        quiet(&mut set, 1, u8::MAX, 30);
-        set.remove(new);
-        new_client.close(&mut set);
+        until(&mut set, 2, Ready::READABLE);
+        quiet(&mut set, 1, Ready::ANY, 30);
+        set.remove(new).unwrap();
+        new_client.close(&mut set).unwrap();
     }
 }
 
@@ -546,7 +563,7 @@ fn dropped_without_close() {
     let mut others = Vec::new();
     for mut set in sets() {
         let (mut old, old_server) = pair(&mut set, v4());
-        assert!(old.watch(&mut set, READ, 1));
+        old.watch(&mut set, Interest::Read, 1).unwrap();
         let old_token = old.token().unwrap();
         let number = old.raw();
         drop(old);
@@ -558,12 +575,15 @@ fn dropped_without_close() {
             others.push(listener);
             listener = Listener::bind(v4(), 4).unwrap();
         }
-        assert!(listener.watch(&mut set, READ, 2));
-        set.remove(old_token);
+        listener.watch(&mut set, Interest::Read, 2).unwrap();
+        // Gone where the listener took its number; elsewhere owned by
+        // the stream that was dropped, and left until a socket does.
+        let removed = set.remove(old_token);
+        assert!(matches!(removed, Err(SetError::Gone | SetError::Owned)));
         let client = Stream::connect(listener.local().unwrap()).unwrap();
-        until(&mut set, 2, READ);
-        quiet(&mut set, 1, u8::MAX, 30);
-        listener.close(&mut set);
+        until(&mut set, 2, Ready::READABLE);
+        quiet(&mut set, 1, Ready::ANY, 30);
+        listener.close(&mut set).unwrap();
         drop(client);
         drop(old_server);
     }
@@ -580,16 +600,16 @@ fn address_in_use_then_free() {
     let address = first.local().unwrap();
     assert!(matches!(Listener::bind(address, 4), Err(Error::InUse)));
     let mut client = Stream::connect(address).unwrap();
-    assert!(client.watch(&mut set, WRITE, 1));
-    until(&mut set, 1, WRITE);
-    assert!(first.watch(&mut set, READ, 2));
-    until(&mut set, 2, READ);
+    client.watch(&mut set, Interest::Write, 1).unwrap();
+    until(&mut set, 1, Ready::WRITABLE);
+    first.watch(&mut set, Interest::Read, 2).unwrap();
+    until(&mut set, 2, Ready::READABLE);
     let (server, _) = first.accept().unwrap().unwrap();
-    server.close(&mut set);
-    assert!(client.watch(&mut set, READ, 1));
-    until(&mut set, 1, READ | HUP);
-    client.close(&mut set);
-    first.close(&mut set);
+    server.close(&mut set).unwrap();
+    client.watch(&mut set, Interest::Read, 1).unwrap();
+    until(&mut set, 1, Ready::READABLE.with(Ready::HANGUP));
+    client.close(&mut set).unwrap();
+    first.close(&mut set).unwrap();
     let again = Listener::bind(address, 4);
     assert!(again.is_ok(), "{:?}", again.err());
 }
@@ -603,7 +623,7 @@ fn many_clients() {
     let mut set = Set::new().unwrap();
     let mut listener = Listener::bind(v4(), 256).unwrap();
     let address = listener.local().unwrap();
-    assert!(listener.watch(&mut set, READ, LISTENER));
+    listener.watch(&mut set, Interest::Read, LISTENER).unwrap();
     let total: usize = 200;
     let mut clients = Vec::new();
     let mut servers: Vec<Stream> = Vec::new();
@@ -615,7 +635,7 @@ fn many_clients() {
         while clients.len() < total && clients.len() - done < 64 {
             let mut client = Stream::connect(address).unwrap();
             let key = u64::try_from(clients.len()).unwrap();
-            assert!(client.watch(&mut set, WRITE, key));
+            client.watch(&mut set, Interest::Write, key).unwrap();
             clients.push((client, false, false));
         }
         assert!(!end.reached_by(Instant::now()), "{done} of {total}");
@@ -624,7 +644,9 @@ fn many_clients() {
             if key == LISTENER {
                 while let Some((mut server, _)) = listener.accept().unwrap() {
                     let index = u64::try_from(servers.len()).unwrap();
-                    assert!(server.watch(&mut set, READ, SERVER | index));
+                    server
+                        .watch(&mut set, Interest::Read, SERVER | index)
+                        .unwrap();
                     servers.push(server);
                 }
             } else if key & SERVER == SERVER {
@@ -637,18 +659,18 @@ fn many_clients() {
                 }
             } else {
                 let (client, sent, finished) = &mut clients[usize::try_from(key).unwrap()];
-                assert_eq!(ready & ERROR, 0);
-                if !*sent && ready & WRITE != 0 {
+                assert!(!ready.error());
+                if !*sent && ready.writable() {
                     assert!(client.connected().unwrap());
                     assert_eq!(client.write(line), Ok(Io::Done(line.len())));
                     *sent = true;
-                    assert!(client.watch(&mut set, READ, key));
-                } else if !*finished && ready & READ != 0 {
+                    client.watch(&mut set, Interest::Read, key).unwrap();
+                } else if !*finished && ready.readable() {
                     let mut buffer = [0u8; 64];
                     assert_eq!(client.read(&mut buffer), Ok(Io::Done(line.len())));
                     assert_eq!(&buffer[..line.len()], line);
                     *finished = true;
-                    assert!(client.watch(&mut set, 0, key));
+                    client.watch(&mut set, Interest::None, key).unwrap();
                     done += 1;
                 } else {
                     // Reported before, or spurious.
@@ -657,12 +679,12 @@ fn many_clients() {
         }
     }
     for (client, _, _) in clients {
-        client.close(&mut set);
+        client.close(&mut set).unwrap();
     }
     for server in servers {
-        server.close(&mut set);
+        server.close(&mut set).unwrap();
     }
-    listener.close(&mut set);
+    listener.close(&mut set).unwrap();
 }
 
 /// A thousand connections, all idle but one, which gets a byte: a wait
@@ -675,12 +697,12 @@ fn one_of_a_thousand(b: &mut Bencher) {
     let mut pairs = Vec::new();
     for key in 0..1000u64 {
         let (client, mut server) = pair(&mut set, v4());
-        assert!(server.watch(&mut set, READ, key));
+        server.watch(&mut set, Interest::Read, key).unwrap();
         pairs.push((client, server));
     }
     let mut byte_read = [0u8; 1];
     {
-        let (writer, reader) = &pairs[500];
+        let (writer, reader) = &mut pairs[500];
         b.iter(|| {
             assert_eq!(writer.write(b"x"), Ok(Io::Done(1)));
             loop {
@@ -692,8 +714,8 @@ fn one_of_a_thousand(b: &mut Bencher) {
         });
     }
     for (client, server) in pairs {
-        client.close(&mut set);
-        server.close(&mut set);
+        client.close(&mut set).unwrap();
+        server.close(&mut set).unwrap();
     }
 }
 
@@ -715,45 +737,42 @@ fn descriptors_as_held() {
 #[test]
 fn removed_and_added_again() {
     for mut set in sets() {
-        let (client, server) = pair(&mut set, v4());
-        let first = set.add(server.raw(), READ, 1).unwrap();
-        set.remove(first);
-        let again = set.add(server.raw(), READ, 2).unwrap();
+        let (mut client, server) = pair(&mut set, v4());
+        let first = set.add(server.raw(), Interest::Read, 1).unwrap();
+        set.remove(first).unwrap();
+        let again = set.add(server.raw(), Interest::Read, 2).unwrap();
         assert_eq!(client.write(b"x"), Ok(Io::Done(1)));
-        until(&mut set, 2, READ);
-        set.remove(again);
-        client.close(&mut set);
+        until(&mut set, 2, Ready::READABLE);
+        set.remove(again).unwrap();
+        client.close(&mut set).unwrap();
     }
 }
 
 /// The peer finished while the writer waits for room: the hangup, which
 /// ends reading, is not reported to a Set that waits for writing alone,
-/// and wakes it no more than writing does.
+/// on any system, and wakes it no more than writing does but on WSAPoll,
+/// which reports it whatever it is asked, and where it shows as writable.
 #[test]
 fn half_closed_writer() {
     let chunk = [7u8; 16 * 1024];
     for (at, mut set) in sets().into_iter().enumerate() {
-        // WSAPoll reports a hangup whatever it is asked (wait's sys.rs).
         let polled = cfg!(target_os = "windows") && at == 1;
-        let (mut client, server) = pair(&mut set, v4());
+        let (mut client, mut server) = pair(&mut set, v4());
         let mut sent = 0usize;
         while let Io::Done(count) = client.write(&chunk).unwrap() {
             sent += count;
             assert!(sent < 1 << 30, "never blocked");
         }
         server.finish().unwrap();
-        assert!(client.watch(&mut set, WRITE, 1));
+        client.watch(&mut set, Interest::Write, 1).unwrap();
         let end = Instant::now().after_ms(100);
         let mut idle = 0;
         while !end.reached_by(Instant::now()) {
             let mut writable = false;
             for event in set.wait(Some(end)) {
                 if event.key == 1 {
-                    assert!(
-                        polled || event.ready & HUP == 0,
-                        "a writer told of a hangup"
-                    );
-                    writable |= event.ready & WRITE != 0;
+                    assert!(!event.ready.hangup(), "a writer told of a hangup");
+                    writable |= event.ready.writable();
                 }
             }
             if writable {
@@ -767,8 +786,8 @@ fn half_closed_writer() {
             polled || idle <= 3,
             "woken {idle} times with nothing to write"
         );
-        client.close(&mut set);
-        server.close(&mut set);
+        client.close(&mut set).unwrap();
+        server.close(&mut set).unwrap();
     }
 }
 
@@ -780,12 +799,26 @@ fn closed_handles_taken_again() {
     for mut set in sets() {
         for round in 0..50u64 {
             let (mut client, mut server) = pair(&mut set, v4());
-            assert!(client.watch(&mut set, READ, 2 * round + 1));
-            assert!(server.watch(&mut set, READ, 2 * round + 2));
-            quiet(&mut set, 2 * round + 1, HUP | ERROR, 10);
-            quiet(&mut set, 2 * round + 2, HUP | ERROR, 10);
-            client.abort(&mut set);
-            server.close(&mut set);
+            client
+                .watch(&mut set, Interest::Read, 2 * round + 1)
+                .unwrap();
+            server
+                .watch(&mut set, Interest::Read, 2 * round + 2)
+                .unwrap();
+            quiet(
+                &mut set,
+                2 * round + 1,
+                Ready::HANGUP.with(Ready::ERROR),
+                10,
+            );
+            quiet(
+                &mut set,
+                2 * round + 2,
+                Ready::HANGUP.with(Ready::ERROR),
+                10,
+            );
+            client.abort(&mut set).unwrap();
+            server.close(&mut set).unwrap();
         }
     }
 }
@@ -799,31 +832,29 @@ fn closed_handles_taken_again() {
 fn finished_writer() {
     let mut buffer = [0u8; 64];
     let mut answer = Vec::new();
-    for (at, mut set) in sets().into_iter().enumerate() {
-        // WSAPoll reports a hangup whatever it is asked (wait's sys.rs).
-        let polled = cfg!(target_os = "windows") && at == 1;
+    for mut set in sets() {
         let (mut client, mut server) = pair(&mut set, v4());
         assert_eq!(client.write(b"request"), Ok(Io::Done(7)));
         client.finish().unwrap();
-        assert!(client.watch(&mut set, WRITE, 1));
+        client.watch(&mut set, Interest::Write, 1).unwrap();
         let end = Instant::now().after_ms(50);
         let mut writable = false;
         while !end.reached_by(Instant::now()) {
             for event in set.wait(Some(end)) {
                 if event.key == 1 {
-                    assert!(polled || event.ready & HUP == 0, "its own finish a hangup");
-                    assert_eq!(event.ready & ERROR, 0);
-                    writable |= event.ready & WRITE != 0;
+                    assert!(!event.ready.hangup(), "its own finish a hangup");
+                    assert!(!event.ready.error());
+                    writable |= event.ready.writable();
                 }
             }
         }
         // Linux and macOS say a socket that finished is writable: a write
         // fails at once, and does not block.
         assert!(writable || cfg!(target_os = "windows"));
-        assert!(server.watch(&mut set, READ, 2));
+        server.watch(&mut set, Interest::Read, 2).unwrap();
         let mut got = 0;
         while got < 7 {
-            until(&mut set, 2, READ);
+            until(&mut set, 2, Ready::READABLE);
             if let Io::Done(count) = server.read(&mut buffer).unwrap() {
                 got += count;
             }
@@ -831,12 +862,12 @@ fn finished_writer() {
         assert_eq!(server.read(&mut buffer), Ok(Io::Done(0)));
         assert_eq!(server.write(b"answer"), Ok(Io::Done(6)));
         server.finish().unwrap();
-        assert!(server.watch(&mut set, 0, 2));
-        assert!(client.watch(&mut set, READ | WRITE, 1));
+        server.watch(&mut set, Interest::None, 2).unwrap();
+        client.watch(&mut set, Interest::Both, 1).unwrap();
         answer.clear();
         loop {
-            let ready = until(&mut set, 1, READ | HUP);
-            assert_eq!(ready & ERROR, 0);
+            let ready = until(&mut set, 1, Ready::READABLE.with(Ready::HANGUP));
+            assert!(!ready.error());
             match client.read(&mut buffer).unwrap() {
                 Io::Done(0) => break,
                 Io::Done(count) => answer.extend_from_slice(&buffer[..count]),
@@ -844,8 +875,8 @@ fn finished_writer() {
             }
         }
         assert_eq!(answer, b"answer");
-        client.close(&mut set);
-        server.close(&mut set);
+        client.close(&mut set).unwrap();
+        server.close(&mut set).unwrap();
     }
 }
 
@@ -858,23 +889,100 @@ fn finished_writer() {
 fn added_twice() {
     for (at, mut set) in sets().into_iter().enumerate() {
         let polled = cfg!(target_os = "windows") && at == 1;
-        let (client, server) = pair(&mut set, v4());
-        let first = set.add(server.raw(), READ, 1).unwrap();
-        let again = set.add(server.raw(), READ | WRITE, 2);
-        assert_eq!(again.is_some(), polled);
+        let (mut client, mut server) = pair(&mut set, v4());
+        let first = set.add(server.raw(), Interest::Read, 1).unwrap();
+        let again = set.add(server.raw(), Interest::Both, 2);
+        assert_eq!(again.is_ok(), polled);
+        if !polled {
+            assert_eq!(again.err(), Some(SetError::Twice));
+        }
         let (kept, gone) = if polled { (2, 1) } else { (1, 2) };
         assert_eq!(client.write(b"x"), Ok(Io::Done(1)));
-        until(&mut set, kept, READ);
+        until(&mut set, kept, Ready::READABLE);
         assert_eq!(server.read(&mut [0; 8]), Ok(Io::Done(1)));
         if !polled {
-            quiet(&mut set, kept, READ, 50);
+            quiet(&mut set, kept, Ready::READABLE, 50);
             assert!(
                 wakeups(&mut set, 100) <= 3,
                 "the refused entry woke the Set"
             );
         }
-        quiet(&mut set, gone, u8::MAX, 30);
-        set.remove(again.unwrap_or(first));
-        client.close(&mut set);
+        quiet(&mut set, gone, Ready::ANY, 30);
+        set.remove(again.unwrap_or(first)).unwrap();
+        client.close(&mut set).unwrap();
+    }
+}
+
+/// A connection still being made reads and writes as NotConnected, on
+/// every system, until connected says otherwise: to TEST-NET-1 (RFC
+/// 5737), which nothing answers; where it has no route the system
+/// refuses it at once, or connected's error is then every call's.
+#[test]
+fn not_connected_yet() {
+    let address = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 9));
+    let Ok(mut stream) = Stream::connect(address) else {
+        return;
+    };
+    match stream.connected() {
+        Ok(false) => {
+            assert_eq!(stream.read(&mut [0; 8]), Err(Error::NotConnected));
+            assert_eq!(stream.write(b"x"), Err(Error::NotConnected));
+            assert_eq!(stream.finish(), Err(Error::NotConnected));
+        }
+        Ok(true) => panic!("TEST-NET-1 answered"),
+        Err(error) => {
+            assert_eq!(stream.read(&mut [0; 8]), Err(error));
+            assert_eq!(stream.write(b"x"), Err(error));
+        }
+    }
+}
+
+/// A read into no room is refused: its Done(0) would be the peer's end.
+#[test]
+fn no_room() {
+    let mut set = Set::new().unwrap();
+    let (mut client, mut server) = pair(&mut set, v4());
+    assert_eq!(server.write(b"x"), Ok(Io::Done(1)));
+    assert_eq!(client.read(&mut []), Err(Error::NoRoom));
+    client.watch(&mut set, Interest::Read, 1).unwrap();
+    until(&mut set, 1, Ready::READABLE);
+    assert_eq!(client.read(&mut [0; 8]), Ok(Io::Done(1)));
+    client.close(&mut set).unwrap();
+    server.close(&mut set).unwrap();
+}
+
+/// A stream is its first Set's: another refuses to watch it, and to close
+/// it, which closes the socket all the same, once: the peer reads its
+/// end, and the sockets made after, one of which may take its number,
+/// stay open. Its token is lent for deadlines: neither Set removes it.
+#[test]
+fn closed_once_in_its_own_set() {
+    for mut set in sets() {
+        let mut other = Set::new().unwrap();
+        let (mut client, mut server) = pair(&mut set, v4());
+        let token = client.token().unwrap();
+        assert_eq!(set.remove(token), Err(SetError::Owned));
+        assert_eq!(other.remove(token), Err(SetError::Foreign));
+        assert_eq!(
+            client.watch(&mut other, Interest::Read, 1),
+            Err(SetError::Foreign)
+        );
+        assert_eq!(client.close(&mut other), Err(SetError::Foreign));
+        server.watch(&mut set, Interest::Read, 2).unwrap();
+        until(&mut set, 2, Ready::READABLE.with(Ready::HANGUP));
+        assert_eq!(server.read(&mut [0; 8]), Ok(Io::Done(0)));
+        let mut listener = Listener::bind(v4(), 4).unwrap();
+        listener.watch(&mut set, Interest::Read, 3).unwrap();
+        let mut late = Stream::connect(listener.local().unwrap()).unwrap();
+        until(&mut set, 3, Ready::READABLE);
+        let (mut accepted, _) = listener.accept().unwrap().unwrap();
+        assert_eq!(accepted.write(b"y"), Ok(Io::Done(1)));
+        late.watch(&mut set, Interest::Read, 4).unwrap();
+        until(&mut set, 4, Ready::READABLE);
+        assert_eq!(late.read(&mut [0; 8]), Ok(Io::Done(1)));
+        late.close(&mut set).unwrap();
+        accepted.close(&mut set).unwrap();
+        server.close(&mut set).unwrap();
+        listener.close(&mut set).unwrap();
     }
 }
