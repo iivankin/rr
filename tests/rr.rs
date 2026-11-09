@@ -1547,6 +1547,28 @@ fn const_generic_code_is_checked_in_each_instantiation() {
 }
 
 #[test]
+fn an_event_loop_path_does_not_block() {
+    let sys = "pub mod sys {\n// rr: escape(unsafe): the C library.\nunsafe extern \"C\" {\n #[must_use]\n fn sleep(s: u32) -> u32;\n}\n\
+               #[must_use]\npub fn nap(s: u32) -> u32 {\n // rr: escape(unsafe): sleep takes any count.\n unsafe { sleep(s) }\n}\n}\n\
+               #[cfg_attr(rr, rr::blocking)]\n#[must_use]\npub fn lookup(n: u8) -> u8 { n }\n";
+    for body in ["lookup(n)", "u8::try_from(sys::nap(1)).unwrap_or(n)"] {
+        let source = format!(
+            "#![no_std]\n{sys}fn handle(n: u8) -> u8 {{ {body} }}\n#[cfg_attr(rr, rr::poll)]\n#[must_use]\npub fn on_event(n: u8) -> u8 {{ handle(n) }}"
+        );
+        rejected(&source, "rr_blocking");
+    }
+    // Off the loop's path, or with a reason at the call, it may block.
+    accepted(&format!(
+        "#![no_std]\n{sys}#[must_use]\npub fn start(n: u8) -> u8 {{ lookup(n) }}\n#[cfg_attr(rr, rr::poll)]\n#[must_use]\n\
+         pub fn on_event(n: u8) -> u8 {{\n // rr: escape(block): the first event only, before any connection is open.\n lookup(n)\n}}"
+    ));
+    // A misspelt mark marks nothing: it is an error.
+    for mark in ["#[rr::hott]", "#[cfg_attr(rr, rr::pol)]"] {
+        rejected(&format!("#![no_std]\n{mark}\npub fn f() {{}}"), "rr_no_macros");
+    }
+}
+
+#[test]
 fn a_hot_path_grows_a_lent_buffer_only_up_to_a_limit() {
     rejected(
         &alloc_fixture("#[rr::hot]\npub fn put(out: &mut Vec<u8>, b: u8) { out.push(b); }"),

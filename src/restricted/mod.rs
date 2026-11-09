@@ -5,6 +5,7 @@ use rustc_middle::ty::TyCtxt;
 use rustc_session::declare_lint;
 
 mod allocs;
+mod blocking;
 mod bounds;
 mod builtins;
 mod calls;
@@ -41,6 +42,7 @@ declare_lint! { pub RR_DUPLICATE, Deny, "rr forbids a function body that repeats
 declare_lint! { pub RR_UNUSED_DERIVE, Deny, "rr forbids a derived trait that nothing in the program uses" }
 declare_lint! { pub RR_LOOP_BUFFER, Deny, "rr forbids a buffer made and freed again on every turn of a loop" }
 declare_lint! { pub RR_MUST_USE, Deny, "rr requires #[must_use] on a function that changes something and returns a bool, an integer or an Option" }
+declare_lint! { pub RR_BLOCKING, Deny, "rr forbids a call that blocks on a path marked #[rr::poll] without a reason" }
 declare_lint! { pub RR_UNBOUNDED, Deny, "rr forbids a collection kept in a field growing with nothing that holds it to a limit" }
 
 /// The kinds of rr's own rules a reason names.
@@ -58,6 +60,7 @@ const RULE_KINDS: &[&str] = &[
     "tag",
     "duplicate",
     "dyn",
+    "block",
 ];
 
 /// Clippy lints rr enforces as its own: forbidden in every rr command,
@@ -353,6 +356,7 @@ pub fn register(store: &mut LintStore) {
         RR_NO_RECURSION,
         RR_UNUSED_ESCAPE,
         RR_MUST_USE,
+        RR_BLOCKING,
     ];
     store.register_lints(lints);
     store.register_group(true, "rr", None, lints.iter().map(|lint| LintId::of(lint)).collect());
@@ -363,6 +367,7 @@ pub fn register(store: &mut LintStore) {
     store.register_late_lint_pass(Box::new(|_| Box::new(chains::Chains)));
     store.register_late_lint_pass(Box::new(|_| Box::new(ffi::Ffi)));
     store.register_late_lint_pass(Box::new(|_| Box::new(outcomes::Outcomes)));
+    store.register_late_lint_pass(Box::new(|_| Box::new(blocking::Blocking)));
     store.register_late_lint_pass(Box::new(|_| Box::<disguises::Disguises>::default()));
     store.register_late_lint_pass(Box::new(|_| Box::new(duplicates::Duplicates)));
     store.register_late_lint_pass(Box::new(|_| Box::new(derives::Derives::default())));

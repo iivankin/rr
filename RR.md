@@ -186,6 +186,7 @@ Rules are compiler errors and cannot be lowered with `allow`, `-A rr`,
 | rr_unused_escape | Forbid a reason that answers nothing: a kind with no such operation beside it, a kind rr does not know, or the old form that names none |
 | rr_c_signature | Forbid a reference in a C function's declaration: C has pointers |
 | rr_must_use | Require `#[must_use]` on a function that changes something (takes `&mut`, calls foreign code, or is a C function) and returns a bool, an integer or an Option |
+| rr_blocking | Forbid a call on a path marked #[rr::poll] to a C function that always blocks, or to a function marked #[rr::blocking], without a `block` reason |
 | rr_unused_derive | Forbid a derived trait that nothing in the program uses |
 | rr_duplicate | Forbid a function whose body repeats another's, token for token without comments and spacing and type for type, of four statements or more, without a `duplicate` reason: one function, called from both places, says it once. Two types spelled the same way (`Self { memo: Memo::new() }`, `self.workspace.abort()`) are not a copy: one function for both would need a trait |
 
@@ -342,7 +343,7 @@ let snapshot = value.clone();
 
 A reason names the kinds of operation it answers, and answers only those:
 `unsafe`, `copy`, `shared`, `leak`, `alloc`, `cold`, `bound`, `recursion`, `panic`, `discard`,
-`wildcard`, `cast`, `move`, `stack`, `loop`, `bools`, `sentinel`, `tag`, `duplicate`, `dyn`; several are written
+`wildcard`, `cast`, `move`, `stack`, `loop`, `bools`, `sentinel`, `tag`, `duplicate`, `dyn`, `block`; several are written
 `// rr: escape(unsafe, cast): ...`. A reason for one kind does not cover an
 operation of another on the same line. The old `// rr: escape: ...` names no
 kind and answers nothing; a diagnostic points at an adjacent reason that does
@@ -629,6 +630,24 @@ there. Such a reason is used only when what the path forbids, without its
 own reason, lies beyond the call; otherwise rr_unused_escape reports it.
 The diagnostic shows the calls from the hot root down. A copy rr does not
 see by its form still shows in rr prof.
+
+## Event loops
+
+`#[rr::poll]` marks a function a poll loop runs for an event, as
+`#[rr::hot]` marks one that runs for every event: while it blocks, every
+other connection the loop serves waits. Rule rr_blocking follows the
+call graph from there and forbids a call to a C function that blocks
+whatever it is given, which rr knows by name (sleep and nanosleep,
+getaddrinfo and the other lookups, pthread_join, sem_wait, system,
+Windows' Sleep and GetAddrInfoW, and the systems' certificate chain
+checks, which may fetch from the network), and a call to a function of
+the crate marked `#[rr::blocking]`, such as a lookup that waits for its
+answer; what that function calls is its own. Whether a read, an accept
+or a connect blocks depends on how its descriptor was opened, which rr
+cannot see, and those are not looked at. A call that may block there,
+such as one before the first connection, takes `// rr: escape(block):
+<reason>`. rr knows its attributes by name: a misspelt one, which would
+mark nothing, is an error.
 
 ## Bounds
 

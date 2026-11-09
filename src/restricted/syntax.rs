@@ -383,6 +383,16 @@ impl EarlyLintPass for RestrictedSyntax {
         }
         let path = attr.path();
         let Some(&first) = path.first() else { return };
+        // A misspelt mark would mark nothing, and its check would not run.
+        if first.as_str() == "rr" && !matches!(path.as_slice(), [_, name] if RR_ATTRIBUTES.contains(&name.as_str())) {
+            report(
+                cx,
+                RR_NO_MACROS,
+                attr.span,
+                "rr knows no such attribute",
+                "rr's attributes are #[rr::hot], #[rr::poll] and #[rr::blocking]",
+            );
+        }
         let conditional_forbidden = attr.has_name(sym::cfg_attr)
             && attr
                 .meta_item_list()
@@ -407,6 +417,10 @@ impl EarlyLintPass for RestrictedSyntax {
         }
     }
 }
+
+/// rr's own attributes: a hot path's root, an event loop's handler, and
+/// a function that blocks.
+const RR_ATTRIBUTES: &[&str] = &["hot", "poll", "blocking"];
 
 /// The most lines of a function that takes a closure: the compiler copies
 /// it for each closure it is given.
@@ -582,6 +596,8 @@ fn forbidden_meta(inner: &ast::MetaItemInner) -> bool {
     ) || (!is_builtin_attr_name(first)
         && !allowed_builtin_attribute(&meta.path.segments.iter().map(|s| s.ident.name).collect::<Vec<_>>())
         && !matches!(first.as_str(), "clippy" | "rustfmt" | "rr"))
+        || (first.as_str() == "rr"
+            && !matches!(meta.path.segments.as_slice(), [_, name] if RR_ATTRIBUTES.contains(&name.ident.name.as_str())))
 }
 
 /// The compiler's own derives that ordinary syntax needs on a type of the
