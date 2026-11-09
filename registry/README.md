@@ -85,6 +85,44 @@ root: rr.json maps a scope to that root,
 rr fetches its own registry at the tag of its release, so a change here
 reaches only the rr made with it.
 
+## The rule over every component
+
+As fast as the machine allows; boilerplate is cheap; an agent that uses
+the component cannot get it wrong. A wrong call that compiles and runs
+quietly is a defect of the component, not of its caller. In order of
+strength:
+
+- **What is wrong does not compile.** Distinct things have distinct
+  types: a secret, a public key and a shared secret; a digest of a named
+  hash and a message; an interest and a readiness; a policy and a store
+  of anchors. A size is an array, not a slice checked at run time.
+- **A proof is a value only the component makes.** A verdict that a
+  chain is trusted for a host is a struct with private fields that the
+  verifier returns, never a `bool` the caller passes in.
+- **Nothing the component can do is asked of the caller.** It numbers
+  its own nonces, keeps its own order of calls and checks its own host.
+- **No outcome goes unread.** A function that returns a verdict, a
+  count or a tag returns a `Result` or is `#[must_use]`, and so is a
+  value whose drop cancels work. `bool` answers questions, not outcomes.
+- **Every failure is a variant, and loud.** An error enum says what went
+  wrong; which errors end the value and which leave it usable is written
+  at the enum. A call that cannot go on says why, never `Ok(0)` or the
+  end again forever, and behaves the same on every system.
+- **A resource leaves once.** One owner closes it; nothing hands out a
+  handle another can close.
+- **Secrets are not Copy, Clone or Debug, and are wiped when dropped.**
+- **The safe way is the short way**; what is less safe has a name that
+  says so (`seal_with_nonce`, `verify_blocking`).
+- **The intended loop is a test.** Each component has a test that drives
+  it as a program does: short reads and writes, the end of input, each
+  error, and every rule its docs state.
+
+These cost nothing at run time: no generics, no heap, no copy of a large
+value. A state that changes when the system says so (a socket connects,
+a handshake ends) is held as data and checked at each call, with the
+same loud error everywhere; a type for each state is for code where the
+change is a line of the program.
+
 ## What a component here is
 
 - **No I/O of its own.** Bytes, time and random bytes come in as
@@ -92,7 +130,7 @@ reaches only the rr made with it.
   The same component then serves a blocking loop, a poll loop or a
   thread: the caller moves the bytes.
 - **Its own errors.** A component does not name the project's error type;
-  it returns its own small enum, or false.
+  it returns its own small enum.
 - **Unsafe only in sys.** CPU instructions (AES, SHA, carry-less
   multiply) are in the component's sys.rs behind a safe function that
   says whether it ran; `cpu` says what the CPU has. The portable code is

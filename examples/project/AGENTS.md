@@ -6,7 +6,10 @@ targets, profiles). rr's rules are part of the check. An rr error says
 what the design must change, never what to hide from it.
 
 When goals pull apart, safety comes first, then performance, then ease
-of work. Performance is first the time an event takes, then the memory
+of work. Boilerplate is cheap; a mistake that compiles is not. Code
+that others call, the components in src/base/ above all, is written so
+that its caller cannot get it wrong (registry/README.md in rr's
+repository, "The rule over every component"). Performance is first the time an event takes, then the memory
 it holds: an allocation or a copy saved at a cost in time is a
 regression.
 
@@ -134,6 +137,13 @@ operation, and the simple design is rarely the first one.
   loop, each on its own work and buffers, and share only what they read;
   a thread's work is a type of the crate behind `dyn Job + Send`, not a
   queue of closures.
+- Make a wrong call fail to compile, and a wrong state fail loudly.
+  Distinct things get distinct types; a verdict is a value only the
+  checker makes, never a `bool` passed in; an outcome is a `Result` or
+  `#[must_use]`; a call that cannot go on returns why, not 0 forever.
+  When a component in src/base/ lets a wrong call compile, fix the
+  component, which is the project's code, rather than remembering the
+  rule at each call.
 - Pass options where they matter, at the call, not left to defaults.
 - Names are whole words that mean one thing everywhere, and say what
   the thing is for, not its type (`pending`, not `vec`). Units and
