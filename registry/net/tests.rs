@@ -925,10 +925,12 @@ fn not_connected_yet() {
     };
     // The attempt may fail at any moment, as Windows says at once that
     // the network is unreachable: until then each call is NotConnected,
-    // and from then on each is that failure, the same every time.
+    // and from then on each is that failure, the same every time. A
+    // network that answers for TEST-NET-1 itself, as a proxy in front of
+    // a CI runner may, leaves nothing to test here.
     let mut failed = match stream.connected() {
         Ok(false) => None,
-        Ok(true) => panic!("TEST-NET-1 answered"),
+        Ok(true) => return,
         Err(error) => Some(error),
     };
     let mut buf = [0; 8];
@@ -942,7 +944,9 @@ fn not_connected_yet() {
             (None, Err(Error::NotConnected)) => {}
             (None, Err(error)) => failed = Some(error),
             (Some(first), Err(error)) => assert_eq!(error, first),
-            (_, Ok(())) => panic!("TEST-NET-1 took data"),
+            // Answered meanwhile: connected, so nothing more to test.
+            (None, Ok(())) => return,
+            (Some(_), Ok(())) => panic!("a failed stream took a call"),
         }
     }
     if let Some(error) = failed {
