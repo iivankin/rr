@@ -3,7 +3,13 @@
 //! SSL_CERT_FILE or SSL_CERT_DIR names anchors to verify with instead,
 //! which Go honours on every system since 1.27 (root.go).
 //!
-//! Trust checks a server's chain for a host at a time. macOS and Windows
+//! Trust checks a server's chain for a host at a time; its yes is an
+//! x509::Approval of the chain's leaf for that host, which
+//! tls::Client::verified takes and compares with its own, and which a
+//! program cannot make itself. Trust::check never blocks: keep the
+//! Check (dropping it cancels it) and poll it from the loop.
+//! Trust::verify_blocking waits for the answer, for a thread that may
+//! block: never a poll loop's. macOS and Windows
 //! verify it themselves, as Go has them do: SecTrustEvaluateWithError
 //! with the SSL policy, and CertGetCertificateChain with the SSL chain
 //! policy, each on one of wait.rs's threads, as either may fetch a
@@ -26,8 +32,9 @@
 //! error is the answer, as in Go. Freeing the best context frees the
 //! rest.
 //!
-//! A policy laid over the trust (Trust::with_policy), such as Mozilla's
-//! OneCRL and distrust dates that roots::policy gives, holds wherever the
+//! A policy laid over the trust (Trust::with_policy), an x509::Policy
+//! such as Mozilla's OneCRL and distrust dates that roots::policy gives
+//! (a type of its own, which no verify takes for anchors), holds wherever the
 //! chain is verified: x509's anchors take it on, and the path the
 //! system's verifier built (on Windows, each it took, until one passes)
 //! is screened with x509::screen, as Go screens the system's chains for

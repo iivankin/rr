@@ -43,7 +43,7 @@ pub struct Trust {
     /// caller's (with). None: the system verifies.
     store: Option<x509::Store>,
     /// Distrust laid over the system's verdict (with_policy).
-    policy: Option<x509::Store>,
+    policy: Option<x509::Policy>,
 }
 
 impl Trust {
@@ -83,7 +83,7 @@ impl Trust {
     /// (x509::Store::add_policy); where the system does, the path it
     /// built is screened (x509::screen) before a check says yes, as Go
     /// screens the system's chains for its own blocklist.
-    pub fn with_policy(mut self, policy: x509::Store) -> Trust {
+    pub fn with_policy(mut self, policy: x509::Policy) -> Trust {
         match &mut self.store {
             Some(store) => {
                 store.add_policy(&policy);
@@ -94,24 +94,44 @@ impl Trust {
     }
 
     /// Starts checking chain, DER certificates leaf first, for host at
-    /// now (Unix seconds). It never blocks: poll the check. A host that is
-    /// empty or holds a NUL is Error::Input on every system: Windows reads
-    /// the name as a C string, which would end at the NUL, and checks
-    /// none for an empty one.
+    /// now (Unix seconds). It never blocks: poll the check, whose yes is
+    /// the x509::Approval of chain's leaf for host that tls::Client::
+    /// verified takes. A host that is empty or holds a NUL is Error::Input
+    /// on every system: Windows reads the name as a C string, which would
+    /// end at the NUL, and checks none for an empty one.
     pub fn check(&self, chain: &[&[u8]], host: &str, now: i64) -> Check<'_> {
-        let os = match &self.store {
-            Some(store) => os::Check::answered(verify_with(store, chain, host, now)),
-            None => os::check(chain, host, now),
+        let (os, approval) = match &self.store {
+            Some(store) => match verify_with(store, chain, host, now) {
+                Ok(approval) => (
+                    os::Check::answered(Ok(Built::one(Path::new()))),
+                    Some(approval),
+                ),
+                Err(error) => (os::Check::answered(Err(error)), None),
+            },
+            // The system's yes, once it says it, approves the leaf it was
+            // asked about.
+            None => (
+                os::check(chain, host, now),
+                chain.first().map(|leaf| x509::Approval::system(leaf, host)),
+            ),
         };
         Check {
             os,
             policy: self.policy.as_ref(),
+            approval,
             polled: false,
         }
     }
 
-    /// Checks chain for host at now, and waits for the answer.
-    pub fn verify(&self, chain: &[&[u8]], host: &str, now: i64) -> Result<(), Error> {
+    /// Checks chain for host at now, and blocks until the answer: the
+    /// system's verifier may fetch over the network, so never call it on
+    /// a poll loop's thread; poll a check there.
+    pub fn verify_blocking(
+        &self,
+        chain: &[&[u8]],
+        host: &str,
+        now: i64,
+    ) -> Result<x509::Approval, Error> {
         let mut check = self.check(chain, host, now);
         // The system's verifier answers in the end; each wait ends when
         // it has.
@@ -125,14 +145,16 @@ impl Trust {
 }
 
 /// x509::verify on store, at once.
-fn verify_with(store: &x509::Store, chain: &[&[u8]], host: &str, now: i64) -> Result<Built, Error> {
+fn verify_with(
+    store: &x509::Store,
+    chain: &[&[u8]],
+    host: &str,
+    now: i64,
+) -> Result<x509::Approval, Error> {
     if chain.is_empty() || chain.len() > x509::CHAIN_MAX || !named(host) {
         return Err(Error::Input);
     }
-    match x509::verify(chain, store, host, now) {
-        Ok(_leaf) => Ok(Built::one(Path::new())),
-        Err(error) => Err(Error::Untrusted(error)),
-    }
+    x509::verify(chain, store, host, now).map_err(Error::Untrusted)
 }
 
 /// The path the system's verifier built, leaf first: the certificates'
@@ -161,7 +183,7 @@ impl Path {
     }
 
     /// Whether policy takes the path; an empty one it has no say on.
-    fn screen(&self, policy: &x509::Store) -> Result<(), Error> {
+    fn screen(&self, policy: &x509::Policy) -> Result<(), Error> {
         if self.ends.is_empty() {
             return Ok(());
         }
@@ -196,7 +218,7 @@ impl Built {
     /// Whether policy takes one of the paths: the first that it does,
     /// as Go keeps the chains its blocklist leaves; when it takes none,
     /// the best chain's error.
-    fn screen(self, policy: &x509::Store) -> Result<(), Error> {
+    fn screen(self, policy: &x509::Policy) -> Result<(), Error> {
         let mut first = None;
         for path in &self.paths {
             match path.screen(policy) {
@@ -210,26 +232,33 @@ impl Built {
     }
 }
 
-/// One chain's check. Dropping it cancels it.
+/// One chain's check. Dropping it cancels it, so it must be kept until
+/// poll answers.
+#[must_use = "dropping a check cancels it: keep it and poll it"]
 pub struct Check<'t> {
     os: os::Check,
-    policy: Option<&'t x509::Store>,
+    policy: Option<&'t x509::Policy>,
+    /// What a yes gives: x509's approval, or the one for the leaf the
+    /// system was asked about.
+    approval: Option<x509::Approval>,
     /// Whether poll gave the answer.
     polled: bool,
 }
 
 impl Check<'_> {
-    /// None while the system works; then the answer, once.
-    pub fn poll(&mut self) -> Option<Result<(), Error>> {
+    /// None while the system works; then the answer, once: the approval
+    /// of the leaf for the host, or why not. Error::Polled after it.
+    pub fn poll(&mut self) -> Option<Result<x509::Approval, Error>> {
         if self.polled {
             return Some(Err(Error::Polled));
         }
         let answer = self.os.poll()?;
         self.polled = true;
-        Some(answer.and_then(|built| match self.policy {
+        let screened = answer.and_then(|built| match self.policy {
             Some(policy) => built.screen(policy),
             None => Ok(()),
-        }))
+        });
+        Some(screened.and_then(|()| self.approval.take().ok_or(Error::Input)))
     }
 
     /// What to wait on before polling again.
@@ -2304,7 +2333,7 @@ mod thread {
 mod tests {
     use super::disk::{self, Defaults, ENOENT, Files, LINUX, MACOS, Paths, WINDOWS};
     use super::{Built, Error, Found, Path, pem_block};
-    use crate::base::x509::{Store, TEST_NOW, test_certificate, test_revocation};
+    use crate::base::x509::{Policy, Store, TEST_NOW, test_certificate, test_revocation};
     use alloc::vec::Vec;
 
     /// x509's test certificates: anchors, intermediates and leaves.
@@ -2552,7 +2581,8 @@ mod tests {
             let certificates = certificates(names);
             // rr: escape(copy): the chain check takes, borrowed from them.
             let chain: Vec<&[u8]> = certificates.iter().map(Vec::as_slice).collect();
-            assert_eq!(trust.verify(&chain, host, TEST_NOW), Ok(()), "{host}");
+            let approval = trust.verify_blocking(&chain, host, TEST_NOW).unwrap();
+            assert!(approval.approves(chain[0], host), "{host}");
             let mut check = trust.check(&chain, host, TEST_NOW);
             let result = (0..1000)
                 .find_map(|_| {
@@ -2563,18 +2593,19 @@ mod tests {
                     result
                 })
                 .unwrap();
-            assert_eq!(result, Ok(()), "{host}");
-            assert_eq!(check.poll(), Some(Err(Error::Polled)));
+            assert!(result.unwrap().approves(chain[0], host), "{host}");
+            assert_eq!(check.poll().map(Result::err), Some(Some(Error::Polled)));
             // x509 says so before the system is asked, as on Linux.
             assert_eq!(
-                trust.verify(&chain, "example.com", TEST_NOW),
-                Err(Error::Untrusted(crate::base::x509::Error::Host))
+                trust.verify_blocking(&chain, "example.com", TEST_NOW).err(),
+                Some(Error::Untrusted(crate::base::x509::Error::Host))
             );
             // The dot after a name is no other name.
             dotted.clear();
             dotted.push_str(host);
             dotted.push('.');
-            assert_eq!(trust.verify(&chain, &dotted, TEST_NOW), Ok(()), "{dotted}");
+            let dotted_approval = trust.verify_blocking(&chain, &dotted, TEST_NOW).unwrap();
+            assert!(dotted_approval.approves(chain[0], host), "{dotted}");
             // A check dropped while it runs is let go.
             drop(trust.check(&chain, host, TEST_NOW));
         }
@@ -2586,30 +2617,34 @@ mod tests {
         // rr: escape(copy): the chain check takes, borrowed from them.
         let sent: Vec<&[u8]> = openai.iter().map(Vec::as_slice).collect();
         assert_eq!(
-            screened.verify(&sent, CHAINS[0].1, TEST_NOW),
-            Err(Error::Untrusted(crate::base::x509::Error::Revoked))
+            screened.verify_blocking(&sent, CHAINS[0].1, TEST_NOW).err(),
+            Some(Error::Untrusted(crate::base::x509::Error::Revoked))
         );
         let certificates = certificates(&["test.leaf", "test.inter", "test.root"]);
         // rr: escape(copy): the chain check takes, borrowed from them.
         let chain: Vec<&[u8]> = certificates.iter().map(Vec::as_slice).collect();
         // Named, an address in brackets as well, but not trusted.
         for host in ["b.wild.example.test", "192.0.2.1", "[2001:db8::1]"] {
-            let refused = trust.verify(&chain, host, TEST_NOW);
+            let refused = trust.verify_blocking(&chain, host, TEST_NOW).err();
             #[cfg(target_os = "macos")]
-            assert!(matches!(refused, Err(Error::Refused(_))), "{host}");
+            assert!(matches!(refused, Some(Error::Refused(_))), "{host}");
             #[cfg(target_os = "windows")]
-            assert!(matches!(refused, Err(Error::Chain(_))), "{host}");
+            assert!(matches!(refused, Some(Error::Chain(_))), "{host}");
         }
-        assert_eq!(trust.verify(&[], "x.test", TEST_NOW), Err(Error::Input));
+        let empty = trust.verify_blocking(&[], "x.test", TEST_NOW).err();
+        assert_eq!(empty, Some(Error::Input));
         // A NUL would end the name where Windows reads it.
         assert_eq!(
-            trust.verify(&chain, "leaf.example.test\0.x", TEST_NOW),
-            Err(Error::Input)
+            trust
+                .verify_blocking(&chain, "leaf.example.test\0.x", TEST_NOW)
+                .err(),
+            Some(Error::Input)
         );
-        assert_eq!(trust.verify(&chain, "", TEST_NOW), Err(Error::Input));
+        let nameless = trust.verify_blocking(&chain, "", TEST_NOW).err();
+        assert_eq!(nameless, Some(Error::Input));
         assert_eq!(
-            trust.verify(&[b"no"], "x.test", TEST_NOW),
-            Err(Error::Input)
+            trust.verify_blocking(&[b"no"], "x.test", TEST_NOW).err(),
+            Some(Error::Input)
         );
     }
 
@@ -2622,9 +2657,13 @@ mod tests {
             let certificates = certificates(names);
             // rr: escape(copy): the chain check takes, borrowed from them.
             let chain: Vec<&[u8]> = certificates.iter().map(Vec::as_slice).collect();
-            assert_eq!(trust.verify(&chain, host, TEST_NOW), Ok(()), "{host}");
-            let wrong = trust.verify(&chain, "example.com", TEST_NOW);
-            assert_eq!(wrong, Err(Error::Untrusted(crate::base::x509::Error::Host)));
+            let approval = trust.verify_blocking(&chain, host, TEST_NOW).unwrap();
+            assert!(approval.approves(chain[0], host), "{host}");
+            let wrong = trust.verify_blocking(&chain, "example.com", TEST_NOW).err();
+            assert_eq!(
+                wrong,
+                Some(Error::Untrusted(crate::base::x509::Error::Host))
+            );
         }
         // A policy that revokes an intermediate, laid over the anchors.
         let policed = super::Trust::with(test_anchors()).with_policy(revoking("openai.we1"));
@@ -2632,8 +2671,8 @@ mod tests {
         // rr: escape(copy): the chain check takes, borrowed from them.
         let chain: Vec<&[u8]> = certificates.iter().map(Vec::as_slice).collect();
         assert_eq!(
-            policed.verify(&chain, CHAINS[0].1, TEST_NOW),
-            Err(Error::Untrusted(crate::base::x509::Error::Revoked))
+            policed.verify_blocking(&chain, CHAINS[0].1, TEST_NOW).err(),
+            Some(Error::Untrusted(crate::base::x509::Error::Revoked))
         );
     }
 
@@ -2642,15 +2681,15 @@ mod tests {
     fn test_anchors() -> Store {
         let mut store = Store::new();
         for name in ["anchor.sectigo-e46", "anchor.gts-r4", "anchor.isrg-x2"] {
-            assert!(store.add_der(&test_certificate(name).unwrap()));
+            assert_eq!(store.add_der(&test_certificate(name).unwrap()), Ok(()));
         }
         store
     }
 
-    /// A policy store that revokes the named test certificate.
-    fn revoking(name: &str) -> Store {
+    /// A policy that revokes the named test certificate.
+    fn revoking(name: &str) -> Policy {
         let line = test_revocation(&test_certificate(name).unwrap());
-        let mut policy = Store::new();
+        let mut policy = Policy::new();
         assert_eq!(policy.add_revoked(&line), 1);
         policy
     }
@@ -2841,7 +2880,11 @@ mod tests {
         let certificates = certificates(CHAINS[0].0);
         // rr: escape(copy): the chain check takes, borrowed from them.
         let chain: Vec<&[u8]> = certificates.iter().map(Vec::as_slice).collect();
-        b.iter(|| trust.verify(&chain, "api.openai.com", TEST_NOW).is_ok());
+        b.iter(|| {
+            trust
+                .verify_blocking(&chain, "api.openai.com", TEST_NOW)
+                .is_ok()
+        });
     }
 
     /// Loading the system's anchors, as a program does once.

@@ -19,7 +19,7 @@
 //! distrusted (DigiNotar's among them, which certdata.txt no longer
 //! carries), as digests that x509::Store::add_revoked reads. A bundle
 //! from the system carries none of it: policy() gives Mozilla's
-//! distrust alone, to lay over the system's anchors
+//! distrust alone, an x509::Policy, to lay over the system's anchors
 //! (x509::Store::add_policy) or a path the system verified
 //! (x509::screen, trust's Trust::with_policy).
 //!
@@ -44,8 +44,6 @@ use crate::base::x509;
 const MOZILLA: &[u8] = include_bytes!("roots.pem");
 const REVOKED: &[u8] = include_bytes!("revoked.txt");
 
-const PEM_END: &[u8] = b"-----END CERTIFICATE-----";
-
 /// A store of Mozilla's anchors, decoded and checked, and OneCRL's
 /// revocations: about 200 KB of PEM and 125 KB of digests, once per
 /// program.
@@ -59,26 +57,13 @@ pub fn mozilla() -> x509::Store {
 /// Mozilla's distrust without its trust: OneCRL's revocations, and the
 /// anchors that carry a distrust date or imposed name constraints, for
 /// x509::Store::add_policy and x509::screen to apply to anchors and
-/// paths of another source, such as the system's.
-pub fn policy() -> x509::Store {
-    let mut store = x509::Store::new();
-    let mut rest = MOZILLA;
-    while let Some(end) = position(rest, PEM_END) {
-        let (block, after) = rest.split_at(end + PEM_END.len());
-        if position(block, b"\n# distrust-after: ").is_some()
-            || position(block, b"\n# name-constraints: ").is_some()
-        {
-            store.add_pem(block);
-        }
-        rest = after;
-    }
-    store.add_revoked(REVOKED);
-    store
-}
-
-fn position(text: &[u8], needle: &[u8]) -> Option<usize> {
-    text.windows(needle.len())
-        .position(|window| window == needle)
+/// paths of another source, such as the system's. An x509::Policy, not
+/// a store: it trusts nothing, so no verify takes it for anchors.
+pub fn policy() -> x509::Policy {
+    let mut policy = x509::Policy::new();
+    policy.add_pem(MOZILLA);
+    policy.add_revoked(REVOKED);
+    policy
 }
 
 #[cfg(test)]
