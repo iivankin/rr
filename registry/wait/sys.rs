@@ -126,7 +126,9 @@ fn broken() -> ! {
     panic!("the system's wait failed");
 }
 
-/// Waits as wait says.
+/// Waits as wait says: for a thread that may block, never a poll
+/// loop's, which adds the Wait to its own wait.
+#[cfg_attr(rr, rr::blocking)]
 pub fn block(wait: &Wait) {
     // The caller polls whatever woke it.
     ready(wait);
@@ -156,8 +158,9 @@ impl Signal {
 
     /// Says the work is done.
     pub fn set(&self) {
-        // A pipe or pair whose buffer is full is readable already.
-        let _sent: bool = self.os.set();
+        // rr: escape(discard): a pipe or pair whose buffer is full is
+        // readable already.
+        let _: bool = self.os.set();
     }
 
     /// What waits until set.
@@ -407,28 +410,38 @@ mod os {
     #[cfg_attr(all(target_os = "linux", target_env = "gnu"), link(name = "pthread"))]
     // rr: escape(unsafe): each signature is the C library's, from its headers.
     unsafe extern "C" {
+        #[must_use]
         fn pthread_create(
             thread: *mut Thread,
             attributes: *const c_void,
             start: extern "C" fn(*mut c_void) -> *mut c_void,
             argument: *mut c_void,
         ) -> c_int;
+        #[must_use]
         fn pthread_detach(thread: Thread) -> c_int;
+        #[must_use]
         fn pthread_mutex_lock(mutex: *mut u64) -> c_int;
+        #[must_use]
         fn pthread_mutex_unlock(mutex: *mut u64) -> c_int;
         fn abort() -> !;
         #[cfg(target_os = "macos")]
+        #[must_use]
         fn pipe(fds: *mut c_int) -> c_int;
         #[cfg(target_os = "linux")]
+        #[must_use]
         fn pipe2(fds: *mut c_int, flags: c_int) -> c_int;
         #[cfg(target_os = "macos")]
         fn __error() -> *mut c_int;
         #[cfg(target_os = "linux")]
         fn __errno_location() -> *mut c_int;
         #[cfg(any(target_os = "macos", test))]
+        #[must_use]
         fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
+        #[must_use]
         fn write(fd: c_int, buffer: *const c_void, size: usize) -> isize;
+        #[must_use]
         fn close(fd: c_int) -> c_int;
+        #[must_use]
         fn poll(fds: *mut PollFd, count: Count, timeout: c_int) -> c_int;
     }
 
@@ -439,6 +452,7 @@ mod os {
     pub const FD_CLOEXEC: c_int = 1;
 
     /// The calling thread's errno, as the C library keeps it.
+    #[must_use]
     pub fn errno() -> c_int {
         #[cfg(target_os = "macos")]
         // rr: escape(unsafe): the C library's thread-local errno.
@@ -526,6 +540,7 @@ mod os {
     }
 
     /// Starts a detached thread on start; whether it did.
+    #[must_use]
     pub fn thread(start: *mut c_void) -> bool {
         // rr: escape(unsafe): an integer or a null pointer, which
         // pthread_create fills before it is read.
@@ -536,7 +551,11 @@ mod os {
             return false;
         }
         // rr: escape(unsafe): thread was just made, and is detached once.
-        unsafe { pthread_detach(thread) };
+        unsafe {
+            // rr: escape(discard): a thread just made is joinable, which
+            // pthread_detach cannot refuse.
+            let _: c_int = pthread_detach(thread);
+        }
         true
     }
 
@@ -550,6 +569,7 @@ mod os {
 
     impl Signal {
         #[cfg(target_os = "linux")]
+        #[must_use]
         pub fn new() -> Option<Signal> {
             let mut pipe_fds: [c_int; 2] = [-1, -1];
             // rr: escape(unsafe): pipe2 fills the two fds.
@@ -560,6 +580,7 @@ mod os {
         }
 
         #[cfg(target_os = "macos")]
+        #[must_use]
         pub fn new() -> Option<Signal> {
             let mut pipe_fds: [c_int; 2] = [-1, -1];
             // rr: escape(unsafe): pipe fills the two fds.
@@ -578,6 +599,7 @@ mod os {
 
         /// Says the work is done; the pipe is then readable. Whether the
         /// byte went.
+        #[must_use]
         pub fn set(&self) -> bool {
             // rr: escape(unsafe): the pipe is open while self lives.
             unsafe { write(self.pipe[1], b"!".as_ptr().cast(), 1) == 1 }
@@ -589,6 +611,7 @@ mod os {
 
         /// Whether both ends close on exec.
         #[cfg(test)]
+        #[must_use]
         pub fn cloexec(&self) -> bool {
             self.pipe.iter().all(|fd| {
                 // rr: escape(unsafe): fd is the pipe's, open.
@@ -602,7 +625,11 @@ mod os {
         fn drop(&mut self) {
             for fd in self.pipe {
                 // rr: escape(unsafe): the pipe is this value's own.
-                unsafe { close(fd) };
+                unsafe {
+                    // rr: escape(discard): close releases the descriptor
+                    // whatever it answers; no one is left to tell.
+                    let _: c_int = close(fd);
+                }
             }
         }
     }
@@ -636,7 +663,9 @@ mod os {
     #[link(name = "ws2_32", kind = "raw-dylib")]
     // rr: escape(unsafe): each signature is ws2_32's, from its documentation.
     unsafe extern "system" {
+        #[must_use]
         fn WSAStartup(version: u16, data: *mut u8) -> i32;
+        #[must_use]
         fn WSASocketW(
             family: i32,
             kind: i32,
@@ -645,15 +674,25 @@ mod os {
             group: u32,
             flags: u32,
         ) -> usize;
+        #[must_use]
         fn bind(socket: usize, address: *const u8, length: i32) -> i32;
+        #[must_use]
         fn listen(socket: usize, backlog: i32) -> i32;
+        #[must_use]
         fn getsockname(socket: usize, address: *mut u8, length: *mut i32) -> i32;
+        #[must_use]
         fn connect(socket: usize, address: *const u8, length: i32) -> i32;
+        #[must_use]
         fn accept(socket: usize, address: *mut u8, length: *mut i32) -> usize;
+        #[must_use]
         fn send(socket: usize, buffer: *const u8, length: i32, flags: i32) -> i32;
+        #[must_use]
         fn closesocket(socket: usize) -> i32;
+        #[must_use]
         fn WSAPoll(fds: *mut PollFd, count: u32, timeout: i32) -> i32;
+        #[must_use]
         fn recv(socket: usize, buffer: *mut u8, length: i32, flags: i32) -> i32;
+        #[must_use]
         fn ioctlsocket(socket: usize, command: i32, argument: *mut u32) -> i32;
     }
 
@@ -668,7 +707,9 @@ mod os {
             flags: u32,
             id: *mut u32,
         ) -> *mut c_void;
+        #[must_use]
         fn CloseHandle(handle: *mut c_void) -> i32;
+        #[must_use]
         fn SetHandleInformation(handle: *mut c_void, mask: u32, flags: u32) -> i32;
         fn Sleep(milliseconds: u32);
         fn AcquireSRWLockExclusive(lock: *mut *mut c_void);
@@ -768,6 +809,7 @@ mod os {
     }
 
     /// Starts a detached thread on start; whether it did.
+    #[must_use]
     pub fn thread(start: *mut c_void) -> bool {
         // rr: escape(unsafe): run takes the Start passed to it.
         let thread = unsafe { CreateThread(null(), 0, run, start, 0, null_mut()) };
@@ -775,7 +817,11 @@ mod os {
             return false;
         }
         // rr: escape(unsafe): the thread runs on without its handle.
-        unsafe { CloseHandle(thread) };
+        unsafe {
+            // rr: escape(discard): the thread runs on whatever CloseHandle
+            // answers.
+            let _: i32 = CloseHandle(thread);
+        }
         true
     }
 
@@ -786,12 +832,17 @@ mod os {
         fn drop(&mut self) {
             if self.0 != INVALID_SOCKET {
                 // rr: escape(unsafe): the socket is ours and unused from here.
-                unsafe { closesocket(self.0) };
+                unsafe {
+                    // rr: escape(discard): closesocket releases the socket
+                    // whatever it answers; no one is left to tell.
+                    let _: i32 = closesocket(self.0);
+                }
             }
         }
     }
 
     /// A TCP socket that no child process inherits.
+    #[must_use]
     fn tcp() -> Option<Socket> {
         let flags = WSA_FLAG_NO_HANDLE_INHERIT;
         let family = i32::from(AF_INET);
@@ -805,6 +856,7 @@ mod os {
     }
 
     /// The socket's own address.
+    #[must_use]
     fn name(socket: &Socket) -> Option<SockaddrIn> {
         let mut address = loopback(0);
         let mut length = i32::try_from(size_of::<SockaddrIn>()).ok()?;
@@ -830,6 +882,7 @@ mod os {
     /// the first. The listener lives only until it accepted the second,
     /// whose address the accepted peer must have: another process's
     /// connection is refused.
+    #[must_use]
     fn pair() -> Option<(Socket, Socket)> {
         startup();
         let listener = tcp()?;
@@ -879,6 +932,7 @@ mod os {
     /// WSAPoll on fds, up to timeout milliseconds (-1: no limit); how
     /// many have events. It fails only for fds it cannot read, memory or
     /// a network subsystem that failed: no wait that would pass.
+    #[must_use]
     pub fn poll(fds: &mut [PollFd], timeout: i32) -> usize {
         let Ok(count) = u32::try_from(fds.len()) else {
             return 0;
@@ -902,6 +956,7 @@ mod os {
         }
 
         /// Says the work is done; whether the byte went.
+        #[must_use]
         pub fn set(&self) -> bool {
             // rr: escape(unsafe): the socket is open while self lives.
             unsafe { send(self.writer.0, b"!".as_ptr(), 1, 0) == 1 }
@@ -930,7 +985,11 @@ mod os {
     /// Closes a socket the Set was handed to close.
     pub fn close(socket: usize) {
         // rr: escape(unsafe): the caller gave the socket up to be closed.
-        unsafe { closesocket(socket) };
+        unsafe {
+            // rr: escape(discard): closesocket releases the socket whatever it
+            // answers; no one is left to tell.
+            let _: i32 = closesocket(socket);
+        }
     }
 }
 
@@ -966,13 +1025,21 @@ mod poller {
     #[link(name = "c")]
     // rr: escape(unsafe): each signature is the C library's, from its headers.
     unsafe extern "C" {
+        #[must_use]
         fn epoll_create1(flags: c_int) -> c_int;
+        #[must_use]
         fn epoll_ctl(epoll: c_int, operation: c_int, fd: c_int, event: *mut Event) -> c_int;
+        #[must_use]
         fn epoll_wait(epoll: c_int, events: *mut Event, count: c_int, timeout: c_int) -> c_int;
+        #[must_use]
         fn eventfd(initial: u32, flags: c_int) -> c_int;
+        #[must_use]
         fn read(fd: c_int, buffer: *mut c_void, size: usize) -> isize;
+        #[must_use]
         fn write(fd: c_int, buffer: *const c_void, size: usize) -> isize;
+        #[must_use]
         fn close(fd: c_int) -> c_int;
+        #[must_use]
         fn clock_gettime(clock: c_int, time: *mut Timespec) -> c_int;
     }
 
@@ -994,13 +1061,18 @@ mod poller {
     /// The events one wait takes; the rest, still ready, the next.
     const BATCH: usize = 256;
 
+    #[must_use]
     pub fn monotonic_ns() -> u64 {
         let mut time = Timespec {
             seconds: 0,
             nanoseconds: 0,
         };
         // rr: escape(unsafe): time is a local timespec.
-        unsafe { clock_gettime(CLOCK_MONOTONIC, &raw mut time) };
+        unsafe {
+            // rr: escape(discard): CLOCK_MONOTONIC is every Linux's and time is
+            // valid, so it cannot fail.
+            let _: c_int = clock_gettime(CLOCK_MONOTONIC, &raw mut time);
+        }
         let seconds = u64::try_from(time.seconds).unwrap_or(0);
         let nanoseconds = u64::try_from(time.nanoseconds).unwrap_or(0);
         seconds
@@ -1018,7 +1090,11 @@ mod poller {
             // eventfd adds a u64 in the host's order: little on both targets.
             let one = 1u64.to_le_bytes();
             // rr: escape(unsafe): one is a local of 8 bytes, as eventfd takes.
-            unsafe { write(self.fd, one.as_ptr().cast(), one.len()) };
+            unsafe {
+                // rr: escape(discard): a write refused finds the counter at its
+                // most, which is readable already.
+                let _: isize = write(self.fd, one.as_ptr().cast(), one.len());
+            }
         }
 
         /// Reads the count back to 0, so that the eventfd is not ready.
@@ -1026,14 +1102,22 @@ mod poller {
             let mut count = [0u8; 8];
             // rr: escape(unsafe): count is a local of 8 bytes; the eventfd
             // does not block.
-            unsafe { read(self.fd, count.as_mut_ptr().cast(), count.len()) };
+            unsafe {
+                // rr: escape(discard): a read refused finds the counter at 0
+                // already, which is not ready.
+                let _: isize = read(self.fd, count.as_mut_ptr().cast(), count.len());
+            }
         }
     }
 
     impl Drop for Wake {
         fn drop(&mut self) {
             // rr: escape(unsafe): the eventfd is this value's own.
-            unsafe { close(self.fd) };
+            unsafe {
+                // rr: escape(discard): close releases the descriptor whatever
+                // it answers; no one is left to tell.
+                let _: c_int = close(self.fd);
+            }
         }
     }
 
@@ -1044,6 +1128,7 @@ mod poller {
     }
 
     impl Poller {
+        #[must_use]
         pub fn new() -> Option<Poller> {
             // rr: escape(unsafe): epoll_create1 takes a flag.
             let epoll = unsafe { epoll_create1(O_CLOEXEC) };
@@ -1054,7 +1139,11 @@ mod poller {
             let fd = unsafe { eventfd(0, O_CLOEXEC | O_NONBLOCK) };
             if fd < 0 {
                 // rr: escape(unsafe): the epoll is this call's.
-                unsafe { close(epoll) };
+                unsafe {
+                    // rr: escape(discard): close releases the descriptor
+                    // whatever it answers; no one is left to tell.
+                    let _: c_int = close(epoll);
+                }
                 return None;
             }
             let poller = Poller {
@@ -1070,6 +1159,7 @@ mod poller {
                 .then_some(poller)
         }
 
+        #[must_use]
         fn control(&self, operation: c_int, fd: c_int, key: u64, events: u32) -> bool {
             let mut event = Event { events, data: key };
             // rr: escape(unsafe): event is a local epoll_event, which the
@@ -1111,7 +1201,11 @@ mod poller {
             self.remove(fd, key, interest);
             // rr: escape(unsafe): the caller gave the descriptor up to be
             // closed.
-            unsafe { close(fd) };
+            unsafe {
+                // rr: escape(discard): close releases the descriptor whatever
+                // it answers; no one is left to tell.
+                let _: c_int = close(fd);
+            }
         }
 
         pub fn waker(&self) -> Arc<Wake> {
@@ -1151,7 +1245,11 @@ mod poller {
     impl Drop for Poller {
         fn drop(&mut self) {
             // rr: escape(unsafe): the epoll is this value's own.
-            unsafe { close(self.epoll) };
+            unsafe {
+                // rr: escape(discard): close releases the descriptor whatever
+                // it answers; no one is left to tell.
+                let _: c_int = close(self.epoll);
+            }
         }
     }
 
@@ -1213,7 +1311,9 @@ mod poller {
     #[link(name = "c")]
     // rr: escape(unsafe): each signature is the C library's, from its headers.
     unsafe extern "C" {
+        #[must_use]
         fn kqueue() -> c_int;
+        #[must_use]
         fn kevent(
             kq: c_int,
             changes: *const Kevent,
@@ -1222,9 +1322,12 @@ mod poller {
             event_count: c_int,
             timeout: *const Timespec,
         ) -> c_int;
+        #[must_use]
         fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
+        #[must_use]
         fn close(fd: c_int) -> c_int;
         /// clockid_t is an enum, an int.
+        #[must_use]
         fn clock_gettime_nsec_np(clock: c_int) -> u64;
     }
 
@@ -1249,6 +1352,7 @@ mod poller {
     /// The events one wait takes; the rest, still ready, the next.
     const BATCH: usize = 256;
 
+    #[must_use]
     pub fn monotonic_ns() -> u64 {
         // rr: escape(unsafe): the call takes a clock's number.
         unsafe { clock_gettime_nsec_np(CLOCK_UPTIME_RAW) }
@@ -1274,10 +1378,14 @@ mod poller {
         pub fn wake(&self) {
             let mut trigger = change(WAKE, EVFILT_USER, 0, 0);
             trigger.fflags = NOTE_TRIGGER;
-            self.apply(&[trigger]);
+            // rr: escape(discard): the user filter is added with the
+            // kqueue, so a trigger is refused only for a kqueue gone, which
+            // nothing waits on.
+            let _: bool = self.apply(&[trigger]);
         }
 
         /// Makes the changes; false when the system refused one.
+        #[must_use]
         fn apply(&self, changes: &[Kevent]) -> bool {
             let Ok(count) = c_int::try_from(changes.len()) else {
                 return false;
@@ -1292,7 +1400,11 @@ mod poller {
     impl Drop for Wake {
         fn drop(&mut self) {
             // rr: escape(unsafe): the kqueue is this value's own.
-            unsafe { close(self.kq) };
+            unsafe {
+                // rr: escape(discard): close releases the descriptor whatever
+                // it answers; no one is left to tell.
+                let _: c_int = close(self.kq);
+            }
         }
     }
 
@@ -1302,6 +1414,7 @@ mod poller {
     }
 
     impl Poller {
+        #[must_use]
         pub fn new() -> Option<Poller> {
             // rr: escape(unsafe): kqueue takes nothing.
             let kq = unsafe { kqueue() };
@@ -1352,7 +1465,10 @@ mod poller {
                     if !self.queue.apply(&[change(ident, filter, EV_ADD, key)]) {
                         for (undo_bit, undo) in filters {
                             if added & undo_bit != 0 {
-                                self.queue.apply(&[change(ident, undo, EV_DELETE, key)]);
+                                // rr: escape(discard): a deletion refused
+                                // finds its filter gone already.
+                                let _: bool =
+                                    self.queue.apply(&[change(ident, undo, EV_DELETE, key)]);
                             }
                         }
                         return false;
@@ -1362,7 +1478,9 @@ mod poller {
             }
             for (bit, filter) in filters {
                 if old & bit != 0 && interest & bit == 0 {
-                    self.queue.apply(&[change(ident, filter, EV_DELETE, key)]);
+                    // rr: escape(discard): a deletion refused finds its
+                    // filter gone already.
+                    let _: bool = self.queue.apply(&[change(ident, filter, EV_DELETE, key)]);
                 }
             }
             true
@@ -1393,7 +1511,11 @@ mod poller {
             self.remove(fd, key, interest);
             // rr: escape(unsafe): the caller gave the descriptor up to be
             // closed.
-            unsafe { close(fd) };
+            unsafe {
+                // rr: escape(discard): close releases the descriptor whatever
+                // it answers; no one is left to tell.
+                let _: c_int = close(fd);
+            }
         }
 
         pub fn waker(&self) -> Arc<Wake> {
@@ -1537,16 +1659,20 @@ mod poller {
             key: usize,
             threads: u32,
         ) -> *mut c_void;
+        #[must_use]
         fn PostQueuedCompletionStatus(
             port: *mut c_void,
             bytes: u32,
             key: usize,
             overlapped: *mut c_void,
         ) -> i32;
+        #[must_use]
         fn CloseHandle(handle: *mut c_void) -> i32;
         fn GetModuleHandleW(name: *const u16) -> *mut c_void;
         fn GetProcAddress(module: *mut c_void, name: *const c_char) -> *mut c_void;
+        #[must_use]
         fn QueryPerformanceCounter(count: *mut i64) -> i32;
+        #[must_use]
         fn QueryPerformanceFrequency(frequency: *mut i64) -> i32;
     }
 
@@ -1571,13 +1697,19 @@ mod poller {
     const WAIT_TIMEOUT: u32 = 258;
     const ERROR_TIMEOUT: u32 = 1460;
 
+    #[must_use]
     pub fn monotonic_ns() -> u64 {
         let (mut count, mut frequency) = (0i64, 0i64);
-        // rr: escape(unsafe): count is a local; the call cannot fail since
-        // Windows XP.
-        unsafe { QueryPerformanceCounter(&raw mut count) };
+        // rr: escape(unsafe): count is a local.
+        unsafe {
+            // rr: escape(discard): it cannot fail since Windows XP.
+            let _: i32 = QueryPerformanceCounter(&raw mut count);
+        }
         // rr: escape(unsafe): frequency is a local, fixed at boot.
-        unsafe { QueryPerformanceFrequency(&raw mut frequency) };
+        unsafe {
+            // rr: escape(discard): it cannot fail since Windows XP.
+            let _: i32 = QueryPerformanceFrequency(&raw mut frequency);
+        }
         let count = u64::try_from(count).unwrap_or(0);
         let Some(frequency) = u64::try_from(frequency).ok().filter(|&f| f > 0) else {
             return 0;
@@ -1647,7 +1779,11 @@ mod poller {
     impl Drop for Port {
         fn drop(&mut self) {
             // rr: escape(unsafe): the port is this value's own.
-            unsafe { CloseHandle(self.handle) };
+            unsafe {
+                // rr: escape(discard): the handle is released whatever
+                // CloseHandle answers; no one is left to tell.
+                let _: i32 = CloseHandle(self.handle);
+            }
         }
     }
 
@@ -1671,6 +1807,7 @@ mod poller {
             Polled::new().map(Poller::Polled)
         }
 
+        #[must_use]
         pub fn add(&mut self, socket: usize, key: u64, interest: u8) -> bool {
             match self {
                 Poller::Notified(notified) => notified.add(socket, key, interest),
@@ -1678,6 +1815,7 @@ mod poller {
             }
         }
 
+        #[must_use]
         pub fn modify(&mut self, socket: usize, key: u64, _old: u8, interest: u8) -> bool {
             match self {
                 Poller::Notified(notified) => notified.watch(socket, key, interest),
@@ -1696,6 +1834,7 @@ mod poller {
         /// port can say; WSAPoll, which the Set hands each socket's handle
         /// on every wait, cannot tell it from a new socket with a closed
         /// one's handle.
+        #[must_use]
         pub fn holds(&mut self, socket: usize, _key: u64, _interest: u8) -> bool {
             match self {
                 Poller::Notified(notified) => notified.holds(socket),
@@ -1744,6 +1883,7 @@ mod poller {
     }
 
     /// ProcessSocketNotifications, where ws2_32 has it.
+    #[must_use]
     fn notifier() -> Option<Notify> {
         let name = b"ws2_32.dll\0".map(u16::from);
         // rr: escape(unsafe): name is NUL-terminated; ws2_32 is loaded,
@@ -1798,6 +1938,7 @@ mod poller {
     }
 
     impl Notified {
+        #[must_use]
         fn new(notify: Notify) -> Option<Notified> {
             let invalid = without_provenance_mut(usize::MAX);
             // rr: escape(unsafe): a new port, for one thread.
@@ -1850,6 +1991,7 @@ mod poller {
 
         /// A socket new to the Set: one closed without being removed had
         /// its handle, and what the port holds of it is dropped.
+        #[must_use]
         fn add(&mut self, socket: usize, key: u64, interest: u8) -> bool {
             if let Some(old) = self.sockets.remove(&socket) {
                 self.registrations.remove(&old.registration);
@@ -1866,6 +2008,7 @@ mod poller {
         /// new socket that has the handle of one closed (whose removal's
         /// word closesocket may have dropped); the same socket it refuses
         /// until the word, and the interest waits for it.
+        #[must_use]
         fn watch(&mut self, socket: usize, key: u64, interest: u8) -> bool {
             let registration = self.sockets.get(&socket).map_or(0, |w| w.registration);
             self.sockets.insert(
@@ -1880,8 +2023,9 @@ mod poller {
             match (registration, interest) {
                 (0, 0) => true,
                 (_, 0) => {
-                    // A removal refused finds the registration gone already.
-                    self.unregister(socket, true);
+                    // rr: escape(discard): a removal refused finds the
+                    // registration gone already.
+                    let _: bool = self.unregister(socket, true);
                     true
                 }
                 (0, _) => {
@@ -1904,7 +2048,9 @@ mod poller {
         /// gone.
         fn remove(&mut self, socket: usize, close: bool) {
             if self.sockets.contains_key(&socket) {
-                self.unregister(socket, !close);
+                // rr: escape(discard): a removal refused finds the
+                // registration gone already; the socket leaves either way.
+                let _: bool = self.unregister(socket, !close);
                 self.sockets.remove(&socket);
             }
             if close {
@@ -1916,6 +2062,7 @@ mod poller {
         /// Asks the port to remove the socket's registration; with wait,
         /// the socket stays open and is registered again only after the
         /// port's word. Whether the port removed one.
+        #[must_use]
         fn unregister(&mut self, socket: usize, wait: bool) -> bool {
             let Some(watched) = self.sockets.get_mut(&socket) else {
                 return false;
@@ -1945,6 +2092,7 @@ mod poller {
         /// took a closed one's handle (closesocket ended that one's
         /// registration); one it removes is the socket's again at the
         /// port's word, as after any removal, with the interest it has.
+        #[must_use]
         fn holds(&mut self, socket: usize) -> bool {
             let registered = self
                 .sockets
@@ -2107,11 +2255,13 @@ mod poller {
             })
         }
 
+        #[must_use]
         fn add(&mut self, socket: usize, key: u64, interest: u8) -> bool {
             self.sockets.insert(key, socket);
             self.modify(key, interest)
         }
 
+        #[must_use]
         fn modify(&mut self, key: u64, interest: u8) -> bool {
             let Some(&socket) = self.sockets.get(&key) else {
                 return false;

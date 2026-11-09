@@ -9,7 +9,8 @@
 //! program cannot make itself. Trust::check never blocks: keep the
 //! Check (dropping it cancels it) and poll it from the loop.
 //! Trust::verify_blocking waits for the answer, for a thread that may
-//! block: never a poll loop's. macOS and Windows
+//! block: never a poll loop's, where rr refuses it, as it is
+//! `#[rr::blocking]` (see wait). macOS and Windows
 //! verify it themselves, as Go has them do: SecTrustEvaluateWithError
 //! with the SSL policy, and CertGetCertificateChain with the SSL chain
 //! policy, each on one of wait.rs's threads, as either may fetch a

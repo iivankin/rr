@@ -49,8 +49,11 @@ const REVOKED: &[u8] = include_bytes!("revoked.txt");
 /// program.
 pub fn mozilla() -> x509::Store {
     let mut store = x509::Store::new();
-    store.add_pem(MOZILLA);
-    store.add_revoked(REVOKED);
+    // rr: escape(discard): the bundle is roots-gen.py's, whole; the
+    // tests count what it adds.
+    let _: usize = store.add_pem(MOZILLA);
+    // rr: escape(discard): as above.
+    let _: usize = store.add_revoked(REVOKED);
     store
 }
 
@@ -61,8 +64,11 @@ pub fn mozilla() -> x509::Store {
 /// a store: it trusts nothing, so no verify takes it for anchors.
 pub fn policy() -> x509::Policy {
     let mut policy = x509::Policy::new();
-    policy.add_pem(MOZILLA);
-    policy.add_revoked(REVOKED);
+    // rr: escape(discard): the bundle is roots-gen.py's, whole; the
+    // tests count what it adds.
+    let _: usize = policy.add_pem(MOZILLA);
+    // rr: escape(discard): as above.
+    let _: usize = policy.add_revoked(REVOKED);
     policy
 }
 

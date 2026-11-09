@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -376,10 +377,39 @@ fn add_lists_a_registrys_components_with_what_they_need_and_ask() {
     let output = project.rr(&["add", "--list", &index]);
     success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("tls  A TLS 1.3 client"), "{stdout}");
-    assert!(stdout.contains("needs: sha256, aesgcm, x25519, x509"), "{stdout}");
-    assert!(
-        stdout.contains("asks: --option roots=system|system-mozilla|mozilla|none (default system)"),
-        "{stdout}"
-    );
+    // What the index says of each component, as the list prints it; the
+    // index changes with the registry, the form does not.
+    let json: serde_json::Value = serde_json::from_str(&fs::read_to_string(&index).unwrap()).unwrap();
+    let strings = |value: &serde_json::Value| -> Vec<String> {
+        value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|item| item.as_str().unwrap().to_owned())
+            .collect()
+    };
+    let components = json["components"].as_array().unwrap();
+    assert!(components.iter().any(|component| component["name"] == "tls"));
+    for component in components {
+        let mut expected = format!(
+            "{}  {}\n",
+            component["name"].as_str().unwrap(),
+            component["description"].as_str().unwrap()
+        );
+        let needs = strings(&component["dependencies"]);
+        if !needs.is_empty() {
+            writeln!(expected, "    needs: {}", needs.join(", ")).unwrap();
+        }
+        for option in component["options"].as_array().into_iter().flatten() {
+            writeln!(
+                expected,
+                "    asks: --option {}={} (default {})",
+                option["name"].as_str().unwrap(),
+                strings(&option["choices"]).join("|"),
+                option["default"].as_str().unwrap()
+            )
+            .unwrap();
+        }
+        assert!(stdout.contains(&expected), "{expected}\nin\n{stdout}");
+    }
 }

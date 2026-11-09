@@ -85,6 +85,7 @@ impl Modulus {
 
     /// signature^e mod m as the modulus's bytes, in the first of them in
     /// out; None unless the signature has that length and is below m.
+    #[must_use]
     fn public<'out>(
         &self,
         signature: &[u8],

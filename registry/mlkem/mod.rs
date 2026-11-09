@@ -632,6 +632,7 @@ fn encode12(f: &Poly, out: &mut [u8; POLY_BYTES]) {
 
 /// ByteDecode12 (FIPS 203 Algorithm 6); None for a coefficient of q or
 /// more, which the modulus check refuses.
+#[must_use]
 fn decode12(bytes: &[u8; POLY_BYTES], f: &mut Poly) -> Option<()> {
     for (pair, &[b0, b1, b2]) in f
         .as_chunks_mut::<2>()

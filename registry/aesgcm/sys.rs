@@ -62,6 +62,7 @@ pub fn available() -> bool {
 /// CTR in place over data with round keys rk: the counter blocks are
 /// block (the nonce, then four bytes the counter replaces) with ctr,
 /// ctr + 1, ... big-endian in its last four bytes.
+#[must_use]
 pub fn ctr(rk: &RoundKeys, block: &[u8; 16], ctr: u32, data: &mut [u8]) -> bool {
     if !available() {
         return false;
@@ -72,6 +73,7 @@ pub fn ctr(rk: &RoundKeys, block: &[u8; 16], ctr: u32, data: &mut [u8]) -> bool 
 }
 
 /// The table ghash, seal and open take, from H = E(K, 0).
+#[must_use]
 pub fn ghash_key(h: &[u8; 16], tbl: &mut Table) -> bool {
     if !available() {
         return false;
@@ -82,6 +84,7 @@ pub fn ghash_key(h: &[u8; 16], tbl: &mut Table) -> bool {
 }
 
 /// y = GHASH of y continued over blocks.
+#[must_use]
 pub fn ghash(tbl: &Table, y: &mut [u8; 16], blocks: &[[u8; 16]]) -> bool {
     if !available() {
         return false;
@@ -93,6 +96,7 @@ pub fn ghash(tbl: &Table, y: &mut [u8; 16], blocks: &[[u8; 16]]) -> bool {
 
 /// CTR in place over blocks as ctr() does, and y continued over the
 /// ciphertext it makes.
+#[must_use]
 pub fn seal(
     rk: &RoundKeys,
     tbl: &Table,
@@ -110,6 +114,7 @@ pub fn seal(
 }
 
 /// y continued over the ciphertext in blocks, and CTR in place over it.
+#[must_use]
 pub fn open(
     rk: &RoundKeys,
     tbl: &Table,

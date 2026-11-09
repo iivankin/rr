@@ -227,6 +227,7 @@ impl AesGcm {
 
     /// y continued over the ciphertext in data; on the instructions, in
     /// the same pass, data decrypted, and then true.
+    #[must_use]
     fn decrypt(&self, block: &[u8; 16], data: &mut [u8], y: &mut [u8; 16]) -> bool {
         let (blocks, tail) = data.as_chunks_mut::<16>();
         let c = 2u32.wrapping_add(low32(blocks.len() as u64));

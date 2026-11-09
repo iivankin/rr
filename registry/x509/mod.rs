@@ -1130,6 +1130,7 @@ impl Store {
     /// nowhere on a path, leaf, intermediate or anchor, as Firefox does
     /// with OneCRL; a path around it may still verify. Returns how many
     /// it added; a line that is not 64 hex digits is skipped.
+    #[must_use = "how many revocations it added"]
     pub fn add_revoked(&mut self, text: &[u8]) -> usize {
         let mut added = 0;
         for line in text.split(|byte| *byte == b'\n') {
@@ -1201,6 +1202,7 @@ impl Store {
     /// A first scan counts the blocks and the bytes they decode to, so
     /// that the store grows once, to the size it needs; then each block
     /// is decoded straight into the store and parsed there.
+    #[must_use = "how many it added: a store of none trusts nothing"]
     pub fn add_pem(&mut self, text: &[u8]) -> usize {
         let (blocks, size) = pem_size(text);
         self.bytes.reserve_exact(size);
@@ -1210,6 +1212,7 @@ impl Store {
 
     /// The blocks of add_pem's text; with distrust alone, those with a
     /// distrust date or imposed name constraints, as a policy keeps.
+    #[must_use]
     fn add_blocks(&mut self, text: &[u8], distrust_alone: bool) -> usize {
         let mut rest = text;
         let mut added = 0;
@@ -1269,6 +1272,7 @@ impl Store {
 
     /// Adds each of ders, as add_der does, growing the store once.
     /// Returns how many it added.
+    #[must_use = "how many it added: a store of none trusts nothing"]
     pub fn add_ders(&mut self, ders: &[&[u8]]) -> usize {
         self.bytes
             .reserve_exact(ders.iter().map(|der| der.len()).sum());
@@ -1319,6 +1323,7 @@ impl Store {
 
     /// Imposes the NameConstraints in hex on the name at subject in
     /// bytes; whether it was one.
+    #[must_use]
     fn impose(&mut self, subject: (usize, usize), hex: &[u8]) -> bool {
         let start = self.bytes.len();
         let decoded = hex.len().is_multiple_of(2)
@@ -1374,6 +1379,7 @@ impl Store {
     /// and the distrust date of each of its anchors for an anchor here
     /// with the same subject and key (the earlier date winning). Returns
     /// how many anchors here took a date.
+    #[must_use = "how many anchors here took a date"]
     pub fn add_policy(&mut self, policy: &Policy) -> usize {
         let policy = &policy.store;
         let room = REVOKED_MAX.saturating_sub(self.revoked.len());
@@ -1433,6 +1439,7 @@ impl Policy {
     /// "# name-constraints:" line, as Store::add_pem reads them; a block
     /// without either means nothing here, and is passed over. Returns how
     /// many it added.
+    #[must_use = "how many it added"]
     pub fn add_pem(&mut self, text: &[u8]) -> usize {
         self.store.add_blocks(text, true)
     }
@@ -1444,6 +1451,7 @@ impl Policy {
     }
 
     /// Revokes certificates, as Store::add_revoked does.
+    #[must_use = "how many revocations it added"]
     pub fn add_revoked(&mut self, text: &[u8]) -> usize {
         self.store.add_revoked(text)
     }
@@ -1643,6 +1651,7 @@ fn find(text: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// Appends the bytes of base64 text to out; whitespace is skipped, and
 /// padding ends it. False on anything else.
+#[must_use]
 fn base64(text: &[u8], out: &mut Vec<u8>) -> bool {
     let mut group = [0_u8; 4];
     let mut filled = 0;
@@ -2209,6 +2218,7 @@ impl Folded {
 
     /// Folds the string value; false when a character is not of its
     /// type, or the value not of whole characters.
+    #[must_use]
     fn fold(&mut self, value: &Element<'_>) -> bool {
         let body = value.body;
         match value.id {
@@ -2233,6 +2243,7 @@ impl Folded {
         }
     }
 
+    #[must_use]
     fn character(&mut self, code: u32) -> bool {
         let Some(character) = char::from_u32(code) else {
             return false;
@@ -2242,6 +2253,7 @@ impl Folded {
         encoded.bytes().all(|byte| self.byte(byte, Charset::Any))
     }
 
+    #[must_use]
     fn byte(&mut self, byte: u8, charset: Charset) -> bool {
         if byte == b' ' {
             self.space = !self.text.is_empty();
@@ -3146,7 +3158,7 @@ mod tests {
         assert_eq!(screen(&skipping, &policy), Err(Error::Order));
         let mut lines = Vec::new();
         revocation_line(&inter, true, &mut lines);
-        policy.add_revoked(&lines);
+        assert_eq!(policy.add_revoked(&lines), 1);
         assert_eq!(screen(&path, &policy), Err(Error::Revoked));
         assert_eq!(screen(&[], &policy), Err(Error::Malformed));
         let mut system = Store::new();

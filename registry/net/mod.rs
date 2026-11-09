@@ -35,6 +35,10 @@
 //! A listener that runs out of descriptors keeps its connections waiting
 //! and stays readable: the loop stops watching it for a while (watch it
 //! with Interest::None), or it spins.
+//!
+//! Nothing here blocks the loop, which a program marks `#[cfg_attr(rr,
+//! rr::poll)]` (as the echo test does) so that rr refuses on its path a
+//! call that would: see wait.
 
 mod sys;
 #[cfg(test)]

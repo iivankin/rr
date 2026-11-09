@@ -8,6 +8,7 @@ use crate::base::cpu;
 /// Compresses blocks into state, true when the instructions ran; false,
 /// and state untouched, on a CPU without them.
 #[cfg(target_arch = "aarch64")]
+#[must_use]
 pub fn compress(state: &mut [u32; 8], blocks: &[[u8; 64]]) -> bool {
     if !cpu::has(&cpu::SHA256) {
         return false;
@@ -20,6 +21,7 @@ pub fn compress(state: &mut [u32; 8], blocks: &[[u8; 64]]) -> bool {
 /// Compresses blocks into state, true when the instructions ran; false,
 /// and state untouched, on a CPU without them.
 #[cfg(target_arch = "x86_64")]
+#[must_use]
 pub fn compress(state: &mut [u32; 8], blocks: &[[u8; 64]]) -> bool {
     if !cpu::has(&cpu::SHA256) {
         return false;

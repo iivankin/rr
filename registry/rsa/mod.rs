@@ -177,6 +177,7 @@ pub fn verify_pss(
 impl Encoding<'_> {
     /// Whether em, signature^e mod m as the modulus's bytes, is this
     /// encoding under a modulus of bits.
+    #[must_use]
     fn matches(&self, em: &mut [u8], bits: usize) -> bool {
         match self {
             Encoding::Pkcs1(hash, digest) => pkcs1_matches(em, hash, digest),
@@ -209,6 +210,7 @@ fn pkcs1_matches(em: &[u8], hash: &Hash, digest: &[u8]) -> bool {
 
 /// Whether em, under a modulus of bits, is a PSS encoding of digest
 /// with MGF1 of hash and a salt of the hash's length (RFC 8017 9.1.2).
+#[must_use]
 fn pss_matches(em: &mut [u8], bits: usize, hash: &Hash, digest: &[u8]) -> bool {
     let length = hash.len();
     // EM has emBits = modBits - 1 bits. When those fill whole bytes the

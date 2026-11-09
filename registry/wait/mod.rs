@@ -21,6 +21,15 @@
 //! system: epoll on Linux, kqueue on macOS, socket notifications on
 //! Windows 11 and Server 2022 and WSAPoll on the Windows before them.
 //! follow keeps a component's Wait in a Set.
+//!
+//! A program marks the function its loop runs `#[cfg_attr(rr,
+//! rr::poll)]`, as net's echo test marks its own: rr then follows each
+//! call from there and refuses one that blocks whatever it is given, a C
+//! function such as getaddrinfo or sleep, or one marked
+//! `#[rr::blocking]`: block here, resolve::resolve and
+//! trust::Trust::verify_blocking, which wait for an answer. Nothing here
+//! is `#[rr::poll]`: the loop is the program's, and Set::wait is the one
+//! wait it makes.
 
 mod set;
 mod sys;

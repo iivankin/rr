@@ -74,6 +74,7 @@ fn promised() -> u32 {
 /// (asm/hwcap.h): AES and PMULL for AES, SHA2 for SHA-256, SHA512 and
 /// SHA3 (its EOR3) for SHA-512.
 #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+#[must_use]
 fn detect() -> u32 {
     const AT_HWCAP: core::ffi::c_ulong = 16;
     const HWCAP_AES: core::ffi::c_ulong = 1 << 3;
@@ -84,6 +85,7 @@ fn detect() -> u32 {
     #[link(name = "c")]
     // rr: escape(unsafe): its signature is the C library's, from sys/auxv.h.
     unsafe extern "C" {
+        #[must_use]
         fn getauxval(kind: core::ffi::c_ulong) -> core::ffi::c_ulong;
     }
     // rr: escape(unsafe): getauxval only reads the process's vector.
@@ -106,6 +108,7 @@ fn detect() -> u32 {
 #[link(name = "kernel32", kind = "raw-dylib")]
 // rr: escape(unsafe): the signature is kernel32's, from its documentation.
 unsafe extern "system" {
+    #[must_use]
     // rr: escape(unsafe): it takes a number and only reads the CPU's
     // features.
     safe fn IsProcessorFeaturePresent(feature: u32) -> i32;
@@ -116,6 +119,7 @@ unsafe extern "system" {
 /// PF_ARM_SHA512_INSTRUCTIONS_AVAILABLE (65), from Windows 11 24H2 on: an
 /// older Windows answers false to a number it does not know.
 #[cfg(all(target_arch = "aarch64", target_os = "windows"))]
+#[must_use]
 fn detect() -> u32 {
     const CRYPTO: u32 = 30;
     const SHA3: u32 = 64;

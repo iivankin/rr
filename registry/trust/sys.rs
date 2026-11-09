@@ -86,7 +86,9 @@ impl Trust {
     pub fn with_policy(mut self, policy: x509::Policy) -> Trust {
         match &mut self.store {
             Some(store) => {
-                store.add_policy(&policy);
+                // rr: escape(discard): how many anchors took a date
+                // changes nothing here; any number is right.
+                let _: usize = store.add_policy(&policy);
             }
             None => self.policy = Some(policy),
         }
@@ -126,6 +128,7 @@ impl Trust {
     /// Checks chain for host at now, and blocks until the answer: the
     /// system's verifier may fetch over the network, so never call it on
     /// a poll loop's thread; poll a check there.
+    #[cfg_attr(rr, rr::blocking)]
     pub fn verify_blocking(
         &self,
         chain: &[&[u8]],
@@ -248,6 +251,7 @@ pub struct Check<'t> {
 impl Check<'_> {
     /// None while the system works; then the answer, once: the approval
     /// of the leaf for the host, or why not. Error::Polled after it.
+    #[must_use]
     pub fn poll(&mut self) -> Option<Result<x509::Approval, Error>> {
         if self.polled {
             return Some(Err(Error::Polled));
@@ -388,6 +392,7 @@ impl Found {
     }
     /// Adds the trusted certificates to store, each once and none that
     /// is denied; how many the store took.
+    #[must_use]
     fn add_to(mut self, store: &mut x509::Store) -> usize {
         let bytes = &self.bytes;
         self.trusted
@@ -464,6 +469,7 @@ fn position(text: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// Appends what base64 text decodes to, white space aside; whether it
 /// was base64.
+#[must_use]
 fn base64(text: &[u8], out: &mut Vec<u8>) -> bool {
     let (mut bits, mut count, mut padding) = (0u32, 0u32, 0u32);
     for &byte in text {
@@ -567,6 +573,7 @@ mod disk {
     /// directories paths name (SSL_CERT_DIR) or the defaults'. Returns
     /// the first error other than a missing file, which counts only
     /// when nothing was found.
+    #[must_use]
     pub fn collect(
         files: &mut dyn Files,
         paths: &Paths<'_>,
@@ -676,8 +683,11 @@ mod posix {
     // rr: escape(unsafe): each signature is the C library's, from its headers.
     unsafe extern "C" {
         fn getenv(name: *const c_char) -> *const c_char;
+        #[must_use]
         fn open(path: *const c_char, flags: c_int, ...) -> c_int;
+        #[must_use]
         fn read(fd: c_int, buffer: *mut c_void, size: usize) -> isize;
+        #[must_use]
         fn close(fd: c_int) -> c_int;
         #[cfg_attr(
             all(target_os = "macos", target_arch = "x86_64"),
@@ -689,8 +699,11 @@ mod posix {
             link_name = "readdir$INODE64"
         )]
         fn readdir(dir: *mut c_void) -> *mut Dirent;
+        #[must_use]
         fn closedir(dir: *mut c_void) -> c_int;
+        #[must_use]
         fn dirfd(dir: *mut c_void) -> c_int;
+        #[must_use]
         fn readlinkat(fd: c_int, path: *const c_char, buffer: *mut c_char, size: usize) -> isize;
         #[cfg(target_os = "linux")]
         fn __errno_location() -> *mut c_int;
@@ -717,6 +730,7 @@ mod posix {
 
     /// The environment's value of name (with its NUL), when it is there
     /// and not empty, as Go's Getenv takes it.
+    #[must_use]
     pub fn variable(name: &[u8]) -> Option<Vec<u8>> {
         let name = CStr::from_bytes_with_nul(name).ok()?;
         // rr: escape(unsafe): name is a C string; the value lives as long
@@ -736,6 +750,7 @@ mod posix {
     }
 
     /// This thread's errno.
+    #[must_use]
     fn errno() -> i32 {
         #[cfg(target_os = "linux")]
         // rr: escape(unsafe): __errno_location gives this thread's errno.
@@ -749,6 +764,7 @@ mod posix {
 
     /// path with a NUL after it, in buffer; EINVAL-like None when it
     /// holds a NUL or is too long.
+    #[must_use]
     fn terminated<'a>(path: &[u8], buffer: &'a mut [u8; PATH_BYTES_MAX]) -> Option<&'a CStr> {
         if path.contains(&0) || path.len() >= PATH_BYTES_MAX {
             return None;
@@ -761,6 +777,7 @@ mod posix {
 
     /// Whether name, in the directory open at dir, is a link to a file
     /// beside it.
+    #[must_use]
     fn same_dir_link(dir: *mut c_void, name: &CStr) -> bool {
         let mut target = [0u8; PATH_BYTES_MAX];
         // rr: escape(unsafe): dir is open until the caller closes it.
@@ -796,7 +813,11 @@ mod posix {
             }
             let result = read_all(fd, text);
             // rr: escape(unsafe): fd is this call's, closed once.
-            unsafe { close(fd) };
+            unsafe {
+                // rr: escape(discard): close releases the descriptor whatever
+                // it answers; no one is left to tell.
+                let _: c_int = close(fd);
+            }
             result
         }
 
@@ -831,7 +852,11 @@ mod posix {
                 names.push(0);
             }
             // rr: escape(unsafe): stream is this call's, closed once.
-            unsafe { closedir(stream) };
+            unsafe {
+                // rr: escape(discard): closedir frees the stream whatever it
+                // answers; no one is left to tell.
+                let _: c_int = closedir(stream);
+            }
             Ok(())
         }
     }
@@ -890,6 +915,7 @@ mod os {
             }
         }
 
+        #[must_use]
         pub fn poll(&mut self) -> Option<Result<Built, Error>> {
             self.result.take()
         }
@@ -915,16 +941,21 @@ mod os {
     // rr: escape(unsafe): each signature is CoreFoundation's, from its headers.
     unsafe extern "C" {
         fn CFRelease(object: *const c_void);
+        #[must_use]
         fn CFArrayGetCount(array: *const c_void) -> isize;
         fn CFArrayGetValueAtIndex(array: *const c_void, index: isize) -> *const c_void;
+        #[must_use]
         fn CFDataGetLength(data: *const c_void) -> isize;
         fn CFDataGetBytePtr(data: *const c_void) -> *const u8;
+        #[must_use]
         fn CFDictionaryGetValueIfPresent(
             dictionary: *const c_void,
             key: *const c_void,
             value: *mut *const c_void,
         ) -> u8;
+        #[must_use]
         fn CFEqual(a: *const c_void, b: *const c_void) -> u8;
+        #[must_use]
         fn CFNumberGetValue(number: *const c_void, kind: isize, value: *mut c_void) -> u8;
         fn CFStringCreateWithBytes(
             allocator: *const c_void,
@@ -942,6 +973,7 @@ mod os {
             callbacks: *const c_void,
         ) -> *const c_void;
         fn CFDateCreate(allocator: *const c_void, at: f64) -> *const c_void;
+        #[must_use]
         fn CFErrorGetCode(error: *const c_void) -> isize;
         /// CFArrayCallBacks: a version and four functions.
         #[link_name = "kCFTypeArrayCallBacks"]
@@ -952,7 +984,9 @@ mod os {
     // rr: escape(unsafe): each signature is the Security framework's, from
     // its headers.
     unsafe extern "C" {
+        #[must_use]
         fn SecTrustSettingsCopyCertificates(domain: u32, certificates: *mut *const c_void) -> i32;
+        #[must_use]
         fn SecTrustSettingsCopyTrustSettings(
             certificate: *const c_void,
             domain: u32,
@@ -965,12 +999,15 @@ mod os {
             data: *const c_void,
         ) -> *const c_void;
         fn SecPolicyCreateSSL(server: u8, host: *const c_void) -> *const c_void;
+        #[must_use]
         fn SecTrustCreateWithCertificates(
             certificates: *const c_void,
             policies: *const c_void,
             trust: *mut *const c_void,
         ) -> i32;
+        #[must_use]
         fn SecTrustSetVerifyDate(trust: *const c_void, date: *const c_void) -> i32;
+        #[must_use]
         fn SecTrustEvaluateWithError(trust: *const c_void, error: *mut *const c_void) -> u8;
         fn SecTrustCopyCertificateChain(trust: *const c_void) -> *const c_void;
     }
@@ -1109,6 +1146,7 @@ mod os {
     }
 
     /// The bytes of a CFData of ours, while it lives.
+    #[must_use]
     fn bytes(data: &Owned) -> Option<&[u8]> {
         if data.0.is_null() {
             return None;
@@ -1153,6 +1191,7 @@ mod os {
     }
 
     /// The value of key in dictionary, when present.
+    #[must_use]
     fn value(dictionary: *const c_void, key: &Owned) -> Option<*const c_void> {
         let mut value = null();
         // rr: escape(unsafe): dictionary is a CFDictionary, value a local
@@ -1162,6 +1201,7 @@ mod os {
     }
 
     /// Whether policy is Apple's SSL policy.
+    #[must_use]
     fn ssl(keys: &Keys, policy: *const c_void) -> bool {
         // rr: escape(unsafe): policy is a SecPolicyRef of trust settings.
         let properties = Owned(unsafe { SecPolicyCopyProperties(policy) });
@@ -1497,12 +1537,15 @@ mod os {
     // rr: escape(unsafe): each signature is crypt32's, from its documentation.
     unsafe extern "system" {
         fn CertOpenSystemStoreW(provider: usize, name: *const u16) -> *mut c_void;
+        #[must_use]
         fn CertCloseStore(store: *mut c_void, flags: u32) -> i32;
         fn CertEnumCertificatesInStore(
             store: *mut c_void,
             previous: *const Context,
         ) -> *const Context;
+        #[must_use]
         fn CertFreeCertificateContext(context: *const Context) -> i32;
+        #[must_use]
         fn CertGetEnhancedKeyUsage(
             context: *const Context,
             flags: u32,
@@ -1516,6 +1559,7 @@ mod os {
             flags: u32,
             parameter: *const c_void,
         ) -> *mut c_void;
+        #[must_use]
         fn CertAddEncodedCertificateToStore(
             store: *mut c_void,
             encoding: u32,
@@ -1524,6 +1568,7 @@ mod os {
             disposition: u32,
             context: *mut *const Context,
         ) -> i32;
+        #[must_use]
         fn CertGetCertificateChain(
             engine: *mut c_void,
             context: *const Context,
@@ -1535,6 +1580,7 @@ mod os {
             chain: *mut *const ChainContext,
         ) -> i32;
         fn CertFreeCertificateChain(chain: *const ChainContext);
+        #[must_use]
         fn CertVerifyCertificateChainPolicy(
             policy: *const c_char,
             chain: *const ChainContext,
@@ -1546,8 +1592,10 @@ mod os {
     #[link(name = "kernel32", kind = "raw-dylib")]
     // rr: escape(unsafe): each signature is kernel32's, from its documentation.
     unsafe extern "system" {
+        #[must_use]
         fn GetLastError() -> u32;
         fn SetLastError(code: u32);
+        #[must_use]
         fn GetEnvironmentVariableW(name: *const u16, buffer: *mut u16, size: u32) -> u32;
         fn CreateFileW(
             name: *const u16,
@@ -1558,6 +1606,7 @@ mod os {
             flags: u32,
             template: *mut c_void,
         ) -> *mut c_void;
+        #[must_use]
         fn ReadFile(
             file: *mut c_void,
             buffer: *mut u8,
@@ -1565,9 +1614,12 @@ mod os {
             read: *mut u32,
             overlapped: *mut c_void,
         ) -> i32;
+        #[must_use]
         fn CloseHandle(handle: *mut c_void) -> i32;
         fn FindFirstFileW(name: *const u16, data: *mut FindData) -> *mut c_void;
+        #[must_use]
         fn FindNextFileW(find: *mut c_void, data: *mut FindData) -> i32;
+        #[must_use]
         fn FindClose(find: *mut c_void) -> i32;
     }
 
@@ -1605,10 +1657,15 @@ mod os {
     impl Drop for Store {
         fn drop(&mut self) {
             // rr: escape(unsafe): the store is ours and unused from here.
-            unsafe { CertCloseStore(self.0, 0) };
+            unsafe {
+                // rr: escape(discard): the store is released whatever
+                // CertCloseStore answers; no one is left to tell.
+                let _: i32 = CertCloseStore(self.0, 0);
+            }
         }
     }
 
+    #[must_use]
     fn last_error() -> i32 {
         // rr: escape(unsafe): GetLastError takes nothing.
         unsafe { GetLastError() }.cast_signed()
@@ -1616,6 +1673,7 @@ mod os {
 
     /// The current user's system store name (UTF-16 with its NUL),
     /// which holds the machine's, Group Policy's and the enterprise's.
+    #[must_use]
     fn open(name: &[u16]) -> Option<Store> {
         // rr: escape(unsafe): name is NUL-terminated.
         let store = unsafe { CertOpenSystemStoreW(0, name.as_ptr()) };
@@ -1661,11 +1719,16 @@ mod os {
             f(context, der);
         }
         // rr: escape(unsafe): stopped early: the last context is ours to free.
-        unsafe { CertFreeCertificateContext(context) };
+        unsafe {
+            // rr: escape(discard): it always answers TRUE, as its documentation
+            // says.
+            let _: i32 = CertFreeCertificateContext(context);
+        }
     }
 
     /// Whether the certificate's usages, its extension's and those the
     /// store sets, allow server authentication, as certmgr shows them.
+    #[must_use]
     fn server_auth(context: *const Context) -> bool {
         let mut size = 0u32;
         // rr: escape(unsafe): a null buffer asks for the size.
@@ -1749,7 +1812,11 @@ mod os {
         fn drop(&mut self) {
             if !self.0.is_null() {
                 // rr: escape(unsafe): the context is ours and unused from here.
-                unsafe { CertFreeCertificateContext(self.0) };
+                unsafe {
+                    // rr: escape(discard): it always answers TRUE, as its
+                    // documentation says.
+                    let _: i32 = CertFreeCertificateContext(self.0);
+                }
             }
         }
     }
@@ -1956,6 +2023,7 @@ mod os {
 
     /// The environment's value of name (ASCII with its NUL) as UTF-8,
     /// when it is there, not empty, and Unicode.
+    #[must_use]
     pub fn variable(name: &[u8]) -> Option<Vec<u8>> {
         // rr: escape(copy): the name in UTF-16, as Windows takes it.
         let wide: Vec<u16> = name.iter().map(|byte| u16::from(*byte)).collect();
@@ -2010,7 +2078,11 @@ mod os {
     impl Drop for Handle {
         fn drop(&mut self) {
             // rr: escape(unsafe): the handle is ours and unused from here.
-            unsafe { CloseHandle(self.0) };
+            unsafe {
+                // rr: escape(discard): the handle is released whatever
+                // CloseHandle answers; no one is left to tell.
+                let _: i32 = CloseHandle(self.0);
+            }
         }
     }
 
@@ -2020,7 +2092,11 @@ mod os {
     impl Drop for Find {
         fn drop(&mut self) {
             // rr: escape(unsafe): the find handle is ours and unused from here.
-            unsafe { FindClose(self.0) };
+            unsafe {
+                // rr: escape(discard): the handle is released whatever
+                // FindClose answers; no one is left to tell.
+                let _: i32 = FindClose(self.0);
+            }
         }
     }
 
@@ -2291,6 +2367,7 @@ mod thread {
             check
         }
 
+        #[must_use]
         pub fn poll(&mut self) -> Option<Result<Built, Error>> {
             if self.taken.is_none() && !self.shared.is_null() {
                 // rr: escape(unsafe): this check holds shared.

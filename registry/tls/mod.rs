@@ -1067,6 +1067,7 @@ impl<'a> Client<'a> {
     /// awaits a verdict; how many. They are borrowed from the handshake
     /// buffer, not copied. None when there is no chain to verify, or out
     /// is shorter than it: x509::CHAIN_MAX slots hold any this takes.
+    #[must_use]
     pub fn chain<'c>(&'c self, out: &mut [&'c [u8]]) -> Option<usize> {
         if !self.awaiting() {
             return None;
@@ -1258,6 +1259,7 @@ impl<'a> Client<'a> {
     }
 
     /// Takes from rest up to want bytes of the record; the count taken.
+    #[must_use]
     fn fill(&mut self, rest: &[u8], want: usize) -> usize {
         let count = want.saturating_sub(self.rx.len()).min(rest.len());
         if let Some(part) = rest.get(..count) {

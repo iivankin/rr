@@ -2,6 +2,8 @@
 //! the caller's loop, the same on all three: start a lookup, poll it
 //! until it is done, take the addresses; drop it to cancel. Connect to
 //! an address's socket_addr, which keeps a link-local one's interface.
+//! resolve waits for the answer, for a thread that may block: it is
+//! `#[rr::blocking]`, which rr refuses on a poll loop's path (see wait).
 //!
 //! Some names are answered before any system sees them, the same on all
 //! three: no name (empty, ".", not ASCII: an internationalized name comes

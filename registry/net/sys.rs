@@ -376,10 +376,14 @@ mod os {
         #[link(name = "c")]
         // rr: escape(unsafe): each signature is the C library's, from its headers.
         unsafe extern "C" {
+            #[must_use]
             pub(super) fn socket(domain: c_int, kind: c_int, protocol: c_int) -> c_int;
+            #[must_use]
             pub(super) fn bind(fd: c_int, address: *const u8, length: u32) -> c_int;
+            #[must_use]
             pub(super) fn listen(fd: c_int, backlog: c_int) -> c_int;
             #[cfg(target_os = "linux")]
+            #[must_use]
             pub(super) fn accept4(
                 fd: c_int,
                 address: *mut u8,
@@ -387,10 +391,14 @@ mod os {
                 flags: c_int,
             ) -> c_int;
             #[cfg(target_os = "macos")]
+            #[must_use]
             pub(super) fn accept(fd: c_int, address: *mut u8, length: *mut u32) -> c_int;
+            #[must_use]
             pub(super) fn connect(fd: c_int, address: *const u8, length: u32) -> c_int;
+            #[must_use]
             pub(super) fn getsockname(fd: c_int, address: *mut u8, length: *mut u32) -> c_int;
             #[cfg(target_os = "macos")]
+            #[must_use]
             pub(super) fn sysctlbyname(
                 name: *const core::ffi::c_char,
                 old: *mut c_void,
@@ -398,7 +406,9 @@ mod os {
                 new: *const c_void,
                 new_length: usize,
             ) -> c_int;
+            #[must_use]
             pub(super) fn getpeername(fd: c_int, address: *mut u8, length: *mut u32) -> c_int;
+            #[must_use]
             pub(super) fn getsockopt(
                 fd: c_int,
                 level: c_int,
@@ -406,6 +416,7 @@ mod os {
                 value: *mut c_void,
                 length: *mut u32,
             ) -> c_int;
+            #[must_use]
             pub(super) fn setsockopt(
                 fd: c_int,
                 level: c_int,
@@ -413,23 +424,30 @@ mod os {
                 value: *const c_void,
                 length: u32,
             ) -> c_int;
+            #[must_use]
             pub(super) fn send(
                 fd: c_int,
                 buffer: *const c_void,
                 length: usize,
                 flags: c_int,
             ) -> isize;
+            #[must_use]
             pub(super) fn recv(
                 fd: c_int,
                 buffer: *mut c_void,
                 length: usize,
                 flags: c_int,
             ) -> isize;
+            #[must_use]
             pub(super) fn shutdown(fd: c_int, how: c_int) -> c_int;
+            #[must_use]
             pub(super) fn close(fd: c_int) -> c_int;
             #[cfg(target_os = "macos")]
+            #[must_use]
             pub(super) fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
+            #[must_use]
             pub(super) fn getrlimit(resource: c_int, limit: *mut u64) -> c_int;
+            #[must_use]
             pub(super) fn setrlimit(resource: c_int, limit: *const u64) -> c_int;
         }
     }
@@ -638,6 +656,7 @@ mod os {
     }
 
     #[cfg(target_os = "linux")]
+    #[must_use]
     fn accept_one(fd: c_int, address: &mut [u8], size: &mut u32) -> c_int {
         use numbers::{SOCK_CLOEXEC, SOCK_NONBLOCK};
         // rr: escape(unsafe): address holds size bytes.
@@ -645,6 +664,7 @@ mod os {
     }
 
     #[cfg(target_os = "macos")]
+    #[must_use]
     fn accept_one(fd: c_int, address: &mut [u8], size: &mut u32) -> c_int {
         // rr: escape(unsafe): address holds size bytes.
         unsafe { c::accept(fd, address.as_mut_ptr(), size) }
@@ -769,6 +789,7 @@ mod os {
         }
     }
 
+    #[must_use]
     pub fn local(fd: c_int) -> Option<SocketAddr> {
         let mut address = [0u8; ADDRESS_BYTES];
         let mut size = length(&address);
@@ -783,6 +804,7 @@ mod os {
         peer(fd).is_some()
     }
 
+    #[must_use]
     pub fn peer(fd: c_int) -> Option<SocketAddr> {
         let mut address = [0u8; ADDRESS_BYTES];
         let mut size = length(&address);
@@ -800,12 +822,20 @@ mod os {
             on.copy_from_slice(&1i32.to_le_bytes());
         }
         // rr: escape(unsafe): linger is a struct linger of its length.
-        unsafe { c::setsockopt(fd, SOL_SOCKET, SO_LINGER, linger.as_ptr().cast(), 8) };
+        unsafe {
+            // rr: escape(discard): refused, the close that follows is an
+            // orderly one: a reset is only asked for.
+            let _: c_int = c::setsockopt(fd, SOL_SOCKET, SO_LINGER, linger.as_ptr().cast(), 8);
+        }
     }
 
     pub fn close(fd: c_int) {
         // rr: escape(unsafe): fd is its owner's, closed once, by its drop.
-        unsafe { c::close(fd) };
+        unsafe {
+            // rr: escape(discard): close releases the descriptor whatever it
+            // answers; no one is left to tell.
+            let _: c_int = c::close(fd);
+        }
     }
 
     /// RLIMIT_NOFILE (sys/resource.h); struct rlimit is two rlim_t, the
@@ -818,6 +848,7 @@ mod os {
     /// macOS's kern.maxfilesperproc, the most descriptors a process may
     /// hold whatever its hard limit says; no limit when it cannot be read.
     #[cfg(target_os = "macos")]
+    #[must_use]
     fn per_process() -> u64 {
         let mut most = 0i32;
         let mut length = size_of::<i32>();
@@ -855,6 +886,7 @@ mod os {
         Some(BEFORE.load(Ordering::Acquire)).filter(|&before| before != 0)
     }
 
+    #[must_use]
     pub fn descriptors(want: u64) -> u64 {
         let mut limit = [0u64; 2];
         // rr: escape(unsafe): limit is a local struct rlimit.
@@ -871,9 +903,12 @@ mod os {
             // rr: escape(discard): the first raise keeps what it raised
             // from; a later one finds it kept.
             let _first = BEFORE.compare_exchange(0, current, Ordering::AcqRel, Ordering::Acquire);
-            // rr: escape(unsafe): raised is a local struct rlimit. Refused,
-            // the limit stays as it was.
-            unsafe { c::setrlimit(RLIMIT_NOFILE, raised.as_ptr()) };
+            // rr: escape(unsafe): raised is a local struct rlimit.
+            unsafe {
+                // rr: escape(discard): refused, the limit stays as it was,
+                // which getrlimit reads below.
+                let _: c_int = c::setrlimit(RLIMIT_NOFILE, raised.as_ptr());
+            }
         }
         // What the system holds now, which it may have cut.
         // rr: escape(unsafe): limit is a local struct rlimit.
@@ -904,6 +939,7 @@ mod os {
         #[link(name = "ws2_32", kind = "raw-dylib")]
         // rr: escape(unsafe): each signature is ws2_32's, from its documentation.
         unsafe extern "system" {
+            #[must_use]
             pub(super) fn WSASocketW(
                 family: i32,
                 kind: i32,
@@ -912,12 +948,19 @@ mod os {
                 group: u32,
                 flags: u32,
             ) -> usize;
+            #[must_use]
             pub(super) fn bind(socket: usize, address: *const u8, length: i32) -> i32;
+            #[must_use]
             pub(super) fn listen(socket: usize, backlog: i32) -> i32;
+            #[must_use]
             pub(super) fn accept(socket: usize, address: *mut u8, length: *mut i32) -> usize;
+            #[must_use]
             pub(super) fn connect(socket: usize, address: *const u8, length: i32) -> i32;
+            #[must_use]
             pub(super) fn getsockname(socket: usize, address: *mut u8, length: *mut i32) -> i32;
+            #[must_use]
             pub(super) fn getpeername(socket: usize, address: *mut u8, length: *mut i32) -> i32;
+            #[must_use]
             pub(super) fn getsockopt(
                 socket: usize,
                 level: i32,
@@ -925,6 +968,7 @@ mod os {
                 value: *mut u8,
                 length: *mut i32,
             ) -> i32;
+            #[must_use]
             pub(super) fn setsockopt(
                 socket: usize,
                 level: i32,
@@ -932,11 +976,17 @@ mod os {
                 value: *const u8,
                 length: i32,
             ) -> i32;
+            #[must_use]
             pub(super) fn send(socket: usize, buffer: *const u8, length: i32, flags: i32) -> i32;
+            #[must_use]
             pub(super) fn recv(socket: usize, buffer: *mut u8, length: i32, flags: i32) -> i32;
+            #[must_use]
             pub(super) fn shutdown(socket: usize, how: i32) -> i32;
+            #[must_use]
             pub(super) fn closesocket(socket: usize) -> i32;
+            #[must_use]
             pub(super) fn ioctlsocket(socket: usize, command: i32, argument: *mut u32) -> i32;
+            #[must_use]
             pub(super) fn WSAGetLastError() -> i32;
         }
     }
@@ -944,6 +994,7 @@ mod os {
     #[link(name = "kernel32", kind = "raw-dylib")]
     // rr: escape(unsafe): its signature is kernel32's, from its documentation.
     unsafe extern "system" {
+        #[must_use]
         fn SetHandleInformation(handle: *mut c_void, mask: u32, flags: u32) -> i32;
     }
 
@@ -973,6 +1024,7 @@ mod os {
     const WSAEHOSTDOWN: i32 = 10064;
     const WSAEHOSTUNREACH: i32 = 10065;
 
+    #[must_use]
     fn last() -> i32 {
         // rr: escape(unsafe): the thread's last Winsock error.
         unsafe { c::WSAGetLastError() }
@@ -1176,6 +1228,7 @@ mod os {
     /// WSAENOTCONN; SO_CONNECT_TIME says it: the seconds since it was
     /// made, and before that 0xFFFFFFFF or an error, as its two pages
     /// in Microsoft's documentation tell it differently.
+    #[must_use]
     pub fn established(socket: usize) -> bool {
         let mut seconds = [0u8; 4];
         let mut size = length(&seconds);
@@ -1194,6 +1247,7 @@ mod os {
         done == 0 && u32::from_le_bytes(seconds) != u32::MAX
     }
 
+    #[must_use]
     pub fn local(socket: usize) -> Option<SocketAddr> {
         let mut address = [0u8; ADDRESS_BYTES];
         let mut size = length(&address);
@@ -1203,6 +1257,7 @@ mod os {
         decode(address.get(..usize::try_from(size).ok()?)?)
     }
 
+    #[must_use]
     pub fn peer(socket: usize) -> Option<SocketAddr> {
         let mut address = [0u8; ADDRESS_BYTES];
         let mut size = length(&address);
@@ -1217,13 +1272,21 @@ mod os {
         let [on, off] = 1u16.to_le_bytes();
         let linger = [on, off, 0, 0];
         // rr: escape(unsafe): linger is a struct linger of its length.
-        unsafe { c::setsockopt(socket, SOL_SOCKET, SO_LINGER, linger.as_ptr(), 4) };
+        unsafe {
+            // rr: escape(discard): refused, the close that follows is an
+            // orderly one: a reset is only asked for.
+            let _: i32 = c::setsockopt(socket, SOL_SOCKET, SO_LINGER, linger.as_ptr(), 4);
+        }
     }
 
     pub fn close(socket: usize) {
         // rr: escape(unsafe): the socket is its owner's, closed once, by its
         // drop.
-        unsafe { c::closesocket(socket) };
+        unsafe {
+            // rr: escape(discard): closesocket releases the socket whatever it
+            // answers; no one is left to tell.
+            let _: i32 = c::closesocket(socket);
+        }
     }
 
     /// Windows has no limit to raise: as many as asked.

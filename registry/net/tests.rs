@@ -136,6 +136,9 @@ fn echo_many() {
     }
 }
 
+/// The loop of a server and its clients, marked as a program marks its
+/// own: rr follows each call from here and refuses one that blocks.
+#[cfg_attr(rr, rr::poll)]
 fn echo(set: &mut Set, count: usize) {
     let mut listener = Listener::bind(v4(), 1024).unwrap();
     let address = listener.local().unwrap();

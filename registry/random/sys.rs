@@ -54,9 +54,13 @@ mod linux {
     // rr: escape(unsafe): their signatures are the C library's, from
     // sys/random.h, fcntl.h, unistd.h and errno.h.
     unsafe extern "C" {
+        #[must_use]
         pub fn getrandom(buffer: *mut c_void, length: usize, flags: c_uint) -> isize;
+        #[must_use]
         pub fn open(path: *const c_char, flags: c_int, ...) -> c_int;
+        #[must_use]
         pub fn read(fd: c_int, buffer: *mut c_void, length: usize) -> isize;
+        #[must_use]
         pub fn close(fd: c_int) -> c_int;
         fn __errno_location() -> *mut c_int;
     }
@@ -100,6 +104,7 @@ pub fn fill(out: &mut [u8]) {
 /// Fills out from /dev/urandom, for a kernel without getrandom.
 #[cfg(target_os = "linux")]
 fn urandom(out: &mut [u8]) {
+    use core::ffi::c_int;
     use linux::{Failure, URANDOM_FLAGS, close, failure, open, read};
     // rr: escape(unsafe): the path ends in its NUL; no mode is read
     // without O_CREAT.
@@ -122,7 +127,11 @@ fn urandom(out: &mut [u8]) {
         }
     }
     // rr: escape(unsafe): fd is the descriptor open gave, closed once.
-    unsafe { close(fd) };
+    unsafe {
+        // rr: escape(discard): close releases the descriptor whatever it
+        // answers; no one is left to tell.
+        let _: c_int = close(fd);
+    }
 }
 
 /// Fills out with the system's randomness.
@@ -132,6 +141,7 @@ pub fn fill(out: &mut [u8]) {
     // rr: escape(unsafe): the signature is bcryptprimitives.dll's, as Go's
     // and BoringSSL's declare it.
     unsafe extern "system" {
+        #[must_use]
         fn ProcessPrng(data: *mut u8, length: usize) -> i32;
     }
     // rr: escape(unsafe): it writes length bytes at data, which out has.

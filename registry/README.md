@@ -106,6 +106,15 @@ strength:
 - **No outcome goes unread.** A function that returns a verdict, a
   count or a tag returns a `Result` or is `#[must_use]`, and so is a
   value whose drop cancels work. `bool` answers questions, not outcomes.
+  rr asks it of every function that changes something (takes `&mut`
+  or calls C) and returns a bool, an integer or an Option, and of each
+  C declaration; a value dropped on purpose says why in an
+  `escape(discard)` reason.
+- **What blocks says so.** A function that waits for an answer, such as
+  resolve::resolve or trust::Trust::verify_blocking, is
+  `#[cfg_attr(rr, rr::blocking)]`, which rr refuses on the path of a
+  loop the program marks `#[cfg_attr(rr, rr::poll)]`; no component
+  marks a function `rr::poll`, as the loop is the program's.
 - **Every failure is a variant, and loud.** An error enum says what went
   wrong; which errors end the value and which leave it usable is written
   at the enum. A call that cannot go on says why, never `Ok(0)` or the

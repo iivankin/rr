@@ -220,6 +220,7 @@ fn pack(n: &Fe) -> [u8; KEY_BYTES] {
 
 /// One carry pass through the limbs; returns what passes 2^255 for the
 /// caller to fold back or to test.
+#[must_use]
 fn carry(t: &mut Fe) -> u64 {
     let mut c = 0;
     for x in t.iter_mut() {

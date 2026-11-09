@@ -61,6 +61,7 @@ impl Lookup {
 
     /// Does what is ready, without waiting: None while the lookup runs,
     /// then the addresses, best first, or why there are none.
+    #[must_use]
     pub fn poll(&mut self) -> Option<Result<&[Address], Error>> {
         match &mut self.found {
             Ok(Ok(addresses)) => Some(Ok(addresses)),
@@ -83,7 +84,9 @@ impl Lookup {
     }
 }
 
-/// Looks up name and waits for the answer.
+/// Looks up name and waits for the answer: never on a poll loop's
+/// thread; start a Lookup and poll it there.
+#[cfg_attr(rr, rr::blocking)]
 pub fn resolve(name: &[u8]) -> Result<Vec<Address>, Error> {
     answered(name).unwrap_or_else(|| os::resolve(name))
 }
@@ -224,6 +227,7 @@ mod os {
     #[link(name = "c")]
     // rr: escape(unsafe): each signature is the C library's, from its headers.
     unsafe extern "C" {
+        #[must_use]
         fn getaddrinfo(
             node: *const c_char,
             service: *const c_char,
@@ -403,6 +407,7 @@ mod os {
             state
         }
 
+        #[must_use]
         pub fn poll(&mut self) -> Option<Result<&[Address], Error>> {
             if self.taken.is_none() && !self.shared.is_null() {
                 // rr: escape(unsafe): this lookup holds shared.
@@ -495,6 +500,7 @@ mod os {
     // rr: escape(unsafe): each signature is the C library's, from its headers
     // (dns_sd.h, net/if.h, sys/socket.h, unistd.h).
     unsafe extern "C" {
+        #[must_use]
         fn DNSServiceGetAddrInfo(
             service: *mut *mut c_void,
             flags: u32,
@@ -504,14 +510,22 @@ mod os {
             reply: Reply,
             context: *mut c_void,
         ) -> i32;
+        #[must_use]
         fn DNSServiceRefSockFD(service: *mut c_void) -> c_int;
+        #[must_use]
         fn DNSServiceProcessResult(service: *mut c_void) -> i32;
         fn DNSServiceRefDeallocate(service: *mut c_void);
+        #[must_use]
         fn if_nametoindex(name: *const c_char) -> u32;
+        #[must_use]
         fn socket(domain: c_int, kind: c_int, protocol: c_int) -> c_int;
+        #[must_use]
         fn connect(fd: c_int, address: *const u8, length: u32) -> c_int;
+        #[must_use]
         fn getsockname(fd: c_int, address: *mut u8, length: *mut u32) -> c_int;
+        #[must_use]
         fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
+        #[must_use]
         fn close(fd: c_int) -> c_int;
     }
 
@@ -686,6 +700,7 @@ mod os {
 
     /// A literal address, with a zone after % for IPv6: an interface's
     /// number or name.
+    #[must_use]
     fn literal(name: &[u8]) -> Option<Address> {
         let text = core::str::from_utf8(name).ok()?;
         let Some((ip, zone)) = text.split_once('%') else {
@@ -716,6 +731,7 @@ mod os {
     /// The source address the system would use to reach address, as Go
     /// and glibc learn it: connect a UDP socket, which sends nothing, and
     /// ask. None where there is no route.
+    #[must_use]
     fn source(address: &Address) -> Option<IpAddr> {
         let mut peer = [0u8; SOCKADDR_BYTES];
         // The discard port: any port will do, as nothing is sent.
@@ -753,7 +769,11 @@ mod os {
         // rr: escape(unsafe): local holds size bytes.
         let named = connected && unsafe { getsockname(fd, local.as_mut_ptr(), &raw mut size) } == 0;
         // rr: escape(unsafe): fd is this call's, closed once.
-        unsafe { close(fd) };
+        unsafe {
+            // rr: escape(discard): close releases the descriptor whatever it
+            // answers; no one is left to tell.
+            let _: c_int = close(fd);
+        }
         if !named {
             return None;
         }
@@ -813,6 +833,7 @@ mod os {
             state
         }
 
+        #[must_use]
         fn fd(&self) -> c_int {
             // rr: escape(unsafe): service is live while the lookup runs.
             unsafe { DNSServiceRefSockFD(self.service) }
@@ -881,6 +902,7 @@ mod os {
             self.done = Some(Ok(found));
         }
 
+        #[must_use]
         pub fn poll(&mut self) -> Option<Result<&[Address], Error>> {
             if self.done.is_none() {
                 self.read();
@@ -1058,6 +1080,7 @@ mod os {
     #[link(name = "ws2_32", kind = "raw-dylib")]
     // rr: escape(unsafe): each signature is ws2_32's, from its documentation.
     unsafe extern "system" {
+        #[must_use]
         fn GetAddrInfoExW(
             name: *const u16,
             service: *const u16,
@@ -1070,6 +1093,7 @@ mod os {
             completion: Completion,
             handle: *mut *mut c_void,
         ) -> i32;
+        #[must_use]
         fn GetAddrInfoExCancel(handle: *mut *mut c_void) -> i32;
         fn FreeAddrInfoExW(info: *mut AddrInfo);
     }
@@ -1292,6 +1316,7 @@ mod os {
             state
         }
 
+        #[must_use]
         pub fn poll(&mut self) -> Option<Result<&[Address], Error>> {
             if self.taken.is_none() && !self.shared.is_null() {
                 // rr: escape(unsafe): this lookup holds shared.
@@ -1344,7 +1369,11 @@ mod os {
                 // Should it have begun already, the handle is no longer
                 // the system's, and GetAddrInfoExCancel says so.
                 // rr: escape(unsafe): the handle the call wrote.
-                unsafe { GetAddrInfoExCancel(shared.handle.get()) };
+                unsafe {
+                    // rr: escape(discard): refused, the lookup has begun and
+                    // answers through its callback, as above.
+                    let _: i32 = GetAddrInfoExCancel(shared.handle.get());
+                }
             } else {
                 // Done, never polled: the list is the lookup's to free.
                 // rr: escape(unsafe): the system is done writing the list.
