@@ -173,7 +173,7 @@ Rules are compiler errors and cannot be lowered with `allow`, `-A rr`,
 | Rule | Restriction |
 | --- | --- |
 | rr_no_std | Require #![no_std]; forbid explicit std imports |
-| rr_no_generics | Forbid own type/const generic parameters, impl Trait other than a closure parameter or an iterator returned, async fn/blocks/closures and await |
+| rr_no_generics | Forbid own type parameters, const parameters other than `const N: usize` of a function, struct or impl, impl Trait other than a closure parameter or an iterator returned, async fn/blocks/closures and await |
 | rr_simple_traits | Forbid associated types/GATs, supertraits, where clauses, trait aliases and dyn of a trait from another crate |
 | rr_no_macros | Allow no_std compiler builtins, core panic/assert, matches! and seven of the compiler's own derives; forbid own/library macros, other derives and external procedural attributes, including nested calls and cfg_attr derives |
 | rr_unexplained_escape | Require a nearby real comment with a nonempty explanation for the operations below |
@@ -190,7 +190,8 @@ Rules are compiler errors and cannot be lowered with `allow`, `-A rr`,
 | rr_duplicate | Forbid a function whose body repeats another's, token for token without comments and spacing and type for type, of four statements or more, without a `duplicate` reason: one function, called from both places, says it once. Two types spelled the same way (`Self { memo: Memo::new() }`, `self.workspace.abort()`) are not a copy: one function for both would need a trait |
 
 Lifetime parameters, ordinary traits/impls, and concrete uses of existing generic
-library types such as Vec<u8> remain allowed. A function's parameter may be
+library types such as Vec<u8> remain allowed, and so does `const N: usize`
+(below). A function's parameter may be
 `impl Fn(..)`, `impl FnMut(..)` or `impl FnOnce(..)`: a closure handed in,
 one bound and nothing else, so that work around a call, such as undoing a
 step when it fails, is written once. `Send` and `Sync` may stand beside
@@ -264,6 +265,32 @@ a string from one character that needs escaping to the next, an indent
 as one slice of a constant of spaces, a number formatted into a small
 array on the stack; a `push(char)` per character is a call to memcpy
 for each, which rr prof counts.
+
+### Const parameters
+
+A function, a struct, an impl and a method of one may take `const N:
+usize`: one implementation for each width, such as the limbs of a
+modulus or the words of a block, which the compiler builds once for
+each N it is given, as fast as a copy written by hand and smaller than
+the copies a script would write. Nothing else: no type parameter, no
+default, no other type of constant, none on a trait, its methods, an
+enum or a type alias, and none of the features that compute with one
+(generic_const_exprs, adt_const_params and their kin).
+
+rr checks the code as it runs: from each function that is not generic,
+it follows every call, function value, closure, drop and coercion to
+dyn with the numbers put in, as the compiler does before it builds the
+program, and finds each instantiation. What depends on a size takes the
+size of each one: a move of more than 256 bytes on a hot path, for the
+N the path reaches (`a move of 512 bytes with N = 64`; through dyn or a
+function pointer, every N the crate makes); `Box::new` past 256 bytes;
+`impl Copy` past 64; and an array past 16 KiB or a frame past 512 kB on
+the stack, which Clippy's large_stack_arrays and large_stack_frames do
+not see in generic code. A size rr cannot know, such as that of a
+generic function nothing in the crate calls (a library's exported one),
+is reported as such and takes the same reason as the operation it would
+be. The call graph, recursion and repeated bodies are the
+definitions', whatever N is.
 
 Compiler builtin macros that do not require std are allowed: concat!, cfg!,
 format_args!, stringify!, env!/option_env!, file!/line!/column!/module_path!,

@@ -34,6 +34,9 @@ pub struct RestrictedSyntax {
     /// calls; and the whole return type of a free function or an inherent
     /// method that is `impl Iterator<Item = T>`.
     allowed: FxHashSet<BytePos>,
+    /// Whether the item whose generics come next may have `const N:
+    /// usize`: a function, a struct, an impl or a method of one.
+    consts: bool,
 }
 impl_lint_pass!(RestrictedSyntax => [RR_NO_STD, RR_NO_GENERICS, RR_NO_MACROS, RR_SIMPLE_TRAITS, RR_UNEXPLAINED_ESCAPE]);
 
@@ -83,6 +86,19 @@ fn report(
 impl EarlyLintPass for RestrictedSyntax {
     fn check_crate(&mut self, cx: &EarlyContext<'_>, krate: &ast::Crate) {
         self.no_main = krate.attrs.iter().any(|attr| attr.has_name(sym::no_main));
+        for attr in krate.attrs.iter().filter(|attr| attr.has_name(sym::feature)) {
+            for item in attr.meta_item_list().unwrap_or_default() {
+                if item.name().is_some_and(|name| CONST_FEATURES.contains(&name.as_str())) {
+                    report(
+                        cx,
+                        RR_NO_GENERICS,
+                        item.span(),
+                        "this feature makes a const parameter more than a number, and is forbidden by rr",
+                        "a const parameter is `const N: usize`, given as a number or another such parameter",
+                    );
+                }
+            }
+        }
         if !krate.attrs.iter().any(|attr| attr.has_name(sym::no_std)) {
             report(
                 cx,
@@ -95,6 +111,10 @@ impl EarlyLintPass for RestrictedSyntax {
     }
 
     fn check_item(&mut self, cx: &EarlyContext<'_>, item: &ast::Item) {
+        self.consts = matches!(
+            item.kind,
+            ast::ItemKind::Fn(_) | ast::ItemKind::Struct(..) | ast::ItemKind::Impl(_)
+        );
         if self.no_main
             && let ast::ItemKind::Fn(f) = &item.kind
             && ENTRIES.contains(&f.ident.name.as_str())
@@ -175,18 +195,32 @@ impl EarlyLintPass for RestrictedSyntax {
         }
     }
 
+    fn check_impl_item(&mut self, _: &EarlyContext<'_>, _: &ast::AssocItem) {
+        self.consts = true;
+    }
+
     fn check_generics(&mut self, cx: &EarlyContext<'_>, generics: &ast::Generics) {
         for param in &generics.params {
-            if !matches!(param.kind, ast::GenericParamKind::Lifetime) {
-                report(
+            match &param.kind {
+                ast::GenericParamKind::Lifetime => {},
+                ast::GenericParamKind::Const { ty, default: None, .. } if self.consts && usize_path(ty) => {},
+                ast::GenericParamKind::Const { .. } => report(
                     cx,
                     RR_NO_GENERICS,
                     param.span(),
-                    "type and const parameters are forbidden by rr",
+                    "a const parameter other than `const N: usize` of a function, a struct or an impl is forbidden by rr",
+                    "write `const N: usize`, without a default, on a function, a struct, an impl or a method of one; \
+                     not on a trait, an enum or a type alias",
+                ),
+                ast::GenericParamKind::Type { .. } => report(
+                    cx,
+                    RR_NO_GENERICS,
+                    param.span(),
+                    "type parameters are forbidden by rr",
                     "use concrete types: for a set of types the crate knows, an enum with a variant for each \
                      (a slice or a reader, a string or standard output); for code that must call what the caller \
-                     brings, `&mut dyn` of a trait of the crate; lifetime parameters are allowed",
-                );
+                     brings, `&mut dyn` of a trait of the crate; lifetime parameters and `const N: usize` are allowed",
+                ),
             }
         }
         if !generics.where_clause.is_empty() {
@@ -300,6 +334,7 @@ impl EarlyLintPass for RestrictedSyntax {
     }
 
     fn check_trait_item(&mut self, cx: &EarlyContext<'_>, item: &ast::AssocItem) {
+        self.consts = false;
         if matches!(item.kind, ast::AssocItemKind::Type(_)) {
             report(
                 cx,
@@ -460,6 +495,33 @@ fn item_only(args: &ast::AngleBracketedArgs) -> bool {
             ast::AssocItemConstraintKind::Equality { term: ast::Term::Ty(_) }
         )
 }
+
+/// Whether ty is `usize`, by its name or its path in core.
+fn usize_path(ty: &ast::Ty) -> bool {
+    let ast::TyKind::Path(None, path) = &ty.kind else {
+        return false;
+    };
+    let names: Vec<&str> = path
+        .segments
+        .iter()
+        .filter(|segment| segment.ident.name != kw::PathRoot && segment.args.is_none())
+        .map(|segment| segment.ident.name.as_str())
+        .collect();
+    names.len() == path.segments.iter().filter(|s| s.ident.name != kw::PathRoot).count()
+        && matches!(names.as_slice(), ["usize"] | ["core", "primitive", "usize"])
+}
+
+/// The compiler's features that would let a const parameter be more than
+/// a number: a computed one, one of a type of the crate, a generic constant.
+const CONST_FEATURES: &[&str] = &[
+    "generic_const_exprs",
+    "adt_const_params",
+    "unsized_const_params",
+    "generic_const_items",
+    "min_generic_const_args",
+    "generic_const_parameter_types",
+    "generic_arg_infer",
+];
 
 fn allowed_macro_path(path: &ast::Path) -> bool {
     let names: Vec<_> = path

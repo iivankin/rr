@@ -19,7 +19,7 @@ use rustc_hir::{
     Safety, UnsafeSource,
 };
 use rustc_lint::{LateContext, LateLintPass, LintContext as _};
-use rustc_middle::ty::{self, Ty, TypeckResults};
+use rustc_middle::ty::{self, Ty, TypeVisitableExt as _, TypeckResults};
 use rustc_session::impl_lint_pass;
 use rustc_span::Span;
 
@@ -31,6 +31,9 @@ use super::comments::note;
 pub struct Disguises {
     /// The locals of the function last looked into.
     locals: super::inbounds::Locals,
+    /// A `Box::new` in const-generic code: its size is each
+    /// instantiation's, known once the crate's are found.
+    generic_boxes: Vec<(rustc_hir::def_id::LocalDefId, HirId, Span, HirId)>,
 }
 
 impl_lint_pass!(Disguises => [RR_UNEXPLAINED_ESCAPE]);
@@ -52,6 +55,16 @@ fn ask(cx: &LateContext<'_>, id: HirId, span: Span, kind: &'static str, what: St
 }
 
 impl<'tcx> LateLintPass<'tcx> for Disguises {
+    fn check_crate_post(&mut self, cx: &LateContext<'tcx>) {
+        if self.generic_boxes.is_empty() {
+            return;
+        }
+        let instances = super::mono::collect(cx.tcx, cx.tcx.hir_body_owners());
+        for &(owner, id, span, arg) in &self.generic_boxes {
+            large_box(cx, cx.tcx.typeck(owner), id, span, arg, Some(&instances));
+        }
+    }
+
     fn check_expr(&mut self, cx: &LateContext<'tcx>, e: &'tcx Expr<'tcx>) {
         if !super::builtins::is_user_code(e.span) {
             return;
@@ -110,17 +123,13 @@ impl<'tcx> LateLintPass<'tcx> for Disguises {
             && let Res::Def(DefKind::AssocFn, def) = typeck.qpath_res(path, f.hir_id)
             && cx.tcx.item_name(def).as_str() == "new"
             && cx.tcx.def_path_str(def).starts_with("alloc::boxed::Box")
-            && let Some(size) = size(cx, typeck, arg)
-            && size > BOX_MAX
         {
-            ask(
-                cx,
-                e.hir_id,
-                e.span,
-                "move",
-                format!("`Box::new` of {size} bytes builds the value on the stack and copies it into the heap"),
-                "box its large parts where they are made, or say in a reason why this copy is rare",
-            );
+            if typeck.expr_ty(arg).has_param() {
+                self.generic_boxes
+                    .push((typeck.hir_owner.def_id, e.hir_id, e.span, arg.hir_id));
+            } else {
+                large_box(cx, typeck, e.hir_id, e.span, arg.hir_id, None);
+            }
         }
         if let ExprKind::Block(block, _) = e.kind
             && let BlockCheckMode::UnsafeBlock(UnsafeSource::UserProvided) = block.rules
@@ -307,11 +316,46 @@ fn is_result(cx: &LateContext<'_>, ty: Ty<'_>) -> bool {
     matches!(ty.kind(), ty::Adt(adt, _) if cx.tcx.is_diagnostic_item(rustc_span::sym::Result, adt.did()))
 }
 
-/// The size of the value e, when it is known.
-fn size<'tcx>(cx: &LateContext<'tcx>, typeck: &TypeckResults<'tcx>, e: &Expr<'_>) -> Option<u64> {
-    let ty = typeck.expr_ty(e);
-    let env = ty::TypingEnv::post_analysis(cx.tcx, typeck.hir_owner.def_id);
-    Some(cx.tcx.layout_of(env.as_query_input(ty)).ok()?.size.bytes())
+/// A `Box::new` at id of the value arg, larger than `BOX_MAX` bytes in
+/// some instantiation of the code it is in, or of a size rr cannot know.
+fn large_box<'tcx>(
+    cx: &LateContext<'tcx>,
+    typeck: &TypeckResults<'tcx>,
+    id: HirId,
+    span: Span,
+    arg: HirId,
+    instances: Option<&super::mono::Instances<'tcx>>,
+) {
+    let ty = typeck.node_type(arg);
+    let what = match super::mono::sizes(cx.tcx, typeck.hir_owner.def_id, ty, instances) {
+        Ok(sizes) => {
+            let Some(&(size, args)) = sizes.iter().max_by_key(|(size, _)| *size) else {
+                return;
+            };
+            if size <= BOX_MAX {
+                return;
+            }
+            let with = args.map_or_else(String::new, |args| {
+                format!(
+                    " with {}",
+                    super::mono::describe(cx.tcx, typeck.hir_owner.def_id.to_def_id(), args)
+                )
+            });
+            format!("`Box::new` of {size} bytes{with} builds the value on the stack and copies it into the heap")
+        },
+        Err(why) => format!(
+            "`Box::new` of a value whose size rr cannot know here (`{ty}`: {why}) may build it on the stack and \
+             copy it into the heap"
+        ),
+    };
+    ask(
+        cx,
+        id,
+        span,
+        "move",
+        what,
+        "box its large parts where they are made, or say in a reason why this copy is rare",
+    );
 }
 
 /// The integer whose bytes e takes, `x.to_le_bytes()` and the like, and

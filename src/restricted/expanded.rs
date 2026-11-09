@@ -1,6 +1,7 @@
 //! Check language restrictions after builtin macros have expanded (notably include!).
 
 use clippy_utils::diagnostics::{span_lint_and_help, span_lint_and_then};
+use rustc_hir::def::DefKind;
 use rustc_hir::{self as hir, AmbigArg};
 use rustc_lint::{LateContext, LateLintPass, LintContext as _};
 use rustc_session::impl_lint_pass;
@@ -35,6 +36,8 @@ impl<'tcx> LateLintPass<'tcx> for ExpandedSyntax {
                 hir::GenericParamKind::Lifetime { .. } => {},
                 // An `impl Fn` parameter: a closure handed in.
                 hir::GenericParamKind::Type { synthetic: true, .. } if closure_param(cx, generics, param) => {},
+                // `const N: usize` of a function, a struct, an impl or its method.
+                hir::GenericParamKind::Const { default: None, .. } if const_param(cx, param) => {},
                 _ => reject(cx, RR_NO_GENERICS, param.span, "type/const generic parameters"),
             }
         }
@@ -129,6 +132,20 @@ impl<'tcx> LateLintPass<'tcx> for ExpandedSyntax {
             reject(cx, RR_NO_GENERICS, expr.span, "async/await");
         }
     }
+}
+
+/// Whether a const parameter is `const N: usize` of a function, a
+/// struct, an impl or a method of an impl: each instantiation is then
+/// code rr can follow with the number put in.
+fn const_param(cx: &LateContext<'_>, param: &hir::GenericParam<'_>) -> bool {
+    let tcx = cx.tcx;
+    let owner = tcx.parent(param.def_id.to_def_id());
+    let place = match tcx.def_kind(owner) {
+        DefKind::Fn | DefKind::Struct | DefKind::Impl { .. } => true,
+        DefKind::AssocFn => tcx.trait_of_assoc(owner).is_none(),
+        _ => false,
+    };
+    place && tcx.type_of(param.def_id).instantiate_identity().skip_norm_wip() == tcx.types.usize
 }
 
 /// Whether the synthetic parameter of an `impl Trait` argument is bound

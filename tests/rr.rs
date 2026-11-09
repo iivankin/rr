@@ -236,7 +236,7 @@ fn external_macro_cannot_impersonate_a_builtin() {
 fn rejects_generic_definitions_and_impl_trait() {
     for source in [
         "pub fn id<T>(v: T) -> T { v }",
-        "pub struct Buffer<const N: usize>([u8; N]);",
+        "pub struct Buffer<const N: u8>([u8; 4]);",
         "pub fn id(v: impl Copy) {}",
     ] {
         rejected(&format!("#![no_std]\n{source}"), "rr_no_generics");
@@ -1461,6 +1461,88 @@ fn an_outcome_of_a_change_is_must_use() {
          pub struct C(pub u8);\nimpl Iterator for C { type Item = u8; fn next(&mut self) -> Option<u8> { self.0 = self.0.checked_sub(1)?; Some(self.0) } }\n\
          pub trait Sink {\n #[must_use]\n fn put(&mut self, b: u8) -> bool;\n}\nimpl Sink for S { fn put(&mut self, b: u8) -> bool { self.n = b; true } }\n\
          pub extern \"C\" fn back(n: &mut u8) -> i32 { *n = 0; 0 }",
+    );
+}
+
+#[test]
+fn const_generic_code_is_checked_in_each_instantiation() {
+    accepted(
+        "#![no_std]\npub struct Ring<const N: usize> {\n pub words: [u64; N],\n}\nimpl<const N: usize> Ring<N> {\n #[must_use]\n pub fn new() -> Self { Self { words: [0; N] } }\n #[must_use]\n pub fn first(&self) -> u64 { self.words.first().copied().unwrap_or(0) }\n}\n\
+         pub trait Len { fn len(&self) -> usize; }\nimpl<const N: usize> Len for Ring<N> { fn len(&self) -> usize { N } }\n\
+         pub fn sum<const N: usize>(v: &[u64; N]) -> u64 { v.iter().sum() }\n#[must_use]\npub fn run() -> u64 { let r = Ring::<8>::new(); sum(&r.words) + r.first() }",
+    );
+    for source in [
+        "pub struct S<T>(pub T);",
+        "pub struct S<const N: u8>(pub [u8; 4]);",
+        "pub struct S<const N: usize = 4>(pub [u8; N]);",
+        "pub enum E<const N: usize> { A([u8; N]) }",
+        "pub trait T<const N: usize> {}",
+        "pub trait T { fn f<const N: usize>(&self); }",
+        "pub type A<const N: usize> = [u8; N];",
+        "#![feature(generic_const_exprs)]\npub struct S<const N: usize>(pub [u8; N]);",
+    ] {
+        let source = match source.strip_prefix("#![feature(generic_const_exprs)]\n") {
+            Some(rest) => format!("#![no_std]\n#![feature(generic_const_exprs)]\n{rest}"),
+            None => format!("#![no_std]\n{source}"),
+        };
+        rejected(&source, "rr_no_generics");
+    }
+    // A move on a hot path is as large as the instantiation the path
+    // reaches: Ring<4> moves 32 bytes, Ring<64> 512.
+    let ring = "pub struct Ring<const N: usize> {\n pub cur: [u64; N],\n pub prev: [u64; N],\n}\nimpl<const N: usize> Ring<N> {\n #[must_use]\n fn step(&mut self) -> u64 {\n let keep = self.prev;\n self.cur = keep;\n self.cur.first().copied().unwrap_or(0)\n }\n}\n";
+    accepted(&format!(
+        "#![no_std]\n{ring}#[rr::hot]\n#[must_use]\npub fn hot(a: &mut Ring<4>) -> u64 {{\n a.step()\n}}\n#[must_use]\npub fn cold(b: &mut Ring<64>) -> u64 {{\n b.step()\n}}"
+    ));
+    let big = format!(
+        "#![no_std]\n{ring}#[rr::hot]\n#[must_use]\npub fn hot(a: &mut Ring<4>, b: &mut Ring<64>) -> u64 {{\n a.step() + b.step()\n}}"
+    );
+    rejected(&big, "rr_hot_path");
+    assert!(diagnostics(&big, false).contains("a move of 512 bytes with N = 64"));
+    // Through dyn, and a closure written in generic code.
+    rejected(
+        "#![no_std]\npub struct Big<const N: usize>(pub [u64; N]);\npub trait First { fn first(&self) -> u64; }\n\
+         impl<const N: usize> First for Big<N> {\n fn first(&self) -> u64 {\n let keep = self.0;\n keep.first().copied().unwrap_or(0)\n }\n}\n\
+         #[rr::hot]\n#[must_use]\npub fn hot(f: &dyn First) -> u64 {\n // rr: escape(dyn): one call per event.\n f.first()\n}\n#[must_use]\npub fn run(b: &Big<64>) -> u64 { hot(b) }",
+        "rr_hot_path",
+    );
+    rejected(
+        "#![no_std]\npub struct Big<const N: usize>(pub [u64; N]);\nfn each<const N: usize>(v: &[Big<N>]) -> u64 {\n let mut n = 0;\n v.iter().for_each(|b| {\n let keep = b.0;\n n += keep.first().copied().unwrap_or(0);\n });\n n\n}\n\
+         #[rr::hot]\n#[must_use]\npub fn hot(v: &[Big<64>]) -> u64 {\n each(v)\n}",
+        "rr_hot_path",
+    );
+    // Where rr finds no instantiation, it says it cannot know the size.
+    let unknown = "#![no_std]\nextern crate alloc;\n#[must_use]\npub fn boxed<const N: usize>() -> usize {\n let b = alloc::boxed::Box::new([0u8; N]);\n b.len()\n}";
+    rejected(unknown, "rr_unexplained_escape");
+    assert!(diagnostics(unknown, false).contains("cannot know"));
+    // Box, Copy and the stack, in each instantiation.
+    for (source, says) in [
+        (
+            "extern crate alloc;\npub struct B<const N: usize>(pub [u64; N]);\n#[must_use]\npub fn boxed<const N: usize>() -> alloc::boxed::Box<B<N>> { alloc::boxed::Box::new(B([0; N])) }\n\
+             #[must_use]\npub fn run() -> u64 { boxed::<4>().0[0] + boxed::<64>().0[0] }",
+            "`Box::new` of 512 bytes with N = 64",
+        ),
+        (
+            "#[derive(Clone, Copy)]\npub struct B<const N: usize>(pub [u64; N]);\n#[must_use]\npub fn run() -> u64 { let b = B([1u64; 64]); let c = b; b.0[0] + c.0[0] }",
+            "Copy on a type of 512 bytes with N = 64",
+        ),
+        (
+            "#[must_use]\npub fn table<const N: usize>() -> u64 {\n let t = [7u8; N];\n t.iter().map(|&b| u64::from(b)).sum()\n}\n#[must_use]\npub fn run() -> u64 { table::<4>() + table::<100000>() }",
+            "an array of 100000 bytes on the stack with N = 100000",
+        ),
+    ] {
+        let source = format!("#![no_std]\n{source}");
+        let found = diagnostics(&source, false);
+        assert!(found.contains(says), "{says}: {found}");
+    }
+    // Recursion and repeated bodies are the definitions', whatever N.
+    rejected(
+        "#![no_std]\n#[must_use]\npub fn down<const N: usize>(n: usize) -> usize {\n if n == 0 { N } else { down::<N>(n - 1) }\n}",
+        "rr_no_recursion",
+    );
+    rejected(
+        "#![no_std]\n#[must_use]\npub fn a<const N: usize>(v: &[u8; N]) -> u32 {\n let mut n = 0u32;\n for b in v { n += u32::from(*b); }\n n += 1;\n n *= 3;\n n\n}\n\
+         #[must_use]\npub fn b<const N: usize>(v: &[u8; N]) -> u32 {\n let mut n = 0u32;\n for b in v { n += u32::from(*b); }\n n += 1;\n n *= 3;\n n\n}",
+        "rr_duplicate",
     );
 }
 

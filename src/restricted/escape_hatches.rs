@@ -1,7 +1,7 @@
 use clippy_utils::diagnostics::{span_lint_and_help, span_lint_and_then};
 use rustc_hir::{BlockCheckMode, Expr, ExprKind, Item, ItemKind, LetStmt, Mutability, Node, UnsafeSource};
 use rustc_lint::{LateContext, LateLintPass, LintContext as _};
-use rustc_middle::ty::{self, Ty};
+use rustc_middle::ty::{self, Ty, TypeVisitableExt as _};
 use rustc_session::impl_lint_pass;
 use rustc_span::Span;
 use rustc_span::def_id::DefId;
@@ -10,10 +10,56 @@ use rustc_span::hygiene::{ExpnKind, MacroKind};
 use super::comments::{has_escape_reason, note};
 use super::{RR_NO_STD, RR_UNEXPLAINED_ESCAPE, copies};
 
-pub struct EscapeHatches;
+#[derive(Default)]
+pub struct EscapeHatches {
+    /// An `impl Copy` for a const-generic type, at its span: its size is
+    /// each instantiation's, known once the crate's are found.
+    generic_copies: Vec<(rustc_hir::def_id::LocalDefId, Span)>,
+}
 impl_lint_pass!(EscapeHatches => [RR_NO_STD, RR_UNEXPLAINED_ESCAPE]);
 
 impl<'tcx> LateLintPass<'tcx> for EscapeHatches {
+    fn check_crate_post(&mut self, cx: &LateContext<'tcx>) {
+        if !super::mono::any_generic(cx.tcx) {
+            return;
+        }
+        let instances = super::mono::collect(cx.tcx, cx.tcx.hir_body_owners());
+        super::mono::stack(cx, &instances);
+        for &(item, span) in &self.generic_copies {
+            let ty = cx.tcx.type_of(item).instantiate_identity().skip_norm_wip();
+            let sizes = match *ty.kind() {
+                ty::Adt(adt, _) => {
+                    let found = instances.adts.get(&adt.did()).map_or(&[][..], Vec::as_slice);
+                    let env = ty::TypingEnv::fully_monomorphized();
+                    let mut sizes = Vec::new();
+                    for &args in found {
+                        let concrete = Ty::new_adt(cx.tcx, adt, args);
+                        match cx.tcx.layout_of(env.as_query_input(concrete)) {
+                            Ok(layout) => sizes.push((layout.size.bytes(), args)),
+                            Err(error) => {
+                                unknown_copy(cx, span, &format!("`{concrete}`: {error}"));
+                                break;
+                            },
+                        }
+                    }
+                    if found.is_empty() {
+                        unknown_copy(cx, span, &format!("nothing in the crate instantiates `{ty}`"));
+                    }
+                    sizes
+                },
+                _ => {
+                    unknown_copy(cx, span, &format!("`{ty}` is not a type of the crate rr instantiates"));
+                    Vec::new()
+                },
+            };
+            if let Some(&(size, args)) = sizes.iter().max_by_key(|(size, _)| *size) {
+                let ty::Adt(adt, _) = *ty.kind() else { continue };
+                let with = super::mono::describe(cx.tcx, adt.did(), args);
+                too_large_copy(cx, span, size, &format!(" with {with}"));
+            }
+        }
+    }
+
     fn check_path(&mut self, cx: &LateContext<'tcx>, path: &rustc_hir::Path<'tcx>, _: rustc_hir::HirId) {
         if !super::builtins::is_user_code(path.span) {
             return;
@@ -99,7 +145,7 @@ impl<'tcx> LateLintPass<'tcx> for EscapeHatches {
         if let ItemKind::Impl(implementation) = &item.kind
             && let Some(span) = written(item.span)
         {
-            large_copy(cx, item, implementation, span);
+            large_copy(cx, item, implementation, span, &mut self.generic_copies);
             return;
         }
         if !super::builtins::is_user_code(item.span) {
@@ -165,16 +211,45 @@ fn large_copy<'tcx>(
     item: &'tcx Item<'tcx>,
     implementation: &'tcx rustc_hir::Impl<'tcx>,
     span: Span,
+    generic: &mut Vec<(rustc_hir::def_id::LocalDefId, Span)>,
 ) {
     let Some(header) = implementation.of_trait else { return };
     if header.trait_ref.trait_def_id() != cx.tcx.lang_items().copy_trait() {
         return;
     }
     let ty = cx.tcx.type_of(item.owner_id).instantiate_identity().skip_norm_wip();
-    let Ok(layout) = cx.tcx.layout_of(cx.typing_env().as_query_input(ty)) else {
+    if ty.has_param() {
+        generic.push((item.owner_id.def_id, span));
         return;
-    };
-    let size = layout.size.bytes();
+    }
+    match cx.tcx.layout_of(cx.typing_env().as_query_input(ty)) {
+        Ok(layout) => too_large_copy(cx, span, layout.size.bytes(), ""),
+        Err(error) => unknown_copy(cx, span, &format!("`{ty}`: {error}")),
+    }
+}
+
+/// `impl Copy` at span for a type whose size rr cannot know: a reason
+/// says it is small, or that copying it whole is meant.
+fn unknown_copy(cx: &LateContext<'_>, span: Span, why: &str) {
+    if has_escape_reason(cx, span, span, "copy") {
+        return;
+    }
+    span_lint_and_then(
+        cx,
+        RR_UNEXPLAINED_ESCAPE,
+        span,
+        format!(
+            "Copy on a type whose size rr cannot know here ({why}) may copy much at every use; this needs an ownership justification"
+        ),
+        |diag| {
+            diag.help(format!("keep it a moved value, or Copy only up to {COPY_MAX} bytes"));
+            note(diag, cx.sess(), span, span, "copy");
+        },
+    );
+}
+
+/// `impl Copy` at span for a type of size bytes, with which arguments.
+fn too_large_copy(cx: &LateContext<'_>, span: Span, size: u64, with: &str) {
     if size <= COPY_MAX || has_escape_reason(cx, span, span, "copy") {
         return;
     }
@@ -182,7 +257,9 @@ fn large_copy<'tcx>(
         cx,
         RR_UNEXPLAINED_ESCAPE,
         span,
-        format!("Copy on a type of {size} bytes copies it whole at every use; this needs an ownership justification"),
+        format!(
+            "Copy on a type of {size} bytes{with} copies it whole at every use; this needs an ownership justification"
+        ),
         |diag| {
             diag.help(format!("keep it a moved value, or Copy only up to {COPY_MAX} bytes"));
             note(diag, cx.sess(), span, span, "copy");

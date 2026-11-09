@@ -20,13 +20,14 @@ mod expanded;
 mod ffi;
 mod inbounds;
 mod macros;
+mod mono;
 mod outcomes;
 mod recursion;
 mod stale;
 mod syntax;
 
 declare_lint! { pub RR_NO_STD, Deny, "rr requires a no_std crate without explicit std imports" }
-declare_lint! { pub RR_NO_GENERICS, Deny, "rr forbids user-defined type and const generics, impl Trait other than a closure parameter or a returned iterator, and async fn" }
+declare_lint! { pub RR_NO_GENERICS, Deny, "rr forbids user-defined type generics, const generics other than const N: usize, impl Trait other than a closure parameter or a returned iterator, and async fn" }
 declare_lint! { pub RR_NO_MACROS, Deny, "rr forbids macro definitions, derives and calls except no_std compiler builtins and core panic/assert macros" }
 declare_lint! { pub RR_SIMPLE_TRAITS, Deny, "rr forbids associated types, supertraits and where clauses" }
 declare_lint! { pub RR_UNEXPLAINED_ESCAPE, Deny, "rr requires a reason for ownership and borrow-checker escape hatches" }
@@ -356,7 +357,7 @@ pub fn register(store: &mut LintStore) {
     store.register_lints(lints);
     store.register_group(true, "rr", None, lints.iter().map(|lint| LintId::of(lint)).collect());
     store.register_pre_expansion_lint_pass(Box::new(|| Box::new(syntax::RestrictedSyntax::default())));
-    store.register_late_lint_pass(Box::new(|_| Box::new(escape_hatches::EscapeHatches)));
+    store.register_late_lint_pass(Box::new(|_| Box::<escape_hatches::EscapeHatches>::default()));
     store.register_late_lint_pass(Box::new(|_| Box::new(allocs::Allocs::default())));
     store.register_late_lint_pass(Box::new(|_| Box::new(bounds::Bounds::default())));
     store.register_late_lint_pass(Box::new(|_| Box::new(chains::Chains)));
