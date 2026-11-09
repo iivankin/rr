@@ -1,0 +1,21 @@
+{
+  "name": "queue",
+  "description": "A bounded queue between threads for a loop on each core: net Handoffs, accepted sockets in no Poll, with a tag, from the thread that accepts to a worker's loop, whose Poll each push wakes; a line under the system's mutex with condition variables for threads that may block, no lock-free code; a push to a full queue refused at once with the connection given back; Closed once every Sender is gone. Its tests run a server on N threads, a Poll each, over SO_REUSEPORT listeners on Linux and an accept thread that hands off on macOS and Windows, and bench its connections a second.",
+  "rr": "0.5.2",
+  "dependencies": [
+    "poll",
+    "thread",
+    "net"
+  ],
+  "files": [
+    {
+      "path": "mod.rs"
+    },
+    {
+      "path": "sys.rs"
+    },
+    {
+      "path": "tests.rs"
+    }
+  ]
+}
