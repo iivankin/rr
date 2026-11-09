@@ -10,10 +10,10 @@
 //! Check (dropping it cancels it) and poll it from the loop.
 //! Trust::verify_blocking waits for the answer, for a thread that may
 //! block: never a poll loop's, where rr refuses it, as it is
-//! `#[rr::blocking]` (see wait). macOS and Windows
+//! `#[rr::blocking]` (see poll). macOS and Windows
 //! verify it themselves, as Go has them do: SecTrustEvaluateWithError
 //! with the SSL policy, and CertGetCertificateChain with the SSL chain
-//! policy, each on one of wait.rs's threads, as either may fetch a
+//! policy, each on one of thread's pool's threads, as either may fetch a
 //! missing intermediate over the network (neither is asked to check
 //! revocation, as Go does not); a poll
 //! loop waits on a pipe or a loopback socket, as for resolve. Linux

@@ -1,0 +1,19 @@
+{
+  "name": "thread",
+  "description": "Threads for a program whose loops wait on a poll::Poll, as libuv gives them: a pool of at most 32 threads for work that blocks (libuv's threadpool: started as work comes, asleep on a condition variable, one first-in-first-out line under a mutex), its work a Box<dyn Work + Send> moved in and given back once it ran, a Job that cancels work still in line when dropped and wakes the loop's Poll or sets a Signal when done; threads of their own for loops on other cores, with a 2 MiB stack, joined by a blocking join; and the system's mutex and condition variable (pthread on Linux and macOS, SRWLOCK and CONDITION_VARIABLE on Windows), held by a guard.",
+  "rr": "0.5.2",
+  "dependencies": [
+    "poll"
+  ],
+  "files": [
+    {
+      "path": "mod.rs"
+    },
+    {
+      "path": "sys.rs"
+    },
+    {
+      "path": "tests.rs"
+    }
+  ]
+}

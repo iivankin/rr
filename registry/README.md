@@ -28,11 +28,17 @@ add declares it in src/base/mod.rs; the crate root declares `mod base;`.
 | roots | x509 | Mozilla's trust anchors and OneCRL, with Chrome's announced distrusts and Firefox's imposed name constraints; policy(), an x509::Policy, for the system's anchors |
 | tls | random, sha256, sha384, aesgcm, x25519, mlkem, ecdh, x509; asks for trust or roots | TLS 1.3 client, its randomness a tls::Random that only random or a test makes, given as the time is, AES-128-GCM and AES-256-GCM, with post-quantum X25519MLKEM768, bytes in any split, counts that must be used and loud errors for a step a loop forgets, eof that refuses a truncation; the chain verified by x509 or by the caller (the system, through trust) with an x509::Approval bound to the leaf and host; secrets wiped |
 | http1 | | HTTP/1.1 requests, pipelined in order, bodies counted by an Upload, and an incremental response parser; misuse refused with a reason |
-| net | wait | TCP for a loop of many connections: a Listener and Streams that own their socket and their Owned entry in a wait Set, closed once; non-blocking, not inherited, no SIGPIPE; NotConnected the same everywhere; errors by kind |
-| resolve | wait | host lookup that never blocks the loop, by the system: DNSServiceGetAddrInfo on macOS and GetAddrInfoExW on Windows, asynchronous and cancellable; getaddrinfo on a thread on Linux |
-| trust | x509, wait | the system verifies a chain, as Go does: SecTrust on macOS, CertGetCertificateChain on Windows, x509 with the system's roots on Linux or SSL_CERT_FILE's and SSL_CERT_DIR's anywhere; a policy (roots::policy) over either; a check that never blocks and answers with an x509::Approval, or verify_blocking off the loop |
-| wait | | what a program's loop waits on: a Set of many sockets with deadlines (epoll, kqueue, socket notifications or WSAPoll), Interest in and Ready out the same on every system, refusals as SetError, and wakes from other threads; a component's Wait; a thread that signals when done |
+| net | poll | TCP for a loop of many connections: a Listener and Streams that own their socket and their Owned entry in a Poll, closed once; non-blocking, not inherited, no SIGPIPE; NotConnected the same everywhere; errors by kind; for a loop on each core, listeners that share an address on Linux (SO_REUSEPORT) and a Handoff, an accepted socket in no Poll, for another thread's loop on macOS and Windows |
+| resolve | poll, thread | host lookup that never blocks the loop, by the system: DNSServiceGetAddrInfo on macOS and GetAddrInfoExW on Windows, asynchronous and cancellable; getaddrinfo on thread's pool on Linux |
+| trust | x509, poll, thread | the system verifies a chain, as Go does: SecTrust on macOS, CertGetCertificateChain on Windows (on thread's pool), x509 with the system's roots on Linux or SSL_CERT_FILE's and SSL_CERT_DIR's anywhere; a policy (roots::policy) over either; a check that never blocks and answers with an x509::Approval, or verify_blocking off the loop |
+| poll | | what a program's loop waits on, in mio's words: a Poll of many sockets with deadlines (epoll, kqueue, socket notifications or WSAPoll), Interest in and Ready out the same on every system, Events dispatched by key, refusals as PollError, and a Waker for other threads; a component's Want, which a Poll follows; a Signal another thread sets |
+| thread | poll | threads for loops, as libuv has them: a pool of at most 32 for work that blocks, a Box<dyn Work + Send> moved in and given back, a Job that cancels what is still in line and wakes its loop when done; a thread of its own for a loop on another core; the system's mutex and condition variable |
 | cpu | | what the CPU has of the instructions the components use, asked once, by Features only it names |
+
+wait was renamed poll, after mio: `rr add wait` no longer exists, and a
+project that has it adds poll and thread, and renames Set, SetError,
+Wait, Watch and Set::wait to Poll, PollError, Want, Follow and
+Poll::poll; wait::spawn is thread::spawn, with a Work moved in.
 
 ## A component
 
@@ -156,7 +162,7 @@ change is a line of the program.
   multiply) are in the component's sys.rs behind a safe function that
   says whether it ran; `cpu` says what the CPU has. The portable code is
   always there and passes the same vectors. What talks to the system
-  (wait, resolve, trust, cpu) is all in its sys.rs, through the C
+  (poll, thread, resolve, trust, cpu) is all in its sys.rs, through the C
   library on Linux and macOS and the system's DLLs on Windows; mod.rs
   says what it is and exports it.
 - **Arithmetic that cannot overflow, or says it wraps.** The template

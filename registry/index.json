@@ -45,10 +45,15 @@
     },
     {
       "name": "net",
-      "description": "TCP over the system's sockets for a loop that serves many: a Listener and the Streams it accepts or that connect out, non-blocking, closed on exec or never inherited, no SIGPIPE; each owns its socket and its Owned entry in a wait Set, which close removes before the socket is closed, once; a Stream remembers how its connection went, and a read or write before it is made is NotConnected on every system; errors by kind, IPv4 and IPv6.",
+      "description": "TCP over the system's sockets for a loop that serves many: a Listener and the Streams it accepts or that connect out, non-blocking, closed on exec or never inherited, no SIGPIPE; each owns its socket and its Owned entry in a poll Poll, which close removes before the socket is closed, once; a Stream remembers how its connection went, and a read or write before it is made is NotConnected on every system; errors by kind, IPv4 and IPv6. For a loop on each core: listeners that share an address on Linux (SO_REUSEPORT, bind_shared), refused as Unbalanced on macOS and Windows, where one loop accepts a Handoff, a socket in no Poll, for another thread's loop to adopt.",
       "dependencies": [
-        "wait"
+        "poll"
       ]
+    },
+    {
+      "name": "poll",
+      "description": "What a program's loop waits on, in mio's words, for the program and every component that works while it runs: a Poll of any number of descriptors (sockets on Windows), each with its Interest and a key, and deadlines on the monotonic clock (one moved a little later left where it is filed, as nginx does), level-triggered on epoll (Linux), kqueue (macOS), socket notifications (Windows from build 20348: Server 2022, Windows 11) or WSAPoll (Windows 10, Server 2019, or a layered provider over TCP), what is ready reported as Events of Ready, the same on every system, and every refusal as a PollError; tokens of one Poll refused by another; Owned entries that only close takes out, closing the descriptor once; a Waker for other threads; a component's Want (up to two descriptors and a timeout), which a Poll follows or block waits on alone; and a Signal, the close-on-exec pipe (Linux and macOS) or non-inherited loopback socket pair (Windows) another thread makes readable. Formerly wait.",
+      "dependencies": []
     },
     {
       "name": "random",
@@ -57,9 +62,10 @@
     },
     {
       "name": "resolve",
-      "description": "Host lookup that never blocks the caller's loop, one API on Linux, macOS and Windows: start, poll, take the addresses (socket_addr keeps a link-local one's interface), drop to cancel. The system answers: mDNSResponder through DNSServiceGetAddrInfo on macOS, on a socket the caller's poll waits on, sorted by RFC 6724 as getaddrinfo sorts; GetAddrInfoExW on Windows, asynchronous and cancellable, its callback signalling the caller's poll; the C library's getaddrinfo on Linux, on a thread of wait's, where a lookup cancelled after it started runs on to the system's timeout.",
+      "description": "Host lookup that never blocks the caller's loop, one API on Linux, macOS and Windows: start, poll, take the addresses (socket_addr keeps a link-local one's interface), drop to cancel. The system answers: mDNSResponder through DNSServiceGetAddrInfo on macOS, on a socket the caller's poll waits on, sorted by RFC 6724 as getaddrinfo sorts; GetAddrInfoExW on Windows, asynchronous and cancellable, its callback signalling the caller's poll; the C library's getaddrinfo on Linux, on thread's pool, where a lookup cancelled after it started runs on to the system's timeout.",
       "dependencies": [
-        "wait"
+        "poll",
+        "thread"
       ]
     },
     {
@@ -93,6 +99,13 @@
       ]
     },
     {
+      "name": "thread",
+      "description": "Threads for a program whose loops wait on a poll::Poll, as libuv gives them: a pool of at most 32 threads for work that blocks (libuv's threadpool: started as work comes, asleep on a condition variable, one first-in-first-out line under a mutex), its work a Box<dyn Work + Send> moved in and given back once it ran, a Job that cancels work still in line when dropped and wakes the loop's Poll or sets a Signal when done; threads of their own for loops on other cores, with a 2 MiB stack, joined by a blocking join; and the system's mutex and condition variable (pthread on Linux and macOS, SRWLOCK and CONDITION_VARIABLE on Windows), held by a guard.",
+      "dependencies": [
+        "poll"
+      ]
+    },
+    {
       "name": "tls",
       "description": "A TLS 1.3 client (RFC 9846) without I/O: TLS_AES_128_GCM_SHA256 and TLS_AES_256_GCM_SHA384 with X25519MLKEM768 and X25519 key shares and P-256 on a retry, ECDSA and RSA-PSS server signatures, SNI, ALPN, middlebox compatibility, HelloRetryRequest, KeyUpdate and close_notify; bytes in any split, application records opened in place in the receive buffer and sealed in place in the pending one; counts that must be used, loud errors for a step a loop forgets, eof that refuses a truncation, a caller's verdict as an x509::Approval bound to the leaf and host, and secrets wiped; its randomness drawn from random, records numbered by aesgcm's keys.",
       "dependencies": [
@@ -120,16 +133,12 @@
     },
     {
       "name": "trust",
-      "description": "TLS server authentication by the operating system's trust, as Go's crypto/x509 does it: macOS's SecTrustEvaluateWithError and Windows's CertGetCertificateChain with the SSL policy, on a thread a poll loop waits on, and on Linux x509::verify against the system's anchors (its bundle and certificate directories, or SSL_CERT_FILE and SSL_CERT_DIR, read through the C library); SSL_CERT_FILE and SSL_CERT_DIR replace the system's verifier on macOS and Windows too, as in Go 1.27; a policy such as roots::policy (OneCRL, distrust dates) screens the path whichever verifies. system() also loads the anchors themselves on all three: macOS's trust domains with their SSL trust settings, Windows's ROOT store less what is disabled for server authentication or Disallowed A check answers with an x509::Approval; verify_blocking is for threads that may block.",
+      "description": "TLS server authentication by the operating system's trust, as Go's crypto/x509 does it: macOS's SecTrustEvaluateWithError and Windows's CertGetCertificateChain with the SSL policy, on thread's pool, whose Signal a poll loop waits on, and on Linux x509::verify against the system's anchors (its bundle and certificate directories, or SSL_CERT_FILE and SSL_CERT_DIR, read through the C library); SSL_CERT_FILE and SSL_CERT_DIR replace the system's verifier on macOS and Windows too, as in Go 1.27; a policy such as roots::policy (OneCRL, distrust dates) screens the path whichever verifies. system() also loads the anchors themselves on all three: macOS's trust domains with their SSL trust settings, Windows's ROOT store less what is disabled for server authentication or Disallowed. A check answers with an x509::Approval; verify_blocking is for threads that may block.",
       "dependencies": [
         "x509",
-        "wait"
+        "poll",
+        "thread"
       ]
-    },
-    {
-      "name": "wait",
-      "description": "What a program's loop waits on, for every component that works while it runs: a Set of any number of descriptors (sockets on Windows), each with its Interest and a key, and deadlines on the monotonic clock, level-triggered on epoll (Linux), kqueue (macOS), socket notifications (Windows 11, Server 2022) or WSAPoll (earlier Windows), what is ready reported as Ready, the same on every system, and every refusal as a SetError; tokens of one Set refused by another; Owned entries that only close takes out, closing the descriptor once; a Waker for other threads; a component's Wait (up to two descriptors and a timeout), which a Set follows or block waits on alone; and a pool of at most 32 threads with a cancellable FIFO line (unsafe spawn, a Ticket that cancels when dropped), and the close-on-exec pipe (Linux and macOS) or non-inherited loopback socket pair (Windows) that says the work is done.",
-      "dependencies": []
     },
     {
       "name": "x25519",

@@ -1,6 +1,6 @@
 //! The system side of net: what mod.rs says it is, for each system.
 
-use crate::base::wait::{Interest, Owned, Raw, Set, SetError, Token};
+use crate::base::poll::{Interest, Owned, Poll, PollError, Raw, Token};
 use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 /// Why a socket call failed, as a loop acts on it.
@@ -24,6 +24,11 @@ pub enum Error {
     /// A read into no room, whose Done(0) could not be told from the
     /// peer's end.
     NoRoom,
+    /// bind_shared where the system does not balance connections among
+    /// listeners that share an address: macOS gives them all to the one
+    /// bound last, Windows shares none. Accept on one thread and hand
+    /// the connections to the others (accept_handoff).
+    Unbalanced,
     /// Anything else: the system's code (errno, or WSAGetLastError's).
     Other(i32),
 }
@@ -40,9 +45,9 @@ pub enum Io {
 /// The bytes of a sockaddr_in6, the larger of the two.
 const ADDRESS_BYTES: usize = 28;
 
-/// A socket, and its entry in a Set with the key it was watched with;
-/// open until its Set or its drop closes it, once: the entry is Owned,
-/// which only close takes out of the Set.
+/// A socket, and its entry in a Poll with the key it was watched with;
+/// open until its Poll or its drop closes it, once: the entry is Owned,
+/// which only close takes out of the Poll.
 struct Socket {
     fd: Raw,
     entry: Option<(Owned, u64)>,
@@ -56,33 +61,33 @@ impl Socket {
     /// The socket's entry: added once, then changed in place, its key as
     /// well, as the system holds a registration for each socket once
     /// (socket notifications take another only after the first is gone).
-    /// Another Set than the first is refused.
-    fn watch(&mut self, set: &mut Set, interest: Interest, key: u64) -> Result<(), SetError> {
+    /// Another Poll than the first is refused.
+    fn watch(&mut self, poll: &mut Poll, interest: Interest, key: u64) -> Result<(), PollError> {
         let Some((owned, old)) = &mut self.entry else {
-            let owned = set.add_owned(self.fd, interest, key)?;
+            let owned = poll.add_owned(self.fd, interest, key)?;
             self.entry = Some((owned, key));
             return Ok(());
         };
         if *old != key {
-            set.rekey(owned.token(), key)?;
+            poll.rekey(owned.token(), key)?;
             *old = key;
         }
-        set.modify(owned.token(), interest)
+        poll.modify(owned.token(), interest)
     }
 
     fn token(&self) -> Option<Token> {
         self.entry.as_ref().map(|(owned, _)| owned.token())
     }
 
-    /// Hands the socket to its Set, which takes it out and closes it; one
-    /// in no Set, or one set does not hold, drop closes, and the Set's
+    /// Hands the socket to its Poll, which takes it out and closes it; one
+    /// in no Poll, or one poll does not hold, drop closes, and the Poll's
     /// refusal says why.
-    fn close(mut self, set: &mut Set) -> Result<(), SetError> {
+    fn close(mut self, poll: &mut Poll) -> Result<(), PollError> {
         let Some((owned, _)) = self.entry.take() else {
             return Ok(());
         };
-        set.close(owned)?;
-        // rr: escape(leak): the Set closed the socket, which drop would
+        poll.close(owned)?;
+        // rr: escape(leak): the Poll closed the socket, which drop would
         // close again; the value holds nothing else.
         core::mem::forget(self);
         Ok(())
@@ -196,13 +201,18 @@ impl Stream {
         os::peer(self.socket.fd)
     }
 
-    /// Puts the stream in set with interest, reported with key, or
-    /// changes them. Refused for another Set than the first.
-    pub fn watch(&mut self, set: &mut Set, interest: Interest, key: u64) -> Result<(), SetError> {
-        self.socket.watch(set, interest, key)
+    /// Puts the stream in poll with interest, reported with key, or
+    /// changes them. Refused for another Poll than the first.
+    pub fn watch(
+        &mut self,
+        poll: &mut Poll,
+        interest: Interest,
+        key: u64,
+    ) -> Result<(), PollError> {
+        self.socket.watch(poll, interest, key)
     }
 
-    /// The stream's entry in its Set, for a deadline: Set::remove refuses
+    /// The stream's entry in its Poll, for a deadline: Poll::remove refuses
     /// it, and only the stream's close takes it out.
     pub fn token(&self) -> Option<Token> {
         self.socket.token()
@@ -213,18 +223,46 @@ impl Stream {
         self.socket.fd
     }
 
-    /// Takes the stream out of set, and closes it. The socket is closed
-    /// whatever set says; Err when set is not the Set it was watched in,
-    /// whose entry then stays until that Set gets a socket of its number.
-    pub fn close(self, set: &mut Set) -> Result<(), SetError> {
-        self.socket.close(set)
+    /// Takes the stream out of poll, and closes it. The socket is closed
+    /// whatever poll says; Err when poll is not the Poll it was watched in,
+    /// whose entry then stays until that Poll gets a socket of its number.
+    pub fn close(self, poll: &mut Poll) -> Result<(), PollError> {
+        self.socket.close(poll)
     }
 
     /// Closes with a reset (SO_LINGER 0), as for a peer that misbehaved:
     /// what was not sent is dropped. Err as close says.
-    pub fn abort(self, set: &mut Set) -> Result<(), SetError> {
+    pub fn abort(self, poll: &mut Poll) -> Result<(), PollError> {
         os::reset(self.socket.fd);
-        self.socket.close(set)
+        self.socket.close(poll)
+    }
+}
+
+/// An accepted connection in no Poll yet, for another thread's loop:
+/// accept_handoff makes it, a queue carries it, and Stream::adopt makes
+/// it a stream of the thread that watches it, in its Poll alone. Its
+/// socket is its own, closed when it is dropped: one that never arrives
+/// is closed all the same.
+pub struct Handoff {
+    socket: Socket,
+    peer: SocketAddr,
+}
+
+impl Handoff {
+    /// The address of the peer, as accept gave it.
+    pub fn peer(&self) -> SocketAddr {
+        self.peer
+    }
+}
+
+impl Stream {
+    /// The handed-off connection as a stream of this thread's: made, and
+    /// in no Poll until watch puts it in one.
+    pub fn adopt(handoff: Handoff) -> Stream {
+        Stream {
+            socket: handoff.socket,
+            link: Link::Connected,
+        }
     }
 }
 
@@ -243,6 +281,40 @@ impl Listener {
         os::bind(socket.fd, bytes.get(..length).unwrap_or_default())?;
         os::listen(socket.fd, backlog)?;
         Ok(Listener { socket })
+    }
+
+    /// Listens on address beside other listeners on it, each on its own
+    /// thread's loop, among which the system spreads the connections:
+    /// SO_REUSEPORT on Linux, whose kernel picks a listener by a hash of
+    /// each connection's addresses. Every one of them is bound so, by the
+    /// same user, who alone may join them; one closed drops the
+    /// connections waiting in its queue (net.ipv4.tcp_migrate_req is off
+    /// by default). macOS and Windows refuse it (Unbalanced): macOS gives
+    /// every connection to the listener bound last, and Windows has no
+    /// such option; one listener there accepts, and hands off.
+    pub fn bind_shared(address: SocketAddr, backlog: u32) -> Result<Listener, Error> {
+        if !os::BALANCED {
+            return Err(Error::Unbalanced);
+        }
+        let socket = Socket::new(os::open(&address)?);
+        os::prepare(socket.fd, address.is_ipv6())?;
+        os::share(socket.fd)?;
+        let (bytes, length) = encode(&address);
+        os::bind(socket.fd, bytes.get(..length).unwrap_or_default())?;
+        os::listen(socket.fd, backlog)?;
+        Ok(Listener { socket })
+    }
+
+    /// The next connection, in no Poll yet, for another thread's loop
+    /// (Handoff); None when none waits.
+    pub fn accept_handoff(&self) -> Result<Option<Handoff>, Error> {
+        let Some((stream, peer)) = self.accept()? else {
+            return Ok(None);
+        };
+        Ok(Some(Handoff {
+            socket: stream.socket,
+            peer,
+        }))
     }
 
     /// The next connection and its peer's address; None when none waits.
@@ -271,21 +343,26 @@ impl Listener {
         os::local(self.socket.fd)
     }
 
-    /// Puts the listener in set with interest, reported with key, or
-    /// changes them. Refused for another Set than the first.
-    pub fn watch(&mut self, set: &mut Set, interest: Interest, key: u64) -> Result<(), SetError> {
-        self.socket.watch(set, interest, key)
+    /// Puts the listener in poll with interest, reported with key, or
+    /// changes them. Refused for another Poll than the first.
+    pub fn watch(
+        &mut self,
+        poll: &mut Poll,
+        interest: Interest,
+        key: u64,
+    ) -> Result<(), PollError> {
+        self.socket.watch(poll, interest, key)
     }
 
-    /// The listener's entry in its Set, for a deadline.
+    /// The listener's entry in its Poll, for a deadline.
     pub fn token(&self) -> Option<Token> {
         self.socket.token()
     }
 
-    /// Takes the listener out of set, and closes it; Err as Stream's
+    /// Takes the listener out of poll, and closes it; Err as Stream's
     /// close says.
-    pub fn close(self, set: &mut Set) -> Result<(), SetError> {
-        self.socket.close(set)
+    pub fn close(self, poll: &mut Poll) -> Result<(), PollError> {
+        self.socket.close(poll)
     }
 }
 
@@ -364,7 +441,7 @@ fn decode(bytes: &[u8]) -> Option<SocketAddr> {
 #[cfg(unix)]
 mod os {
     use super::{ADDRESS_BYTES, Error, Io, decode};
-    use crate::base::wait::SOCK_STREAM;
+    use crate::base::poll::SOCK_STREAM;
     use core::ffi::c_int;
     use core::net::SocketAddr;
     use core::sync::atomic::{AtomicU64, Ordering};
@@ -455,8 +532,8 @@ mod os {
     // sys/socket.h's, netinet/in.h's, netinet/tcp.h's and errno.h's: Linux's
     // from asm-generic, as x86_64 and aarch64 have them, macOS's from its
     // SDK.
-    pub use crate::base::wait::{AF_INET, AF_INET6};
-    use crate::base::wait::{EINTR, ETIMEDOUT, errno};
+    pub use crate::base::poll::{AF_INET, AF_INET6};
+    use crate::base::poll::{EINTR, ETIMEDOUT, errno};
     const IPPROTO_TCP: c_int = 6;
     const IPPROTO_IPV6: c_int = 41;
     const TCP_NODELAY: c_int = 1;
@@ -469,6 +546,7 @@ mod os {
         pub const SO_ERROR: c_int = 4;
         pub const SO_LINGER: c_int = 13;
         pub const SO_REUSEADDR: c_int = 2;
+        pub const SO_REUSEPORT: c_int = 15;
         pub const IPV6_V6ONLY: c_int = 26;
         pub const SEND_FLAGS: c_int = 0x4000;
         pub const SOCK_NONBLOCK: c_int = 0x800;
@@ -598,7 +676,7 @@ mod os {
 
     #[cfg(target_os = "macos")]
     fn prepare_new(fd: c_int) -> Result<(), Error> {
-        use crate::base::wait::{F_SETFD, FD_CLOEXEC};
+        use crate::base::poll::{F_SETFD, FD_CLOEXEC};
         use numbers::{F_GETFL, F_SETFL, O_NONBLOCK, SO_NOSIGPIPE};
         // rr: escape(unsafe): fd is open.
         let flags = unsafe { c::fcntl(fd, F_GETFL) };
@@ -630,6 +708,26 @@ mod os {
 
     pub fn no_delay(fd: c_int, on: bool) -> Result<(), Error> {
         option(fd, IPPROTO_TCP, TCP_NODELAY, i32::from(on))
+    }
+
+    /// Whether the kernel spreads connections among listeners that share
+    /// an address: Linux's SO_REUSEPORT does (since 3.9); macOS's gives
+    /// them to the one bound last.
+    #[cfg(target_os = "linux")]
+    pub const BALANCED: bool = true;
+    #[cfg(target_os = "macos")]
+    pub const BALANCED: bool = false;
+
+    /// Lets other listeners of this user bind the address beside it.
+    #[cfg(target_os = "linux")]
+    pub fn share(fd: c_int) -> Result<(), Error> {
+        option(fd, SOL_SOCKET, numbers::SO_REUSEPORT, 1)
+    }
+
+    /// Never reached: BALANCED refuses first.
+    #[cfg(target_os = "macos")]
+    pub fn share(_fd: c_int) -> Result<(), Error> {
+        Err(Error::Unbalanced)
     }
 
     pub fn bind(fd: c_int, address: &[u8]) -> Result<(), Error> {
@@ -924,7 +1022,7 @@ mod os {
 #[cfg(target_os = "windows")]
 mod os {
     use super::{ADDRESS_BYTES, Error, Io, decode};
-    use crate::base::wait::{
+    use crate::base::poll::{
         FIONBIO, HANDLE_FLAG_INHERIT, INVALID_SOCKET, IPPROTO_TCP, SOCK_STREAM,
         WSA_FLAG_NO_HANDLE_INHERIT, startup,
     };
@@ -999,7 +1097,7 @@ mod os {
     }
 
     // ws2def.h's, ws2ipdef.h's, winsock2.h's and their WSAE* codes.
-    pub use crate::base::wait::{AF_INET, AF_INET6};
+    pub use crate::base::poll::{AF_INET, AF_INET6};
     const SOL_SOCKET: i32 = 0xffff;
     const SO_ERROR: i32 = 0x1007;
     const SO_LINGER: i32 = 0x80;
@@ -1110,6 +1208,15 @@ mod os {
 
     pub fn no_delay(socket: usize, on: bool) -> Result<(), Error> {
         option(socket, IPPROTO_TCP, TCP_NODELAY, i32::from(on))
+    }
+
+    /// Windows has no option that spreads connections among listeners
+    /// on one address: SO_REUSEADDR lets one take it, unbalanced.
+    pub const BALANCED: bool = false;
+
+    /// Never reached: BALANCED refuses first.
+    pub fn share(_socket: usize) -> Result<(), Error> {
+        Err(Error::Unbalanced)
     }
 
     /// Binds; an address another user's socket holds, or one that set

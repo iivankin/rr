@@ -1,11 +1,11 @@
 //! The system side of trust: what mod.rs says it is, for each system.
 
-use crate::base::wait;
+use crate::base::poll;
 use crate::base::x509;
 use alloc::vec::Vec;
 
 /// What a check waits on: the type every component's poll loop takes.
-pub use crate::base::wait::Wait;
+pub use crate::base::poll::Want;
 
 /// Why a chain was refused, or the system gave no anchors.
 #[cfg_attr(test, derive(Debug, PartialEq))]
@@ -142,7 +142,7 @@ impl Trust {
             if let Some(result) = check.poll() {
                 return result;
             }
-            wait::block(&check.wait());
+            poll::block(&check.want());
         }
     }
 }
@@ -266,8 +266,8 @@ impl Check<'_> {
     }
 
     /// What to wait on before polling again.
-    pub fn wait(&self) -> Wait {
-        os::wait(&self.os)
+    pub fn want(&self) -> Want {
+        os::want(&self.os)
     }
 }
 
@@ -640,9 +640,9 @@ mod disk {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod posix {
     use super::disk::Files;
-    use crate::base::wait::EINTR;
+    use crate::base::poll::EINTR;
     #[cfg(target_os = "linux")]
-    use crate::base::wait::O_CLOEXEC;
+    use crate::base::poll::O_CLOEXEC;
     use alloc::vec::Vec;
     use core::ffi::{CStr, c_char, c_int, c_void};
 
@@ -896,7 +896,7 @@ mod posix {
 mod os {
     pub use super::disk::LINUX as DEFAULTS;
     pub use super::posix::{System, variable};
-    use super::{Built, Error, Wait};
+    use super::{Built, Error, Want};
 
     /// No verifier but x509: Trust always holds anchors here.
     pub fn check(_chain: &[&[u8]], _host: &str, _now: i64) -> Check {
@@ -922,15 +922,15 @@ mod os {
     }
 
     /// Nothing: the answer is there from the start.
-    pub fn wait(_check: &Check) -> Wait {
-        Wait::READY
+    pub fn want(_check: &Check) -> Want {
+        Want::READY
     }
 }
 #[cfg(target_os = "macos")]
 mod os {
     pub use super::disk::MACOS as DEFAULTS;
     pub use super::posix::{System, variable};
-    pub use super::thread::{Check, wait};
+    pub use super::worker::{Check, want};
     use super::{Built, Error, Found, Path};
     use crate::base::x509;
     use alloc::vec::Vec;
@@ -1283,6 +1283,12 @@ mod os {
         trust: Owned,
     }
 
+    // rr: escape(unsafe): the SecTrust is this job's alone, made on the
+    // caller's thread and evaluated on the pool's, never two at once, as
+    // Apple has an evaluation run off the main thread; CoreFoundation's
+    // retain and release may run on any thread.
+    unsafe impl Send for Job {}
+
     impl Job {
         pub fn run(&self) -> Result<Built, Error> {
             evaluate(self.trust.0).map(Built::one)
@@ -1389,7 +1395,7 @@ mod os {
 mod os {
     pub use super::disk::WINDOWS as DEFAULTS;
     use super::disk::{ENOENT, Files};
-    pub use super::thread::{Check, wait};
+    pub use super::worker::{Check, want};
     use super::{Built, Error, Found, Path};
     use crate::base::x509;
     use alloc::vec::Vec;
@@ -2258,156 +2264,107 @@ mod os {
     }
 }
 
-/// A check the system runs on a thread of its own, on macOS and
-/// Windows: the thread and the check share a block, which the last of
-/// the two to let go frees, so a check dropped while the thread runs
-/// never waits for it.
+/// A check the system runs on thread's pool, on macOS and Windows,
+/// which sets the check's Signal when it returned: a check dropped while
+/// its thread runs never waits for it, as the thread drops the work; one
+/// dropped while still in the pool's line never starts.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-mod thread {
+mod worker {
     use super::os::Job;
     use super::{Built, Error};
-    use crate::base::wait::{self, Signal, Wait};
+    use crate::base::poll::{Signal, Want};
+    use crate::base::thread::{self, Done, Work};
     use alloc::boxed::Box;
-    use core::cell::UnsafeCell;
-    use core::ffi::c_void;
-    use core::ptr::null_mut;
-    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use alloc::sync::Arc;
 
-    /// The thread writes result, then sets done and the signal; the
-    /// check reads result only after it saw done.
-    struct Shared {
-        holders: AtomicUsize,
-        done: AtomicBool,
-        result: UnsafeCell<Result<Built, Error>>,
-        signal: Signal,
+    /// A check for the pool: the job in, its answer out.
+    struct Checking {
         job: Job,
+        result: Result<Built, Error>,
     }
 
-    /// Lets go of shared; the last holder frees it.
-    fn release(shared: *mut Shared) {
-        // rr: escape(unsafe): shared lives until its holders let go.
-        let holders = unsafe { &(*shared).holders };
-        if holders.fetch_sub(1, Ordering::AcqRel) == 1 {
-            // rr: escape(unsafe): no one else holds it now.
-            drop(unsafe { Box::from_raw(shared) });
+    impl Work for Checking {
+        fn run(&mut self) {
+            self.result = self.job.run();
         }
     }
 
-    fn run(argument: *mut c_void) {
-        let shared = argument.cast::<Shared>();
-        // rr: escape(unsafe): the thread is a holder of shared.
-        let state = unsafe { &*shared };
-        let result = state.job.run();
-        // rr: escape(unsafe): only this thread touches result before done.
-        unsafe { *state.result.get() = result };
-        state.done.store(true, Ordering::Release);
-        state.signal.set();
-        release(shared);
-    }
-
     pub struct Check {
-        shared: *mut Shared,
+        /// The check in the pool, until it is done; each job of it holds
+        /// a Checking, as start alone spawns them.
+        job: Option<thread::Job>,
+        /// What the job sets when it is done, which want names.
+        signal: Option<Arc<Signal>>,
         /// The answer, once known and not yet polled.
         taken: Option<Result<Built, Error>>,
-        /// The work, to take out of spawn's line when dropped before it
-        /// started.
-        ticket: Option<wait::Ticket>,
     }
 
     impl Check {
         /// A check whose answer is known.
         pub fn answered(result: Result<Built, Error>) -> Check {
             Check {
-                shared: null_mut(),
+                job: None,
+                signal: None,
                 taken: Some(result),
-                ticket: None,
             }
         }
 
-        /// Runs job on a thread of its own, or answers with its error.
+        /// Runs job on the pool, or answers with its error.
         pub fn start(job: Result<Job, Error>) -> Check {
-            let mut check = Check {
-                shared: null_mut(),
-                taken: None,
-                ticket: None,
-            };
             let job = match job {
                 Ok(job) => job,
-                Err(error) => {
-                    check.taken = Some(Err(error));
-                    return check;
-                }
+                Err(error) => return Check::answered(Err(error)),
             };
             let Some(signal) = Signal::new() else {
-                check.taken = Some(Err(Error::Thread));
-                return check;
+                return Check::answered(Err(Error::Thread));
             };
-            let shared = Box::new(Shared {
-                // rr: escape(shared): the check and the thread both hold it.
-                holders: AtomicUsize::new(2),
-                // rr: escape(shared): the thread says it is done.
-                done: AtomicBool::new(false),
-                // rr: escape(shared): the thread's answer, handed over once.
-                result: UnsafeCell::new(Err(Error::Polled)),
-                signal,
+            // rr: escape(shared): the check waits on it, the job sets it.
+            let signal = Arc::new(signal);
+            let work = Box::new(Checking {
                 job,
+                result: Err(Error::Polled),
             });
-            // rr: escape(leak): the check and the thread hold it, and release
-            // frees it.
-            let raw = Box::into_raw(shared);
-            check.shared = raw;
-            // rr: escape(unsafe): run takes shared as its holder, which it
-            // lets go; the ticket's cancel says when it never runs.
-            check.ticket = unsafe { wait::spawn(run, raw.cast()) };
-            if check.ticket.is_none() {
-                // The thread never held it.
-                release(raw);
-                check.taken = Some(Err(Error::Thread));
+            // rr: escape(copy): the job's holder of the signal.
+            match thread::spawn(work, Done::Signal(Arc::clone(&signal))) {
+                Ok(spawned) => Check {
+                    job: Some(spawned),
+                    signal: Some(signal),
+                    taken: None,
+                },
+                Err(_) => Check::answered(Err(Error::Thread)),
             }
-            check
         }
 
         #[must_use]
         pub fn poll(&mut self) -> Option<Result<Built, Error>> {
-            if self.taken.is_none() && !self.shared.is_null() {
-                // rr: escape(unsafe): this check holds shared.
-                let shared = unsafe { &*self.shared };
-                if !shared.done.load(Ordering::Acquire) {
-                    return None;
+            if let Some(job) = self.job.take() {
+                match job.take() {
+                    Ok(work) => self.taken = Some(answer(work)),
+                    Err(job) => self.job = Some(job),
                 }
-                // rr: escape(unsafe): the thread is done with result.
-                let result = unsafe { &mut *shared.result.get() };
-                self.taken = Some(core::mem::replace(result, Err(Error::Polled)));
-                release(self.shared);
-                self.shared = null_mut();
             }
             self.taken.take()
         }
     }
 
-    pub fn wait(check: &Check) -> Wait {
-        if check.taken.is_some() || check.shared.is_null() {
-            return Wait::READY;
-        }
-        // rr: escape(unsafe): this check holds shared.
-        let shared = unsafe { &*check.shared };
-        shared.signal.wait()
+    /// What a Checking the pool gave back found.
+    fn answer(work: Box<dyn Work + Send>) -> Result<Built, Error> {
+        // rr: escape(unsafe, cast, leak): Check::start alone spawns the
+        // jobs a Check keeps, each with a Box<Checking>, and the pool
+        // gives that Box back: the pointer is the Checking's, which
+        // from_raw owns again.
+        let checking = unsafe { Box::from_raw(Box::into_raw(work).cast::<Checking>()) };
+        checking.result
     }
 
-    impl Drop for Check {
-        fn drop(&mut self) {
-            if self.shared.is_null() {
-                return;
-            }
-            // Work still in line never runs: its holder is let go here.
-            if self.ticket.take().is_some_and(wait::Ticket::cancel) {
-                release(self.shared);
-            }
-            // The thread, when it runs on, frees what is left.
-            release(self.shared);
+    pub fn want(check: &Check) -> Want {
+        match (&check.job, &check.signal) {
+            (Some(_), Some(signal)) => signal.want(),
+            _ => Want::READY,
         }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::disk::{self, Defaults, ENOENT, Files, LINUX, MACOS, Paths, WINDOWS};
@@ -2667,7 +2624,7 @@ mod tests {
                 .find_map(|_| {
                     let result = check.poll();
                     if result.is_none() {
-                        crate::base::wait::block(&check.wait());
+                        crate::base::poll::block(&check.want());
                     }
                     result
                 })
@@ -2935,7 +2892,7 @@ mod tests {
                 .find_map(|_| {
                     let result = check.poll();
                     if result.is_none() {
-                        crate::base::wait::block(&super::os::wait(&check));
+                        crate::base::poll::block(&super::os::want(&check));
                     }
                     result
                 })

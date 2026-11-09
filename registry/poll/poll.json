@@ -1,0 +1,17 @@
+{
+  "name": "poll",
+  "description": "What a program's loop waits on, in mio's words, for the program and every component that works while it runs: a Poll of any number of descriptors (sockets on Windows), each with its Interest and a key, and deadlines on the monotonic clock (one moved a little later left where it is filed, as nginx does), level-triggered on epoll (Linux), kqueue (macOS), socket notifications (Windows from build 20348: Server 2022, Windows 11) or WSAPoll (Windows 10, Server 2019, or a layered provider over TCP), what is ready reported as Events of Ready, the same on every system, and every refusal as a PollError; tokens of one Poll refused by another; Owned entries that only close takes out, closing the descriptor once; a Waker for other threads; a component's Want (up to two descriptors and a timeout), which a Poll follows or block waits on alone; and a Signal, the close-on-exec pipe (Linux and macOS) or non-inherited loopback socket pair (Windows) another thread makes readable. Formerly wait.",
+  "rr": "0.5.2",
+  "dependencies": [],
+  "files": [
+    {
+      "path": "mod.rs"
+    },
+    {
+      "path": "entries.rs"
+    },
+    {
+      "path": "sys.rs"
+    }
+  ]
+}

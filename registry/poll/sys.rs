@@ -1,19 +1,14 @@
-//! The system side of wait: what mod.rs says it is, for each system.
-
-use alloc::boxed::Box;
-use core::cell::UnsafeCell;
-use core::ffi::c_void;
-use core::ptr::null_mut;
-use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+//! The system side of poll: what mod.rs says it is, for each system.
 
 /// fcntl.h's close-on-exec, for net's sockets as for the signal's pipe;
 /// errno, for net's and resolve's calls.
 #[cfg(unix)]
 pub use os::{F_SETFD, FD_CLOEXEC, errno};
-/// Winsock's, for net's sockets as for the signal's pair.
+/// Winsock's, for net's sockets as for the signal's pair; a wait with
+/// no limit, for thread's.
 #[cfg(target_os = "windows")]
 pub use os::{
-    FIONBIO, HANDLE_FLAG_INHERIT, INVALID_SOCKET, IPPROTO_TCP, WSA_FLAG_NO_HANDLE_INHERIT,
+    FIONBIO, HANDLE_FLAG_INHERIT, INFINITE, INVALID_SOCKET, IPPROTO_TCP, WSA_FLAG_NO_HANDLE_INHERIT,
 };
 /// Linux's close-on-exec flag, which epoll, eventfd, pipe2 and open take.
 #[cfg(target_os = "linux")]
@@ -99,44 +94,45 @@ impl Fd {
     };
 }
 
-/// Wait on the first count of fds, at most timeout_ms (None: no
-/// limit); Fd::NONE is none.
-pub struct Wait {
+/// What a component wants its caller's loop to wait for before it polls
+/// the component again: the first count of fds, at most timeout_ms
+/// (None: no limit); Fd::NONE is none.
+pub struct Want {
     pub fds: [Fd; 2],
     pub count: usize,
     pub timeout_ms: Option<u64>,
 }
 
-impl Wait {
+impl Want {
     /// Nothing to wait on: poll again now.
-    pub const READY: Wait = Wait {
+    pub const READY: Want = Want {
         fds: [Fd::NONE; 2],
         count: 0,
         timeout_ms: Some(0),
     };
 }
 
-/// A Set's wait failed for no passing reason: the system no longer takes
-/// the Set's own descriptor or memory, which is a bug in this program,
+/// A Poll's wait failed for no passing reason: the system no longer takes
+/// the Poll's own descriptor or memory, which is a bug in this program,
 /// and the loop could only spin on it. The process stops there, as Go's
 /// runtime throws and libuv aborts.
 fn broken() -> ! {
-    // rr: escape(panic): the Set's own descriptor or memory is no longer
+    // rr: escape(panic): the Poll's own descriptor or memory is no longer
     // valid; nothing the loop does can wait again.
     panic!("the system's wait failed");
 }
 
-/// Waits as wait says: for a thread that may block, never a poll
-/// loop's, which adds the Wait to its own wait.
+/// Waits as want says: for a thread that may block, never a poll
+/// loop's, which follows the Want in its Poll.
 #[cfg_attr(rr, rr::blocking)]
-pub fn block(wait: &Wait) {
+pub fn block(want: &Want) {
     // The caller polls whatever woke it.
-    ready(wait);
+    ready(want);
 }
 
-/// Waits as wait says; what happened on each of its fds (revents).
-pub fn ready(wait: &Wait) -> [i16; 2] {
-    os::ready(wait)
+/// Waits as want says; what happened on each of its fds (revents).
+pub fn ready(want: &Want) -> [i16; 2] {
+    os::ready(want)
 }
 
 /// Winsock, started once for the process: WSAPoll and the sockets
@@ -146,7 +142,8 @@ pub fn startup() {
     os::startup();
 }
 
-/// Set when a thread's work is done; what waits on it is readable then.
+/// Set when a thread's work is done; what waits on it is readable then:
+/// a component's Want names it, and a pool's Job can set it (thread).
 pub struct Signal {
     os: os::Signal,
 }
@@ -164,226 +161,21 @@ impl Signal {
     }
 
     /// What waits until set.
-    pub fn wait(&self) -> Wait {
-        let mut wait = Wait::READY;
-        wait.fds[0] = Fd {
+    pub fn want(&self) -> Want {
+        let mut want = Want::READY;
+        want.fds[0] = Fd {
             fd: self.os.read_end(),
             events: POLLIN,
         };
-        wait.count = 1;
-        wait.timeout_ms = None;
-        wait
-    }
-}
-
-/// The most threads spawn runs at once; more work waits its turn.
-pub const THREADS_MAX: usize = 32;
-
-/// Work's states: in line, taken by a thread, or cancelled first.
-const QUEUED: u8 = 0;
-const STARTED: u8 = 1;
-const CANCELLED: u8 = 2;
-
-/// Work spawn took: what runs, on what, the next in line, its state,
-/// and its two holders, the line or thread and the Ticket.
-struct Start {
-    work: fn(*mut c_void),
-    argument: *mut c_void,
-    next: *mut Start,
-    state: AtomicU8,
-    holders: AtomicUsize,
-}
-
-/// Lets go of start; the last holder frees it.
-fn release(start: *mut Start) {
-    // rr: escape(unsafe): start lives until its holders let go.
-    let holders = unsafe { &(*start).holders };
-    if holders.fetch_sub(1, Ordering::AcqRel) == 1 {
-        // rr: escape(unsafe): no one else holds it now.
-        drop(unsafe { Box::from_raw(start) });
-    }
-}
-
-/// Work spawn took. Dropped, it cancels the work if no thread took it
-/// yet, as cancel does; detach lets it run whenever its turn comes.
-#[must_use]
-pub struct Ticket {
-    start: *mut Start,
-    /// The work runs in its turn whatever becomes of the ticket.
-    detached: bool,
-}
-
-impl Ticket {
-    /// Keeps the work from starting, when it has not: then it never
-    /// runs, and its argument is the caller's again. False when a
-    /// thread took it, which runs it to its end.
-    #[must_use]
-    pub fn cancel(mut self) -> bool {
-        self.detached = true;
-        self.stop()
-    }
-
-    /// Lets the work run, in its turn, without a ticket to cancel it.
-    pub fn detach(mut self) {
-        self.detached = true;
-    }
-
-    /// Keeps the work from starting; whether it had not.
-    fn stop(&self) -> bool {
-        // rr: escape(unsafe): the ticket holds its Start.
-        let state = unsafe { &(*self.start).state };
-        state
-            .compare_exchange(QUEUED, CANCELLED, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    }
-}
-
-impl Drop for Ticket {
-    fn drop(&mut self) {
-        if !self.detached {
-            // Work still in line never runs: its argument is never touched.
-            let _cancelled: bool = self.stop();
-        }
-        release(self.start);
-    }
-}
-
-/// The line of work waiting for a thread, and the threads running.
-struct Line {
-    running: usize,
-    first: *mut Start,
-    last: *mut Start,
-}
-
-/// The process's line, under its lock: the threads spawn starts reach
-/// it from outside any caller's call tree, as a signal handler would.
-struct Queue {
-    lock: os::Lock,
-    line: UnsafeCell<Line>,
-}
-
-// rr: escape(unsafe): Queue's line is only reached under its lock.
-unsafe impl Sync for Queue {}
-
-// rr: escape(shared): one line for the process, which the worker threads
-// reach without a caller to lend it to them.
-static QUEUE: Queue = Queue {
-    lock: os::Lock::new(),
-    // rr: escape(shared): the line, under the lock.
-    line: UnsafeCell::new(Line {
-        running: 0,
-        first: null_mut(),
-        last: null_mut(),
-    }),
-};
-
-/// Runs f on the line under its lock. f never calls locked: the lock
-/// is not taken twice by one thread, which POSIX leaves undefined for
-/// the mutex PTHREAD_MUTEX_INITIALIZER makes.
-fn locked(f: impl FnOnce(&mut Line)) {
-    QUEUE.lock.lock();
-    // rr: escape(unsafe): the lock is held: no one else touches the line.
-    f(unsafe { &mut *QUEUE.line.get() });
-    QUEUE.lock.unlock();
-}
-
-/// Runs work(argument) on a thread: a new one while fewer than
-/// THREADS_MAX run, else the first to finish its work, in the order
-/// spawn was called. None when no thread could be started, and work
-/// never runs. The Ticket cancels the work when it is dropped before a
-/// thread took it, as cancel does; detach lets it run.
-///
-/// # Safety
-///
-/// work runs on another thread, with argument: whatever argument points
-/// to must stay valid, and be safe to reach from that thread, until work
-/// returns, or until cancel returns true or the Ticket is dropped while
-/// the work is still in line (then work never runs, and argument is the
-/// caller's again). A caller that cannot tell which happened holds what
-/// argument points to until work says it is done (resolve and trust
-/// count two holders: the caller and the thread).
-// rr: escape(unsafe): work reaches what argument points to from
-// another thread, which the caller keeps alive as Safety says.
-pub unsafe fn spawn(work: fn(*mut c_void), argument: *mut c_void) -> Option<Ticket> {
-    let start = Box::new(Start {
-        work,
-        argument,
-        next: null_mut(),
-        // rr: escape(shared): the ticket and the thread race to it.
-        state: AtomicU8::new(QUEUED),
-        // rr: escape(shared): the ticket and the line or thread hold it.
-        holders: AtomicUsize::new(2),
-    });
-    // rr: escape(leak): its holders let go of it, and release frees it.
-    let raw = Box::into_raw(start);
-    let mut queued = false;
-    locked(|line| {
-        if line.running < THREADS_MAX {
-            line.running += 1;
-            return;
-        }
-        if line.last.is_null() {
-            line.first = raw;
-        } else {
-            // rr: escape(unsafe): the last is in the line, under the lock.
-            unsafe { (*line.last).next = raw };
-        }
-        line.last = raw;
-        queued = true;
-    });
-    if queued || os::thread(raw.cast()) {
-        return Some(Ticket {
-            start: raw,
-            detached: false,
-        });
-    }
-    locked(|line| line.running -= 1);
-    // Neither a thread nor a ticket holds it.
-    release(raw);
-    release(raw);
-    None
-}
-
-/// A thread's life: its work, then the line's first while there is one;
-/// work cancelled in line is passed over.
-fn begin(first: *mut c_void) {
-    let mut next = first.cast::<Start>();
-    // Each turn takes one work off the line, which is finite.
-    loop {
-        // rr: escape(unsafe): this thread holds next.
-        let start = unsafe { &*next };
-        let taken = start
-            .state
-            .compare_exchange(QUEUED, STARTED, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
-        if taken {
-            (start.work)(start.argument);
-        }
-        release(next);
-        let mut head = null_mut();
-        locked(|line| {
-            head = line.first;
-            if head.is_null() {
-                line.running -= 1;
-            } else {
-                // rr: escape(unsafe): head is in the line, under the lock.
-                line.first = unsafe { (*head).next };
-                if line.first.is_null() {
-                    line.last = null_mut();
-                }
-            }
-        });
-        if head.is_null() {
-            return;
-        }
-        next = head;
+        want.count = 1;
+        want.timeout_ms = None;
+        want
     }
 }
 
 #[cfg(unix)]
 mod os {
-    use super::Wait;
-    use core::cell::UnsafeCell;
+    use super::Want;
     use core::ffi::{c_int, c_void};
 
     #[repr(C)]
@@ -393,37 +185,15 @@ mod os {
         revents: i16,
     }
 
-    /// pthread_t: a pointer on macOS, an unsigned long in glibc and musl.
-    #[cfg(target_os = "macos")]
-    type Thread = *mut c_void;
-    #[cfg(not(target_os = "macos"))]
-    type Thread = core::ffi::c_ulong;
-
     /// nfds_t: an unsigned int on macOS, an unsigned long on Linux.
     #[cfg(target_os = "macos")]
     type Count = core::ffi::c_uint;
     #[cfg(not(target_os = "macos"))]
     type Count = core::ffi::c_ulong;
 
-    // glibc before 2.34 keeps the threads in libpthread; later ones and
-    // musl keep them in libc, and glibc's libpthread is then empty.
-    #[cfg_attr(all(target_os = "linux", target_env = "gnu"), link(name = "pthread"))]
+    #[link(name = "c")]
     // rr: escape(unsafe): each signature is the C library's, from its headers.
     unsafe extern "C" {
-        #[must_use]
-        fn pthread_create(
-            thread: *mut Thread,
-            attributes: *const c_void,
-            start: extern "C" fn(*mut c_void) -> *mut c_void,
-            argument: *mut c_void,
-        ) -> c_int;
-        #[must_use]
-        fn pthread_detach(thread: Thread) -> c_int;
-        #[must_use]
-        fn pthread_mutex_lock(mutex: *mut u64) -> c_int;
-        #[must_use]
-        fn pthread_mutex_unlock(mutex: *mut u64) -> c_int;
-        fn abort() -> !;
         #[cfg(target_os = "macos")]
         #[must_use]
         fn pipe(fds: *mut c_int) -> c_int;
@@ -464,8 +234,8 @@ mod os {
         unsafe { place.read() }
     }
 
-    pub fn ready(wait: &Wait) -> [i16; 2] {
-        let [one, two] = &wait.fds;
+    pub fn ready(want: &Want) -> [i16; 2] {
+        let [one, two] = &want.fds;
         let mut fds = [
             PollFd {
                 fd: one.fd,
@@ -478,8 +248,8 @@ mod os {
                 revents: 0,
             },
         ];
-        let count = Count::try_from(wait.count.min(2)).unwrap_or(0);
-        let timeout = wait
+        let count = Count::try_from(want.count.min(2)).unwrap_or(0);
+        let timeout = want
             .timeout_ms
             .map_or(-1, |ms| c_int::try_from(ms).unwrap_or(c_int::MAX));
         // rr: escape(unsafe): fds holds count entries.
@@ -488,75 +258,6 @@ mod os {
         }
         let [first, second] = fds;
         [first.revents, second.revents]
-    }
-
-    extern "C" fn run(start: *mut c_void) -> *mut c_void {
-        super::begin(start);
-        core::ptr::null_mut()
-    }
-
-    /// PTHREAD_MUTEX_INITIALIZER's first word: macOS's
-    /// _PTHREAD_MUTEX_SIG_init (its SDK's pthread/pthread_impl.h); glibc's
-    /// (sysdeps/nptl/bits/struct_mutex.h, whose kind PTHREAD_MUTEX_TIMED_NP
-    /// is 0) and musl's (include/pthread.h) are all zeros.
-    #[cfg(target_os = "macos")]
-    const MUTEX_INIT: u64 = 0x32AA_ABA7;
-    #[cfg(not(target_os = "macos"))]
-    const MUTEX_INIT: u64 = 0;
-
-    /// A pthread_mutex_t, made as PTHREAD_MUTEX_INITIALIZER makes it: a
-    /// long and 56 bytes on macOS (sys/_pthread/_pthread_types.h), 40
-    /// bytes in musl (include/alltypes.h.in) and in glibc on x86_64, 48 in
-    /// glibc on aarch64 (sysdeps/*/nptl/bits/pthreadtypes-arch.h). Eight
-    /// words hold each.
-    pub struct Lock(UnsafeCell<[u64; 8]>);
-
-    impl Lock {
-        pub const fn new() -> Lock {
-            // rr: escape(shared): the C library's mutex, which threads
-            // share to take turns.
-            Lock(UnsafeCell::new([MUTEX_INIT, 0, 0, 0, 0, 0, 0, 0]))
-        }
-
-        /// Takes the mutex. It fails only on a mutex never made or
-        /// taken twice, which leaves the line in no known state: the
-        /// process stops there.
-        pub fn lock(&self) {
-            // rr: escape(unsafe): the mutex lives as long as self, which
-            // is never moved once shared (a static).
-            if unsafe { pthread_mutex_lock(self.0.get().cast()) } != 0 {
-                // rr: escape(unsafe): abort takes nothing and never returns.
-                unsafe { abort() }
-            }
-        }
-
-        pub fn unlock(&self) {
-            // rr: escape(unsafe): this thread locked the mutex.
-            if unsafe { pthread_mutex_unlock(self.0.get().cast()) } != 0 {
-                // rr: escape(unsafe): abort takes nothing and never returns.
-                unsafe { abort() }
-            }
-        }
-    }
-
-    /// Starts a detached thread on start; whether it did.
-    #[must_use]
-    pub fn thread(start: *mut c_void) -> bool {
-        // rr: escape(unsafe): an integer or a null pointer, which
-        // pthread_create fills before it is read.
-        let mut thread: Thread = unsafe { core::mem::zeroed() };
-        // rr: escape(unsafe): run takes the Start passed to it.
-        let code = unsafe { pthread_create(&raw mut thread, core::ptr::null(), run, start) };
-        if code != 0 {
-            return false;
-        }
-        // rr: escape(unsafe): thread was just made, and is detached once.
-        unsafe {
-            // rr: escape(discard): a thread just made is joinable, which
-            // pthread_detach cannot refuse.
-            let _: c_int = pthread_detach(thread);
-        }
-        true
     }
 
     /// A pipe a byte is written to when the work is done; both ends
@@ -637,10 +338,9 @@ mod os {
 
 #[cfg(target_os = "windows")]
 mod os {
-    use super::{AF_INET, SOCK_STREAM, Wait};
-    use core::cell::UnsafeCell;
+    use super::{AF_INET, SOCK_STREAM, Want};
     use core::ffi::c_void;
-    use core::ptr::{null, null_mut, without_provenance_mut};
+    use core::ptr::{null, without_provenance_mut};
     use core::sync::atomic::{AtomicBool, Ordering};
 
     /// WSAPOLLFD.
@@ -699,21 +399,9 @@ mod os {
     #[link(name = "kernel32", kind = "raw-dylib")]
     // rr: escape(unsafe): each signature is kernel32's, from its documentation.
     unsafe extern "system" {
-        fn CreateThread(
-            attributes: *const c_void,
-            stack: usize,
-            start: extern "system" fn(*mut c_void) -> u32,
-            argument: *mut c_void,
-            flags: u32,
-            id: *mut u32,
-        ) -> *mut c_void;
-        #[must_use]
-        fn CloseHandle(handle: *mut c_void) -> i32;
         #[must_use]
         fn SetHandleInformation(handle: *mut c_void, mask: u32, flags: u32) -> i32;
         fn Sleep(milliseconds: u32);
-        fn AcquireSRWLockExclusive(lock: *mut *mut c_void);
-        fn ReleaseSRWLockExclusive(lock: *mut *mut c_void);
     }
 
     pub const IPPROTO_TCP: i32 = 6;
@@ -739,18 +427,18 @@ mod os {
         }
     }
 
-    pub fn ready(wait: &Wait) -> [i16; 2] {
-        let milliseconds = wait
+    pub fn ready(want: &Want) -> [i16; 2] {
+        let milliseconds = want
             .timeout_ms
             .map_or(INFINITE, |ms| u32::try_from(ms).unwrap_or(INFINITE - 1));
         // WSAPoll refuses an empty set: nothing to wait on is a sleep.
-        if wait.count == 0 {
+        if want.count == 0 {
             // rr: escape(unsafe): Sleep takes a plain number.
             unsafe { Sleep(milliseconds) };
             return [0, 0];
         }
         startup();
-        let [one, two] = &wait.fds;
+        let [one, two] = &want.fds;
         let mut fds = [
             PollFd {
                 fd: one.fd,
@@ -763,7 +451,7 @@ mod os {
                 revents: 0,
             },
         ];
-        let count = u32::try_from(wait.count.min(2)).unwrap_or(0);
+        let count = u32::try_from(want.count.min(2)).unwrap_or(0);
         // -1 waits with no limit; a finite wait past i32's milliseconds
         // waits as long as it can.
         let timeout = match milliseconds {
@@ -776,53 +464,6 @@ mod os {
         }
         let [first, second] = fds;
         [first.revents, second.revents]
-    }
-
-    extern "system" fn run(start: *mut c_void) -> u32 {
-        super::begin(start);
-        0
-    }
-
-    /// An SRWLOCK, one pointer, made as SRWLOCK_INIT makes it: null
-    /// (synchapi.h). Taken only exclusive: the shared mode's bug that
-    /// Rust's std left SRWLOCK for (rust-lang/rust#121949) is not met.
-    /// Acquire and Release return nothing, and cannot fail.
-    pub struct Lock(UnsafeCell<*mut c_void>);
-
-    impl Lock {
-        pub const fn new() -> Lock {
-            // rr: escape(shared): the system's lock, which threads share
-            // to take turns.
-            Lock(UnsafeCell::new(null_mut()))
-        }
-
-        pub fn lock(&self) {
-            // rr: escape(unsafe): the lock lives as long as self, which is
-            // never moved once shared (a static).
-            unsafe { AcquireSRWLockExclusive(self.0.get()) };
-        }
-
-        pub fn unlock(&self) {
-            // rr: escape(unsafe): this thread holds the lock.
-            unsafe { ReleaseSRWLockExclusive(self.0.get()) };
-        }
-    }
-
-    /// Starts a detached thread on start; whether it did.
-    #[must_use]
-    pub fn thread(start: *mut c_void) -> bool {
-        // rr: escape(unsafe): run takes the Start passed to it.
-        let thread = unsafe { CreateThread(null(), 0, run, start, 0, null_mut()) };
-        if thread.is_null() {
-            return false;
-        }
-        // rr: escape(unsafe): the thread runs on without its handle.
-        unsafe {
-            // rr: escape(discard): the thread runs on whatever CloseHandle
-            // answers.
-            let _: i32 = CloseHandle(thread);
-        }
-        true
     }
 
     /// A socket of ours, closed on drop.
@@ -1001,7 +642,7 @@ mod os {
 mod poller {
     use super::os::errno;
     use super::{EINTR, broken};
-    use crate::base::wait::{ERROR, HUP, READ, WRITE};
+    use crate::base::poll::{ERROR, HUP, READ, WRITE};
     use alloc::sync::Arc;
     use alloc::vec::Vec;
     use core::ffi::{c_int, c_void};
@@ -1124,7 +765,9 @@ mod poller {
     pub struct Poller {
         epoll: c_int,
         wake: Arc<Wake>,
-        events: [Event; BATCH],
+        /// What a wait takes from the epoll: BATCH entries, on the heap,
+        /// so that a Poll is small to move to its thread.
+        events: Vec<Event>,
     }
 
     impl Poller {
@@ -1146,12 +789,14 @@ mod poller {
                 }
                 return None;
             }
+            let mut events = Vec::with_capacity(BATCH);
+            events.resize_with(BATCH, || Event { events: 0, data: 0 });
             let poller = Poller {
                 epoll,
                 // rr: escape(shared): the poller and each Waker hold the
                 // eventfd.
                 wake: Arc::new(Wake { fd }),
-                events: [const { Event { events: 0, data: 0 } }; BATCH],
+                events,
             };
             // The eventfd's key is 0, which names the waker.
             poller
@@ -1219,7 +864,7 @@ mod poller {
             let ms = timeout.map_or(-1, |ns| {
                 c_int::try_from(ns.div_ceil(1_000_000)).unwrap_or(c_int::MAX)
             });
-            let room = c_int::try_from(BATCH).unwrap_or(0);
+            let room = c_int::try_from(self.events.len()).unwrap_or(0);
             // rr: escape(unsafe): events holds room entries.
             let got = unsafe { epoll_wait(self.epoll, self.events.as_mut_ptr(), room, ms) };
             // An interrupted wait: nothing is ready. epoll_wait's other
@@ -1283,7 +928,7 @@ mod poller {
 mod poller {
     use super::os::{F_SETFD, FD_CLOEXEC, errno};
     use super::{EINTR, ETIMEDOUT, broken};
-    use crate::base::wait::{ERROR, HUP, READ, WRITE};
+    use crate::base::poll::{ERROR, HUP, READ, WRITE};
     use alloc::sync::Arc;
     use alloc::vec::Vec;
     use core::ffi::{c_int, c_void};
@@ -1410,8 +1055,15 @@ mod poller {
 
     pub struct Poller {
         queue: Arc<Wake>,
-        events: [Kevent; BATCH],
+        /// What a wait takes from the kqueue: BATCH entries, on the heap,
+        /// so that a Poll is small to move to its thread.
+        events: Vec<Kevent>,
     }
+
+    // rr: escape(unsafe): a kqueue is the process's, which any thread may
+    // wait on; events is scratch whose udata are keys, not pointers. A Poll
+    // made on one thread may so run on another, one at a time.
+    unsafe impl Send for Poller {}
 
     impl Poller {
         #[must_use]
@@ -1431,19 +1083,9 @@ mod poller {
             if !queue.apply(&[change(WAKE, EVFILT_USER, EV_ADD | EV_CLEAR, 0)]) {
                 return None;
             }
-            Some(Poller {
-                queue,
-                events: [const {
-                    Kevent {
-                        ident: 0,
-                        filter: 0,
-                        flags: 0,
-                        fflags: 0,
-                        data: 0,
-                        udata: null_mut(),
-                    }
-                }; BATCH],
-            })
+            let mut events = Vec::with_capacity(BATCH);
+            events.resize_with(BATCH, || change(0, 0, 0, 0));
+            Some(Poller { queue, events })
         }
 
         pub fn add(&self, fd: c_int, key: u64, interest: u8) -> bool {
@@ -1531,7 +1173,7 @@ mod poller {
                 nanoseconds: i64::try_from(ns % 1_000_000_000).unwrap_or(0),
             });
             let limit = time.as_ref().map_or(null(), core::ptr::from_ref);
-            let room = c_int::try_from(BATCH).unwrap_or(0);
+            let room = c_int::try_from(self.events.len()).unwrap_or(0);
             // rr: escape(unsafe): events holds room entries; limit is null
             // or a local timespec.
             let got = unsafe {
@@ -1591,25 +1233,34 @@ mod poller {
     }
 }
 
-/// Windows: socket notifications (ProcessSocketNotifications, Windows 11
-/// and Server 2022, build 20348) where the system has them: readiness
-/// through a completion port, as epoll has it: persistent and
+/// Windows: socket notifications (ProcessSocketNotifications, which
+/// ws2_32 has from build 20348: Windows Server 2022 and Windows 11) where
+/// the system has them and every TCP provider is Microsoft's own:
+/// readiness through a completion port, as epoll has it: persistent and
 /// level-triggered, as Microsoft's single-threaded replacement for poll
 /// has it, each socket's registration changed in place, each under a
 /// completion key of its own, never used again, so that what the port
 /// still holds of one removed finds nothing; a packet posted to the port
 /// wakes it.
-/// Elsewhere WSAPoll, whose wait costs every socket watched, and which
-/// reports a hangup whatever it is asked: a socket that waits for
-/// writing alone after its peer finished wakes it until it can write;
-/// the signal's pair of sockets wakes it.
+/// Elsewhere WSAPoll: on Windows 10 (up to 22H2, build 19045) and Server
+/// 2019 (build 17763), which lack socket notifications, and where a
+/// layered service provider (an LSP, deprecated since Windows 8) chains
+/// itself over TCP, as "Only Microsoft Winsock provider sockets are
+/// supported" by socket notifications (ProcessSocketNotifications's
+/// remarks): the Poll asks the catalog once, when it is made, and never
+/// changes its way after, as Wakers already handed out name its port.
+/// WSAPoll's wait costs every socket watched, which is fine to some
+/// hundreds of sockets, and it reports a hangup whatever it is asked: a
+/// socket that waits for writing alone after its peer finished wakes it
+/// until it can write; the signal's pair of sockets wakes it.
 /// Time is QueryPerformanceCounter, as Rust's std reads it; both waits
 /// take milliseconds, rounded up.
 #[cfg(target_os = "windows")]
 mod poller {
     use super::os::{self, INFINITE, PollFd, Signal};
     use super::{POLLERR, POLLHUP};
-    use crate::base::wait::{ERROR, HUP, READ, WRITE};
+    use crate::base::poll::{ERROR, HUP, READ, WRITE};
+    use alloc::boxed::Box;
     use alloc::collections::BTreeMap;
     use alloc::sync::Arc;
     use alloc::vec::Vec;
@@ -1636,6 +1287,72 @@ mod poller {
         overlapped: *mut c_void,
         internal: usize,
         bytes: u32,
+    }
+
+    /// WSAPROTOCOL_INFOW, from winsock2.h: no pointer in it, so 628
+    /// bytes aligned to 4 on x64 and arm64 alike (MAX_PROTOCOL_CHAIN 7,
+    /// WSAPROTOCOL_LEN 255); the GUID as four words, its alignment.
+    #[repr(C)]
+    struct ProtocolInfo {
+        service_flags: [u32; 4],
+        provider_flags: u32,
+        provider: [u32; 4],
+        catalog_entry: u32,
+        /// 1 for a base provider, more for a layered chain over one.
+        chain_length: i32,
+        chain_entries: [u32; 7],
+        version: i32,
+        family: i32,
+        address_max: i32,
+        address_min: i32,
+        socket_type: i32,
+        protocol: i32,
+        protocol_offset_max: i32,
+        byte_order: i32,
+        security: i32,
+        message_size: u32,
+        provider_reserved: u32,
+        name: [u16; 256],
+    }
+
+    const _: () = assert!(size_of::<ProtocolInfo>() == 628 && align_of::<ProtocolInfo>() == 4);
+
+    impl ProtocolInfo {
+        const ZERO: ProtocolInfo = ProtocolInfo {
+            service_flags: [0; 4],
+            provider_flags: 0,
+            provider: [0; 4],
+            catalog_entry: 0,
+            chain_length: 0,
+            chain_entries: [0; 7],
+            version: 0,
+            family: 0,
+            address_max: 0,
+            address_min: 0,
+            socket_type: 0,
+            protocol: 0,
+            protocol_offset_max: 0,
+            byte_order: 0,
+            security: 0,
+            message_size: 0,
+            provider_reserved: 0,
+            name: [0; 256],
+        };
+    }
+
+    /// The most TCP providers the catalog is read for: a base provider
+    /// for each family and a few chains over them.
+    const PROVIDERS_MAX: usize = 64;
+
+    #[link(name = "ws2_32", kind = "raw-dylib")]
+    // rr: escape(unsafe): its signature is ws2_32's, from its documentation.
+    unsafe extern "system" {
+        #[must_use]
+        fn WSAEnumProtocolsW(
+            protocols: *const i32,
+            buffer: *mut ProtocolInfo,
+            length: *mut u32,
+        ) -> i32;
     }
 
     /// ProcessSocketNotifications, which ws2_32 exports from build 20348:
@@ -1788,23 +1505,33 @@ mod poller {
     }
 
     pub enum Poller {
-        Notified(Notified),
-        Polled(Polled),
+        /// Boxed, as Polled is, so that a Poll is small to move to its
+        /// thread.
+        Notified(Box<Notified>),
+        Polled(Box<Polled>),
     }
+
+    // rr: escape(unsafe): a completion port and sockets are the process's
+    // handles, which any thread may wait on; the raw pointers held are a
+    // handle and scratch for the port's entries. A Poll made on one thread
+    // may so run on another, one at a time.
+    unsafe impl Send for Poller {}
 
     impl Poller {
         pub fn new() -> Option<Poller> {
             os::startup();
             match notifier() {
-                Some(notify) => Notified::new(notify).map(Poller::Notified),
-                None => Polled::new().map(Poller::Polled),
+                Some(notify) if !layered() => {
+                    Notified::new(notify).map(Box::new).map(Poller::Notified)
+                }
+                _ => Polled::new().map(Box::new).map(Poller::Polled),
             }
         }
 
         #[cfg(test)]
         pub fn polled() -> Option<Poller> {
             os::startup();
-            Polled::new().map(Poller::Polled)
+            Polled::new().map(Box::new).map(Poller::Polled)
         }
 
         #[must_use]
@@ -1880,6 +1607,35 @@ mod poller {
                 Poller::Polled(polled) => polled.wait(timeout, found),
             }
         }
+    }
+
+    /// Whether a layered provider chains itself over TCP, or the catalog
+    /// cannot be read to say it does not: socket notifications take a
+    /// Microsoft provider's sockets alone, and an LSP's would be refused,
+    /// or never reported.
+    #[must_use]
+    fn layered() -> bool {
+        let tcp = [os::IPPROTO_TCP, 0];
+        let mut length = 0u32;
+        // rr: escape(unsafe): no buffer: the call says the length it needs.
+        let none = unsafe { WSAEnumProtocolsW(tcp.as_ptr(), null_mut(), &raw mut length) };
+        let size = size_of::<ProtocolInfo>();
+        let count = usize::try_from(length).unwrap_or(usize::MAX).div_ceil(size);
+        if none >= 0 || count > PROVIDERS_MAX {
+            return none != 0;
+        }
+        let mut providers = Vec::new();
+        providers.resize_with(count, || ProtocolInfo::ZERO);
+        // rr: escape(unsafe): providers holds length bytes, or more.
+        let found =
+            unsafe { WSAEnumProtocolsW(tcp.as_ptr(), providers.as_mut_ptr(), &raw mut length) };
+        let Ok(found) = usize::try_from(found) else {
+            return true;
+        };
+        providers
+            .iter()
+            .take(found)
+            .any(|provider| provider.chain_length > 1)
     }
 
     /// ProcessSocketNotifications, where ws2_32 has it.
@@ -2363,88 +2119,7 @@ mod poller {
 
 #[cfg(test)]
 mod tests {
-    use super::{POLLIN, Signal, THREADS_MAX, Ticket, Wait, ready, spawn};
-    use crate::base::wait::{Instant, Ready, Set, Waker};
-    use alloc::boxed::Box;
-    use alloc::vec::Vec;
-    use core::ffi::c_void;
-    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
-    const JOBS: usize = THREADS_MAX + 8;
-
-    // The jobs' record, which their threads write.
-    // rr: escape(shared): the jobs running now.
-    static NOW: AtomicUsize = AtomicUsize::new(0);
-    // rr: escape(shared): the most that ran at once.
-    static MOST: AtomicUsize = AtomicUsize::new(0);
-    // rr: escape(shared): the jobs done.
-    static DONE: AtomicUsize = AtomicUsize::new(0);
-    // rr: escape(shared): lets the jobs end.
-    static OPEN: AtomicBool = AtomicBool::new(false);
-    // rr: escape(shared): which jobs ran.
-    static RAN: [AtomicBool; JOBS] = [const { AtomicBool::new(false) }; JOBS];
-
-    /// Waits a millisecond.
-    fn nap() {
-        let mut wait = Wait::READY;
-        wait.timeout_ms = Some(1);
-        ready(&wait);
-    }
-
-    /// Waits up to five seconds for done.
-    fn until(done: impl Fn() -> bool) -> bool {
-        (0..5000).any(|_| {
-            nap();
-            done()
-        })
-    }
-
-    fn job(argument: *mut c_void) {
-        RAN[argument.addr()].store(true, Ordering::SeqCst);
-        let now = NOW.fetch_add(1, Ordering::SeqCst) + 1;
-        MOST.fetch_max(now, Ordering::SeqCst);
-        while !OPEN.load(Ordering::SeqCst) {
-            nap();
-        }
-        NOW.fetch_sub(1, Ordering::SeqCst);
-        DONE.fetch_add(1, Ordering::SeqCst);
-    }
-
-    fn start(index: usize) -> Ticket {
-        // rr: escape(unsafe): the argument is a number, which job reads
-        // as one; it points to nothing.
-        unsafe { spawn(job, core::ptr::without_provenance_mut(index)) }.unwrap()
-    }
-
-    /// More jobs than threads: THREADS_MAX run, the rest wait in line
-    /// and run as threads free; one cancelled in line never runs, nor
-    /// one whose ticket is dropped there; one detached runs.
-    #[test]
-    fn queue() {
-        let mut tickets = Vec::new();
-        for index in 0..JOBS - 3 {
-            tickets.push(start(index));
-        }
-        let dropped = start(JOBS - 3);
-        let cancelled = start(JOBS - 2);
-        start(JOBS - 1).detach();
-        assert!(until(|| NOW.load(Ordering::SeqCst) == THREADS_MAX));
-        nap();
-        assert_eq!(NOW.load(Ordering::SeqCst), THREADS_MAX);
-        assert!(cancelled.cancel());
-        drop(dropped);
-        assert!(!tickets.swap_remove(0).cancel());
-        OPEN.store(true, Ordering::SeqCst);
-        assert!(until(|| DONE.load(Ordering::SeqCst) == JOBS - 2));
-        for _ in 0..50 {
-            nap();
-        }
-        assert_eq!(DONE.load(Ordering::SeqCst), JOBS - 2);
-        assert_eq!(MOST.load(Ordering::SeqCst), THREADS_MAX);
-        assert!(!RAN[JOBS - 3].load(Ordering::SeqCst));
-        assert!(!RAN[JOBS - 2].load(Ordering::SeqCst));
-        assert!(RAN[JOBS - 1].load(Ordering::SeqCst));
-    }
+    use super::{POLLIN, Signal, Want, ready};
 
     /// A signal's descriptor joins a poll beside one that stays quiet,
     /// and only it wakes the poll.
@@ -2452,19 +2127,19 @@ mod tests {
     fn joins_a_poll() {
         let quiet = Signal::new().unwrap();
         let signal = Signal::new().unwrap();
-        let Wait {
+        let Want {
             fds: [other, _], ..
-        } = quiet.wait();
-        let Wait { fds: [own, _], .. } = signal.wait();
-        let mut wait = Wait {
+        } = quiet.want();
+        let Want { fds: [own, _], .. } = signal.want();
+        let mut want = Want {
             fds: [other, own],
             count: 2,
             timeout_ms: Some(0),
         };
-        assert_eq!(ready(&wait), [0, 0]);
+        assert_eq!(ready(&want), [0, 0]);
         signal.set();
-        wait.timeout_ms = Some(1000);
-        let [first, second] = ready(&wait);
+        want.timeout_ms = Some(1000);
+        let [first, second] = ready(&want);
         assert_eq!(first, 0);
         assert_ne!(second & POLLIN, 0);
     }
@@ -2474,27 +2149,5 @@ mod tests {
     #[test]
     fn close_on_exec() {
         assert!(Signal::new().unwrap().os.cloexec());
-    }
-
-    fn wake(argument: *mut c_void) {
-        // rr: escape(unsafe): argument is the Box the test made for this
-        // thread, which takes it back once.
-        let waker = unsafe { Box::from_raw(argument.cast::<Waker>()) };
-        nap();
-        waker.wake();
-    }
-
-    /// Another thread wakes a Set that waits with no limit.
-    #[test]
-    fn wakes_a_set() {
-        let mut set = Set::new().unwrap();
-        let waker = set.waker(9);
-        // rr: escape(leak): the thread takes it back.
-        let argument = Box::into_raw(Box::new(waker));
-        // rr: escape(unsafe): the thread takes the Box back once, and the
-        // ticket lets it run.
-        unsafe { spawn(wake, argument.cast()) }.unwrap().detach();
-        let events = set.wait(Some(Instant::now().after_ms(10_000)));
-        assert!(events.len() == 1 && events[0].key == 9 && events[0].ready.woken());
     }
 }

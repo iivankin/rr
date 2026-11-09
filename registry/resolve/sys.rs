@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use core::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
 /// What a lookup waits on: the type every component's poll loop takes.
-pub use crate::base::wait::Wait;
+pub use crate::base::poll::Want;
 
 /// An address, and for a link-local IPv6 one the interface it is on:
 /// connect to socket_addr's, which keeps it, as a SocketAddr made of ip
@@ -71,10 +71,10 @@ impl Lookup {
     }
 
     /// What to wait on before polling again.
-    pub fn wait(&self) -> Wait {
+    pub fn want(&self) -> Want {
         match &self.found {
-            Ok(_) => Wait::READY,
-            Err(state) => state.wait(),
+            Ok(_) => Want::READY,
+            Err(state) => state.want(),
         }
     }
 
@@ -176,7 +176,7 @@ fn finish(mut lookup: Lookup) -> Result<Vec<Address>, Error> {
         if let Some(result) = lookup.poll() {
             return owned(result);
         }
-        crate::base::wait::block(&lookup.wait());
+        crate::base::poll::block(&lookup.want());
     }
 }
 
@@ -195,21 +195,21 @@ fn c_string(name: &[u8]) -> Option<Vec<u8>> {
 /// Linux: the C library's getaddrinfo, which reads nsswitch.conf and
 /// asks what it names (files, DNS, systemd-resolved, mDNS) and sorts the
 /// addresses by RFC 6724. It blocks, and nothing asks the system without
-/// blocking, so a lookup runs it on one of wait's threads. The thread
-/// and the lookup share a block, which the last of the two to let go
-/// frees, so a lookup dropped while the thread runs never waits; one
-/// dropped while still in spawn's line never starts.
+/// blocking, so a lookup runs it on thread's pool, which sets the
+/// lookup's Signal when it returned. A lookup dropped while its thread
+/// runs never waits: the thread drops the work; one dropped while still
+/// in the pool's line never starts.
 #[cfg(target_os = "linux")]
 mod os {
-    use super::{Address, Error, Wait, c_string};
-    use crate::base::wait::{self, AF_INET, AF_INET6, SOCK_STREAM, Signal, errno};
+    use super::{Address, Error, Want, c_string};
+    use crate::base::poll::{AF_INET, AF_INET6, SOCK_STREAM, Signal, errno};
+    use crate::base::thread::{self, Done, Job, Work};
     use alloc::boxed::Box;
+    use alloc::sync::Arc;
     use alloc::vec::Vec;
-    use core::cell::UnsafeCell;
-    use core::ffi::{c_char, c_int, c_void};
+    use core::ffi::{c_char, c_int};
     use core::net::IpAddr;
     use core::ptr::null_mut;
-    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// struct addrinfo, as glibc's and musl's netdb.h lay it out.
     #[repr(C)]
@@ -325,54 +325,35 @@ mod os {
         }
     }
 
-    /// The thread writes result, then sets done and the signal; the
-    /// lookup reads result only after it saw done.
-    struct Shared {
-        holders: AtomicUsize,
-        done: AtomicBool,
-        /// The name, NUL-terminated.
+    /// A lookup for the pool: the name, NUL-terminated, in; what
+    /// getaddrinfo answered, out.
+    struct Lookup {
         name: Vec<u8>,
-        result: UnsafeCell<Result<Vec<Address>, Error>>,
-        signal: Signal,
+        result: Result<Vec<Address>, Error>,
     }
 
-    /// Lets go of shared; the last holder frees it.
-    fn release(shared: *mut Shared) {
-        // rr: escape(unsafe): shared lives until its holders let go.
-        let holders = unsafe { &(*shared).holders };
-        if holders.fetch_sub(1, Ordering::AcqRel) == 1 {
-            // rr: escape(unsafe): no one else holds it now.
-            drop(unsafe { Box::from_raw(shared) });
+    impl Work for Lookup {
+        fn run(&mut self) {
+            self.result = lookup(&self.name);
         }
     }
 
-    fn run(argument: *mut c_void) {
-        let shared = argument.cast::<Shared>();
-        // rr: escape(unsafe): the thread is a holder of shared.
-        let state = unsafe { &*shared };
-        let result = lookup(&state.name);
-        // rr: escape(unsafe): only this thread touches result before done.
-        unsafe { *state.result.get() = result };
-        state.done.store(true, Ordering::Release);
-        state.signal.set();
-        release(shared);
-    }
-
     pub struct State {
-        shared: *mut Shared,
-        /// The result, once taken from the thread.
+        /// The lookup in the pool, until it is done; each job of it holds
+        /// a Lookup, as start alone spawns them.
+        job: Option<Job>,
+        /// What the job sets when it is done, which want names.
+        signal: Option<Arc<Signal>>,
+        /// The result, once taken from the job.
         taken: Option<Result<Vec<Address>, Error>>,
-        /// The work, to take out of spawn's line when dropped before it
-        /// started.
-        ticket: Option<wait::Ticket>,
     }
 
     impl State {
         pub fn start(name: &[u8]) -> State {
             let mut state = State {
-                shared: null_mut(),
+                job: None,
+                signal: None,
                 taken: None,
-                ticket: None,
             };
             let Some(name) = c_string(name) else {
                 state.taken = Some(Err(Error::NotFound));
@@ -382,44 +363,30 @@ mod os {
                 state.taken = Some(Err(Error::Failed));
                 return state;
             };
-            let shared = Box::new(Shared {
-                // rr: escape(shared): the lookup and the thread both hold it.
-                holders: AtomicUsize::new(2),
-                // rr: escape(shared): the thread says it is done.
-                done: AtomicBool::new(false),
+            // rr: escape(shared): the lookup waits on it, the job sets it.
+            let signal = Arc::new(signal);
+            let work = Box::new(Lookup {
                 name,
-                // rr: escape(shared): the thread's answer, handed over once.
-                result: UnsafeCell::new(Err(Error::Failed)),
-                signal,
+                result: Err(Error::Failed),
             });
-            // rr: escape(leak): the lookup and the thread hold it, and
-            // release frees it.
-            let raw = Box::into_raw(shared);
-            state.shared = raw;
-            // rr: escape(unsafe): run takes shared as its holder, which it
-            // lets go; the ticket's cancel says when it never runs.
-            state.ticket = unsafe { wait::spawn(run, raw.cast()) };
-            if state.ticket.is_none() {
-                // The thread never held it.
-                release(raw);
-                state.taken = Some(Err(Error::Failed));
+            // rr: escape(copy): the job's holder of the signal.
+            match thread::spawn(work, Done::Signal(Arc::clone(&signal))) {
+                Ok(job) => {
+                    state.job = Some(job);
+                    state.signal = Some(signal);
+                }
+                Err(_) => state.taken = Some(Err(Error::Failed)),
             }
             state
         }
 
         #[must_use]
         pub fn poll(&mut self) -> Option<Result<&[Address], Error>> {
-            if self.taken.is_none() && !self.shared.is_null() {
-                // rr: escape(unsafe): this lookup holds shared.
-                let shared = unsafe { &*self.shared };
-                if !shared.done.load(Ordering::Acquire) {
-                    return None;
+            if let Some(job) = self.job.take() {
+                match job.take() {
+                    Ok(work) => self.taken = Some(answer(work)),
+                    Err(job) => self.job = Some(job),
                 }
-                // rr: escape(unsafe): the thread is done with result.
-                let result = unsafe { &mut *shared.result.get() };
-                self.taken = Some(core::mem::replace(result, Err(Error::Failed)));
-                release(self.shared);
-                self.shared = null_mut();
             }
             match &self.taken {
                 Some(Ok(addresses)) => Some(Ok(addresses)),
@@ -428,28 +395,22 @@ mod os {
             }
         }
 
-        pub fn wait(&self) -> Wait {
-            if self.taken.is_some() || self.shared.is_null() {
-                return Wait::READY;
+        pub fn want(&self) -> Want {
+            match (&self.job, &self.signal) {
+                (Some(_), Some(signal)) => signal.want(),
+                _ => Want::READY,
             }
-            // rr: escape(unsafe): this lookup holds shared.
-            let shared = unsafe { &*self.shared };
-            shared.signal.wait()
         }
     }
 
-    impl Drop for State {
-        fn drop(&mut self) {
-            if self.shared.is_null() {
-                return;
-            }
-            // Work still in line never runs: its holder is let go here.
-            if self.ticket.take().is_some_and(wait::Ticket::cancel) {
-                release(self.shared);
-            }
-            // The thread, when it runs on, frees what is left.
-            release(self.shared);
-        }
+    /// What a Lookup the pool gave back found.
+    fn answer(work: Box<dyn Work + Send>) -> Result<Vec<Address>, Error> {
+        // rr: escape(unsafe, cast, leak): State::start alone spawns the
+        // jobs State keeps, each with a Box<Lookup>, and the pool gives
+        // that Box back: the pointer is the Lookup's, which from_raw owns
+        // again.
+        let lookup = unsafe { Box::from_raw(Box::into_raw(work).cast::<Lookup>()) };
+        lookup.result
     }
 
     /// getaddrinfo blocks the caller's thread, which is what was asked.
@@ -476,8 +437,8 @@ mod os {
 #[cfg(target_os = "macos")]
 mod os {
     use super::super::sort::{ADDRESSES_MAX, sort};
-    use super::{Address, Error, Wait, c_string, finish};
-    use crate::base::wait::{self, F_SETFD, FD_CLOEXEC, Fd, Instant, POLLIN};
+    use super::{Address, Error, Want, c_string, finish};
+    use crate::base::poll::{self, F_SETFD, FD_CLOEXEC, Fd, Instant, POLLIN};
     use alloc::boxed::Box;
     use alloc::vec::Vec;
     use core::ffi::{c_char, c_int, c_void};
@@ -849,13 +810,13 @@ mod os {
                     self.over();
                     return;
                 }
-                let mut ready = Wait::READY;
+                let mut ready = Want::READY;
                 ready.fds[0] = Fd {
                     fd: self.fd(),
                     events: POLLIN,
                 };
                 ready.count = 1;
-                if wait::ready(&ready)[0] == 0 {
+                if poll::ready(&ready)[0] == 0 {
                     return;
                 }
                 // rr: escape(unsafe): service is live and has a reply to read.
@@ -914,21 +875,21 @@ mod os {
             }
         }
 
-        pub fn wait(&self) -> Wait {
+        pub fn want(&self) -> Want {
             if self.done.is_some() {
-                return Wait::READY;
+                return Want::READY;
             }
-            let mut wait = Wait::READY;
-            wait.fds[0] = Fd {
+            let mut want = Want::READY;
+            want.fds[0] = Fd {
                 fd: self.fd(),
                 events: POLLIN,
             };
-            wait.count = 1;
+            want.count = 1;
             // mDNSResponder ends the lookup itself (TIMEOUT), with a reply;
             // the other family is waited for only so long.
             // rr: escape(unsafe): answers is live while the lookup runs.
-            wait.timeout_ms = unsafe { &*self.answers }.left_ms(Instant::now());
-            wait
+            want.timeout_ms = unsafe { &*self.answers }.left_ms(Instant::now());
+            want
         }
     }
 
@@ -958,7 +919,7 @@ mod os {
             ADD, AF_INET, AF_INET6, Answers, DELAY_MS, NO_ERROR, NO_SUCH_RECORD, SOCKADDR_BYTES,
             reply,
         };
-        use crate::base::wait::Instant;
+        use crate::base::poll::Instant;
         use alloc::vec::Vec;
         use core::ptr::{null, null_mut};
 
@@ -1038,8 +999,8 @@ mod os {
 /// and the callback share a block, which the last of the two frees.
 #[cfg(target_os = "windows")]
 mod os {
-    use super::{Address, Error, Wait, finish};
-    use crate::base::wait::{self, AF_INET, AF_INET6, SOCK_STREAM, Signal};
+    use super::{Address, Error, Want, finish};
+    use crate::base::poll::{self, AF_INET, AF_INET6, SOCK_STREAM, Signal};
     use alloc::boxed::Box;
     use alloc::vec::Vec;
     use core::cell::UnsafeCell;
@@ -1242,7 +1203,7 @@ mod os {
                 shared: null_mut(),
                 taken: None,
             };
-            wait::startup();
+            poll::startup();
             let Some(name) = name(text) else {
                 state.taken = Some(Err(Error::NotFound));
                 return state;
@@ -1343,13 +1304,13 @@ mod os {
             }
         }
 
-        pub fn wait(&self) -> Wait {
+        pub fn want(&self) -> Want {
             if self.taken.is_some() || self.shared.is_null() {
-                return Wait::READY;
+                return Want::READY;
             }
             // rr: escape(unsafe): this lookup holds shared.
             let shared = unsafe { &*self.shared };
-            shared.signal.wait()
+            shared.signal.want()
         }
     }
 
@@ -1392,7 +1353,7 @@ mod os {
 #[cfg(test)]
 mod tests {
     use super::{Error, Lookup, resolve};
-    use crate::base::wait::{Instant, Set, Watch};
+    use crate::base::poll::{Follow, Instant, Poll};
 
     fn loopback(addresses: &[super::Address]) -> bool {
         !addresses.is_empty() && addresses.iter().all(|address| address.ip.is_loopback())
@@ -1409,17 +1370,17 @@ mod tests {
                 assert!(loopback(result.unwrap()));
                 return;
             }
-            crate::base::wait::block(&lookup.wait());
+            crate::base::poll::block(&lookup.want());
         }
         panic!("localhost did not resolve");
     }
 
-    /// localhost through a Set, as a loop that serves many connections
+    /// localhost through a Poll, as a loop that serves many connections
     /// runs a lookup beside them.
     #[test]
-    fn in_a_set() {
-        let mut set = Set::new().unwrap();
-        let mut watch = Watch::NONE;
+    fn in_a_poll() {
+        let mut poll = Poll::new().unwrap();
+        let mut follow = Follow::NONE;
         let mut lookup = Lookup::start(b"localhost");
         let end = Instant::now().after_ms(10_000);
         loop {
@@ -1427,11 +1388,11 @@ mod tests {
                 assert!(loopback(result.unwrap()));
                 break;
             }
-            set.follow(&mut watch, &lookup.wait(), 1).unwrap();
-            set.wait(Some(end));
+            poll.follow(&mut follow, &lookup.want(), 1).unwrap();
+            poll.poll(Some(end));
             assert!(!end.reached_by(Instant::now()), "localhost did not resolve");
         }
-        set.unfollow(&mut watch);
+        poll.unfollow(&mut follow);
     }
 
     /// A link-local address keeps its interface on the way to a socket.

@@ -3,7 +3,7 @@
 //! until it is done, take the addresses; drop it to cancel. Connect to
 //! an address's socket_addr, which keeps a link-local one's interface.
 //! resolve waits for the answer, for a thread that may block: it is
-//! `#[rr::blocking]`, which rr refuses on a poll loop's path (see wait).
+//! `#[rr::blocking]`, which rr refuses on a poll loop's path (see poll).
 //!
 //! Some names are answered before any system sees them, the same on all
 //! three: no name (empty, ".", not ASCII: an internationalized name comes
@@ -25,8 +25,8 @@
 //!   callback sets a Signal that the caller's WSAPoll waits on.
 //! - Linux: the C library's getaddrinfo, with nsswitch.conf, files, DNS,
 //!   systemd-resolved and mDNS as the system has them. It blocks, and
-//!   the C library has no other way, so it runs on a thread of wait's:
-//!   at most wait::THREADS_MAX at once, the rest in line, and one
+//!   the C library has no other way, so it runs on thread's pool:
+//!   at most thread::THREADS_MAX at once, the rest in line, and one
 //!   cancelled once its thread took it runs on to the C library's
 //!   timeout (resolv.conf's timeout and attempts), its answer dropped.
 //!
