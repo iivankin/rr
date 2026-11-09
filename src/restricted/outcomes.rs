@@ -1,12 +1,12 @@
 //! An outcome a caller may drop unseen: a function that changes something
 //! and says how it went in a bool, an integer or an Option, without
-//! `#[must_use]`. rustc reports a dropped Result, whose type is must_use,
+//! `#[must_use]`. rustc reports a dropped Result, whose type is `must_use`,
 //! but not `if !set.insert(x)` written as `set.insert(x);`, a count of
 //! bytes written that is never compared with what was meant, or a `pop`
 //! whose value is lost. A function changes something when it takes `&mut`
 //! (itself or a parameter), when it calls foreign code, and when it is a
 //! foreign function: C says how a call went in what it returns. With
-//! `#[must_use]`, dropping it is rustc's unused_must_use, which rr
+//! `#[must_use]`, dropping it is rustc's `unused_must_use`, which rr
 //! forbids, and `let _ =` takes an `escape(discard)` reason. No reason
 //! answers this rule: the attribute is always possible.
 

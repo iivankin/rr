@@ -33,7 +33,7 @@ pub struct Instances<'tcx> {
     pub cut: bool,
 }
 
-impl<'tcx> Instances<'tcx> {
+impl Instances<'_> {
     /// These, and for a function they lack, its instantiations in all:
     /// what a path reaches through dyn or a function pointer may be made
     /// anywhere in the crate.
@@ -62,7 +62,7 @@ pub fn any_generic(tcx: TyCtxt<'_>) -> bool {
 
 /// The instantiations reached from roots, the functions that are not
 /// generic among them.
-pub fn collect<'tcx>(tcx: TyCtxt<'tcx>, roots: impl IntoIterator<Item = LocalDefId>) -> Instances<'tcx> {
+pub fn collect(tcx: TyCtxt<'_>, roots: impl IntoIterator<Item = LocalDefId>) -> Instances<'_> {
     let mut walk = Walk {
         tcx,
         seen: FxHashSet::default(),
@@ -200,7 +200,7 @@ impl<'tcx> Walk<'tcx> {
             .ok()
     }
 
-    /// The function a value of FnDef type def with args runs.
+    /// The function a value of `FnDef` type def with args runs.
     fn resolve(&mut self, def: DefId, args: GenericArgsRef<'tcx>) {
         let tcx = self.tcx;
         if !matches!(tcx.def_kind(def), DefKind::Fn | DefKind::AssocFn) {
@@ -313,7 +313,7 @@ impl<'tcx> Visitor<'tcx> for Walk<'tcx> {
 }
 
 /// The most bytes of one array on the stack, and of a whole frame, as
-/// Clippy's large_stack_arrays and large_stack_frames have them by
+/// Clippy's `large_stack_arrays` and `large_stack_frames` have them by
 /// default. Those look at a generic body, where `[u8; N]` has no size, and
 /// stop; rr looks at each instantiation.
 const ARRAY_MAX: u64 = 16 * 1024;
@@ -357,7 +357,7 @@ pub fn stack<'tcx>(cx: &rustc_lint::LateContext<'tcx>, instances: &Instances<'tc
                 too_large(
                     cx,
                     span,
-                    format!("an array of {size} bytes on the stack with {with}"),
+                    &format!("an array of {size} bytes on the stack with {with}"),
                     "keep it in a Box, or in a buffer that lives outside the function",
                 );
             }
@@ -371,14 +371,14 @@ pub fn stack<'tcx>(cx: &rustc_lint::LateContext<'tcx>, instances: &Instances<'tc
             too_large(
                 cx,
                 span,
-                format!("a stack frame of {frame} bytes with {with}"),
+                &format!("a stack frame of {frame} bytes with {with}"),
                 "keep its large values in a Box, or in a buffer that lives outside the function",
             );
         }
     }
 }
 
-fn too_large(cx: &rustc_lint::LateContext<'_>, span: rustc_span::Span, what: String, help: &'static str) {
+fn too_large(cx: &rustc_lint::LateContext<'_>, span: rustc_span::Span, what: &str, help: &'static str) {
     clippy_utils::diagnostics::span_lint_and_then(
         cx,
         super::RR_UNEXPLAINED_ESCAPE,

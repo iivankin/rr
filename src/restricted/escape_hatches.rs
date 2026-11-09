@@ -27,33 +27,27 @@ impl<'tcx> LateLintPass<'tcx> for EscapeHatches {
         super::mono::stack(cx, &instances);
         for &(item, span) in &self.generic_copies {
             let ty = cx.tcx.type_of(item).instantiate_identity().skip_norm_wip();
-            let sizes = match *ty.kind() {
-                ty::Adt(adt, _) => {
-                    let found = instances.adts.get(&adt.did()).map_or(&[][..], Vec::as_slice);
-                    let env = ty::TypingEnv::fully_monomorphized();
-                    let mut sizes = Vec::new();
-                    for &args in found {
-                        let concrete = Ty::new_adt(cx.tcx, adt, args);
-                        match cx.tcx.layout_of(env.as_query_input(concrete)) {
-                            Ok(layout) => sizes.push((layout.size.bytes(), args)),
-                            Err(error) => {
-                                unknown_copy(cx, span, &format!("`{concrete}`: {error}"));
-                                break;
-                            },
-                        }
-                    }
-                    if found.is_empty() {
-                        unknown_copy(cx, span, &format!("nothing in the crate instantiates `{ty}`"));
-                    }
-                    sizes
-                },
-                _ => {
-                    unknown_copy(cx, span, &format!("`{ty}` is not a type of the crate rr instantiates"));
-                    Vec::new()
-                },
+            let ty::Adt(adt, _) = *ty.kind() else {
+                unknown_copy(cx, span, &format!("`{ty}` is not a type of the crate rr instantiates"));
+                continue;
             };
+            let found = instances.adts.get(&adt.did()).map_or(&[][..], Vec::as_slice);
+            let env = ty::TypingEnv::fully_monomorphized();
+            let mut sizes = Vec::new();
+            for &args in found {
+                let concrete = Ty::new_adt(cx.tcx, adt, args);
+                match cx.tcx.layout_of(env.as_query_input(concrete)) {
+                    Ok(layout) => sizes.push((layout.size.bytes(), args)),
+                    Err(error) => {
+                        unknown_copy(cx, span, &format!("`{concrete}`: {error}"));
+                        break;
+                    },
+                }
+            }
+            if found.is_empty() {
+                unknown_copy(cx, span, &format!("nothing in the crate instantiates `{ty}`"));
+            }
             if let Some(&(size, args)) = sizes.iter().max_by_key(|(size, _)| *size) {
-                let ty::Adt(adt, _) = *ty.kind() else { continue };
                 let with = super::mono::describe(cx.tcx, adt.did(), args);
                 too_large_copy(cx, span, size, &format!(" with {with}"));
             }

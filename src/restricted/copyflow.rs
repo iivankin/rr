@@ -232,7 +232,10 @@ impl<'a, 'tcx> Flow<'a, 'tcx> {
                                 .is_some_and(|local| summaries.returns_given(self.tcx, local)),
                             _ => false,
                         },
-                        Ok(None) | Err(_) => self.tcx.trait_of_assoc(def).is_some_and(|t| t.is_local()),
+                        Ok(None) | Err(_) => self
+                            .tcx
+                            .trait_of_assoc(def)
+                            .is_some_and(rustc_span::def_id::DefId::is_local),
                     };
                     if returns_given && destination.projection.is_empty() {
                         self.tainted.insert(destination.local);
