@@ -30,6 +30,10 @@
 //! Secrets are wiped where they go: the key shares' once used, each
 //! traffic and handshake secret when it is replaced or dropped (the AES
 //! key schedules and ML-KEM's key are aesgcm's and mlkem's to wipe).
+//! The client draws its randomness from random itself: the ClientHello's
+//! random and session ID, and each key share's seed. Records are sealed
+//! and opened by aesgcm's SealingKey and OpeningKey, which number their
+//! own nonces.
 //!
 //! The server's chain is verified by x509 against a store, or by the
 //! caller (Verify::Caller), such as the operating system's verifier,
@@ -44,7 +48,7 @@
 //! tests.rs's program runs it:
 //!
 //! ```text
-//! let mut tls = Client::new(host, &[b"http/1.1"], Verify::Caller, now, &random)?;
+//! let mut tls = Client::new(host, &[b"http/1.1"], Verify::Caller, now)?;
 //! let (mut at, mut end) = (0, 0);
 //! loop {
 //!     while !tls.pending().is_empty() {
@@ -87,9 +91,10 @@
 //! bytes and the socket as before. Never call verify_blocking on the
 //! loop's thread.
 
-use crate::base::aesgcm::{self, AesGcm};
+use crate::base::aesgcm::{self, OpeningKey, SealingKey};
 use crate::base::ecdh;
 use crate::base::mlkem;
+use crate::base::random;
 use crate::base::sha256::{self, Sha256};
 use crate::base::sha384::{self, Sha384};
 use crate::base::x509;
@@ -113,11 +118,6 @@ pub const PENDING_MAX: usize = SEALED_MAX;
 pub const COOKIE_MAX: usize = 4096;
 /// The most bytes of the ALPN list, each protocol with its length byte.
 pub const ALPN_MAX: usize = 1024;
-/// The system's randomness a client takes: the ClientHello's random and
-/// legacy_session_id, the X25519 secret, ML-KEM-768's seed and a P-256
-/// secret, in that order.
-pub const RANDOM_BYTES: usize =
-    32 + 32 + x25519::KEY_BYTES + mlkem::SEED_BYTES + ecdh::SECRET_BYTES;
 /// Records in a row that carry nothing, before the client gives up on
 /// the server: empty application data, change_cipher_spec, user_canceled,
 /// KeyUpdate and NewSessionTicket, as BoringSSL bounds them.
@@ -134,7 +134,7 @@ const SEALED_MAX: usize = HEADER + RECORD_MAX + 1 + TAG;
 /// 5.5 allows AES-GCM 2^24.5 full records.
 const KEY_RECORDS_MAX: u64 = 1 << 24;
 /// The longest hash of a suite: SHA-384's.
-const HASH_MAX: usize = sha384::DIGEST_BYTES;
+const HASH_MAX: usize = sha384::SHA384_BYTES;
 /// Key changes in pending at once, each a Mark: the handshake keys after
 /// the ClientHello, the application keys after Finished, one KeyUpdate
 /// that answers the server and one of the client's own.
@@ -211,11 +211,6 @@ const X25519MLKEM768: u16 = 0x11ec;
 /// then X25519's key (draft-ietf-tls-ecdhe-mlkem 3).
 const HYBRID_SHARE: usize = mlkem::ENCAPSULATION_KEY_BYTES + x25519::KEY_BYTES;
 const HYBRID_REPLY: usize = mlkem::CIPHERTEXT_BYTES + x25519::KEY_BYTES;
-/// The order of P-256's base point, big-endian: a secret is below it.
-const P256_ORDER: [u8; 32] = [
-    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xbc, 0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63, 0x25, 0x51,
-];
 
 /// ServerHello's random when it is a HelloRetryRequest: SHA-256 of
 /// "HelloRetryRequest" (RFC 9846 4.2.3).
@@ -350,6 +345,9 @@ impl From<aesgcm::Error> for Error {
         match error {
             aesgcm::Error::Forged => Error::Forged,
             aesgcm::Error::TooLong => Error::Overflow,
+            // 2^64 - 1 records would take a peer longer than a connection
+            // lasts; the client ends it rather than wrap (RFC 9846 5.3).
+            aesgcm::Error::Exhausted => Error::Internal,
         }
     }
 }
@@ -431,7 +429,7 @@ enum State {
 /// goes.
 enum Digest {
     Sha256([u8; sha256::DIGEST_BYTES]),
-    Sha384([u8; sha384::DIGEST_BYTES]),
+    Sha384([u8; sha384::SHA384_BYTES]),
 }
 
 impl Digest {
@@ -453,7 +451,7 @@ impl Digest {
     fn zero(&self) -> Digest {
         match self {
             Digest::Sha256(_) => Digest::Sha256([0; sha256::DIGEST_BYTES]),
-            Digest::Sha384(_) => Digest::Sha384([0; sha384::DIGEST_BYTES]),
+            Digest::Sha384(_) => Digest::Sha384([0; sha384::SHA384_BYTES]),
         }
     }
 
@@ -461,34 +459,38 @@ impl Digest {
     fn of(&self, data: &[u8]) -> Digest {
         match self {
             Digest::Sha256(_) => Digest::Sha256(sha256::digest(data)),
-            Digest::Sha384(_) => Digest::Sha384(sha384::digest(data)),
+            Digest::Sha384(_) => Digest::Sha384(sha384::digest384(data)),
         }
     }
 
     /// HKDF-Extract of input with this as the salt.
     fn extract(&self, input: &[u8]) -> Digest {
         match self {
-            Digest::Sha256(salt) => Digest::Sha256(sha256::hkdf_extract(salt, input)),
-            Digest::Sha384(salt) => Digest::Sha384(sha384::hkdf_extract(salt, input)),
+            Digest::Sha256(salt) => Digest::Sha256(*sha256::hkdf_extract(salt, input).bytes()),
+            Digest::Sha384(salt) => Digest::Sha384(*sha384::hkdf_extract(salt, input).bytes()),
         }
     }
 }
 
 impl Drop for Digest {
     fn drop(&mut self) {
-        wipe(self.bytes_mut());
+        random::wipe(self.bytes_mut());
     }
 }
 
-/// One direction's record protection: the traffic secret, for
-/// KeyUpdate, its key and IV, and the next record's sequence number.
+/// The client's direction's record protection: the traffic secret, for
+/// KeyUpdate, and the key and IV, which number the records it seals.
 /// The secret's hash names the suite: AES-128-GCM after SHA-256's,
 /// AES-256-GCM after SHA-384's.
 struct Keys {
     secret: Digest,
-    aead: AesGcm,
-    iv: [u8; aesgcm::NONCE_LEN],
-    seq: u64,
+    key: SealingKey,
+}
+
+/// The server's direction's: the same, opening its records.
+struct Opening {
+    secret: Digest,
+    key: OpeningKey,
 }
 
 impl Keys {
@@ -496,47 +498,58 @@ impl Keys {
     fn new(secret: Digest) -> Keys {
         let mut iv = [0; aesgcm::NONCE_LEN];
         expand(&secret, b"iv", &[], &mut iv);
-        let aead = match secret {
+        let key = match secret {
             Digest::Sha256(_) => {
                 let mut key = [0; aesgcm::KEY_LEN];
                 expand(&secret, b"key", &[], &mut key);
-                let aead = AesGcm::new(&key);
-                wipe(&mut key);
-                aead
+                let sealing = SealingKey::new(&key, &iv);
+                random::wipe(&mut key);
+                sealing
             }
             Digest::Sha384(_) => {
                 let mut key = [0; aesgcm::KEY256_LEN];
                 expand(&secret, b"key", &[], &mut key);
-                let aead = AesGcm::new256(&key);
-                wipe(&mut key);
-                aead
+                let sealing = SealingKey::new256(&key, &iv);
+                random::wipe(&mut key);
+                sealing
             }
         };
-        Keys {
-            secret,
-            aead,
-            iv,
-            seq: 0,
-        }
+        Keys { secret, key }
     }
 
     /// The keys after a KeyUpdate (RFC 9846 7.2).
     fn next(&self) -> Keys {
         Keys::new(derive(&self.secret, b"traffic upd", &[]))
     }
+}
 
-    /// The next record's nonce: the sequence number XORed into the IV's
-    /// last eight bytes (RFC 9846 5.3).
-    fn nonce(&mut self) -> Result<[u8; aesgcm::NONCE_LEN], Error> {
-        let mut nonce = self.iv;
-        for (byte, number) in nonce.iter_mut().skip(4).zip(self.seq.to_be_bytes()) {
-            *byte ^= number;
-        }
-        // 2^64 records would take a peer longer than a connection lasts;
-        // the client ends it rather than wrap (RFC 9846 5.3), on its own
-        // limit: internal_error.
-        self.seq = self.seq.checked_add(1).ok_or(Error::Internal)?;
-        Ok(nonce)
+impl Opening {
+    /// The keys of secret, which they keep.
+    fn new(secret: Digest) -> Opening {
+        let mut iv = [0; aesgcm::NONCE_LEN];
+        expand(&secret, b"iv", &[], &mut iv);
+        let key = match secret {
+            Digest::Sha256(_) => {
+                let mut key = [0; aesgcm::KEY_LEN];
+                expand(&secret, b"key", &[], &mut key);
+                let opening = OpeningKey::new(&key, &iv);
+                random::wipe(&mut key);
+                opening
+            }
+            Digest::Sha384(_) => {
+                let mut key = [0; aesgcm::KEY256_LEN];
+                expand(&secret, b"key", &[], &mut key);
+                let opening = OpeningKey::new256(&key, &iv);
+                random::wipe(&mut key);
+                opening
+            }
+        };
+        Opening { secret, key }
+    }
+
+    /// The keys after a KeyUpdate (RFC 9846 7.2).
+    fn next(&self) -> Opening {
+        Opening::new(derive(&self.secret, b"traffic upd", &[]))
     }
 }
 
@@ -698,13 +711,14 @@ pub struct Client<'a> {
     /// E.4), and echoed by the server; none without it, as RFC 8448's
     /// client.
     session: Option<[u8; 32]>,
-    secret: [u8; x25519::KEY_BYTES],
+    /// The X25519 secret, until ServerHello, and its public key.
+    secret: Option<x25519::Secret>,
     public: [u8; x25519::KEY_BYTES],
     /// ML-KEM-768's half of the X25519MLKEM768 share, until ServerHello.
     kem: Option<Box<mlkem::DecapsulationKey>>,
-    /// A P-256 secret, for a server that asks for that group, and its
-    /// public key once one did.
-    p256: [u8; ecdh::SECRET_BYTES],
+    /// A P-256 secret, for a server that asks for that group, until
+    /// ServerHello, and its public key once one did.
+    p256: Option<ecdh::Secret>,
     p256_public: Option<[u8; ecdh::PUBLIC_BYTES]>,
     /// The group a HelloRetryRequest asked for: the second ClientHello
     /// shares a key for it alone, and ServerHello must choose it.
@@ -731,7 +745,7 @@ pub struct Client<'a> {
     /// The server asked for a certificate: the client answers with an
     /// empty Certificate.
     requested: bool,
-    input_keys: Option<Keys>,
+    input_keys: Option<Opening>,
     output_keys: Option<Keys>,
     /// One record as it comes; an application record is opened here.
     rx: Vec<u8>,
@@ -755,19 +769,69 @@ pub struct Client<'a> {
     failed: Option<Error>,
 }
 
+/// The randomness a client draws: the ClientHello's random and
+/// legacy_session_id, and the seeds of the X25519, ML-KEM-768 and P-256
+/// keys.
+struct Random {
+    client: [u8; 32],
+    session: [u8; 32],
+    x25519: random::Seed32,
+    mlkem: random::Seed64,
+    p256: random::Seed64,
+}
+
+impl Random {
+    /// The system's.
+    fn system() -> Random {
+        let (mut client, mut session) = ([0; 32], [0; 32]);
+        random::fill(&mut client);
+        random::fill(&mut session);
+        Random {
+            client,
+            session,
+            x25519: random::seed32(),
+            mlkem: random::seed64(),
+            p256: random::seed64(),
+        }
+    }
+
+    /// The same every time, so that a test or a fuzz target replays: the
+    /// bytes 0x5c, an X25519 secret of x25519.
+    #[cfg(any(test, fuzzing))]
+    fn fixed(x25519: [u8; x25519::KEY_BYTES]) -> Random {
+        Random {
+            client: [0x5c; 32],
+            session: [0x5c; 32],
+            x25519: random::Seed32::for_tests(x25519),
+            mlkem: random::Seed64::for_tests([0x5c; 64]),
+            p256: random::Seed64::for_tests([0x5c; 64]),
+        }
+    }
+}
+
 impl<'a> Client<'a> {
     /// A client for host (a DNS name, or an IP literal, which SNI does
     /// not carry), offering the ALPN protocols given, if any, and
     /// verifying the server's chain as verify says, at now (Unix seconds).
-    /// random is RANDOM_BYTES of the system's randomness. The ClientHello
-    /// is pending: it offers X25519MLKEM768 and X25519, sharing a key for
-    /// both, and P-256 for a server that asks for it in a retry.
+    /// The ClientHello is pending: it offers X25519MLKEM768 and X25519,
+    /// sharing a key for both, and P-256 for a server that asks for it in
+    /// a retry; its random, session ID and keys come from random.
     pub fn new(
         host: &str,
         alpn: &[&[u8]],
         verify: Verify<'a>,
         now: i64,
-        random: &[u8; RANDOM_BYTES],
+    ) -> Result<Client<'a>, Error> {
+        Client::with(host, alpn, verify, now, Random::system())
+    }
+
+    /// new, with the randomness given.
+    fn with(
+        host: &str,
+        alpn: &[&[u8]],
+        verify: Verify<'a>,
+        now: i64,
+        random: Random,
     ) -> Result<Client<'a>, Error> {
         let host = host.strip_suffix('.').unwrap_or(host);
         let literal = ip_literal(host);
@@ -785,25 +849,17 @@ impl<'a> Client<'a> {
             offer.push(length);
             offer.extend_from_slice(name);
         }
-        let mut parts = Reader { rest: random };
-        let mut client_random = [0; 32];
-        let mut session = [0; 32];
-        let mut secret = [0; x25519::KEY_BYTES];
-        let mut seed = [0; mlkem::SEED_BYTES];
-        let mut p256 = [0; ecdh::SECRET_BYTES];
-        for part in [
-            &mut client_random[..],
-            &mut session,
-            &mut secret,
-            &mut seed,
-            &mut p256,
-        ] {
-            part.copy_from_slice(parts.take(part.len())?);
-        }
+        let Random {
+            client: client_random,
+            session,
+            x25519,
+            mlkem,
+            p256,
+        } = random;
+        let secret = x25519::Secret::new(x25519);
         // rr: escape(move): once a connection, as it starts; boxed, so
         // that the client stays small after the handshake drops it.
-        let kem = Box::new(mlkem::generate(&seed));
-        wipe(&mut seed);
+        let kem = Box::new(mlkem::DecapsulationKey::generate(mlkem));
         let mut client = Client {
             verify,
             now,
@@ -815,10 +871,10 @@ impl<'a> Client<'a> {
             chosen: None,
             random: client_random,
             session: Some(session),
-            public: x25519::public_key(&secret),
-            secret,
+            public: *secret.public_key().bytes(),
+            secret: Some(secret),
             kem: Some(kem),
-            p256,
+            p256: Some(ecdh::Secret::new(p256)),
             p256_public: None,
             group: None,
             ccs: Ccs::Due,
@@ -1130,7 +1186,9 @@ impl<'a> Client<'a> {
             Some(mark) => (mark.secret.is_some(), mark.seq, mark.at),
             None => (
                 self.output_keys.is_some(),
-                self.output_keys.as_ref().map_or(0, |keys| keys.seq),
+                self.output_keys
+                    .as_ref()
+                    .map_or(0, |keys| keys.key.sequence()),
                 self.tx.len(),
             ),
         };
@@ -1151,7 +1209,8 @@ impl<'a> Client<'a> {
             self.output_keys = mark.secret.take().map(Keys::new);
         }
         if let Some(keys) = &mut self.output_keys {
-            keys.seq = seq;
+            // The records that took these numbers are dropped unsent.
+            keys.key.set_sequence_less_safe(seq);
         }
         self.tx.truncate(kept);
         self.unmark();
@@ -1169,7 +1228,7 @@ impl<'a> Client<'a> {
         let old = self.output_keys.replace(keys);
         if marking && let Some(slot) = self.marks.get_mut(self.marked) {
             let (secret, seq) = match old {
-                Some(Keys { secret, seq, .. }) => (Some(secret), seq),
+                Some(Keys { secret, key }) => (Some(secret), key.sequence()),
                 None => (None, 0),
             };
             *slot = Mark { at, secret, seq };
@@ -1264,8 +1323,7 @@ impl<'a> Client<'a> {
         let at = body.len().checked_sub(TAG).ok_or(Error::Forged)?;
         let (data, tag) = body.split_at_mut_checked(at).ok_or(Error::Forged)?;
         let tag = tag.first_chunk::<TAG>().ok_or(Error::Forged)?;
-        let nonce = keys.nonce()?;
-        keys.aead.open(&nonce, header, data, tag)?;
+        keys.key.open(header, data, tag)?;
         // TLSInnerPlaintext, padding and all, is 2^14 + 1 bytes at most
         // (RFC 9846 5.4).
         if data.len() > RECORD_MAX + 1 {
@@ -1508,19 +1566,19 @@ impl<'a> Client<'a> {
         };
         let mut shared = [0; 2 * 32];
         let agreed = self.agree(group, key, &mut shared);
-        wipe(&mut self.secret);
-        wipe(&mut self.p256);
+        self.secret = None;
+        self.p256 = None;
         self.kem = None;
         let length = match agreed {
             Ok(length) => length,
             Err(error) => {
-                wipe(&mut shared);
+                random::wipe(&mut shared);
                 return Err(error);
             }
         };
         self.transcript.update(message);
         let secrets = handshake_secrets(shared.get(..length).unwrap_or_default(), &self.hash());
-        wipe(&mut shared);
+        random::wipe(&mut shared);
         self.server_finished = derive(&secrets.server, b"finished", &[]);
         let Secrets {
             client,
@@ -1528,7 +1586,7 @@ impl<'a> Client<'a> {
             master,
         } = secrets;
         self.master = master;
-        self.input_keys = Some(Keys::new(server));
+        self.input_keys = Some(Opening::new(server));
         self.rekey(Keys::new(client))?;
         self.state = State::Extensions;
         Ok(true)
@@ -1552,7 +1610,7 @@ impl<'a> Client<'a> {
                 if key.len() != 32 {
                     return Err(Error::Parameter);
                 }
-                first.copy_from_slice(&x25519::shared(&self.secret, peer).ok_or(Error::Parameter)?);
+                first.copy_from_slice(self.x25519(peer)?.kdf_input());
                 Ok(32)
             }
             X25519MLKEM768 => {
@@ -1566,17 +1624,30 @@ impl<'a> Client<'a> {
                 if key.len() != HYBRID_REPLY {
                     return Err(Error::Parameter);
                 }
-                first.copy_from_slice(&kem.decapsulate(ciphertext));
-                second
-                    .copy_from_slice(&x25519::shared(&self.secret, peer).ok_or(Error::Parameter)?);
+                first.copy_from_slice(kem.decapsulate(ciphertext).kdf_input());
+                second.copy_from_slice(self.x25519(peer)?.kdf_input());
                 Ok(64)
             }
             _ => {
                 // SECP256R1, the only group a retry may ask for.
-                first.copy_from_slice(&ecdh::shared(&self.p256, key).ok_or(Error::Parameter)?);
+                let secret = self.p256.as_ref().ok_or(Error::Parameter)?;
+                let Ok(peer) = ecdh::PublicKey::parse(key) else {
+                    return Err(Error::Parameter);
+                };
+                first.copy_from_slice(secret.agree(&peer).kdf_input());
                 Ok(32)
             }
         }
+    }
+
+    /// The X25519 secret shared with peer; a point of small order is
+    /// illegal_parameter (RFC 9846 7.4.2).
+    fn x25519(&self, peer: &[u8; x25519::KEY_BYTES]) -> Result<x25519::SharedSecret, Error> {
+        let secret = self.secret.as_ref().ok_or(Error::Parameter)?;
+        let Ok(shared) = secret.agree(&x25519::PublicKey::from_bytes(peer)) else {
+            return Err(Error::Parameter);
+        };
+        Ok(shared)
     }
 
     /// A HelloRetryRequest (RFC 9846 4.2.4): the second ClientHello
@@ -1594,7 +1665,8 @@ impl<'a> Client<'a> {
         }
         match share {
             Some((SECP256R1, _)) => {
-                self.p256_public = Some(self.p256_public()?);
+                let secret = self.p256.as_ref().ok_or(Error::Parameter)?;
+                self.p256_public = Some(*secret.public_key().bytes());
                 self.kem = None;
             }
             Some(_) => return Err(Error::Parameter),
@@ -1623,23 +1695,6 @@ impl<'a> Client<'a> {
         self.compatible();
         self.handshake_message(&hello, 3)?;
         Ok(true)
-    }
-
-    /// The P-256 public key of the secret, or of a hash of it while it is
-    /// 0 or not below the order, as a new secret would be drawn: once in
-    /// 2^32.
-    fn p256_public(&mut self) -> Result<[u8; ecdh::PUBLIC_BYTES], Error> {
-        for _ in 0..4 {
-            if self.p256 != [0; ecdh::SECRET_BYTES]
-                && self.p256 < P256_ORDER
-                && let Some(public) = ecdh::public_key(&self.p256)
-            {
-                return Ok(public);
-            }
-            self.p256 = sha256::digest(&self.p256);
-        }
-        // Four hashes in a row at or above the order: never.
-        Err(Error::Parameter)
     }
 
     /// Sends middlebox compatibility's change_cipher_spec once, in the
@@ -1829,18 +1884,12 @@ impl<'a> Client<'a> {
     /// The server's Finished; the client's flight and the application
     /// keys follow it.
     fn finished(&mut self, message: &[u8], body: &[u8]) -> Result<bool, Error> {
-        let expected = mac(&self.server_finished, &self.hash());
-        if body.len() != expected.bytes().len() {
-            return Err(Error::Decode);
-        }
-        if !same(body, expected.bytes()) {
-            return Err(Error::Finished);
-        }
+        verify_mac(&self.server_finished, &self.hash(), body)?;
         self.transcript.update(message);
         let hash = self.hash();
         let client = derive(&self.master, b"c ap traffic", hash.bytes());
         let server = derive(&self.master, b"s ap traffic", hash.bytes());
-        self.input_keys = Some(Keys::new(server));
+        self.input_keys = Some(Opening::new(server));
         // Middlebox compatibility: change_cipher_spec before the client's
         // encrypted flight, unless it went before a second ClientHello.
         self.compatible();
@@ -1917,7 +1966,7 @@ impl<'a> Client<'a> {
             if self
                 .output_keys
                 .as_ref()
-                .is_some_and(|keys| keys.seq >= KEY_RECORDS_MAX)
+                .is_some_and(|keys| keys.key.sequence() >= KEY_RECORDS_MAX)
             {
                 // rr: escape(cold): once in 2^24 records.
                 self.update()?;
@@ -2050,15 +2099,6 @@ impl<'a> Client<'a> {
     }
 }
 
-/// The key shares' secrets go with the client, wiped; the traffic and
-/// handshake secrets wipe themselves (Digest), as do the marks'.
-impl Drop for Client<'_> {
-    fn drop(&mut self) {
-        wipe(&mut self.secret);
-        wipe(&mut self.p256);
-    }
-}
-
 /// The extension types of one block, which may each come once (RFC 9846
 /// 4.3): a block of more than SEEN_MAX is refused, as no server sends
 /// one.
@@ -2156,8 +2196,6 @@ fn seal(keys: &mut Keys, tx: &mut Vec<u8>, kind: u8, data: &[u8]) -> Result<(), 
     if tx.len() + HEADER + usize::from(length) > TX_MAX {
         return Err(Error::Internal);
     }
-    // The number first: a record that cannot have one is never begun.
-    let nonce = keys.nonce()?;
     let start = tx.len();
     let [high, low] = length.to_be_bytes();
     tx.extend_from_slice(&[APPLICATION, 3, 3, high, low]);
@@ -2169,11 +2207,14 @@ fn seal(keys: &mut Keys, tx: &mut Vec<u8>, kind: u8, data: &[u8]) -> Result<(), 
         .split_at_mut_checked(start + HEADER)
         .ok_or(Error::Internal)?;
     let header = head.get(start..).unwrap_or_default();
-    let tag = keys
-        .aead
-        .seal(&nonce, header, body)
-        .map_err(|error| local(&error))?;
-    tx.extend_from_slice(&tag);
+    match keys.key.seal(header, body) {
+        Ok(tag) => tx.extend_from_slice(&tag.into_bytes()),
+        Err(error) => {
+            // A record that has no number is never begun.
+            tx.truncate(start);
+            return Err(local(&error));
+        }
+    }
     Ok(())
 }
 
@@ -2181,7 +2222,9 @@ fn seal(keys: &mut Keys, tx: &mut Vec<u8>, kind: u8, data: &[u8]) -> Result<(), 
 /// its own can cause: internal_error.
 fn local(error: &aesgcm::Error) -> Error {
     match error {
-        aesgcm::Error::TooLong | aesgcm::Error::Forged => Error::Internal,
+        aesgcm::Error::TooLong | aesgcm::Error::Forged | aesgcm::Error::Exhausted => {
+            Error::Internal
+        }
     }
 }
 
@@ -2238,8 +2281,8 @@ fn expand(secret: &Digest, label: &[u8], context: &[u8], out: &mut [u8]) {
     }
     let info = info.get(..at).unwrap_or_default();
     let expanded = match secret {
-        Digest::Sha256(key) => sha256::hkdf_expand(key, info, out),
-        Digest::Sha384(key) => sha384::hkdf_expand(key, info, out),
+        Digest::Sha256(key) => sha256::Prk::new_less_safe(key).expand(info, out).is_ok(),
+        Digest::Sha384(key) => sha384::Prk::new_less_safe(key).expand(info, out).is_ok(),
     };
     if !expanded {
         // rr: escape(panic): out is at most 48 bytes, far under HKDF's
@@ -2254,19 +2297,33 @@ fn mac(key: &Digest, data: &Digest) -> Digest {
     key.extract(data.bytes())
 }
 
-/// Overwrites a secret with zeros. black_box makes the compiler take
-/// the bytes as read after, so it keeps the writes though nothing reads
-/// them; without unsafe code outside sys, as volatile writes would need.
-fn wipe(bytes: &mut [u8]) {
-    bytes.fill(0);
-    core::hint::black_box(bytes);
-}
-
-/// Whether a equals b, in time that does not depend on where they
-/// differ.
-fn same(a: &[u8], b: &[u8]) -> bool {
-    let differ = a.iter().zip(b).fold(0, |differ, (x, y)| differ | (x ^ y));
-    a.len() == b.len() && differ == 0
+/// Checks a Finished's verify_data, received: the HMAC of data under
+/// key by the suite's hash, compared in constant time by sha256's or
+/// sha384's verify. Another length is decode_error, another MAC
+/// decrypt_error (RFC 9846 4.4.4).
+fn verify_mac(key: &Digest, data: &Digest, received: &[u8]) -> Result<(), Error> {
+    let verified = match key {
+        Digest::Sha256(key) => {
+            let Ok(tag) = received.try_into() else {
+                return Err(Error::Decode);
+            };
+            let mut hmac = sha256::Hmac::new(key);
+            hmac.update(data.bytes());
+            hmac.verify(tag).is_ok()
+        }
+        Digest::Sha384(key) => {
+            let Ok(tag) = received.try_into() else {
+                return Err(Error::Decode);
+            };
+            let mut hmac = sha384::Hmac384::new(key);
+            hmac.update(data.bytes());
+            hmac.verify(tag).is_ok()
+        }
+    };
+    if !verified {
+        return Err(Error::Finished);
+    }
+    Ok(())
 }
 
 /// Whether host is an IP address, IPv6 also in brackets.
@@ -2309,12 +2366,12 @@ pub fn fuzz_server(input: &[u8]) {
             .add_der(&x509::test_certificate("test.root").unwrap())
             .is_ok()
     );
-    let mut client = Client::new(
+    let mut client = Client::with(
         "api.example.test",
         &[b"h2"],
         Verify::Store(&store),
         x509::TEST_NOW,
-        &[0x5c; RANDOM_BYTES],
+        Random::fixed([0x5c; 32]),
     );
     fuzz_feed(client.as_mut().unwrap(), rest, usize::from(seed % 64) + 1);
 }
@@ -2340,12 +2397,12 @@ pub fn fuzz_flight(input: &[u8]) {
     } else {
         Verify::Store(&store)
     };
-    let mut client = Client::new(
+    let mut client = Client::with(
         "api.example.test",
         &[b"h2"],
         verify,
         x509::TEST_NOW,
-        &[0x5c; RANDOM_BYTES],
+        Random::fixed([0x5c; 32]),
     )
     .unwrap();
     assert!(client.sent(client.pending().len()).is_ok());
@@ -2353,7 +2410,8 @@ pub fn fuzz_flight(input: &[u8]) {
     hello.extend_from_slice(&[0x7e; 32]);
     hello.extend_from_slice(&[0, 0x13, 0x01, 0, 0, 46, 0, 43, 0, 2, 3, 4]);
     hello.extend_from_slice(&[0, 51, 0, 36, 0, 0x1d, 0, 32]);
-    hello.extend_from_slice(&x25519::public_key(&[0x3a; 32]));
+    let server = x25519::Secret::new(random::Seed32::for_tests([0x3a; 32]));
+    hello.extend_from_slice(server.public_key().bytes());
     assert!(
         client
             .input(&hello)

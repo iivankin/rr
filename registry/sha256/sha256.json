@@ -1,6 +1,6 @@
 {
   "name": "sha256",
-  "description": "SHA-256 (FIPS 180-4), HMAC-SHA256 (RFC 2104) and HKDF-SHA256 (RFC 5869), with SHA instructions where the CPU has them.",
+  "description": "SHA-256 (FIPS 180-4), HMAC-SHA256 (RFC 2104) with a constant-time verify, and HKDF-SHA256 (RFC 5869) whose Expand takes only the Prk Extract makes, wiped when dropped; with SHA instructions where the CPU has them.",
   "rr": "0.5.2",
   "dependencies": [
     "cpu"

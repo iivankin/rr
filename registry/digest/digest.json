@@ -1,0 +1,11 @@
+{
+  "name": "digest",
+  "description": "A digest that names its hash, SHA-256, SHA-384 or SHA-512, at its length: what a signature verifier (ecdsa, rsa) takes instead of bytes of any length.",
+  "rr": "0.5.2",
+  "dependencies": [],
+  "files": [
+    {
+      "path": "mod.rs"
+    }
+  ]
+}

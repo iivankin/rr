@@ -10,7 +10,7 @@ use crate::base::cpu;
 /// and state untouched, on a CPU without them.
 #[cfg(target_arch = "aarch64")]
 pub fn compress(state: &mut [u64; 8], blocks: &[[u8; 128]]) -> bool {
-    if !cpu::has(cpu::SHA512) {
+    if !cpu::has(&cpu::SHA512) {
         return false;
     }
     // rr: escape(unsafe): the CPU has SHA512.

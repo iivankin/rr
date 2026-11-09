@@ -1,0 +1,14 @@
+{
+  "name": "random",
+  "description": "The system's randomness: arc4random_buf on macOS, getrandom(2) on Linux (/dev/urandom before 3.17), ProcessPrng on Windows; seeds of 32 and 64 bytes that only it makes, which keys are made from, wiped when dropped.",
+  "rr": "0.5.2",
+  "dependencies": [],
+  "files": [
+    {
+      "path": "mod.rs"
+    },
+    {
+      "path": "sys.rs"
+    }
+  ]
+}

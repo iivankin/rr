@@ -4,19 +4,33 @@
 //! Whole blocks are compressed straight from the caller's input; only a
 //! part block waits in the state. The rounds run on SHA512 instructions
 //! where sys finds them, as portable code elsewhere.
+//!
+//! Each name says its hash: digest384 and digest512, SHA384_BYTES and
+//! SHA512_BYTES. A MAC received is checked by verify, in constant time;
+//! HKDF-Extract gives a Prk, the only key HKDF-Expand takes, not Copy,
+//! Clone or Debug and wiped when dropped, as sha256's.
 
 mod sys;
 
 /// The bytes of a SHA-384 digest.
-pub const DIGEST_BYTES: usize = 48;
+pub const SHA384_BYTES: usize = 48;
 /// The bytes of a SHA-512 digest.
 pub const SHA512_BYTES: usize = 64;
 /// The bytes of one block the compression takes.
 pub const BLOCK_BYTES: usize = 128;
-/// The most bytes hkdf_expand writes: its counter is one byte.
-pub const EXPAND_BYTES_MAX: usize = 255 * DIGEST_BYTES;
+/// The most bytes Prk::expand writes: its counter is one byte.
+pub const EXPAND_BYTES_MAX: usize = 255 * SHA384_BYTES;
 /// The bytes the padding gives the message's length in bits.
 const LENGTH_BYTES: usize = 16;
+
+/// What went wrong; nothing is left changed by either.
+#[cfg_attr(test, derive(Debug, PartialEq))]
+pub enum Error {
+    /// The tag is not the MAC of the message.
+    Mismatch,
+    /// More than EXPAND_BYTES_MAX asked of HKDF-Expand.
+    TooLong,
+}
 
 const INITIAL: [u64; 8] = [
     0xcbbb9d5dc1059ed8,
@@ -222,8 +236,8 @@ impl Sha384 {
     }
 
     /// The digest of the message. It takes the hash, which padding ends.
-    pub fn finish(self) -> [u8; DIGEST_BYTES] {
-        let mut digest = [0; DIGEST_BYTES];
+    pub fn finish(self) -> [u8; SHA384_BYTES] {
+        let mut digest = [0; SHA384_BYTES];
         for (byte, word) in digest.iter_mut().zip(self.0.finish()) {
             *byte = word;
         }
@@ -251,7 +265,7 @@ impl Sha512 {
 }
 
 /// The SHA-384 digest of data in one call.
-pub fn digest(data: &[u8]) -> [u8; DIGEST_BYTES] {
+pub fn digest384(data: &[u8]) -> [u8; SHA384_BYTES] {
     let mut hash = Sha384::new();
     hash.update(data);
     hash.finish()
@@ -298,6 +312,7 @@ impl Keyed {
         }
         let mut outer = Hash::new(initial);
         outer.update(&pad);
+        wipe(&mut pad);
         Self {
             inner,
             outer,
@@ -320,19 +335,26 @@ pub struct Hmac384(Keyed);
 
 impl Hmac384 {
     pub fn new(key: &[u8]) -> Self {
-        Self(Keyed::new(INITIAL, DIGEST_BYTES, key))
+        Self(Keyed::new(INITIAL, SHA384_BYTES, key))
     }
 
     pub fn update(&mut self, data: &[u8]) {
         self.0.inner.update(data);
     }
 
-    pub fn finish(self) -> [u8; DIGEST_BYTES] {
-        let mut tag = [0; DIGEST_BYTES];
+    /// The MAC, to send.
+    pub fn finish(self) -> [u8; SHA384_BYTES] {
+        let mut tag = [0; SHA384_BYTES];
         for (byte, word) in tag.iter_mut().zip(self.0.finish()) {
             *byte = word;
         }
         tag
+    }
+
+    /// Whether tag, received, is the MAC: every byte is compared, so the
+    /// time does not say where they differ.
+    pub fn verify(self, tag: &[u8; SHA384_BYTES]) -> Result<(), Error> {
+        same(&self.finish(), tag)
     }
 }
 
@@ -348,42 +370,98 @@ impl Hmac512 {
         self.0.inner.update(data);
     }
 
+    /// The MAC, to send.
     pub fn finish(self) -> [u8; SHA512_BYTES] {
         self.0.finish()
     }
+
+    /// Whether tag, received, is the MAC, as Hmac384::verify.
+    pub fn verify(self, tag: &[u8; SHA512_BYTES]) -> Result<(), Error> {
+        same(&self.finish(), tag)
+    }
+}
+
+/// Ok when a and b, of one length, are equal: every byte is compared,
+/// and black_box keeps the compiler from ending at the first that
+/// differs.
+fn same(a: &[u8], b: &[u8]) -> Result<(), Error> {
+    let differ = a.iter().zip(b).fold(0, |acc, (x, y)| acc | (x ^ y));
+    if core::hint::black_box(differ) == 0 && a.len() == b.len() {
+        Ok(())
+    } else {
+        Err(Error::Mismatch)
+    }
+}
+
+/// A pseudorandom key of HKDF-SHA384 (RFC 5869 2.2), which HKDF-Expand
+/// takes: hkdf_extract makes one. Not Copy, Clone or Debug; wiped when
+/// dropped.
+pub struct Prk {
+    bytes: [u8; SHA384_BYTES],
 }
 
 /// HKDF-Extract: the pseudorandom key from salt and input keying
 /// material. An empty salt stands for a block of zeros, as HMAC pads it.
-pub fn hkdf_extract(salt: &[u8], input: &[u8]) -> [u8; DIGEST_BYTES] {
+pub fn hkdf_extract(salt: &[u8], input: &[u8]) -> Prk {
     let mut hmac = Hmac384::new(salt);
     hmac.update(input);
-    hmac.finish()
+    Prk {
+        bytes: hmac.finish(),
+    }
 }
 
-/// HKDF-Expand: fills out from the pseudorandom key and info. False,
-/// and out untouched, when out is longer than EXPAND_BYTES_MAX.
-#[must_use]
-pub fn hkdf_expand(key: &[u8; DIGEST_BYTES], info: &[u8], out: &mut [u8]) -> bool {
-    if out.len() > EXPAND_BYTES_MAX {
-        return false;
+impl Prk {
+    /// A secret that is already a pseudorandom key of the hash's length,
+    /// as a protocol's key schedule makes one by HKDF-Expand (TLS 1.3's
+    /// Derive-Secret). Less safe than hkdf_extract: bytes of a password
+    /// or of a shared secret would be taken as they are, not extracted.
+    pub fn new_less_safe(secret: &[u8; SHA384_BYTES]) -> Prk {
+        Prk { bytes: *secret }
     }
-    let keyed = Hmac384::new(key);
-    let mut previous = [0; DIGEST_BYTES];
-    for (counter, chunk) in (1..=u8::MAX).zip(out.chunks_mut(DIGEST_BYTES)) {
-        // rr: escape(copy): each block starts from the keyed hashes, which
-        // spares compressing the two key blocks again.
-        let mut hmac = keyed.clone();
-        if counter > 1 {
-            hmac.update(&previous);
+
+    /// HKDF-Expand: fills out from the key and info; TooLong, and out
+    /// untouched, when out is longer than EXPAND_BYTES_MAX.
+    pub fn expand(&self, info: &[u8], out: &mut [u8]) -> Result<(), Error> {
+        if out.len() > EXPAND_BYTES_MAX {
+            return Err(Error::TooLong);
         }
-        hmac.update(info);
-        hmac.update(&[counter]);
-        previous = hmac.finish();
-        // rr: escape(panic): chunks_mut gives at most DIGEST_BYTES.
-        chunk.copy_from_slice(&previous[..chunk.len()]);
+        let keyed = Hmac384::new(&self.bytes);
+        let mut previous = [0; SHA384_BYTES];
+        for (counter, chunk) in (1..=u8::MAX).zip(out.chunks_mut(SHA384_BYTES)) {
+            // rr: escape(copy): each block starts from the keyed hashes,
+            // which spares compressing the two key blocks again.
+            let mut hmac = keyed.clone();
+            if counter > 1 {
+                hmac.update(&previous);
+            }
+            hmac.update(info);
+            hmac.update(&[counter]);
+            previous = hmac.finish();
+            // rr: escape(panic): chunks_mut gives at most SHA384_BYTES.
+            chunk.copy_from_slice(&previous[..chunk.len()]);
+        }
+        wipe(&mut previous);
+        Ok(())
     }
-    true
+
+    /// The key's bytes: a salt for the next HKDF-Extract, or an HMAC key.
+    pub fn bytes(&self) -> &[u8; SHA384_BYTES] {
+        &self.bytes
+    }
+}
+
+impl Drop for Prk {
+    fn drop(&mut self) {
+        wipe(&mut self.bytes);
+    }
+}
+
+/// Overwrites a secret with zeros. black_box makes the compiler take
+/// the bytes as read after, so it keeps the writes though nothing reads
+/// them.
+fn wipe(bytes: &mut [u8]) {
+    bytes.fill(0);
+    core::hint::black_box(bytes);
 }
 
 fn compress(state: &mut [u64; 8], blocks: &[[u8; BLOCK_BYTES]]) {
@@ -437,8 +515,8 @@ fn compress(state: &mut [u64; 8], blocks: &[[u8; BLOCK_BYTES]]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        BLOCK_BYTES, DIGEST_BYTES, EXPAND_BYTES_MAX, Hmac384, Hmac512, Sha384, Sha512, digest,
-        digest512, hkdf_expand, hkdf_extract,
+        BLOCK_BYTES, EXPAND_BYTES_MAX, Error, Hmac384, Hmac512, Prk, SHA384_BYTES, SHA512_BYTES,
+        Sha384, Sha512, digest384, digest512, hkdf_extract,
     };
     use alloc::vec::Vec;
     use test::Bencher;
@@ -496,7 +574,7 @@ mod tests {
             ),
         ] {
             let expected = hex(expected);
-            assert_eq!(digest(data)[..], expected[..]);
+            assert_eq!(digest384(data)[..], expected[..]);
             let mut hash = Sha384::new();
             for piece in data.chunks(997) {
                 hash.update(piece);
@@ -556,7 +634,7 @@ mod tests {
         }
         for length in 0..=data.len() {
             let data = &data[..length];
-            let whole = digest(data);
+            let whole = digest384(data);
             for split in 0..=length {
                 let (head, tail) = data.split_at(split);
                 let mut hash = Sha384::new();
@@ -698,14 +776,26 @@ mod tests {
                     if bits == "384" {
                         let mut hmac = Hmac384::new(&key);
                         hmac.update(&message);
-                        mac[..DIGEST_BYTES].copy_from_slice(&hmac.finish());
+                        mac[..SHA384_BYTES].copy_from_slice(&hmac.finish());
                     } else {
                         let mut hmac = Hmac512::new(&key);
                         hmac.update(&message);
                         mac = hmac.finish();
                     }
-                    let matches = mac[..size] == field(tag)[..];
+                    let tag = field(tag);
+                    let matches = mac[..size] == tag[..];
                     assert_eq!(matches, valid == "1", "hmac {bits} tcId {id}");
+                    let verified = match bits {
+                        "384" => <&[u8; SHA384_BYTES]>::try_from(&tag[..])
+                            .ok()
+                            .map(|full| verify384(&key, &message, full)),
+                        _ => <&[u8; SHA512_BYTES]>::try_from(&tag[..])
+                            .ok()
+                            .map(|full| verify512(&key, &message, full)),
+                    };
+                    if let Some(verified) = verified {
+                        assert_eq!(verified, valid == "1", "hmac {bits} tcId {id}");
+                    }
                     macs += 1;
                 }
                 ["hkdf", id, input, salt, info, size, okm, ""] => {
@@ -713,9 +803,9 @@ mod tests {
                     out.clear();
                     out.resize(size.parse().unwrap(), 0);
                     let expected = field(okm);
-                    let done = hkdf_expand(&key, &field(info), &mut out);
-                    assert_eq!(done, !expected.is_empty(), "hkdf tcId {id}");
-                    if done {
+                    let done = key.expand(&field(info), &mut out);
+                    assert_eq!(done.is_ok(), !expected.is_empty(), "hkdf tcId {id}");
+                    if done.is_ok() {
                         assert_eq!(out, expected, "hkdf tcId {id}");
                     }
                     keys += 1;
@@ -764,11 +854,11 @@ mod tests {
             ),
         ] {
             let derived = hkdf_extract(salt, input);
-            assert_eq!(derived[..], hex(key)[..]);
+            assert_eq!(derived.bytes()[..], hex(key)[..]);
             let expected = hex(expected);
             let mut out = [0; 82];
             let out = &mut out[..expected.len()];
-            assert!(hkdf_expand(&derived, info, out));
+            assert_eq!(derived.expand(info, out), Ok(()));
             assert_eq!(out[..], expected[..]);
         }
     }
@@ -777,22 +867,66 @@ mod tests {
     /// one at the limit is filled.
     #[test]
     fn hkdf_expand_limit() {
-        let key = [0x42; DIGEST_BYTES];
+        let key = Prk::new_less_safe(&[0x42; SHA384_BYTES]);
         let mut out = [0xa5; EXPAND_BYTES_MAX + 1];
-        assert!(!hkdf_expand(&key, b"", &mut out));
+        assert_eq!(key.expand(b"", &mut out), Err(Error::TooLong));
         assert!(out.iter().all(|byte| *byte == 0xa5));
-        assert!(hkdf_expand(&key, b"", &mut out[..EXPAND_BYTES_MAX]));
+        assert_eq!(key.expand(b"", &mut out[..EXPAND_BYTES_MAX]), Ok(()));
         assert_eq!(out[EXPAND_BYTES_MAX], 0xa5);
-        let mut first = [0; DIGEST_BYTES];
-        assert!(hkdf_expand(&key, b"", &mut first));
-        assert_eq!(out[..DIGEST_BYTES], first);
+        let mut first = [0; SHA384_BYTES];
+        assert_eq!(key.expand(b"", &mut first), Ok(()));
+        assert_eq!(out[..SHA384_BYTES], first);
+    }
+
+    fn verify384(key: &[u8], message: &[u8], tag: &[u8; SHA384_BYTES]) -> bool {
+        let mut hmac = Hmac384::new(key);
+        hmac.update(message);
+        hmac.verify(tag).is_ok()
+    }
+
+    fn verify512(key: &[u8], message: &[u8], tag: &[u8; SHA512_BYTES]) -> bool {
+        let mut hmac = Hmac512::new(key);
+        hmac.update(message);
+        hmac.verify(tag).is_ok()
+    }
+
+    /// As a protocol uses it: a key extracted and expanded into a MAC
+    /// key, a MAC sent and checked by the peer, any byte changed a
+    /// Mismatch; and SHA-384 and SHA-512 told apart by name and length.
+    #[test]
+    fn mac_loop() {
+        let prk = hkdf_extract(b"salt", b"shared secret");
+        let mut key = [0; SHA384_BYTES];
+        assert_eq!(prk.expand(b"mac key", &mut key), Ok(()));
+        let mut sender = Hmac384::new(&key);
+        sender.update(b"a message");
+        let tag = sender.finish();
+        assert!(verify384(&key, b"a message", &tag));
+        assert!(!verify384(&key, b"a messagE", &tag));
+        for at in 0..SHA384_BYTES {
+            let mut forged = tag;
+            forged[at] ^= 0x80;
+            assert!(!verify384(&key, b"a message", &forged));
+        }
+        let mut long = Hmac512::new(&key);
+        long.update(b"a message");
+        let tag512 = long.finish();
+        assert!(verify512(&key, b"a message", &tag512));
+        assert!(!verify512(b"another key", b"a message", &tag512));
+        let (short, wide) = (digest384(b"abc"), digest512(b"abc"));
+        assert_eq!((short.len(), wide.len()), (48, 64));
+        assert_ne!(short[..], wide[..48]);
+        let next = Prk::new_less_safe(&key);
+        let mut out = [0; 16];
+        assert_eq!(next.expand(b"next", &mut out), Ok(()));
+        assert_ne!(out, [0; 16]);
     }
 
     /// One 16 KiB buffer, as a file or a record is hashed.
     #[bench]
     fn digest_16k(b: &mut Bencher) {
         let data = [0x5a; 16 * 1024];
-        b.iter(|| digest(&data));
+        b.iter(|| digest384(&data));
     }
 
     /// The same under SHA-512: the same rounds, a wider digest.

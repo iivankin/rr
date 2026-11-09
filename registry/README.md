@@ -14,23 +14,25 @@ add declares it in src/base/mod.rs; the crate root declares `mod base;`.
 
 | Name | Needs | What |
 |---|---|---|
-| sha256 | cpu | SHA-256, HMAC, HKDF; SHA instructions where the CPU has them |
-| sha384 | cpu | SHA-384 and SHA-512, HMAC, HKDF-SHA384; SHA512 instructions where the CPU has them |
-| aesgcm | cpu | AES-128-GCM and AES-256-GCM in place; AES and carry-less multiply instructions, on 256-bit vectors where x86-64 has VAES, constant-time portable code elsewhere |
-| x25519 | | X25519 key agreement, constant time |
-| mlkem | | ML-KEM-768 key encapsulation (FIPS 203), constant time, for TLS's X25519MLKEM768; its own SHA-3 and SHAKE |
-| ecdh | | P-256 Diffie-Hellman for TLS key shares, constant time |
-| ecdsa | | ECDSA verification on P-256, P-384 and P-521 |
-| rsa | sha256, sha384 | RSA PKCS#1 v1.5 and PSS verification, 2048 to 8192 bits, SHA-256, SHA-384 or SHA-512 |
-| x509 | sha256, sha384, ecdsa, rsa | certificates, a store of anchors, chain verification for a host that yields an Approval (leaf and host, unforgeable); a Policy of revocations, distrust dates and imposed name constraints over other anchors or paths, a type of its own |
+| random | | the system's randomness: arc4random_buf, getrandom(2), ProcessPrng; seeds of 32 and 64 bytes that only it (or a test) makes, which keys are made from, wiped when dropped |
+| digest | | a digest that names its hash, SHA-256, SHA-384 or SHA-512, at its length: what ecdsa and rsa verify |
+| sha256 | cpu | SHA-256, HMAC with a constant-time verify, HKDF whose Expand takes only a Prk; SHA instructions where the CPU has them |
+| sha384 | cpu | SHA-384 and SHA-512 (digest384, digest512), HMAC with verify, HKDF-SHA384 by its Prk; SHA512 instructions where the CPU has them |
+| aesgcm | cpu | AES-128-GCM and AES-256-GCM in place: a SealingKey and an OpeningKey that number their own nonces (seal_with_nonce for the rest), a tag that must be used, key schedules wiped; AES and carry-less multiply instructions, on 256-bit vectors where x86-64 has VAES, constant-time portable code elsewhere |
+| x25519 | random | X25519 key agreement, constant time: a Secret from random's seed, a PublicKey, a SharedSecret only a key derivation takes, LowOrder refused |
+| mlkem | random | ML-KEM-768 key encapsulation (FIPS 203), constant time, for TLS's X25519MLKEM768: a key generated in place and an encapsulation, each from random's seed; its own SHA-3 and SHAKE |
+| ecdh | random | P-256 Diffie-Hellman for TLS key shares, constant time: a Secret from random's seed, a PublicKey checked as a point, a SharedSecret only a key derivation takes |
+| ecdsa | digest | ECDSA verification on P-256, P-384 and P-521 of a digest that names its hash; which part is wrong (key, encoding, signature) |
+| rsa | digest, sha256, sha384 | RSA PKCS#1 v1.5 and PSS verification, 2048 to 8192 bits, of a SHA-256, SHA-384 or SHA-512 digest that names its hash; which part is wrong |
+| x509 | digest, sha256, sha384, ecdsa, rsa | certificates, a store of anchors, chain verification for a host that yields an Approval (leaf and host, unforgeable); a Policy of revocations, distrust dates and imposed name constraints over other anchors or paths, a type of its own |
 | roots | x509 | Mozilla's trust anchors and OneCRL, with Chrome's announced distrusts and Firefox's imposed name constraints; policy(), an x509::Policy, for the system's anchors |
-| tls | sha256, sha384, aesgcm, x25519, mlkem, ecdh, x509; asks for trust or roots | TLS 1.3 client, AES-128-GCM and AES-256-GCM, with post-quantum X25519MLKEM768, bytes in any split, counts that must be used and loud errors for a step a loop forgets, eof that refuses a truncation; the chain verified by x509 or by the caller (the system, through trust) with an x509::Approval bound to the leaf and host; secrets wiped |
+| tls | random, sha256, sha384, aesgcm, x25519, mlkem, ecdh, x509; asks for trust or roots | TLS 1.3 client, its randomness drawn from random, AES-128-GCM and AES-256-GCM, with post-quantum X25519MLKEM768, bytes in any split, counts that must be used and loud errors for a step a loop forgets, eof that refuses a truncation; the chain verified by x509 or by the caller (the system, through trust) with an x509::Approval bound to the leaf and host; secrets wiped |
 | http1 | | HTTP/1.1 requests and an incremental response parser |
 | net | wait | TCP for a loop of many connections: a Listener and Streams that own their socket and their entry in a wait Set; non-blocking, not inherited, no SIGPIPE; errors by kind |
 | resolve | wait | host lookup that never blocks the loop, by the system: DNSServiceGetAddrInfo on macOS and GetAddrInfoExW on Windows, asynchronous and cancellable; getaddrinfo on a thread on Linux |
 | trust | x509, wait | the system verifies a chain, as Go does: SecTrust on macOS, CertGetCertificateChain on Windows, x509 with the system's roots on Linux or SSL_CERT_FILE's and SSL_CERT_DIR's anywhere; a policy (roots::policy) over either; a check that never blocks and answers with an x509::Approval, or verify_blocking off the loop |
 | wait | | what a program's loop waits on: a Set of many sockets with deadlines (epoll, kqueue, socket notifications or WSAPoll) and wakes from other threads; a component's Wait; a thread that signals when done |
-| cpu | | what the CPU has of the instructions the components use, asked once |
+| cpu | | what the CPU has of the instructions the components use, asked once, by Features only it names |
 
 ## A component
 
@@ -125,10 +127,20 @@ change is a line of the program.
 
 ## What a component here is
 
-- **No I/O of its own.** Bytes, time and random bytes come in as
-  arguments; bytes to send, data received and the next deadline go out.
-  The same component then serves a blocking loop, a poll loop or a
-  thread: the caller moves the bytes.
+- **No I/O of its own.** Bytes and time come in as arguments; bytes to
+  send, data received and the next deadline go out. The same component
+  then serves a blocking loop, a poll loop or a thread: the caller moves
+  the bytes.
+- **Randomness from random alone.** A key is made from random's Seed32
+  or Seed64, values only random makes, from the system's randomness
+  (random::seed32, seed64), never from bytes: a constant or a test
+  array does not compile where a key is made. A test or a fuzz target
+  makes a seed of a standard's vector by Seed32::for_tests, which only
+  cfg(test) and cfg(fuzzing) have. A protocol that needs randomness of
+  its own, as tls's ClientHello does, draws it from random, with a test
+  constructor beside for its replays. random's sys.rs is the one place
+  that asks the system, which never blocks once the system's pool is
+  ready at boot; random::wipe is the volatile wipe the others share.
 - **Its own errors.** A component does not name the project's error type;
   it returns its own small enum.
 - **Unsafe only in sys.** CPU instructions (AES, SHA, carry-less

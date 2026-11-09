@@ -4,7 +4,7 @@
 //! registry/ecdsa/ecdsa-gen.py in rr's repository writes this file
 //! from curve.rs.in beside it, which is where to change it.
 
-use super::{TABLE, mac, width};
+use super::{Error, TABLE, mac, width};
 
 /// The limbs of a number.
 const LIMBS: usize = 9;
@@ -44,16 +44,15 @@ struct Point {
     z: Fe,
 }
 
-/// Whether r and s, the signature's numbers as DER wrote them, sign hash
-/// under public, an uncompressed point 04 || X || Y. The hash is cut to
-/// the order's bits when longer (SEC 1 4.1.4 step 5), and may be of any
-/// length.
-pub(super) fn verify(public: &[u8], hash: &[u8], r: &[u8], s: &[u8]) -> bool {
+/// Ok when r and s, the signature's numbers as DER wrote them, sign hash
+/// under public, an uncompressed point 04 || X || Y: Key when public is
+/// not a point of the curve, Signature when r or s is outside [1, n - 1]
+/// or they do not sign hash. The hash is cut to the order's bits when
+/// longer (SEC 1 4.1.4 step 5), and may be of any length here.
+pub(super) fn verify(public: &[u8], hash: &[u8], r: &[u8], s: &[u8]) -> Result<(), Error> {
+    let q = public_point(public).ok_or(Error::Key)?;
     let (Some(r), Some(s)) = (scalar(r), scalar(s)) else {
-        return false;
-    };
-    let Some(q) = public_point(public) else {
-        return false;
+        return Err(Error::Signature);
     };
     let e = truncated(hash);
     // w = s^-1; u1 = e w and u2 = r w, all mod n. w goes into Montgomery
@@ -63,10 +62,10 @@ pub(super) fn verify(public: &[u8], hash: &[u8], r: &[u8], s: &[u8]) -> bool {
     let u2 = nmul(&r, &w);
     let mut sum = infinity();
     combine(&u1, &q, &u2, &mut sum);
-    if is_zero(&sum.z) {
-        return false;
+    if is_zero(&sum.z) || !x_matches(&sum, &r) {
+        return Err(Error::Signature);
     }
-    x_matches(&sum, &r)
+    Ok(())
 }
 
 /// A scalar of the signature as a number in [1, n - 1].

@@ -9,9 +9,25 @@
 //! by masks; decapsulation compares the ciphertexts by folding every
 //! byte and picks its result by a mask. Only the sampling of A, from the
 //! public seed rho, and the parsing of a key loop or branch on data.
+//!
+//! A key is generated from random's seed, in place, and an encapsulation
+//! takes random's seed too, never bytes of the caller's. Both sides get a
+//! SharedSecret, which is only input to a key derivation; it and the
+//! decapsulation key's secret parts are wiped when dropped.
+//!
+//! ```text
+//! let key = mlkem::DecapsulationKey::generate(random::seed64());
+//! send(&key.encapsulation_key());
+//! // The peer:
+//! let (ciphertext, theirs) = mlkem::encapsulate(&received, random::seed32())?;
+//! // Back here:
+//! let ours = key.decapsulate(&ciphertext);
+//! ```
+
+use crate::base::random;
 
 /// Bytes of the seed generate takes: d, then z (FIPS 203 Algorithm 19).
-pub const SEED_BYTES: usize = 64;
+pub const SEED_BYTES: usize = random::SEED64_BYTES;
 /// Bytes of an encapsulation key.
 pub const ENCAPSULATION_KEY_BYTES: usize = K * POLY_BYTES + 32;
 /// Bytes of a ciphertext.
@@ -19,7 +35,7 @@ pub const CIPHERTEXT_BYTES: usize = K * U_BYTES + V_BYTES;
 /// Bytes of the shared secret key, K in FIPS 203.
 pub const SHARED_KEY_BYTES: usize = 32;
 /// Bytes of the randomness m an encapsulation takes.
-pub const MESSAGE_BYTES: usize = 32;
+pub const MESSAGE_BYTES: usize = random::SEED32_BYTES;
 /// Bytes of a decapsulation key in FIPS 203's expanded encoding.
 pub const DECAPSULATION_KEY_BYTES: usize = K * POLY_BYTES + ENCAPSULATION_KEY_BYTES + 64;
 
@@ -118,6 +134,14 @@ const GAMMAS: [u16; 128] = [
     1874, 1455, 1029, 2300, 2110, 1219, 2935, 394, 885, 2444, 2154, 1175,
 ];
 
+/// What went wrong.
+#[cfg_attr(test, derive(Debug, PartialEq))]
+pub enum Error {
+    /// The key fails FIPS 203's checks (7.2, 7.3): a coefficient of q or
+    /// more, or a hash that is not the encapsulation key's.
+    Invalid,
+}
+
 /// An encapsulation key, parsed: t in the NTT domain, the matrix A
 /// sampled from rho, and H(ek) for the encapsulation.
 pub struct EncapsulationKey {
@@ -129,71 +153,114 @@ pub struct EncapsulationKey {
 }
 
 /// A decapsulation key: the encapsulation key it answers, the secret s
-/// in the NTT domain, and z for the implicit rejection.
+/// in the NTT domain, and z for the implicit rejection. About 7.8 KB:
+/// generate builds it where it is returned, and it is lent, not moved.
 pub struct DecapsulationKey {
     ek: EncapsulationKey,
     s: [Poly; K],
     z: [u8; 32],
 }
 
+/// The secret both sides reach: input to a key derivation, not a key.
+pub struct SharedSecret {
+    bytes: [u8; SHARED_KEY_BYTES],
+}
+
+impl SharedSecret {
+    /// The secret as a key derivation's input keying material.
+    pub fn kdf_input(&self) -> &[u8; SHARED_KEY_BYTES] {
+        &self.bytes
+    }
+}
+
+impl Drop for SharedSecret {
+    fn drop(&mut self) {
+        random::wipe(&mut self.bytes);
+    }
+}
+
+impl Drop for DecapsulationKey {
+    fn drop(&mut self) {
+        random::wipe_u16(self.s.as_flattened_mut());
+        random::wipe(&mut self.z);
+    }
+}
+
+/// ML-KEM.Encaps (FIPS 203 Algorithm 20) to the key's bytes, m being
+/// the seed: the ciphertext and the shared secret. Invalid when the key
+/// fails FIPS 203's check (7.2): a coefficient of q or more.
+pub fn encapsulate(
+    key: &[u8; ENCAPSULATION_KEY_BYTES],
+    seed: random::Seed32,
+) -> Result<([u8; CIPHERTEXT_BYTES], SharedSecret), Error> {
+    Ok(EncapsulationKey::parse(key)?.encapsulate(seed))
+}
+
 /// ML-KEM.KeyGen_internal (FIPS 203 Algorithms 16 and 13) from the
-/// seed d || z, 64 bytes of the system's randomness.
-pub fn generate(seed: &[u8; SEED_BYTES]) -> DecapsulationKey {
-    let (d, z) = halves(seed);
-    let g = sha3_512(&[&d, &[3]]);
-    let (rho, sigma) = halves(&g);
-    let a = matrix(&rho);
-    let mut s = [[0; N]; K];
-    let mut t = [[0; N]; K];
-    for (si, n) in s.iter_mut().zip(0..) {
-        *si = cbd(&sigma, n);
+/// seed d || z, in place: A, s and t are written where the key keeps
+/// them.
+fn keygen(seed: &[u8; SEED_BYTES]) -> DecapsulationKey {
+    let (mut d, z) = halves(seed);
+    let mut g = sha3_512(&[&d, &[3]]);
+    random::wipe(&mut d);
+    let (rho, mut sigma) = halves(&g);
+    random::wipe(&mut g);
+    let mut key = DecapsulationKey {
+        ek: EncapsulationKey {
+            t: [[0; N]; K],
+            a: [[[0; N]; K]; K],
+            rho,
+            h: [0; 32],
+        },
+        s: [[0; N]; K],
+        z,
+    };
+    matrix(&rho, &mut key.ek.a);
+    for (si, n) in key.s.iter_mut().zip(0..) {
+        cbd(&sigma, n, si);
         ntt(si);
     }
     // t = A s + e, e from the PRF's next three counters.
-    for ((ti, row), n) in t.iter_mut().zip(&a).zip(3..) {
-        *ti = cbd(&sigma, n);
+    for ((ti, row), n) in key.ek.t.iter_mut().zip(&key.ek.a).zip(3..) {
+        cbd(&sigma, n, ti);
         ntt(ti);
-        for (aij, sj) in row.iter().zip(&s) {
+        for (aij, sj) in row.iter().zip(&key.s) {
             multiply_add(ti, aij, sj);
         }
     }
-    let mut ek = EncapsulationKey {
-        t,
-        a,
-        rho,
-        h: [0; 32],
-    };
-    ek.h = sha3_256(&[&ek.bytes()]);
-    DecapsulationKey { ek, s, z }
+    random::wipe(&mut sigma);
+    key.ek.h = sha3_256(&[&key.ek.bytes()]);
+    key
 }
 
-/// ML-KEM.Encaps_internal (FIPS 203 Algorithm 17) to the key's bytes,
-/// m being 32 bytes of the system's randomness: the ciphertext and the
-/// shared secret. None when the key fails FIPS 203's check (7.2): a
-/// coefficient of q or more.
-pub fn encapsulate(
+/// Encaps_internal (FIPS 203 Algorithm 17) with m, for a standard's
+/// vectors.
+#[cfg(test)]
+fn encapsulate_with(
     key: &[u8; ENCAPSULATION_KEY_BYTES],
     m: &[u8; MESSAGE_BYTES],
 ) -> Option<([u8; CIPHERTEXT_BYTES], [u8; SHARED_KEY_BYTES])> {
-    Some(EncapsulationKey::parse(key)?.encapsulate(m))
+    let (c, shared) = EncapsulationKey::parse(key).ok()?.encapsulate_with(m);
+    Some((c, *shared.kdf_input()))
 }
 
 impl EncapsulationKey {
-    /// The key's bytes parsed, A sampled; None when a coefficient is q
-    /// or more (FIPS 203 7.2, the modulus check).
-    pub fn parse(bytes: &[u8; ENCAPSULATION_KEY_BYTES]) -> Option<Self> {
+    /// The key's bytes parsed, A sampled; Invalid when a coefficient is
+    /// q or more (FIPS 203 7.2, the modulus check).
+    pub fn parse(bytes: &[u8; ENCAPSULATION_KEY_BYTES]) -> Result<Self, Error> {
         let (polys, _) = bytes.as_chunks::<POLY_BYTES>();
-        let mut t = [[0; N]; K];
-        for (ti, chunk) in t.iter_mut().zip(polys) {
-            *ti = decode12(chunk)?;
-        }
-        let rho = *bytes.last_chunk::<32>()?;
-        Some(Self {
-            t,
-            a: matrix(&rho),
+        let rho = *bytes.last_chunk::<32>().ok_or(Error::Invalid)?;
+        let mut key = Self {
+            t: [[0; N]; K],
+            a: [[[0; N]; K]; K],
             rho,
             h: sha3_256(&[bytes]),
-        })
+        };
+        for (ti, chunk) in key.t.iter_mut().zip(polys) {
+            decode12(chunk, ti).ok_or(Error::Invalid)?;
+        }
+        matrix(&rho, &mut key.a);
+        Ok(key)
     }
 
     /// The key's encoding: ByteEncode12(t) || rho.
@@ -209,25 +276,35 @@ impl EncapsulationKey {
         out
     }
 
+    /// ML-KEM.Encaps (FIPS 203 Algorithm 20), m being the seed: the
+    /// ciphertext and the shared secret.
+    pub fn encapsulate(&self, seed: random::Seed32) -> ([u8; CIPHERTEXT_BYTES], SharedSecret) {
+        let mut m = seed.into_bytes();
+        let out = self.encapsulate_with(&m);
+        random::wipe(&mut m);
+        out
+    }
+
     /// Encaps_internal with m: the ciphertext and the shared secret.
-    pub fn encapsulate(
-        &self,
-        m: &[u8; MESSAGE_BYTES],
-    ) -> ([u8; CIPHERTEXT_BYTES], [u8; SHARED_KEY_BYTES]) {
-        let g = sha3_512(&[m, &self.h]);
-        let (shared, r) = halves(&g);
-        (self.encrypt(m, &r), shared)
+    fn encapsulate_with(&self, m: &[u8; MESSAGE_BYTES]) -> ([u8; CIPHERTEXT_BYTES], SharedSecret) {
+        let mut g = sha3_512(&[m, &self.h]);
+        let (bytes, mut r) = halves(&g);
+        random::wipe(&mut g);
+        let c = self.encrypt(m, &r);
+        random::wipe(&mut r);
+        (c, SharedSecret { bytes })
     }
 
     /// K-PKE.Encrypt (FIPS 203 Algorithm 14), A and t already parsed.
     fn encrypt(&self, m: &[u8; MESSAGE_BYTES], r: &[u8; 32]) -> [u8; CIPHERTEXT_BYTES] {
         let mut y = [[0; N]; K];
         for (yi, n) in y.iter_mut().zip(0..) {
-            *yi = cbd(r, n);
+            cbd(r, n, yi);
             ntt(yi);
         }
         let mut out = [0; CIPHERTEXT_BYTES];
         let (us, rest) = out.as_chunks_mut::<U_BYTES>();
+        let mut e = [0; N];
         // u = NTT^-1(A^T y) + e1, e1 from counters 3, 4 and 5.
         for ((chunk, i), n) in us.iter_mut().zip(0..K).zip(3..) {
             let mut u = [0; N];
@@ -236,7 +313,8 @@ impl EncapsulationKey {
                 multiply_add(&mut u, &row[i], yj);
             }
             inverse_ntt(&mut u);
-            add(&mut u, &cbd(r, n));
+            cbd(r, n, &mut e);
+            add(&mut u, &e);
             compress_encode10(&u, chunk);
         }
         // v = NTT^-1(t^T y) + e2 + Decompress1(m), e2 from counter 6.
@@ -245,7 +323,8 @@ impl EncapsulationKey {
             multiply_add(&mut v, ti, yi);
         }
         inverse_ntt(&mut v);
-        add(&mut v, &cbd(r, 6));
+        cbd(r, 6, &mut e);
+        add(&mut v, &e);
         add(&mut v, &decompress1(m));
         compress_encode4(&v, rest);
         out
@@ -253,6 +332,15 @@ impl EncapsulationKey {
 }
 
 impl DecapsulationKey {
+    /// ML-KEM.KeyGen (FIPS 203 Algorithm 19) from 64 bytes of the
+    /// system's randomness, d then z.
+    pub fn generate(seed: random::Seed64) -> DecapsulationKey {
+        let mut bytes = seed.into_bytes();
+        let key = keygen(&bytes);
+        random::wipe(&mut bytes);
+        key
+    }
+
     /// The encapsulation key's bytes, for the peer.
     pub fn encapsulation_key(&self) -> [u8; ENCAPSULATION_KEY_BYTES] {
         self.ek.bytes()
@@ -261,21 +349,26 @@ impl DecapsulationKey {
     /// ML-KEM.Decaps_internal (FIPS 203 Algorithm 18): the shared secret.
     /// A ciphertext that does not re-encrypt to itself gives
     /// J(z || c), a secret the peer cannot know, in the same time.
-    pub fn decapsulate(&self, ciphertext: &[u8; CIPHERTEXT_BYTES]) -> [u8; SHARED_KEY_BYTES] {
-        let m = self.decrypt(ciphertext);
-        let g = sha3_512(&[&m, &self.ek.h]);
-        let (shared, r) = halves(&g);
+    pub fn decapsulate(&self, ciphertext: &[u8; CIPHERTEXT_BYTES]) -> SharedSecret {
+        let mut m = self.decrypt(ciphertext);
+        let mut g = sha3_512(&[&m, &self.ek.h]);
+        let (shared, mut r) = halves(&g);
+        random::wipe(&mut g);
         let mut rejected = [0; SHARED_KEY_BYTES];
         shake256(&[&self.z, ciphertext], &mut rejected);
         let again = self.ek.encrypt(&m, &r);
+        random::wipe(&mut m);
+        random::wipe(&mut r);
         let differ = ciphertext
             .iter()
             .zip(&again)
             .fold(0, |acc, (x, y)| acc | (x ^ y));
         // 0xff when the ciphertexts are equal, 0 when not, by arithmetic.
         let mask = core::hint::black_box(u16::from(differ).wrapping_sub(1) >> 8);
-        let mut out = [0; SHARED_KEY_BYTES];
-        for ((o, k), j) in out.iter_mut().zip(shared).zip(rejected) {
+        let mut out = SharedSecret {
+            bytes: [0; SHARED_KEY_BYTES],
+        };
+        for ((o, k), j) in out.bytes.iter_mut().zip(shared).zip(rejected) {
             *o = narrow((u16::from(k) & mask) | (u16::from(j) & !mask));
         }
         out
@@ -325,23 +418,26 @@ impl DecapsulationKey {
     /// A key in the expanded encoding, checked as FIPS 203's 7.3 asks:
     /// H of the encapsulation key inside it is the H that follows it.
     /// The encapsulation key passes the modulus check, and s too.
-    pub fn from_expanded(bytes: &[u8; DECAPSULATION_KEY_BYTES]) -> Option<Self> {
-        let (s_bytes, rest) = bytes.split_first_chunk::<{ K * POLY_BYTES }>()?;
-        let (ek_bytes, rest) = rest.split_first_chunk::<ENCAPSULATION_KEY_BYTES>()?;
-        let (h, z) = rest.split_first_chunk::<32>()?;
-        let ek = EncapsulationKey::parse(ek_bytes)?;
-        if ek.h != *h {
-            return None;
+    pub fn from_expanded(bytes: &[u8; DECAPSULATION_KEY_BYTES]) -> Result<Self, Error> {
+        let (s_bytes, rest) = bytes
+            .split_first_chunk::<{ K * POLY_BYTES }>()
+            .ok_or(Error::Invalid)?;
+        let (ek_bytes, rest) = rest
+            .split_first_chunk::<ENCAPSULATION_KEY_BYTES>()
+            .ok_or(Error::Invalid)?;
+        let (h, z) = rest.split_first_chunk::<32>().ok_or(Error::Invalid)?;
+        let mut key = Self {
+            ek: EncapsulationKey::parse(ek_bytes)?,
+            s: [[0; N]; K],
+            z: *z.first_chunk::<32>().ok_or(Error::Invalid)?,
+        };
+        if key.ek.h != *h {
+            return Err(Error::Invalid);
         }
-        let mut s = [[0; N]; K];
-        for (si, chunk) in s.iter_mut().zip(s_bytes.as_chunks::<POLY_BYTES>().0) {
-            *si = decode12(chunk)?;
+        for (si, chunk) in key.s.iter_mut().zip(s_bytes.as_chunks::<POLY_BYTES>().0) {
+            decode12(chunk, si).ok_or(Error::Invalid)?;
         }
-        Some(Self {
-            ek,
-            s,
-            z: *z.first_chunk::<32>()?,
-        })
+        Ok(key)
     }
 }
 
@@ -355,25 +451,23 @@ fn halves(bytes: &[u8; 64]) -> ([u8; 32], [u8; 32]) {
     (a, b)
 }
 
-/// A, a[i][j] = SampleNTT(rho || j || i) (FIPS 203 Algorithm 13 step 4).
-fn matrix(rho: &[u8; 32]) -> [[Poly; K]; K] {
-    let mut a = [[[0; N]; K]; K];
+/// A into a, a[i][j] = SampleNTT(rho || j || i) (FIPS 203 Algorithm 13
+/// step 4).
+fn matrix(rho: &[u8; 32], a: &mut [[Poly; K]; K]) {
     for (row, i) in a.iter_mut().zip(0..) {
         for (aij, j) in row.iter_mut().zip(0..) {
-            *aij = sample_ntt(rho, j, i);
+            sample_ntt(rho, j, i, aij);
         }
     }
-    a
 }
 
-/// SampleNTT (FIPS 203 Algorithm 7): 12-bit values from SHAKE128,
-/// those below q kept, until there are N. The seed is public.
-fn sample_ntt(rho: &[u8; 32], j: u8, i: u8) -> Poly {
+/// SampleNTT (FIPS 203 Algorithm 7) into f: 12-bit values from
+/// SHAKE128, those below q kept, until there are N. The seed is public.
+fn sample_ntt(rho: &[u8; 32], j: u8, i: u8, f: &mut Poly) {
     let mut xof = Sponge::new(RATE_SHAKE128);
     xof.absorb(rho);
     xof.absorb(&[j, i]);
     xof.pad(SUFFIX_SHAKE);
-    let mut f = [0; N];
     let mut slots = f.iter_mut();
     let mut block = [0; RATE_SHAKE128];
     // About 3 blocks; rejection makes more, rarely (CCTV's unlucky).
@@ -394,15 +488,14 @@ fn sample_ntt(rho: &[u8; 32], j: u8, i: u8) -> Poly {
             }
         }
     }
-    f
 }
 
-/// SamplePolyCBD with eta = 2 (FIPS 203 Algorithm 8) of PRF(seed, n):
-/// each coefficient the sum of two bits less the sum of two others.
-fn cbd(seed: &[u8; 32], n: u8) -> Poly {
+/// SamplePolyCBD with eta = 2 (FIPS 203 Algorithm 8) of PRF(seed, n),
+/// into f: each coefficient the sum of two bits less the sum of two
+/// others.
+fn cbd(seed: &[u8; 32], n: u8, f: &mut Poly) {
     let mut bytes = [0; CBD_BYTES];
     shake256(&[seed, &[n]], &mut bytes);
-    let mut f = [0; N];
     for (pair, byte) in f.as_chunks_mut::<2>().0.iter_mut().zip(bytes) {
         let b = u16::from(byte);
         let bit = |k: u16| (b >> k) & 1;
@@ -411,7 +504,6 @@ fn cbd(seed: &[u8; 32], n: u8) -> Poly {
             sub(bit(4) + bit(5), bit(6) + bit(7)),
         ];
     }
-    f
 }
 
 /// The NTT (FIPS 203 Algorithm 9), in place.
@@ -540,8 +632,7 @@ fn encode12(f: &Poly, out: &mut [u8; POLY_BYTES]) {
 
 /// ByteDecode12 (FIPS 203 Algorithm 6); None for a coefficient of q or
 /// more, which the modulus check refuses.
-fn decode12(bytes: &[u8; POLY_BYTES]) -> Option<Poly> {
-    let mut f = [0; N];
+fn decode12(bytes: &[u8; POLY_BYTES], f: &mut Poly) -> Option<()> {
     for (pair, &[b0, b1, b2]) in f
         .as_chunks_mut::<2>()
         .0
@@ -555,7 +646,7 @@ fn decode12(bytes: &[u8; POLY_BYTES]) -> Option<Poly> {
         }
         *pair = [a, b];
     }
-    Some(f)
+    Some(())
 }
 
 /// Compress10 then ByteEncode10: four coefficients in 5 bytes.
@@ -799,9 +890,10 @@ mod tests {
     use super::{
         CIPHERTEXT_BYTES, DECAPSULATION_KEY_BYTES, DecapsulationKey, ENCAPSULATION_KEY_BYTES,
         EncapsulationKey, K, MESSAGE_BYTES, N, POLY_BYTES, Q, RATE_SHAKE128, SEED_BYTES,
-        SHARED_KEY_BYTES, SUFFIX_SHAKE, Sponge, decode12, encapsulate, encode12, generate,
-        sha3_256, sha3_512, shake256, sponge,
+        SUFFIX_SHAKE, Sponge, decode12, encapsulate, encapsulate_with, encode12, keygen, sha3_256,
+        sha3_512, shake256, sponge,
     };
+    use crate::base::random::{self, Seed32, Seed64};
     use test::Bencher;
 
     /// Wycheproof's and NIST ACVP's vectors; mlkem-tests.py
@@ -903,7 +995,7 @@ mod tests {
 
     /// The key generated from seed, with the SHA3-256 of its encodings.
     fn check_keygen(seed: &str, ekh: &str, dkh: &str) -> DecapsulationKey {
-        let dk = generate(&h64(seed));
+        let dk = keygen(&h64(seed));
         assert_eq!(sha3_256(&[&dk.encapsulation_key()]), h32(ekh), "{seed}");
         if dkh != "-" {
             assert_eq!(sha3_256(&[&dk.expanded()]), h32(dkh), "{seed}");
@@ -928,31 +1020,35 @@ mod tests {
             match f[0] {
                 "kem" => {
                     let dk = check_keygen(f[1], f[3], f[4]);
-                    let (c, k) = encapsulate(&dk.encapsulation_key(), &h32(f[2]))
+                    let (c, k) = encapsulate_with(&dk.encapsulation_key(), &h32(f[2]))
                         .expect("a generated key is valid");
                     assert_eq!(sha3_256(&[&c]), h32(f[5]), "{line}");
                     assert_eq!(k, h32(f[6]), "{line}");
-                    assert_eq!(dk.decapsulate(&c), k, "{line}");
+                    assert_eq!(*dk.decapsulate(&c).kdf_input(), k, "{line}");
                 }
                 "keygen" => {
                     check_keygen(f[1], f[2], f[3]);
                 }
                 "decaps" => {
-                    let dk = generate(&h64(f[1]));
-                    assert_eq!(dk.decapsulate(&ciphertext(f[2])), h32(f[3]), "{line}");
+                    let dk = keygen(&h64(f[1]));
+                    assert_eq!(
+                        *dk.decapsulate(&ciphertext(f[2])).kdf_input(),
+                        h32(f[3]),
+                        "{line}"
+                    );
                 }
                 "flip" => {
-                    let dk = generate(&h64(f[1]));
-                    let (mut c, k) = encapsulate(&dk.encapsulation_key(), &h32(f[2]))
+                    let dk = keygen(&h64(f[1]));
+                    let (mut c, k) = encapsulate_with(&dk.encapsulation_key(), &h32(f[2]))
                         .expect("a generated key is valid");
                     let at: usize = f[3].parse().expect("a position");
                     c[at] ^= u8::from_str_radix(f[4], 16).expect("a byte");
-                    let rejected = dk.decapsulate(&c);
+                    let rejected = *dk.decapsulate(&c).kdf_input();
                     assert_ne!(rejected, k, "{line}");
                     assert_eq!(rejected, h32(f[5]), "{line}");
                 }
                 "unreduced" => {
-                    let ek = generate(&h64(f[1])).encapsulation_key();
+                    let ek = keygen(&h64(f[1])).encapsulation_key();
                     let mut bad = ek;
                     let (polys, _) = bad.as_chunks_mut::<POLY_BYTES>();
                     for chunk in polys {
@@ -964,23 +1060,26 @@ mod tests {
                         }
                         encode12(&t, chunk);
                     }
-                    assert!(encapsulate(&bad, &[0; MESSAGE_BYTES]).is_none(), "{line}");
+                    assert!(
+                        encapsulate_with(&bad, &[0; MESSAGE_BYTES]).is_none(),
+                        "{line}"
+                    );
                 }
                 "base" => {
                     hex(f[1], &mut base);
-                    assert!(EncapsulationKey::parse(&base).is_some());
+                    assert!(EncapsulationKey::parse(&base).is_ok());
                 }
                 "overflow" => {
                     let at: usize = f[1].parse().expect("a position");
                     let value: u16 = f[2].parse().expect("a value");
                     assert!(
-                        encapsulate(&set(&base, at, value), &[0; 32]).is_none(),
+                        encapsulate_with(&set(&base, at, value), &[0; 32]).is_none(),
                         "{line}"
                     );
                 }
                 "encaps" => {
-                    let (c, k) =
-                        encapsulate(&encapsulation_key(f[1]), &h32(f[2])).expect("a valid key");
+                    let (c, k) = encapsulate_with(&encapsulation_key(f[1]), &h32(f[2]))
+                        .expect("a valid key");
                     assert_eq!(sha3_256(&[&c]), h32(f[3]), "{line}");
                     assert_eq!(k, h32(f[4]), "{line}");
                 }
@@ -988,22 +1087,26 @@ mod tests {
                     hex(f[1], &mut last);
                     let dk = DecapsulationKey::from_expanded(&last).expect("a valid key");
                     assert_eq!(dk.expanded(), last);
-                    assert_eq!(dk.decapsulate(&ciphertext(f[2])), h32(f[3]), "{line}");
+                    assert_eq!(
+                        *dk.decapsulate(&ciphertext(f[2])).kdf_input(),
+                        h32(f[3]),
+                        "{line}"
+                    );
                 }
                 "corrupt" => {
                     let mut bad = last;
                     let at: usize = f[1].parse().expect("a position");
                     bad[at] ^= u8::from_str_radix(f[2], 16).expect("a byte");
-                    assert!(DecapsulationKey::from_expanded(&bad).is_none(), "{line}");
+                    assert!(DecapsulationKey::from_expanded(&bad).is_err(), "{line}");
                 }
                 "ekcheck" => {
                     let ek = encapsulation_key(f[1]);
-                    assert_eq!(EncapsulationKey::parse(&ek).is_some(), f[2] == "1");
+                    assert_eq!(EncapsulationKey::parse(&ek).is_ok(), f[2] == "1");
                 }
                 "dkcheck" => {
                     let mut dk = [0; DECAPSULATION_KEY_BYTES];
                     hex(f[1], &mut dk);
-                    assert_eq!(DecapsulationKey::from_expanded(&dk).is_some(), f[2] == "1");
+                    assert_eq!(DecapsulationKey::from_expanded(&dk).is_ok(), f[2] == "1");
                 }
                 other => panic!("unknown line {other}"),
             }
@@ -1047,21 +1150,21 @@ mod tests {
     /// value from q to 2^12 - 1, each alone, is refused.
     #[test]
     fn modulus() {
-        let ek = generate(&[7; SEED_BYTES]).encapsulation_key();
-        assert!(encapsulate(&ek, &[0; 32]).is_some());
+        let ek = keygen(&[7; SEED_BYTES]).encapsulation_key();
+        assert!(encapsulate_with(&ek, &[0; 32]).is_some());
         let values = 4096 - usize::from(Q);
         for at in 0..K * N {
             let value = Q + u16::try_from(at % values).unwrap_or(0);
             assert!(
-                EncapsulationKey::parse(&set(&ek, at, value)).is_none(),
+                EncapsulationKey::parse(&set(&ek, at, value)).is_err(),
                 "{at}"
             );
         }
         // And a coefficient of q - 1 is taken.
-        assert!(EncapsulationKey::parse(&set(&ek, 5, Q - 1)).is_some());
+        assert!(EncapsulationKey::parse(&set(&ek, 5, Q - 1)).is_ok());
         let mut chunk = [0; POLY_BYTES];
         encode12(&[Q - 1; N], &mut chunk);
-        assert!(decode12(&chunk).is_some());
+        assert!(decode12(&chunk, &mut [0; N]).is_some());
     }
 
     /// Go's accumulated vectors (crypto/mlkem's TestAccumulated, at
@@ -1076,16 +1179,16 @@ mod tests {
         let mut random = [0; CIPHERTEXT_BYTES];
         for _ in 0..n {
             rng.squeeze(&mut seed);
-            let dk = generate(&seed);
+            let dk = keygen(&seed);
             let ek = dk.encapsulation_key();
             acc.absorb(&ek);
             rng.squeeze(&mut m);
-            let (c, k) = encapsulate(&ek, &m).expect("a generated key is valid");
+            let (c, k) = encapsulate_with(&ek, &m).expect("a generated key is valid");
             acc.absorb(&c);
             acc.absorb(&k);
-            assert_eq!(dk.decapsulate(&c), k);
+            assert_eq!(*dk.decapsulate(&c).kdf_input(), k);
             rng.squeeze(&mut random);
-            acc.absorb(&dk.decapsulate(&random));
+            acc.absorb(dk.decapsulate(&random).kdf_input());
         }
         acc.pad(SUFFIX_SHAKE);
         let mut out = [0; 32];
@@ -1111,24 +1214,59 @@ mod tests {
         );
     }
 
+    /// As TLS uses it: the client's key from the system's randomness,
+    /// its encapsulation key sent, the server's encapsulation to it with
+    /// its own randomness, the client's decapsulation: one secret. A
+    /// changed ciphertext gives another secret, as it must, in the same
+    /// time; a changed key is refused; the public functions give what
+    /// the vectors' internal ones do.
+    #[test]
+    fn exchange() {
+        let client = DecapsulationKey::generate(random::seed64());
+        let sent = client.encapsulation_key();
+        let (mut ciphertext, server) = encapsulate(&sent, random::seed32()).unwrap();
+        let ours = client.decapsulate(&ciphertext);
+        assert_eq!(ours.kdf_input(), server.kdf_input());
+        ciphertext[7] ^= 1;
+        assert_ne!(
+            client.decapsulate(&ciphertext).kdf_input(),
+            server.kdf_input()
+        );
+        let mut bad = sent;
+        bad[1] = 0xff;
+        bad[2] |= 0x0f;
+        assert_eq!(
+            encapsulate(&bad, random::seed32()).err(),
+            Some(super::Error::Invalid)
+        );
+        let seed = [9; SEED_BYTES];
+        let made = DecapsulationKey::generate(Seed64::for_tests(seed));
+        assert_eq!(made.expanded(), keygen(&seed).expanded());
+        let ek = EncapsulationKey::parse(&made.encapsulation_key()).unwrap();
+        let (c, k) = ek.encapsulate(Seed32::for_tests([4; MESSAGE_BYTES]));
+        let (c2, k2) = encapsulate_with(&made.encapsulation_key(), &[4; MESSAGE_BYTES]).unwrap();
+        assert_eq!((c, *k.kdf_input()), (c2, k2));
+        assert_eq!(*made.decapsulate(&c).kdf_input(), k2);
+    }
+
     #[bench]
-    fn keygen(b: &mut Bencher) {
+    fn generate(b: &mut Bencher) {
         let seed = [42; SEED_BYTES];
-        b.iter(|| generate(core::hint::black_box(&seed)).z);
+        b.iter(|| keygen(core::hint::black_box(&seed)).z);
     }
 
     #[bench]
     fn encaps(b: &mut Bencher) {
-        let ek = generate(&[42; SEED_BYTES]).encapsulation_key();
+        let ek = keygen(&[42; SEED_BYTES]).encapsulation_key();
         let m = [3; MESSAGE_BYTES];
-        b.iter(|| encapsulate(core::hint::black_box(&ek), &m).map(|(_, k)| k));
+        b.iter(|| encapsulate_with(core::hint::black_box(&ek), &m).map(|(_, k)| k));
     }
 
     #[bench]
     fn decaps(b: &mut Bencher) {
-        let dk = generate(&[42; SEED_BYTES]);
-        let (c, _) = encapsulate(&dk.encapsulation_key(), &[3; MESSAGE_BYTES])
+        let dk = keygen(&[42; SEED_BYTES]);
+        let (c, _) = encapsulate_with(&dk.encapsulation_key(), &[3; MESSAGE_BYTES])
             .expect("a generated key is valid");
-        b.iter(|| -> [u8; SHARED_KEY_BYTES] { dk.decapsulate(core::hint::black_box(&c)) });
+        b.iter(|| dk.decapsulate(core::hint::black_box(&c)));
     }
 }

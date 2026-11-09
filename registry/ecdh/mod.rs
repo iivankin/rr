@@ -12,6 +12,21 @@
 //! limbs in Montgomery form, multiplied by word-by-word Montgomery
 //! reduction with masked final subtraction. The peer's point is public:
 //! it is checked, and a refusal returns at once.
+//!
+//! A Secret is made from random's seed, a PublicKey is the peer's bytes
+//! checked as a point, and agree gives a SharedSecret, which is only
+//! input to a key derivation. Secret and SharedSecret are not Copy,
+//! Clone or Debug, and are wiped when dropped; X25519's are x25519's
+//! own types, so one cannot stand for the other.
+//!
+//! ```text
+//! let secret = ecdh::Secret::new(random::seed64());
+//! send(secret.public_key().bytes());
+//! let peer = ecdh::PublicKey::parse(bytes)?;          // Err(Invalid)
+//! let prk = sha256::hkdf_extract(salt, secret.agree(&peer).kdf_input());
+//! ```
+
+use crate::base::random;
 
 /// Bytes of a secret scalar and of a shared secret.
 pub const SECRET_BYTES: usize = 32;
@@ -89,48 +104,146 @@ const INFINITY: Point = Point {
     z: [0; 4],
 };
 
-/// The public key of secret, uncompressed. None when secret, read
-/// big-endian, is 0 or at least n: the caller takes 32 new random bytes
-/// and asks again, as NIST SP 800-56A Rev. 3 5.6.1.2.2 (key pairs by
-/// testing candidates) and Go's crypto/ecdh do. Random bytes are refused
-/// with a chance below 2^-32.
-pub fn public_key(secret: &[u8; SECRET_BYTES]) -> Option<[u8; PUBLIC_BYTES]> {
-    let k = scalar(secret)?;
-    let base = Point {
-        x: GX,
-        y: GY,
-        z: ONE,
-    };
-    let (x, y) = affine(&multiply(&k, &base))?;
-    let mut out = [0; PUBLIC_BYTES];
-    out[0] = 4;
-    out[1..33].copy_from_slice(&store(&x));
-    out[33..].copy_from_slice(&store(&y));
-    Some(out)
+/// What went wrong.
+#[cfg_attr(test, derive(Debug, PartialEq))]
+pub enum Error {
+    /// The peer's key is not an uncompressed point of the curve (65
+    /// bytes, coordinates below p, on the curve), which TLS 1.3 must
+    /// abort on (RFC 9846 4.3.8.2): compressed points are refused.
+    Invalid,
 }
 
-/// The secret shared with peer, a public key as TLS carries it: the
-/// x-coordinate of secret times peer. None when secret is not one
-/// public_key takes, and when peer is not an uncompressed point of the
-/// curve (65 bytes, coordinates below p, on the curve), which TLS 1.3
-/// must abort on (RFC 9846 4.3.8.2): compressed points are refused.
-#[cfg_attr(rr, rr::hot)]
-pub fn shared(secret: &[u8; SECRET_BYTES], peer: &[u8]) -> Option<[u8; SHARED_BYTES]> {
-    let k = scalar(secret)?;
-    let point = peer_point(peer)?;
-    let (x, _) = affine(&multiply(&k, &point))?;
-    Some(store(&x))
+/// A secret scalar in [1, n - 1], big-endian.
+pub struct Secret {
+    k: [u8; SECRET_BYTES],
 }
 
-/// The scalar as 64-bit words, or None when it is 0 or at least n. The
-/// comparison is a masked subtraction: the time does not tell where a
-/// valid scalar differs from n.
-fn scalar(secret: &[u8; SECRET_BYTES]) -> Option<Fe> {
-    let k = load(secret);
-    let (_, below) = sub_words(&k, &N);
+/// A peer's public key, checked: a point of the curve, of order n.
+pub struct PublicKey {
+    bytes: [u8; PUBLIC_BYTES],
+    point: Point,
+}
+
+/// The x-coordinate two keys agree on: input to a key derivation, not a
+/// key.
+pub struct SharedSecret {
+    bytes: [u8; SHARED_BYTES],
+}
+
+impl Secret {
+    /// A secret from 64 random bytes: the first 32, read big-endian, when
+    /// they are in [1, n - 1]; else the second 32 (NIST SP 800-56A Rev. 3
+    /// 5.6.1.2.2, key pairs by testing candidates, as Go's crypto/ecdh
+    /// draws them); else, once in 2^64, the second less n, made odd, a
+    /// number in [1, 2^256 - n]. Picked by masks: the time does not say
+    /// which.
+    pub fn new(seed: random::Seed64) -> Secret {
+        let mut bytes = seed.into_bytes();
+        let (first, second) = bytes.split_at(SECRET_BYTES);
+        let (c1, c2) = (load(first), load(second));
+        random::wipe(&mut bytes);
+        let (m1, m2) = (valid(&c1).wrapping_neg(), valid(&c2).wrapping_neg());
+        let (mut fallback, _) = sub_words(&c2, &N);
+        fallback[0] |= 1;
+        let mut k = [0; 4];
+        for (((word, x), y), z) in k.iter_mut().zip(c1).zip(c2).zip(fallback) {
+            *word = (x & m1) | (y & !m1 & m2) | (z & !m1 & !m2);
+        }
+        Secret { k: store(&k) }
+    }
+
+    /// The public key, uncompressed: 4, x and y.
+    #[must_use]
+    pub fn public_key(&self) -> PublicKey {
+        let base = Point {
+            x: GX,
+            y: GY,
+            z: ONE,
+        };
+        let point = multiply(&load(&self.k), &base);
+        let Some((x, y)) = affine(&point) else {
+            // rr: escape(panic): k is in [1, n - 1] and G of order n, so
+            // k G is never the point at infinity.
+            unreachable!();
+        };
+        let mut bytes = [0; PUBLIC_BYTES];
+        bytes[0] = 4;
+        bytes[1..33].copy_from_slice(&store(&x));
+        bytes[33..].copy_from_slice(&store(&y));
+        PublicKey { bytes, point }
+    }
+
+    /// The x-coordinate of the secret times peer.
+    #[cfg_attr(rr, rr::hot)]
+    #[must_use]
+    pub fn agree(&self, peer: &PublicKey) -> SharedSecret {
+        let product = multiply(&load(&self.k), &peer.point);
+        let Some((x, _)) = affine(&product) else {
+            // rr: escape(panic): k is in [1, n - 1] and a checked point's
+            // order is n (the cofactor is 1): never the point at infinity.
+            unreachable!();
+        };
+        SharedSecret { bytes: store(&x) }
+    }
+
+    /// The secret of a given scalar, for a standard's vectors; None
+    /// outside [1, n - 1].
+    #[cfg(test)]
+    fn from_scalar(bytes: &[u8; SECRET_BYTES]) -> Option<Secret> {
+        scalar(bytes)?;
+        Some(Secret { k: *bytes })
+    }
+}
+
+impl PublicKey {
+    /// The peer's key: 4 || x || y with x and y below p, on the curve.
+    pub fn parse(bytes: &[u8]) -> Result<PublicKey, Error> {
+        let point = peer_point(bytes).ok_or(Error::Invalid)?;
+        let Ok(bytes) = <[u8; PUBLIC_BYTES]>::try_from(bytes) else {
+            return Err(Error::Invalid);
+        };
+        Ok(PublicKey { bytes, point })
+    }
+
+    /// The key's bytes, to send.
+    pub fn bytes(&self) -> &[u8; PUBLIC_BYTES] {
+        &self.bytes
+    }
+}
+
+impl SharedSecret {
+    /// The secret as a key derivation's input keying material.
+    pub fn kdf_input(&self) -> &[u8; SHARED_BYTES] {
+        &self.bytes
+    }
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        random::wipe(&mut self.k);
+    }
+}
+
+impl Drop for SharedSecret {
+    fn drop(&mut self) {
+        random::wipe(&mut self.bytes);
+    }
+}
+
+/// 1 when k is in [1, n - 1], 0 when not, by arithmetic: the time does
+/// not tell where a valid scalar differs from n.
+fn valid(k: &Fe) -> u64 {
+    let (_, below) = sub_words(k, &N);
     let any = k.iter().fold(0, |acc, word| acc | word);
     let nonzero = (any | any.wrapping_neg()) >> 63;
-    if below & nonzero == 1 { Some(k) } else { None }
+    below & nonzero
+}
+
+/// The scalar as 64-bit words, or None when it is 0 or at least n.
+#[cfg(test)]
+fn scalar(secret: &[u8; SECRET_BYTES]) -> Option<Fe> {
+    let k = load(secret);
+    if valid(&k) == 1 { Some(k) } else { None }
 }
 
 /// peer as a point, or None when it is not 4 || x || y with x and y below
@@ -297,8 +410,8 @@ fn double(p: &Point) -> Point {
     }
 }
 
-/// Four big-endian words as little-endian limbs.
-fn load(bytes: &[u8; 32]) -> Fe {
+/// 32 big-endian bytes, the first of bytes, as four little-endian limbs.
+fn load(bytes: &[u8]) -> Fe {
     let mut out = [0; 4];
     for (word, chunk) in out.iter_mut().rev().zip(bytes.as_chunks::<8>().0) {
         *word = u64::from_be_bytes(*chunk);
@@ -426,8 +539,21 @@ fn invert(a: &Fe) -> Fe {
 
 #[cfg(test)]
 mod tests {
-    use super::{PUBLIC_BYTES, SECRET_BYTES, public_key, shared};
+    use super::{Error, N, PUBLIC_BYTES, PublicKey, SECRET_BYTES, Secret, store};
+    use crate::base::random::{self, Seed64};
     use test::Bencher;
+
+    /// The public key of a scalar, or None outside [1, n - 1].
+    fn public_key(k: &[u8; SECRET_BYTES]) -> Option<[u8; PUBLIC_BYTES]> {
+        Some(*Secret::from_scalar(k)?.public_key().bytes())
+    }
+
+    /// The secret a scalar shares with peer's bytes, or None when the
+    /// scalar or the point is refused.
+    fn shared(k: &[u8; SECRET_BYTES], peer: &[u8]) -> Option<[u8; 32]> {
+        let peer = PublicKey::parse(peer).ok()?;
+        Some(*Secret::from_scalar(k)?.agree(&peer).kdf_input())
+    }
 
     /// Cases of ecdh-wycheproof.txt: Wycheproof's and NIST CAVP's.
     const VECTORS: &str = include_str!("ecdh-wycheproof.txt");
@@ -571,18 +697,76 @@ mod tests {
         assert_eq!(shared(&a, &pb), shared(&b, &pa));
     }
 
+    /// A seed's first half when it is a scalar, else its second, else
+    /// the second less n, odd: always a scalar in [1, n - 1].
+    #[test]
+    fn seeds() {
+        let n = store(&N);
+        let mut one = [0; SECRET_BYTES];
+        one[31] = 1;
+        let key = |first: &[u8; 32], second: &[u8; 32]| {
+            let mut seed = [0; 64];
+            seed[..32].copy_from_slice(first);
+            seed[32..].copy_from_slice(second);
+            Secret::new(Seed64::for_tests(seed)).k
+        };
+        assert_eq!(key(&[7; 32], &[9; 32]), [7; 32]);
+        assert_eq!(key(&n, &[9; 32]), [9; 32]);
+        assert_eq!(key(&[0; 32], &one), one);
+        assert_eq!(key(&[0xff; 32], &[0xff; 32])[..4], [0, 0, 0, 0]);
+        // Neither: 0 less n is 2^256 - n, odd already; n less n is 0,
+        // made 1.
+        let mut expected = n;
+        for byte in &mut expected {
+            *byte = !*byte;
+        }
+        let complement = |bytes: &mut [u8; 32]| {
+            for byte in bytes.iter_mut().rev() {
+                let (sum, carry) = byte.overflowing_add(1);
+                *byte = sum;
+                if !carry {
+                    break;
+                }
+            }
+        };
+        complement(&mut expected);
+        assert_eq!(key(&n, &[0; 32]), expected);
+        assert_eq!(key(&[0; 32], &n), one);
+        for _ in 0..8 {
+            let secret = Secret::new(random::seed64());
+            assert!(Secret::from_scalar(&secret.k).is_some());
+        }
+    }
+
+    /// As TLS uses it: each side's secret from the system, the public
+    /// keys exchanged and parsed, one secret agreed on; a key that is not
+    /// a point is refused at parse.
+    #[test]
+    fn exchange() {
+        let (alice, bob) = (Secret::new(random::seed64()), Secret::new(random::seed64()));
+        let to_bob = PublicKey::parse(alice.public_key().bytes()).unwrap();
+        let to_alice = PublicKey::parse(bob.public_key().bytes()).unwrap();
+        let ours = alice.agree(&to_alice);
+        assert_eq!(ours.kdf_input(), bob.agree(&to_bob).kdf_input());
+        assert_eq!(alice.agree(&to_alice).kdf_input(), ours.kdf_input());
+        let mut bad = *to_alice.bytes();
+        bad[64] ^= 1;
+        assert_eq!(PublicKey::parse(&bad).err(), Some(Error::Invalid));
+        assert_eq!(PublicKey::parse(&bad[..33]).err(), Some(Error::Invalid));
+    }
+
     /// One public key, as a TLS client makes for its key share.
     #[bench]
     fn one_public_key(b: &mut Bencher) {
-        let secret = [42; SECRET_BYTES];
-        b.iter(|| public_key(core::hint::black_box(&secret)));
+        let secret = Secret::from_scalar(&[42; SECRET_BYTES]).unwrap();
+        b.iter(|| core::hint::black_box(&secret).public_key());
     }
 
     /// One key agreement.
     #[bench]
     fn one_shared(b: &mut Bencher) {
-        let secret = [42; SECRET_BYTES];
-        let peer = public_key(&[3; SECRET_BYTES]).expect("a scalar");
-        b.iter(|| shared(core::hint::black_box(&secret), &peer));
+        let secret = Secret::from_scalar(&[42; SECRET_BYTES]).unwrap();
+        let peer = PublicKey::parse(&public_key(&[3; SECRET_BYTES]).unwrap()).unwrap();
+        b.iter(|| core::hint::black_box(&secret).agree(&peer));
     }
 }

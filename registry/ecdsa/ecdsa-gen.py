@@ -190,7 +190,7 @@ def render(curve, shared, own):
             "//! registry/ecdsa/ecdsa-gen.py in rr's repository writes this file",
             "//! from curve.rs.in beside it, which is where to change it.",
             "",
-            "use super::{TABLE, mac, width};",
+            "use super::{Error, TABLE, mac, width};",
             "",
             "/// The limbs of a number.",
             "const LIMBS: usize = %d;" % count,
