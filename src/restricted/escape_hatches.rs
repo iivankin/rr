@@ -20,7 +20,7 @@ impl_lint_pass!(EscapeHatches => [RR_NO_STD, RR_UNEXPLAINED_ESCAPE]);
 
 impl<'tcx> LateLintPass<'tcx> for EscapeHatches {
     fn check_crate_post(&mut self, cx: &LateContext<'tcx>) {
-        if !super::mono::any_generic(cx.tcx) {
+        if self.generic_copies.is_empty() && !super::mono::any_generic(cx.tcx) {
             return;
         }
         let instances = super::mono::collect(cx.tcx, cx.tcx.hir_body_owners());
@@ -218,7 +218,7 @@ fn large_copy<'tcx>(
         return;
     }
     let ty = cx.tcx.type_of(item.owner_id).instantiate_identity().skip_norm_wip();
-    if ty.has_param() {
+    if ty.has_non_region_param() {
         generic.push((item.owner_id.def_id, span));
         return;
     }

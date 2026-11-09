@@ -1510,6 +1510,10 @@ fn const_generic_code_is_checked_in_each_instantiation() {
          #[rr::hot]\n#[must_use]\npub fn hot(v: &[Big<64>]) -> u64 {\n each(v)\n}",
         "rr_hot_path",
     );
+    // A lifetime parameter is not one: the size is known as it is.
+    accepted(
+        "#![no_std]\n#[must_use]\npub fn apply(f: impl Fn(u8) -> u8) -> u8 { f(1) }\n#[derive(Clone, Copy)]\npub struct Key<'a> { pub b: &'a [u8] }\n#[must_use]\npub fn first(k: Key<'_>) -> u8 { let c = k; c.b.first().copied().unwrap_or(0).wrapping_add(k.b.first().copied().unwrap_or(0)) }",
+    );
     // Where rr finds no instantiation, it says it cannot know the size.
     let unknown = "#![no_std]\nextern crate alloc;\n#[must_use]\npub fn boxed<const N: usize>() -> usize {\n let b = alloc::boxed::Box::new([0u8; N]);\n b.len()\n}";
     rejected(unknown, "rr_unexplained_escape");

@@ -124,7 +124,7 @@ impl<'tcx> LateLintPass<'tcx> for Disguises {
             && cx.tcx.item_name(def).as_str() == "new"
             && cx.tcx.def_path_str(def).starts_with("alloc::boxed::Box")
         {
-            if typeck.expr_ty(arg).has_param() {
+            if typeck.expr_ty(arg).has_non_region_param() {
                 self.generic_boxes
                     .push((typeck.hir_owner.def_id, e.hir_id, e.span, arg.hir_id));
             } else {

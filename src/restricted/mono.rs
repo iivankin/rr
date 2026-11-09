@@ -122,7 +122,7 @@ pub fn sizes<'tcx>(
     instances: Option<&Instances<'tcx>>,
 ) -> Result<Vec<(u64, Option<GenericArgsRef<'tcx>>)>, String> {
     let owner = tcx.typeck_root_def_id(owner.to_def_id());
-    if !ty.has_param() {
+    if !ty.has_non_region_param() {
         let env = TypingEnv::post_analysis(tcx, owner);
         return match tcx.layout_of(env.as_query_input(ty)) {
             Ok(layout) => Ok(vec![(layout.size.bytes(), None)]),
@@ -347,7 +347,7 @@ pub fn stack<'tcx>(cx: &rustc_lint::LateContext<'tcx>, instances: &Instances<'tc
             let size = layout.size.bytes();
             frame = frame.saturating_add(size);
             let span = decl.source_info.span;
-            if decl.ty.has_param()
+            if decl.ty.has_non_region_param()
                 && matches!(ty.kind(), ty::Array(..))
                 && size > ARRAY_MAX
                 && super::builtins::is_user_code(span)
