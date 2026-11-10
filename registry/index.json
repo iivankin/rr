@@ -133,6 +133,30 @@
       ]
     },
     {
+      "dependencies": [],
+      "description": "Completion I/O for a loop on each thread, after TigerBeetle's: an Io takes operations (accept, connect, receive, send, a timeout), each with a key the loop picks, runs them on io_uring (Linux 6.1 and later; nothing else there) or kqueue (macOS), and hands each back once, done, as an Event the loop takes by next; what an operation works on (a Listener, a Stream, a buffer) is moved in and comes back in its Event, so nothing the system still writes is in the loop's hands; a table of operations fixed when the Io is made, which refuses one more by handing it back; an Op that cancel takes; errors by kind, IPv4 and IPv6.",
+      "name": "io",
+      "options": [
+        {
+          "choices": [
+            "yes",
+            "no"
+          ],
+          "default": "yes",
+          "name": "tests"
+        },
+        {
+          "choices": [
+            "linux",
+            "macos",
+            "windows"
+          ],
+          "default": "linux,macos,windows",
+          "name": "os"
+        }
+      ]
+    },
+    {
       "dependencies": [
         "random"
       ],
