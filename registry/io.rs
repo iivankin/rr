@@ -418,6 +418,13 @@ mod sys {
         /// kqueue: a connect begun, or the filter it waits on.
         begun: bool,
         armed: Option<i16>,
+        /// How long the operation may take (receive_within and its kin),
+        /// whether that time passed, whether its timer is set (kqueue,
+        /// IOCP), and when it ends on the monotonic clock (io_uring).
+        limit: Option<Duration>,
+        expired: bool,
+        limited: bool,
+        until: u64,
         key: u64,
         work: Work,
         /// A sockaddr, for connect to read and accept to fill, and its
@@ -450,6 +457,10 @@ mod sys {
                 canceled: false,
                 begun: false,
                 armed: None,
+                limit: None,
+                expired: false,
+                limited: false,
+                until: 0,
                 key: 0,
                 work: Work::Idle,
                 address: [0; ADDRESS_BYTES],
@@ -485,13 +496,15 @@ mod sys {
         (u64::from(generation & GENERATIONS) << 32) | u64::from(index)
     }
 
-    const GENERATIONS: u32 = 0x3fff_ffff;
+    const GENERATIONS: u32 = 0x1fff_ffff;
     const CANCEL: u64 = 1 << 63;
     /// The user data of what a Waker sets.
     const WAKE: u64 = 1 << 62;
+    /// The user data of io_uring's linked timeout's own answer.
+    const LIMIT: u64 = 1 << 61;
 
     fn parts(data: u64) -> Option<(usize, u32)> {
-        if data & (CANCEL | WAKE) != 0 {
+        if data & (CANCEL | WAKE | LIMIT) != 0 {
             return None;
         }
         let index = usize::try_from(data & 0xffff_ffff).ok()?;
@@ -515,6 +528,16 @@ mod sys {
     #[must_use]
     fn settle(slot: &mut Slot, answer: Answer) -> bool {
         let canceled = slot.canceled;
+        // An operation its time ran out for was canceled by the system, or
+        // by the Io once its timer fired: it timed out.
+        let answer = match answer {
+            Err(code)
+                if slot.expired || (slot.limit.is_some() && !canceled && code == os::CANCELED) =>
+            {
+                Err(os::TIMED_OUT)
+            }
+            other => other,
+        };
         let work = mem::replace(&mut slot.work, Work::Idle);
         let (work, again) = match (work, answer) {
             (Work::Accept(listener), Ok(fd)) => {
@@ -760,13 +783,56 @@ mod sys {
         /// Accepts the next connection on listener.
         pub fn accept(&mut self, listener: Listener, key: u64) -> Result<Op, Listener> {
             match self.free.pop() {
-                Some(index) => Ok(self.start(index, key, Work::Accept(listener))),
+                Some(index) => Ok(self.start(index, key, Work::Accept(listener), None)),
                 None => Err(listener),
             }
         }
 
         /// Connects to address.
         pub fn connect(&mut self, address: SocketAddr, key: u64) -> Result<Op, SocketAddr> {
+            self.connect_in(address, key, None)
+        }
+
+        /// Connects to address, or gives up with TimedOut once after passed.
+        pub fn connect_within(
+            &mut self,
+            address: SocketAddr,
+            after: Duration,
+            key: u64,
+        ) -> Result<Op, SocketAddr> {
+            self.connect_in(address, key, Some(after))
+        }
+
+        /// Receives as receive does, or gives up with TimedOut, buffer as it
+        /// was, once after passed.
+        pub fn receive_within(
+            &mut self,
+            stream: Stream,
+            buffer: Vec<u8>,
+            after: Duration,
+            key: u64,
+        ) -> Result<Op, (Stream, Vec<u8>)> {
+            self.receive_in(stream, buffer, key, Some(after))
+        }
+
+        /// Sends as send does, or gives up with TimedOut once after passed
+        /// since it started, however much was sent by then.
+        pub fn send_within(
+            &mut self,
+            stream: Stream,
+            buffer: Vec<u8>,
+            after: Duration,
+            key: u64,
+        ) -> Result<Op, (Stream, Vec<u8>)> {
+            self.send_in(stream, buffer, key, Some(after))
+        }
+
+        fn connect_in(
+            &mut self,
+            address: SocketAddr,
+            key: u64,
+            limit: Option<Duration>,
+        ) -> Result<Op, SocketAddr> {
             let Some(index) = self.free.pop() else {
                 return Err(address);
             };
@@ -783,7 +849,7 @@ mod sys {
                 slot.address = bytes;
                 slot.length = u32::try_from(length).unwrap_or(0);
             }
-            Ok(self.start(index, key, Work::Connect(stream)))
+            Ok(self.start(index, key, Work::Connect(stream), limit))
         }
 
         /// Receives into the room buffer has beyond its length.
@@ -792,6 +858,16 @@ mod sys {
             stream: Stream,
             buffer: Vec<u8>,
             key: u64,
+        ) -> Result<Op, (Stream, Vec<u8>)> {
+            self.receive_in(stream, buffer, key, None)
+        }
+
+        fn receive_in(
+            &mut self,
+            stream: Stream,
+            buffer: Vec<u8>,
+            key: u64,
+            limit: Option<Duration>,
         ) -> Result<Op, (Stream, Vec<u8>)> {
             let Some(index) = self.free.pop() else {
                 return Err((stream, buffer));
@@ -808,7 +884,7 @@ mod sys {
                     },
                 ));
             }
-            Ok(self.start(index, key, Work::Receive(stream, buffer)))
+            Ok(self.start(index, key, Work::Receive(stream, buffer), limit))
         }
 
         /// Sends all of buffer.
@@ -817,6 +893,16 @@ mod sys {
             stream: Stream,
             buffer: Vec<u8>,
             key: u64,
+        ) -> Result<Op, (Stream, Vec<u8>)> {
+            self.send_in(stream, buffer, key, None)
+        }
+
+        fn send_in(
+            &mut self,
+            stream: Stream,
+            buffer: Vec<u8>,
+            key: u64,
+            limit: Option<Duration>,
         ) -> Result<Op, (Stream, Vec<u8>)> {
             let Some(index) = self.free.pop() else {
                 return Err((stream, buffer));
@@ -833,7 +919,7 @@ mod sys {
                     },
                 ));
             }
-            Ok(self.start(index, key, Work::Send(stream, buffer, 0)))
+            Ok(self.start(index, key, Work::Send(stream, buffer, 0), limit))
         }
 
         /// Sends buffer to address, as one datagram.
@@ -852,7 +938,7 @@ mod sys {
                 slot.address = bytes;
                 slot.length = u32::try_from(length).unwrap_or(0);
             }
-            Ok(self.start(index, key, Work::SendTo(udp, buffer)))
+            Ok(self.start(index, key, Work::SendTo(udp, buffer), None))
         }
 
         /// Receives a datagram into the room buffer has beyond its length.
@@ -877,7 +963,7 @@ mod sys {
                     },
                 ));
             }
-            Ok(self.start(index, key, Work::ReceiveFrom(udp, buffer)))
+            Ok(self.start(index, key, Work::ReceiveFrom(udp, buffer), None))
         }
 
         /// Runs work that blocks on thread's pool, as tokio's spawn_blocking
@@ -922,7 +1008,7 @@ mod sys {
         /// Done when so much time has passed, on the system's monotonic clock.
         pub fn timeout(&mut self, after: Duration, key: u64) -> Result<Op, Duration> {
             match self.free.pop() {
-                Some(index) => Ok(self.start(index, key, Work::Timeout(after))),
+                Some(index) => Ok(self.start(index, key, Work::Timeout(after), None)),
                 None => Err(after),
             }
         }
@@ -989,6 +1075,10 @@ mod sys {
             slot.canceled = false;
             slot.begun = false;
             slot.armed = None;
+            slot.limit = None;
+            slot.expired = false;
+            slot.limited = false;
+            slot.until = 0;
             let key = slot.key;
             // rr: escape(bound): a slot is free or taken, and there are as
             // many as its capacity.
@@ -996,7 +1086,7 @@ mod sys {
             Some(Event { key, done })
         }
 
-        fn start(&mut self, index: u32, key: u64, work: Work) -> Op {
+        fn start(&mut self, index: u32, key: u64, work: Work, limit: Option<Duration>) -> Op {
             let Some(slot) = self.slots.get_mut(index as usize) else {
                 return Op {
                     index,
@@ -1006,6 +1096,7 @@ mod sys {
             slot.key = key;
             slot.work = work;
             slot.state = State::Running;
+            slot.limit = limit;
             if let Work::Accept(_) | Work::ReceiveFrom(..) = slot.work {
                 slot.length = u32::try_from(ADDRESS_BYTES).unwrap_or(0);
             }
@@ -1330,6 +1421,10 @@ mod sys {
             pub const ETIME: c_int = 62;
             pub const ETIMEDOUT: c_int = 110;
             pub const ECANCELED: c_int = 125;
+            /// What a canceled operation answers, and what one that ran out
+            /// of time is told.
+            pub const CANCELED: c_int = ECANCELED;
+            pub const TIMED_OUT: c_int = ETIMEDOUT;
             pub const ECONNREFUSED: c_int = 111;
             pub const ECONNRESET: c_int = 104;
             pub const ECONNABORTED: c_int = 103;
@@ -1368,6 +1463,8 @@ mod sys {
             pub const EINPROGRESS: c_int = 36;
             pub const ETIMEDOUT: c_int = 60;
             pub const ECANCELED: c_int = 89;
+            pub const CANCELED: c_int = ECANCELED;
+            pub const TIMED_OUT: c_int = ETIMEDOUT;
             pub const ECONNREFUSED: c_int = 61;
             pub const ECONNRESET: c_int = 54;
             pub const ECONNABORTED: c_int = 53;
@@ -1780,6 +1877,8 @@ mod sys {
         pub const WSA_IO_PENDING: i32 = 997;
         /// ERROR_OPERATION_ABORTED, which WSA_OPERATION_ABORTED is too.
         pub const ABORTED: i32 = 995;
+        pub const CANCELED: i32 = ABORTED;
+        pub const TIMED_OUT: i32 = WSAETIMEDOUT;
         /// No system's code: a socket in another Io's completion port.
         pub const FOREIGN: i32 = -1;
         const WSAEINTR: i32 = 10004;
@@ -2017,7 +2116,7 @@ mod sys {
             EAGAIN, EBUSY, EINVAL, ENOSYS, EPERM, ETIME, MSG_NOSIGNAL, SOCK_CLOEXEC, SOCK_NONBLOCK,
             error,
         };
-        use super::{CANCEL, Error, Slot, State, Unavailable, WAKE, Work, running, settle};
+        use super::{CANCEL, Error, LIMIT, Slot, State, Unavailable, WAKE, Work, running, settle};
         use alloc::boxed::Box;
         use alloc::collections::VecDeque;
         use alloc::sync::Arc;
@@ -2052,6 +2151,8 @@ mod sys {
             #[must_use]
             fn eventfd(initial: u32, flags: c_int) -> c_int;
             #[must_use]
+            fn clock_gettime(clock: c_int, time: *mut [i64; 2]) -> c_int;
+            #[must_use]
             fn close(fd: c_int) -> c_int;
         }
 
@@ -2081,7 +2182,11 @@ mod sys {
         const OP_READ: u8 = 22;
         const OP_SENDMSG: u8 = 9;
         const OP_RECVMSG: u8 = 10;
+        const OP_LINK_TIMEOUT: u8 = 15;
         const OP_SEND: u8 = 26;
+        const IOSQE_IO_LINK: u8 = 1 << 2;
+        /// time.h's.
+        const CLOCK_MONOTONIC: c_int = 1;
         const OP_RECV: u8 = 27;
         // sys/mman.h's and fcntl.h's.
         const PROT_READ_WRITE: c_int = 0x3;
@@ -2214,6 +2319,21 @@ mod sys {
             }
         }
 
+        /// Now on the monotonic clock, in nanoseconds.
+        #[must_use]
+        fn monotonic_ns() -> u64 {
+            let mut time = [0i64; 2];
+            // rr: escape(unsafe): time is a struct timespec, two longs.
+            if unsafe { clock_gettime(CLOCK_MONOTONIC, &raw mut time) } != 0 {
+                return 0;
+            }
+            let [seconds, nanoseconds] = time;
+            u64::try_from(seconds)
+                .unwrap_or(0)
+                .saturating_mul(1_000_000_000)
+                .saturating_add(u64::try_from(nanoseconds).unwrap_or(0))
+        }
+
         /// A pointer as the kernel takes it, a __u64: it reads and writes
         /// there, so the address is exposed.
         fn pointer(at: *const u8) -> u64 {
@@ -2267,8 +2387,9 @@ mod sys {
             pub fn new(ops: u32) -> Result<Backend, Error> {
                 let mut params = Params {
                     sq_entries: 0,
-                    // Room for each operation's answer and its cancel's.
-                    cq_entries: ops.saturating_mul(2),
+                    // Room for each operation's answer, its linked
+                    // timeout's and its cancel's.
+                    cq_entries: ops.saturating_mul(4),
                     // Disabled until its first wait, whose thread is then its
                     // one issuer: an Io may be made on one thread and run
                     // on another.
@@ -2388,6 +2509,16 @@ mod sys {
                 // rr: escape(unsafe): the kernel's head, in the
                 // mapped ring, which it moves.
                 unsafe { (*self.sq_head).load(Ordering::Acquire) }
+            }
+
+            /// Hands the kernel what the submission ring holds when it has
+            /// no room for count more.
+            fn room(&mut self, count: u32) {
+                if self.tail.wrapping_sub(self.sq_head()).saturating_add(count) > self.sq_entries {
+                    // rr: escape(discard): a refusal comes back as each
+                    // entry's answer.
+                    let _: Result<(), Error> = self.enter(0, None);
+                }
             }
 
             /// Puts an entry in the submission ring, first handing the
@@ -2556,7 +2687,42 @@ mod sys {
                     }
                     Work::Idle | Work::Run(_) | Work::Finished(_) => return,
                 }
+                let Some(limit) = slot.limit else {
+                    self.push(sqe);
+                    return;
+                };
+                // A linked timeout: the time left of the operation's, which a
+                // send started again does not start over.
+                let now = monotonic_ns();
+                if slot.until == 0 {
+                    slot.until =
+                        now.saturating_add(u64::try_from(limit.as_nanos()).unwrap_or(u64::MAX));
+                }
+                let left = slot.until.saturating_sub(now);
+                slot.time = [
+                    i64::try_from(left / 1_000_000_000).unwrap_or(i64::MAX),
+                    i64::try_from(left % 1_000_000_000).unwrap_or(0),
+                ];
+                // Both in one submission, or the link is broken.
+                self.room(2);
+                sqe.flags |= IOSQE_IO_LINK;
                 self.push(sqe);
+                self.push(Sqe {
+                    opcode: OP_LINK_TIMEOUT,
+                    flags: 0,
+                    ioprio: 0,
+                    fd: -1,
+                    off: 0,
+                    addr: pointer(slot.time.as_ptr().cast()),
+                    len: 1,
+                    op_flags: 0,
+                    user_data: LIMIT,
+                    buf_index: 0,
+                    personality: 0,
+                    file_index: 0,
+                    addr3: 0,
+                    pad: 0,
+                });
             }
 
             /// Asks the kernel to end the operation; its answer comes as
@@ -2924,9 +3090,42 @@ mod sys {
                     self.changes.push(timer);
                     return;
                 }
+                if let Some(limit) = slot.limit {
+                    // Its own timer, in EVFILT_TIMER's namespace by its slot,
+                    // as a timeout's.
+                    let mut timer =
+                        change(slot_ident(data), EVFILT_TIMER, EV_ADD | EV_ONESHOT, data);
+                    timer.fflags = NOTE_NSECONDS;
+                    timer.data = isize::try_from(limit.as_nanos()).unwrap_or(isize::MAX);
+                    slot.limited = true;
+                    // rr: escape(bound): one timer for each running operation
+                    // at most.
+                    self.changes.push(timer);
+                }
                 // rr: escape(bound): each running operation is pending once
                 // at most.
                 self.pending.push_back(data);
+            }
+
+            /// Deletes what the kqueue waits on for an operation, at once.
+            fn delete(&self, ident: usize, filter: i16, data: u64) {
+                let delete = change(ident, filter, EV_DELETE, data);
+                // rr: escape(unsafe): one change, no events asked for.
+                unsafe {
+                    // rr: escape(discard): a filter gone already is what was
+                    // wanted.
+                    let _: c_int = kevent(self.kq, &raw const delete, 1, null_mut(), 0, null());
+                }
+            }
+
+            /// Deletes an operation's own timer, once it is done another way.
+            fn unlimit(&mut self, slot: &mut Slot, data: u64) {
+                if slot.limited {
+                    slot.limited = false;
+                    self.delete(slot_ident(data), EVFILT_TIMER, data);
+                    self.changes
+                        .retain(|c| c.udata.addr() as u64 != data || c.filter != EVFILT_TIMER);
+                }
             }
 
             /// Ends the operation at once: what the kqueue waits on for it
@@ -2939,17 +3138,11 @@ mod sys {
                     } else {
                         ident(slot.fd().unwrap_or(-1))
                     };
-                    let delete = change(ident, filter, EV_DELETE, data);
-                    // rr: escape(unsafe): one change, no events asked for; a
-                    // filter gone already is what was wanted.
-                    unsafe {
-                        // rr: escape(discard): one change, no events asked for;
-                        // a filter gone already is what was wanted.
-                        let _: c_int = kevent(self.kq, &raw const delete, 1, null_mut(), 0, null());
-                    }
+                    self.delete(ident, filter, data);
                     // A change not yet made goes with the operation.
                     self.changes.retain(|c| c.udata.addr() as u64 != data);
                 }
+                self.unlimit(slot, data);
                 // rr: escape(discard): a canceled operation is never tried
                 // again.
                 let _: bool = settle(slot, Err(super::os::ECANCELED));
@@ -3005,8 +3198,21 @@ mod sys {
                     let Some((index, slot)) = running(slots, data) else {
                         continue;
                     };
+                    if filter == EVFILT_TIMER && !matches!(slot.work, Work::Timeout(_)) {
+                        // The operation's time ran out: what it waits on goes,
+                        // and it ends as timed out.
+                        slot.limited = false;
+                        slot.expired = true;
+                        if let (Some(armed), Some(fd)) = (slot.armed.take(), slot.fd()) {
+                            self.delete(ident(fd), armed, data);
+                        }
+                        self.changes.retain(|c| c.udata.addr() as u64 != data);
+                        finish(slot, index, ready, Err(super::os::ECANCELED));
+                        continue;
+                    }
                     slot.armed = None;
                     if flags & EV_ERROR != 0 {
+                        self.unlimit(slot, data);
                         let answer = Err(i32::try_from(code).unwrap_or(0));
                         finish(slot, index, ready, answer);
                         continue;
@@ -3050,6 +3256,7 @@ mod sys {
                         return;
                     }
                     if !settle(slot, answer) {
+                        self.unlimit(slot, data);
                         push_ready(ready, index);
                         return;
                     }
@@ -3502,6 +3709,17 @@ mod sys {
                     self.timers.insert(at, (deadline, data));
                     return;
                 }
+                if slot.limit.is_some() && !slot.limited {
+                    let limit = slot
+                        .limit
+                        .map_or(0, |l| u64::try_from(l.as_nanos()).unwrap_or(u64::MAX));
+                    let deadline = self.now().saturating_add(limit);
+                    let at = self.timers.partition_point(|&(d, _)| d <= deadline);
+                    // rr: escape(bound): one entry for each running operation
+                    // at most.
+                    self.timers.insert(at, (deadline, data));
+                    slot.limited = true;
+                }
                 if let Err(code) = self.start(slot) {
                     // rr: escape(bound): one entry for each running
                     // operation at most.
@@ -3687,18 +3905,11 @@ mod sys {
                     let _: bool = settle(slot, Err(ABORTED));
                     return true;
                 }
-                if let Some(fd) = slot.fd() {
-                    let overlapped = slot.overlapped.as_mut_ptr().cast::<c_void>();
-                    // rr: escape(unsafe): the OVERLAPPED is the operation's;
-                    // one done already is not found, and its answer comes as it
-                    // would.
-                    unsafe {
-                        // rr: escape(discard): the OVERLAPPED is the
-                        // operation's; one done already is not found, and its
-                        // answer comes as it would.
-                        let _: i32 = CancelIoEx(handle(fd), overlapped);
-                    }
+                if slot.limited {
+                    slot.limited = false;
+                    self.timers.retain(|&(_, d)| d != data);
                 }
+                abort(slot);
                 false
             }
 
@@ -3791,9 +4002,13 @@ mod sys {
                 };
                 if settle(slot, answer) {
                     self.submit(data, slot);
-                } else {
-                    ready.push_back(u32::try_from(index).unwrap_or(0));
+                    return;
                 }
+                if slot.limited {
+                    slot.limited = false;
+                    self.timers.retain(|&(_, d)| d != data);
+                }
+                ready.push_back(u32::try_from(index).unwrap_or(0));
             }
 
             /// Ends the timeouts whose deadlines passed, soonest first.
@@ -3804,9 +4019,17 @@ mod sys {
                     let Some((index, slot)) = running(slots, data) else {
                         continue;
                     };
-                    if !settle(slot, Ok(0)) {
-                        ready.push_back(u32::try_from(index).unwrap_or(0));
+                    if let Work::Timeout(_) = slot.work {
+                        if !settle(slot, Ok(0)) {
+                            ready.push_back(u32::try_from(index).unwrap_or(0));
+                        }
+                        continue;
                     }
+                    // An operation's time ran out: the port answers it
+                    // aborted, which settle takes as timed out.
+                    slot.limited = false;
+                    slot.expired = true;
+                    abort(slot);
                 }
             }
 
@@ -3857,6 +4080,21 @@ mod sys {
                         }
                     }
                 }
+            }
+        }
+
+        /// Asks the port to end a socket's operation, which then answers
+        /// aborted; one done already is not found, and answers as it would.
+        fn abort(slot: &mut Slot) {
+            let Some(fd) = slot.fd() else {
+                return;
+            };
+            let overlapped = slot.overlapped.as_mut_ptr().cast::<c_void>();
+            // rr: escape(unsafe): the OVERLAPPED is the operation's.
+            unsafe {
+                // rr: escape(discard): an operation done already is not found,
+                // and its answer comes as it would.
+                let _: i32 = CancelIoEx(handle(fd), overlapped);
             }
         }
 
@@ -4143,6 +4381,48 @@ mod tests {
             }
         }
         assert_eq!(seen, 3);
+    }
+
+    /// A receive within a time gives up with TimedOut once it passed, its
+    /// buffer as it was; one the peer answers in time receives; a send
+    /// within a time sends.
+    #[test]
+    fn within() {
+        let mut io = io(8);
+        let (server, client, _listener) = pair(&mut io, v4());
+        let mut held = Vec::with_capacity(16);
+        held.push(7);
+        let quick = Duration::from_millis(30);
+        assert!(io.receive_within(server, held, quick, SERVER).is_ok());
+        let Done::Received {
+            stream: quiet,
+            buffer,
+            result,
+        } = next(&mut io).done
+        else {
+            panic!("not a receive");
+        };
+        assert_eq!(result, Err(Error::TimedOut));
+        assert_eq!(buffer, [7]);
+        let long = Duration::from_secs(10);
+        assert!(
+            io.receive_within(quiet, Vec::with_capacity(16), long, SERVER)
+                .is_ok()
+        );
+        let mut bytes = Vec::with_capacity(4);
+        bytes.extend_from_slice(b"late");
+        assert!(io.send_within(client, bytes, long, CLIENT).is_ok());
+        for _ in 0..2 {
+            let event = next(&mut io);
+            if event.key == CLIENT {
+                let _client = sent(event);
+            } else {
+                assert_eq!(received(event).1, b"late");
+            }
+        }
+        // The time of one done in time does not end another in its slot.
+        assert!(io.timeout(Duration::from_millis(60), 9).is_ok());
+        assert_eq!(next(&mut io).key, 9);
     }
 
     #[test]
