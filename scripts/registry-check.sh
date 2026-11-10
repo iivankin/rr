@@ -29,6 +29,12 @@ done
 paths=
 for name in "$@"; do
 	paths="$paths $here/registry/$name.rs"
+	# A component is as rr fmt leaves it: rustfmt moves a mark that
+	# follows a closing brace onto that line, where rr add would not see it.
+	cp "$here/registry/$name.rs" .source.rs
+	"$RR" fmt .source.rs
+	cmp -s "$here/registry/$name.rs" .source.rs || { echo "registry-check: rr fmt changes registry/$name.rs"; diff "$here/registry/$name.rs" .source.rs | head -20; exit 1; }
+	rm -f .source.rs
 done
 "$RRADD" add --yes $answers $paths
 # rr add declares each component in src/base/mod.rs; the root declares base.

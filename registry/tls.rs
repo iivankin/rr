@@ -93,13 +93,13 @@
 //! ```
 //!
 //! On an error, send what pending still holds (the alert) before the
-//! socket closes. A poll loop: watch the socket for writing while
-//! pending holds bytes. When the client awaits, start trust's check on
-//! the chain (Trust::check, which never blocks) and stop reading the
-//! socket; keep unread bytes. When the check's poll answers, call
-//! verified with its approval or refused, then go on with the kept
-//! bytes and the socket as before. Never call verify_blocking on the
-//! loop's thread.
+//! socket closes. An io::Io loop: send what pending holds, and receive
+//! again once it is sent. When the client awaits, start trust's check on
+//! the chain (Trust::check, on the Io's pool) and stop receiving; keep
+//! unread bytes. When the check's Event came and its poll answers, call
+//! verified with its approval or refused, then go on with the kept bytes
+//! and the socket as before. Never call verify_blocking on the loop's
+//! thread.
 
 // rr: checked(0.5.2)
 // rr: needs(random, sha256, sha384, aesgcm, x25519, mlkem, ecdh, x509)

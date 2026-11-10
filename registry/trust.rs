@@ -1,9 +1,9 @@
 //! TLS server authentication by the operating system's trust, as Go's
 //! crypto/x509 does it: macOS's SecTrustEvaluateWithError and Windows's
-//! CertGetCertificateChain with the SSL policy, on thread's pool, whose Signal
-//! a poll loop waits on, and on Linux x509::verify against the system's
-//! anchors (its bundle and certificate directories, or SSL_CERT_FILE and
-//! SSL_CERT_DIR, read through the C library); SSL_CERT_FILE and SSL_CERT_DIR
+//! CertGetCertificateChain with the SSL policy, and on Linux x509::verify
+//! against the system's anchors (its bundle and certificate directories, or
+//! SSL_CERT_FILE and SSL_CERT_DIR, read through the C library), each on an
+//! io::Io's pool, its answer an Event; SSL_CERT_FILE and SSL_CERT_DIR
 //! replace the system's verifier on macOS and Windows too, as in Go 1.27; a
 //! policy such as roots::policy (OneCRL, distrust dates) screens the path
 //! whichever verifies. system() also loads the anchors themselves on all
@@ -20,19 +20,18 @@
 //! Trust checks a server's chain for a host at a time; its yes is an
 //! x509::Approval of the chain's leaf for that host, which
 //! tls::Client::verified takes and compares with its own, and which a
-//! program cannot make itself. Trust::check never blocks: keep the
-//! Check (dropping it cancels it) and poll it from the loop.
-//! Trust::verify_blocking waits for the answer, for a thread that may
-//! block: never a poll loop's, where rr refuses it, as it is
-//! `#[rr::blocking]` (see poll). macOS and Windows
+//! program cannot make itself. Trust::check never blocks: it runs the
+//! check on an io::Io's pool, and once its Event came, the Check's poll
+//! gives the answer. Trust::verify_blocking waits for the answer, for a
+//! thread that may block: never a loop's, where rr refuses it, as it is
+//! `#[rr::blocking]`. macOS and Windows
 //! verify it themselves, as Go has them do: SecTrustEvaluateWithError
 //! with the SSL policy, and CertGetCertificateChain with the SSL chain
 //! policy, each on one of thread's pool's threads, as either may fetch a
 //! missing intermediate over the network (neither is asked to check
-//! revocation, as Go does not); a poll
-//! loop waits on a pipe or a loopback socket, as for resolve. Linux
-//! has no verifier of its own: Trust loads the system's anchors once and
-//! x509::verify checks the chain at once. With SSL_CERT_FILE or
+//! revocation, as Go does not). Linux has no verifier of its own: Trust
+//! loads the system's anchors once and x509::verify checks the chain, on
+//! the pool as well, so that a loop's check is the same everywhere. With SSL_CERT_FILE or
 //! SSL_CERT_DIR set, macOS and Windows do as Linux, on the files they
 //! name alone (Go's certFiles and certDirectories are empty there), and
 //! the system's verifier is not asked; SSL_CERT_DIR's list is separated
@@ -83,7 +82,7 @@
 //! `Trust::with(roots::mozilla())`.
 
 // rr: checked(0.5.2)
-// rr: needs(x509, poll, thread)
+// rr: needs(x509, io, thread)
 // rr: option(tests, one): Its tests, which rr test runs?
 // rr: choice(tests = yes, default): the tests, and the data files they read
 // rr: choice(tests = no): none
@@ -108,12 +107,13 @@ compile_error!("rr add cut trust without windows: add it again with windows in -
 mod sys {
     //! The system side of trust: what the top of the file says it is, for each system.
 
-    use crate::base::poll;
+    use crate::base::io::{Io, Op};
+    use crate::base::thread::{Lock, Work};
     use crate::base::x509;
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
     use alloc::vec::Vec;
-
-    /// What a check waits on: the type every component's poll loop takes.
-    pub use crate::base::poll::Want;
+    use core::cell::UnsafeCell;
 
     /// Why a chain was refused, or the system gave no anchors.
     // rr: section(tests = yes)
@@ -139,19 +139,20 @@ mod sys {
         NoRoots,
         /// No certificate, too many, or one the system cannot read.
         Input,
-        /// The check's result was taken by an earlier poll.
+        /// The check's result was taken by an earlier poll, or its Event
+        /// said it was canceled.
         Polled,
-        /// macOS, Windows: no thread, or no pipe or socket pair to say it is
-        /// done.
-        Thread,
+        /// check: the Io's table is full; take its Events and check again.
+        Full,
     }
 
     /// The system's trust, made once for the program.
     pub struct Trust {
         /// The anchors x509 verifies with: on Linux the system's, on macOS
         /// and Windows those SSL_CERT_FILE and SSL_CERT_DIR name, or the
-        /// caller's (with). None: the system verifies.
-        store: Option<x509::Store>,
+        /// caller's (with); shared with the checks on io's pool. None: the
+        /// system verifies.
+        store: Option<Arc<x509::Store>>,
         /// Distrust laid over the system's verdict (with_policy).
         policy: Option<x509::Policy>,
     }
@@ -175,17 +176,16 @@ mod sys {
             if store.is_empty() {
                 return Err(Error::NoRoots);
             }
-            Ok(Trust {
-                store: Some(store),
-                policy: None,
-            })
+            Ok(Trust::with(store))
         }
 
         /// Trust in the anchors of store instead of the system's: x509
         /// verifies, on every system.
         pub fn with(store: x509::Store) -> Trust {
             Trust {
-                store: Some(store),
+                // rr: escape(shared): the trust and its checks on io's pool
+                // hold the anchors.
+                store: Some(Arc::new(store)),
                 policy: None,
             }
         }
@@ -196,7 +196,8 @@ mod sys {
         /// built is screened (x509::screen) before a check says yes, as Go
         /// screens the system's chains for its own blocklist.
         pub fn with_policy(mut self, policy: x509::Policy) -> Trust {
-            match &mut self.store {
+            // No check holds the anchors yet: the trust is being made.
+            match self.store.as_mut().and_then(Arc::get_mut) {
                 Some(store) => {
                     // rr: escape(discard): how many anchors took a date
                     // changes nothing here; any number is right.
@@ -208,38 +209,69 @@ mod sys {
         }
 
         /// Starts checking chain, DER certificates leaf first, for host at
-        /// now (Unix seconds). It never blocks: poll the check, whose yes is
-        /// the x509::Approval of chain's leaf for host that tls::Client::
-        /// verified takes. A host that is empty or holds a NUL is Error::Input
-        /// on every system: Windows reads the name as a C string, which would
-        /// end at the NUL, and checks none for an empty one.
-        pub fn check(&self, chain: &[&[u8]], host: &str, now: i64) -> Check<'_> {
-            let (os, approval) = match &self.store {
-                Some(store) => match verify_with(store, chain, host, now) {
-                    Ok(approval) => (
-                        os::Check::answered(Ok(Built::one(Path::new()))),
-                        Some(approval),
-                    ),
-                    Err(error) => (os::Check::answered(Err(error)), None),
-                },
-                // The system's yes, once it says it, approves the leaf it was
-                // asked about.
-                None => (
-                    os::check(chain, host, now),
-                    chain.first().map(|leaf| x509::Approval::system(leaf, host)),
-                ),
+        /// now (Unix seconds), on io's pool: the Op's Event, with key, says
+        /// it is done (io's Done::Ran), and the check's poll then gives the
+        /// x509::Approval of chain's leaf for host that tls::Client::verified
+        /// takes. A chain or host the check refuses at once is Err: one
+        /// empty or too long, a host that is empty or holds a NUL (Windows
+        /// reads the name as a C string, which would end at the NUL, and
+        /// checks none for an empty one), on every system; and before the
+        /// system is asked, a leaf that does not name the host.
+        pub fn check(
+            &self,
+            io: &mut Io,
+            chain: &[&[u8]],
+            host: &str,
+            now: i64,
+            key: u64,
+        ) -> Result<(Check<'_>, Op), Error> {
+            if chain.is_empty() || chain.len() > x509::CHAIN_MAX || !named(host) {
+                return Err(Error::Input);
+            }
+            let (job, approval) = match &self.store {
+                Some(store) => {
+                    let mut copied = Path::new();
+                    for der in chain {
+                        copied.push(der);
+                    }
+                    let job = Job::X509 {
+                        // rr: escape(copy): the check's holder of the anchors.
+                        store: Arc::clone(store),
+                        chain: copied,
+                        // rr: escape(copy): the pool's thread checks for it.
+                        host: host.into(),
+                        now,
+                    };
+                    (job, None)
+                }
+                None => system_job(chain, host, now)?,
             };
-            Check {
-                os,
+            // rr: escape(shared): the check and its work hold it.
+            let answer = Arc::new(Answer {
+                lock: Lock::new(),
+                found: UnsafeCell::new(None),
+            });
+            let checking = Checking {
+                job,
+                // rr: escape(copy): the work's holder of the answer.
+                answer: Arc::clone(&answer),
+            };
+            // A full table hands the work back, which is let go here.
+            let Ok(op) = io.run(Box::new(checking), key) else {
+                return Err(Error::Full);
+            };
+            let check = Check {
+                answer,
                 policy: self.policy.as_ref(),
                 approval,
                 polled: false,
-            }
+            };
+            Ok((check, op))
         }
 
         /// Checks chain for host at now, and blocks until the answer: the
         /// system's verifier may fetch over the network, so never call it on
-        /// a poll loop's thread; poll a check there.
+        /// a loop's thread; check there.
         #[cfg_attr(rr, rr::blocking)]
         pub fn verify_blocking(
             &self,
@@ -247,15 +279,133 @@ mod sys {
             host: &str,
             now: i64,
         ) -> Result<x509::Approval, Error> {
-            let mut check = self.check(chain, host, now);
-            // The system's verifier answers in the end; each wait ends when
-            // it has.
-            loop {
-                if let Some(result) = check.poll() {
-                    return result;
-                }
-                poll::block(&check.want());
+            if let Some(store) = &self.store {
+                return verify_with(store, chain, host, now);
             }
+            if chain.is_empty() || chain.len() > x509::CHAIN_MAX || !named(host) {
+                return Err(Error::Input);
+            }
+            let built = built(chain, host, now)?;
+            if let Some(policy) = &self.policy {
+                built.screen(policy)?;
+            }
+            let leaf = chain.first().ok_or(Error::Input)?;
+            Ok(x509::Approval::system(leaf, host))
+        }
+    }
+
+    /// What a check runs on io's pool: x509 on its anchors, or the
+    /// system's verifier.
+    enum Job {
+        X509 {
+            store: Arc<x509::Store>,
+            chain: Path,
+            host: alloc::string::String,
+            now: i64,
+        },
+        // rr: section(os = macos windows)
+        #[cfg(not(target_os = "linux"))]
+        System(os::Job),
+        // rr: end(os = macos windows)
+    }
+
+    // rr: section(os = macos windows)
+    /// The system's job for chain and host, and what its yes gives: the
+    /// approval of the leaf it was asked about.
+    #[cfg(not(target_os = "linux"))]
+    fn system_job(
+        chain: &[&[u8]],
+        host: &str,
+        now: i64,
+    ) -> Result<(Job, Option<x509::Approval>), Error> {
+        let job = Job::System(os::job(chain, host, now)?);
+        Ok((
+            job,
+            chain.first().map(|leaf| x509::Approval::system(leaf, host)),
+        ))
+    }
+    // rr: end(os = macos windows)
+
+    // rr: section(os = linux)
+    /// Linux has no verifier but x509, which Trust always has anchors for.
+    #[cfg(target_os = "linux")]
+    fn system_job(
+        _chain: &[&[u8]],
+        _host: &str,
+        _now: i64,
+    ) -> Result<(Job, Option<x509::Approval>), Error> {
+        Err(Error::NoRoots)
+    }
+    // rr: end(os = linux)
+
+    // rr: section(os = macos windows)
+    /// The paths the system's verifier took for chain and host, here.
+    #[cfg(not(target_os = "linux"))]
+    fn built(chain: &[&[u8]], host: &str, now: i64) -> Result<Built, Error> {
+        os::job(chain, host, now)?.run()
+    }
+    // rr: end(os = macos windows)
+
+    // rr: section(os = linux)
+    #[cfg(target_os = "linux")]
+    fn built(_chain: &[&[u8]], _host: &str, _now: i64) -> Result<Built, Error> {
+        Err(Error::NoRoots)
+    }
+    // rr: end(os = linux)
+
+    /// What a check found: x509's approval, or the paths the system took.
+    enum Verdict {
+        Approved(x509::Approval),
+        Built(Built),
+    }
+
+    /// What a check found, which its work writes on the pool's thread and
+    /// the loop takes, under a lock.
+    struct Answer {
+        lock: Lock,
+        found: UnsafeCell<Option<Result<Verdict, Error>>>,
+    }
+
+    // rr: escape(unsafe): found is reached only under lock (Answer::put,
+    // Answer::take).
+    unsafe impl Sync for Answer {}
+
+    impl Answer {
+        fn put(&self, found: Result<Verdict, Error>) {
+            let _held = self.lock.lock();
+            // rr: escape(unsafe): the lock is held: no one else touches it.
+            unsafe { *self.found.get() = Some(found) };
+        }
+
+        #[must_use]
+        fn take(&self) -> Option<Result<Verdict, Error>> {
+            let _held = self.lock.lock();
+            // rr: escape(unsafe): the lock is held: no one else touches it.
+            unsafe { (*self.found.get()).take() }
+        }
+    }
+
+    /// A check for the pool: the job in, its answer out.
+    struct Checking {
+        job: Job,
+        answer: Arc<Answer>,
+    }
+
+    impl Work for Checking {
+        fn run(&mut self) {
+            let found = match &self.job {
+                // rr: section(os = macos windows)
+                #[cfg(not(target_os = "linux"))]
+                Job::System(job) => job.run().map(Verdict::Built),
+                // rr: end(os = macos windows)
+                Job::X509 {
+                    store,
+                    chain,
+                    host,
+                    now,
+                } => verify_with(store, &chain.parts(), host, *now).map(Verdict::Approved),
+            };
+            self.answer.put(found);
         }
     }
 
@@ -297,18 +447,23 @@ mod sys {
             self.ends.push(self.bytes.len());
         }
 
-        /// Whether policy takes the path; an empty one it has no say on.
-        fn screen(&self, policy: &x509::Policy) -> Result<(), Error> {
-            if self.ends.is_empty() {
-                return Ok(());
-            }
+        /// The certificates, leaf first.
+        fn parts(&self) -> Vec<&[u8]> {
             let mut start = 0;
             let mut certificates = Vec::with_capacity(self.ends.len());
             for end in &self.ends {
                 certificates.push(self.bytes.get(start..*end).unwrap_or_default());
                 start = *end;
             }
-            x509::screen(&certificates, policy).map_err(Error::Untrusted)
+            certificates
+        }
+
+        /// Whether policy takes the path; an empty one it has no say on.
+        fn screen(&self, policy: &x509::Policy) -> Result<(), Error> {
+            if self.ends.is_empty() {
+                return Ok(());
+            }
+            x509::screen(&self.parts(), policy).map_err(Error::Untrusted)
         }
     }
 
@@ -347,39 +502,42 @@ mod sys {
         }
     }
 
-    /// One chain's check. Dropping it cancels it, so it must be kept until
-    /// poll answers.
-    #[must_use = "dropping a check cancels it: keep it and poll it"]
+    /// One chain's check, on an Io's pool: poll it once its Event came.
+    /// io's cancel keeps it from starting while it waits in line; dropped,
+    /// it lets go of what it would find.
+    #[must_use = "a check answers by poll, once its Event came"]
     pub struct Check<'t> {
-        os: os::Check,
+        answer: Arc<Answer>,
         policy: Option<&'t x509::Policy>,
-        /// What a yes gives: x509's approval, or the one for the leaf the
-        /// system was asked about.
+        /// What the system's yes gives: the approval of the leaf it was
+        /// asked about.
         approval: Option<x509::Approval>,
         /// Whether poll gave the answer.
         polled: bool,
     }
 
     impl Check<'_> {
-        /// None while the system works; then the answer, once: the approval
-        /// of the leaf for the host, or why not. Error::Polled after it.
+        /// None until the check's Event came; then the answer, once: the
+        /// approval of the leaf for the host, or why not. Error::Polled
+        /// after it.
         #[must_use]
         pub fn poll(&mut self) -> Option<Result<x509::Approval, Error>> {
             if self.polled {
                 return Some(Err(Error::Polled));
             }
-            let answer = self.os.poll()?;
+            let found = self.answer.take()?;
             self.polled = true;
-            let screened = answer.and_then(|built| match self.policy {
-                Some(policy) => built.screen(policy),
-                None => Ok(()),
-            });
-            Some(screened.and_then(|()| self.approval.take().ok_or(Error::Input)))
-        }
-
-        /// What to wait on before polling again.
-        pub fn want(&self) -> Want {
-            os::want(&self.os)
+            Some(match found {
+                Ok(Verdict::Approved(approval)) => Ok(approval),
+                Ok(Verdict::Built(built)) => {
+                    let screened = match self.policy {
+                        Some(policy) => built.screen(policy),
+                        None => Ok(()),
+                    };
+                    screened.and_then(|()| self.approval.take().ok_or(Error::Input))
+                }
+                Err(error) => Err(error),
+            })
         }
     }
 
@@ -759,11 +917,7 @@ mod sys {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     mod posix {
         use super::disk::Files;
-        use crate::base::poll::EINTR;
-        // rr: section(os = linux)
-        #[cfg(target_os = "linux")]
-        use crate::base::poll::O_CLOEXEC;
-        // rr: end(os = linux)
+        use crate::base::io::{EINTR, EINVAL};
         use alloc::vec::Vec;
         use core::ffi::{CStr, c_char, c_int, c_void};
 
@@ -850,15 +1004,18 @@ mod sys {
         }
 
         // fcntl.h's, dirent.h's and errno.h's, the same on Linux and macOS;
-        // macOS's O_CLOEXEC, Linux's wait's.
+        // O_CLOEXEC, each system's own.
         const O_RDONLY: c_int = 0;
         // rr: section(os = macos)
         #[cfg(target_os = "macos")]
         const O_CLOEXEC: c_int = 0x100_0000;
         // rr: end(os = macos)
+        // rr: section(os = linux)
+        #[cfg(target_os = "linux")]
+        const O_CLOEXEC: c_int = 0x8_0000;
+        // rr: end(os = linux)
         const DT_UNKNOWN: u8 = 0;
         const DT_LNK: u8 = 10;
-        const EINVAL: i32 = 22;
         const EFBIG: i32 = 27;
         /// A bundle larger than this is not one.
         const FILE_BYTES_MAX: usize = 8 << 20;
@@ -1042,35 +1199,6 @@ mod sys {
     mod os {
         pub use super::disk::LINUX as DEFAULTS;
         pub use super::posix::{System, variable};
-        use super::{Built, Error, Want};
-
-        /// No verifier but x509: Trust always holds anchors here.
-        pub fn check(_chain: &[&[u8]], _host: &str, _now: i64) -> Check {
-            Check::answered(Err(Error::NoRoots))
-        }
-
-        /// A check that was done when it started.
-        pub struct Check {
-            result: Option<Result<Built, Error>>,
-        }
-
-        impl Check {
-            pub fn answered(result: Result<Built, Error>) -> Check {
-                Check {
-                    result: Some(result),
-                }
-            }
-
-            #[must_use]
-            pub fn poll(&mut self) -> Option<Result<Built, Error>> {
-                self.result.take()
-            }
-        }
-
-        /// Nothing: the answer is there from the start.
-        pub fn want(_check: &Check) -> Want {
-            Want::READY
-        }
     }
     // rr: end(os = linux)
     // rr: section(os = macos)
@@ -1078,7 +1206,6 @@ mod sys {
     mod os {
         pub use super::disk::MACOS as DEFAULTS;
         pub use super::posix::{System, variable};
-        pub use super::worker::{Check, want};
         use super::{Built, Error, Found, Path};
         use crate::base::x509;
         use alloc::vec::Vec;
@@ -1426,11 +1553,12 @@ mod sys {
             Setting::Unspecified
         }
 
-        pub fn check(chain: &[&[u8]], host: &str, now: i64) -> Check {
-            let job = super::platform_host(chain, host)
+        /// A SecTrust of chain for host, made here, which the pool's thread
+        /// evaluates.
+        pub fn job(chain: &[&[u8]], host: &str, now: i64) -> Result<Job, Error> {
+            super::platform_host(chain, host)
                 .and_then(|host| evaluation(chain, host, now))
-                .map(|trust| Job { trust });
-            Check::start(job)
+                .map(|trust| Job { trust })
         }
 
         /// What the thread evaluates: a SecTrust of ours.
@@ -1554,7 +1682,6 @@ mod sys {
     mod os {
         pub use super::disk::WINDOWS as DEFAULTS;
         use super::disk::{ENOENT, Files};
-        pub use super::worker::{Check, want};
         use super::{Built, Error, Found, Path};
         use crate::base::x509;
         use alloc::vec::Vec;
@@ -1928,8 +2055,10 @@ mod sys {
             })
         }
 
-        pub fn check(chain: &[&[u8]], host: &str, now: i64) -> Check {
-            Check::start(super::platform_host(chain, host).map(|host| Job::new(chain, host, now)))
+        /// The chain and host, copied for the pool's thread, which builds
+        /// the chain.
+        pub fn job(chain: &[&[u8]], host: &str, now: i64) -> Result<Job, Error> {
+            super::platform_host(chain, host).map(|host| Job::new(chain, host, now))
         }
 
         /// What the thread checks: the chain's DER, where each certificate
@@ -2428,109 +2557,6 @@ mod sys {
     }
     // rr: end(os = windows)
 
-    // rr: section(os = macos windows)
-    /// A check the system runs on thread's pool, on macOS and Windows,
-    /// which sets the check's Signal when it returned: a check dropped while
-    /// its thread runs never waits for it, as the thread drops the work; one
-    /// dropped while still in the pool's line never starts.
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    mod worker {
-        use super::os::Job;
-        use super::{Built, Error};
-        use crate::base::poll::{Signal, Want};
-        use crate::base::thread::{self, Done, Work};
-        use alloc::boxed::Box;
-        use alloc::sync::Arc;
-
-        /// A check for the pool: the job in, its answer out.
-        struct Checking {
-            job: Job,
-            result: Result<Built, Error>,
-        }
-
-        impl Work for Checking {
-            fn run(&mut self) {
-                self.result = self.job.run();
-            }
-        }
-
-        pub struct Check {
-            /// The check in the pool, until it is done; each job of it holds
-            /// a Checking, as start alone spawns them.
-            job: Option<thread::Job>,
-            /// What the job sets when it is done, which want names.
-            signal: Option<Arc<Signal>>,
-            /// The answer, once known and not yet polled.
-            taken: Option<Result<Built, Error>>,
-        }
-
-        impl Check {
-            /// A check whose answer is known.
-            pub fn answered(result: Result<Built, Error>) -> Check {
-                Check {
-                    job: None,
-                    signal: None,
-                    taken: Some(result),
-                }
-            }
-
-            /// Runs job on the pool, or answers with its error.
-            pub fn start(job: Result<Job, Error>) -> Check {
-                let job = match job {
-                    Ok(job) => job,
-                    Err(error) => return Check::answered(Err(error)),
-                };
-                let Some(signal) = Signal::new() else {
-                    return Check::answered(Err(Error::Thread));
-                };
-                // rr: escape(shared): the check waits on it, the job sets it.
-                let signal = Arc::new(signal);
-                let work = Box::new(Checking {
-                    job,
-                    result: Err(Error::Polled),
-                });
-                // rr: escape(copy): the job's holder of the signal.
-                match thread::spawn(work, Done::Signal(Arc::clone(&signal))) {
-                    Ok(spawned) => Check {
-                        job: Some(spawned),
-                        signal: Some(signal),
-                        taken: None,
-                    },
-                    Err(_) => Check::answered(Err(Error::Thread)),
-                }
-            }
-
-            #[must_use]
-            pub fn poll(&mut self) -> Option<Result<Built, Error>> {
-                if let Some(job) = self.job.take() {
-                    match job.take() {
-                        Ok(work) => self.taken = Some(answer(work)),
-                        Err(job) => self.job = Some(job),
-                    }
-                }
-                self.taken.take()
-            }
-        }
-
-        /// What a Checking the pool gave back found.
-        fn answer(work: Box<dyn Work + Send>) -> Result<Built, Error> {
-            // rr: escape(unsafe, cast, leak): Check::start alone spawns the
-            // jobs a Check keeps, each with a Box<Checking>, and the pool
-            // gives that Box back: the pointer is the Checking's, which
-            // from_raw owns again.
-            let checking = unsafe { Box::from_raw(Box::into_raw(work).cast::<Checking>()) };
-            checking.result
-        }
-
-        pub fn want(check: &Check) -> Want {
-            match (&check.job, &check.signal) {
-                (Some(_), Some(signal)) => signal.want(),
-                _ => Want::READY,
-            }
-        }
-    }
-    // rr: end(os = macos windows)
-
     // rr: section(tests = yes)
     #[cfg(test)]
     mod tests {
@@ -2781,8 +2807,8 @@ mod sys {
 
         // rr: section(os = macos windows)
         /// The system's own verifier takes the real chains for their hosts,
-        /// through the poll loop and blocking, and refuses one for another
-        /// host and one of a PKI it does not trust.
+        /// through an Io and blocking, and refuses one for another host and
+        /// one of a PKI it does not trust.
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         #[test]
         fn platform() {
@@ -2794,14 +2820,14 @@ mod sys {
                 let chain: Vec<&[u8]> = certificates.iter().map(Vec::as_slice).collect();
                 let approval = trust.verify_blocking(&chain, host, TEST_NOW).unwrap();
                 assert!(approval.approves(chain[0], host), "{host}");
-                let mut check = trust.check(&chain, host, TEST_NOW);
+                let mut io = crate::base::io::Io::new(4).unwrap();
+                let (mut check, _op) = trust.check(&mut io, &chain, host, TEST_NOW, 1).unwrap();
                 let result = (0..1000)
                     .find_map(|_| {
-                        let result = check.poll();
-                        if result.is_none() {
-                            crate::base::poll::block(&check.want());
-                        }
-                        result
+                        io.wait(Some(core::time::Duration::from_millis(10)))
+                            .unwrap();
+                        io.next()?;
+                        check.poll()
                     })
                     .unwrap();
                 assert!(result.unwrap().approves(chain[0], host), "{host}");
@@ -2818,7 +2844,7 @@ mod sys {
                 let dotted_approval = trust.verify_blocking(&chain, &dotted, TEST_NOW).unwrap();
                 assert!(dotted_approval.approves(chain[0], host), "{dotted}");
                 // A check dropped while it runs is let go.
-                drop(trust.check(&chain, host, TEST_NOW));
+                drop(trust.check(&mut io, &chain, host, TEST_NOW, 2).unwrap());
             }
             // The path the system built is screened by a policy laid over it.
             let screened = super::Trust::new()
@@ -3072,16 +3098,9 @@ mod sys {
                 let certificates = certificates(names);
                 // rr: escape(copy): the chain check takes, borrowed from them.
                 let chain: Vec<&[u8]> = certificates.iter().map(Vec::as_slice).collect();
-                let mut check = super::os::check(&chain, host, TEST_NOW);
-                let built = (0..1000)
-                    .find_map(|_| {
-                        let result = check.poll();
-                        if result.is_none() {
-                            crate::base::poll::block(&super::os::want(&check));
-                        }
-                        result
-                    })
+                let built = super::os::job(&chain, host, TEST_NOW)
                     .unwrap()
+                    .run()
                     .unwrap();
                 assert!(!built.paths.is_empty(), "{host}");
                 assert!(built.paths.len() <= super::os::CHAINS_MAX, "{host}");

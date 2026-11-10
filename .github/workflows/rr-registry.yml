@@ -66,6 +66,9 @@ jobs:
         run: |
           # Git's GNU link would stand before Visual Studio's linker in bash.
           if [ "$RUNNER_OS" = Windows ]; then mv /usr/bin/link.exe /usr/bin/gnu-link.exe; fi
+          # install.ps1 installs the toolchain minimal; rr's build links
+          # rustc's own crates, which rust-toolchain.toml names.
+          rustup component add rustc-dev rust-src llvm-tools
           RUSTC_BOOTSTRAP=1 CARGO_TARGET_DIR="$RUNNER_TEMP/rr-target" cargo build --locked --release --bin rr
           sysroot=$(rustc --print sysroot | tr -d '\r')
           bin="$RUNNER_TEMP/rr-target/release/rr"

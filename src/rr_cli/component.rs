@@ -299,6 +299,15 @@ pub fn holds(c: &Condition, chosen: &[(String, Vec<String>)]) -> bool {
         .is_some_and(|(_, values)| c.values.iter().any(|v| values.contains(v)))
 }
 
+/// A mark after code on its line, a comment rr add would not see, as
+/// rustfmt leaves one that followed a closing brace.
+fn after_code(raw: &str) -> Option<&str> {
+    let at = raw.find("// rr: ")?;
+    let mark = &raw[at..];
+    let marked = line(mark).is_some_and(|l| MARKS.contains(&l.directive));
+    (marked && !raw[..at].trim().is_empty()).then(|| mark.trim())
+}
+
 /// The text rr add writes: the header and the marks gone, what the
 /// choices drop dropped, and `added` where the header was.
 pub fn cut(
@@ -341,6 +350,12 @@ pub fn cut(
             }
             dropped = true;
             continue;
+        }
+        if let Some(mark) = after_code(raw) {
+            return Err(format!(
+                "{}: `{mark}` follows code; a mark stands on a line of its own",
+                at()
+            ));
         }
         if !open.iter().all(|&(_, keep)| keep) {
             dropped = true;

@@ -133,7 +133,9 @@
       ]
     },
     {
-      "dependencies": [],
+      "dependencies": [
+        "thread"
+      ],
       "description": "Completion I/O for a loop on each thread, after TigerBeetle's: an Io takes operations (accept, connect, receive, send, a timeout), each with a key the loop picks, runs them on io_uring (Linux 6.1 and later; nothing else there) or kqueue (macOS), and hands each back once, done, as an Event the loop takes by next; what an operation works on (a Listener, a Stream, a buffer) is moved in and comes back in its Event, so nothing the system still writes is in the loop's hands; a table of operations fixed when the Io is made, which refuses one more by handing it back; an Op that cancel takes; errors by kind, IPv4 and IPv6.",
       "name": "io",
       "options": [
@@ -175,61 +177,10 @@
     },
     {
       "dependencies": [
-        "poll"
+        "io",
+        "thread"
       ],
-      "description": "TCP over the system's sockets for a loop that serves many: a Listener and the Streams it accepts or that connect out, non-blocking, closed on exec or never inherited, no SIGPIPE; each owns its socket and its Owned entry in a poll Poll, which close removes before the socket is closed, once; a Stream remembers how its connection went, and a read or write before it is made is NotConnected on every system; errors by kind, IPv4 and IPv6. For a loop on each core: listeners that share an address on Linux (SO_REUSEPORT, bind_shared), refused as Unbalanced on macOS and Windows, where one loop accepts a Handoff, a socket in no Poll, for another thread's loop to adopt.",
-      "name": "net",
-      "options": [
-        {
-          "choices": [
-            "yes",
-            "no"
-          ],
-          "default": "yes",
-          "name": "tests"
-        },
-        {
-          "choices": [
-            "linux",
-            "macos",
-            "windows"
-          ],
-          "default": "linux,macos,windows",
-          "name": "os"
-        }
-      ]
-    },
-    {
-      "dependencies": [],
-      "description": "What a program's loop waits on, in mio's words, for the program and every component that works while it runs: a Poll of any number of descriptors (sockets on Windows), each with its Interest and a key, and deadlines on the monotonic clock (one moved a little later left where it is filed, as nginx does), level-triggered on epoll (Linux), kqueue (macOS), socket notifications (Windows from build 20348: Server 2022, Windows 11) or WSAPoll (Windows 10, Server 2019, or a layered provider over TCP), what is ready reported as Events of Ready, the same on every system, and every refusal as a PollError; tokens of one Poll refused by another; Owned entries that only close takes out, closing the descriptor once; a Waker for other threads; a component's Want (up to two descriptors and a timeout), which a Poll follows or block waits on alone; and a Signal, the close-on-exec pipe (Linux and macOS) or non-inherited loopback socket pair (Windows) another thread makes readable. Formerly wait.",
-      "name": "poll",
-      "options": [
-        {
-          "choices": [
-            "yes",
-            "no"
-          ],
-          "default": "yes",
-          "name": "tests"
-        },
-        {
-          "choices": [
-            "linux",
-            "macos",
-            "windows"
-          ],
-          "default": "linux,macos,windows",
-          "name": "os"
-        }
-      ]
-    },
-    {
-      "dependencies": [
-        "poll",
-        "thread",
-        "net"
-      ],
-      "description": "A bounded queue between threads for a loop on each core: net Handoffs, accepted sockets in no Poll, with a tag, from the thread that accepts to a worker's loop, whose Poll each push wakes; a line under the system's mutex with condition variables for threads that may block, no lock-free code; a push to a full queue refused at once with the connection given back; Closed once every Sender is gone. Its tests run a server on N threads, a Poll each, over SO_REUSEPORT listeners on Linux and an accept thread that hands off on macOS and Windows, and bench its connections a second.",
+      "description": "A bounded queue between threads for a loop on each core: io Streams with a tag, from the thread that accepts to a worker's loop, whose Io each push wakes; a line under the system's mutex with condition variables for threads that may block, no lock-free code; a push to a full queue refused at once with the connection given back; Closed once every Sender is gone. Its tests run a server on N threads, an Io each, fed by an accept thread, and bench its connections a second.",
       "name": "queue",
       "options": [
         {
@@ -268,10 +219,10 @@
     },
     {
       "dependencies": [
-        "poll",
+        "io",
         "thread"
       ],
-      "description": "Host lookup that never blocks the caller's loop, one API on Linux, macOS and Windows: start, poll, take the addresses (socket_addr keeps a link-local one's interface), drop to cancel. The system answers: mDNSResponder through DNSServiceGetAddrInfo on macOS, on a socket the caller's poll waits on, sorted by RFC 6724 as getaddrinfo sorts; GetAddrInfoExW on Windows, asynchronous and cancellable, its callback signalling the caller's poll; the C library's getaddrinfo on Linux, on thread's pool, where a lookup cancelled after it started runs on to the system's timeout.",
+      "description": "Host lookup that never blocks the caller's loop, one API on Linux, macOS and Windows: start a Lookup on an io::Io, take the addresses once its Event came (socket_addr keeps a link-local one's interface). The system answers as it answers every program there, on io's pool of threads: the C library's getaddrinfo on Linux and macOS, GetAddrInfoW on Windows, each sorted by RFC 6724; a lookup canceled after a thread took it runs on to the system's timeout, its answer dropped.",
       "name": "resolve",
       "options": [
         {
@@ -391,10 +342,8 @@
       ]
     },
     {
-      "dependencies": [
-        "poll"
-      ],
-      "description": "Threads for a program whose loops wait on a poll::Poll, as libuv gives them: a pool of at most 32 threads for work that blocks (libuv's threadpool: started as work comes, asleep on a condition variable, one first-in-first-out line under a mutex), its work a Box<dyn Work + Send> moved in and given back once it ran, a Job that cancels work still in line when dropped and wakes the loop's Poll or sets a Signal when done; threads of their own for loops on other cores, with a 2 MiB stack, joined by a blocking join; and the system's mutex and condition variable (pthread on Linux and macOS, SRWLOCK and CONDITION_VARIABLE on Windows), held by a guard.",
+      "dependencies": [],
+      "description": "Threads for a program whose loops wait on an io::Io, as libuv gives them: a pool of at most 32 threads for work that blocks (libuv's threadpool: started as work comes, asleep on a condition variable, one first-in-first-out line under a mutex), its work a Box<dyn Work + Send> moved in and given back once it ran, a Job that cancels work still in line when dropped and tells a Notify when done (io's run does, which wakes the loop's Io); threads of their own for loops on other cores, with a 2 MiB stack, joined by a blocking join; and the system's mutex and condition variable (pthread on Linux and macOS, SRWLOCK and CONDITION_VARIABLE on Windows), held by a guard.",
       "name": "thread",
       "options": [
         {
@@ -462,10 +411,10 @@
     {
       "dependencies": [
         "x509",
-        "poll",
+        "io",
         "thread"
       ],
-      "description": "TLS server authentication by the operating system's trust, as Go's crypto/x509 does it: macOS's SecTrustEvaluateWithError and Windows's CertGetCertificateChain with the SSL policy, on thread's pool, whose Signal a poll loop waits on, and on Linux x509::verify against the system's anchors (its bundle and certificate directories, or SSL_CERT_FILE and SSL_CERT_DIR, read through the C library); SSL_CERT_FILE and SSL_CERT_DIR replace the system's verifier on macOS and Windows too, as in Go 1.27; a policy such as roots::policy (OneCRL, distrust dates) screens the path whichever verifies. system() also loads the anchors themselves on all three: macOS's trust domains with their SSL trust settings, Windows's ROOT store less what is disabled for server authentication or Disallowed. A check answers with an x509::Approval; verify_blocking is for threads that may block.",
+      "description": "TLS server authentication by the operating system's trust, as Go's crypto/x509 does it: macOS's SecTrustEvaluateWithError and Windows's CertGetCertificateChain with the SSL policy, and on Linux x509::verify against the system's anchors (its bundle and certificate directories, or SSL_CERT_FILE and SSL_CERT_DIR, read through the C library), each on an io::Io's pool, its answer an Event; SSL_CERT_FILE and SSL_CERT_DIR replace the system's verifier on macOS and Windows too, as in Go 1.27; a policy such as roots::policy (OneCRL, distrust dates) screens the path whichever verifies. system() also loads the anchors themselves on all three: macOS's trust domains with their SSL trust settings, Windows's ROOT store less what is disabled for server authentication or Disallowed. A check answers with an x509::Approval; verify_blocking is for threads that may block.",
       "name": "trust",
       "options": [
         {

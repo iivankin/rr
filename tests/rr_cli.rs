@@ -316,6 +316,26 @@ fn rr_version() -> String {
 }
 
 #[test]
+fn add_refuses_a_mark_after_code() {
+    let project = Project::new();
+    let registry = project.0.join("registry");
+    fs::create_dir_all(&registry).unwrap();
+    // rustfmt leaves a mark that followed a closing brace after it, where
+    // rr add would not see it.
+    fs::write(
+        registry.join("bad.rs"),
+        "// rr: option(os, many): Which?\n// rr: choice(os = linux, default): Linux\nfn f() {\n    // rr: section(os = linux)\n    g();\n} // rr: end(os = linux)\n",
+    )
+    .unwrap();
+    let output = project.rr(&["add", "registry/bad.rs"]);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("follows code"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn add_cuts_what_its_options_leave_out_and_adds_what_they_need() {
     let project = Project::new();
     let registry = project.0.join("registry");

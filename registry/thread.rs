@@ -1,27 +1,27 @@
-//! Threads for a program whose loops wait on a poll::Poll, as libuv gives
+//! Threads for a program whose loops wait on an io::Io, as libuv gives
 //! them: a pool of at most 32 threads for work that blocks (libuv's
 //! threadpool: started as work comes, asleep on a condition variable, one
 //! first-in-first-out line under a mutex), its work a Box<dyn Work + Send>
 //! moved in and given back once it ran, a Job that cancels work still in line
-//! when dropped and wakes the loop's Poll or sets a Signal when done; threads
-//! of their own for loops on other cores, with a 2 MiB stack, joined by a
-//! blocking join; and the system's mutex and condition variable (pthread on
-//! Linux and macOS, SRWLOCK and CONDITION_VARIABLE on Windows), held by a
-//! guard.
+//! when dropped and tells a Notify when done (io's run does, which wakes the
+//! loop's Io); threads of their own for loops on other cores, with a 2 MiB
+//! stack, joined by a blocking join; and the system's mutex and condition
+//! variable (pthread on Linux and macOS, SRWLOCK and CONDITION_VARIABLE on
+//! Windows), held by a guard.
 //!
-//! Threads for a program whose loops wait on a poll::Poll, as libuv
-//! gives a loop its threads: a pool for work that blocks, and threads of
-//! their own for loops on other cores. No callback runs on a loop: a job
-//! that is done tells it (a Waker or a Signal), and the loop takes it.
+//! Threads for a program whose loops wait on an io::Io, as libuv gives a
+//! loop its threads: a pool for work that blocks, and threads of their own
+//! for loops on other cores. No callback runs on a loop: a job that is
+//! done tells its Notify from the pool's thread, as io's run wakes the
+//! loop's Io, and the loop takes it.
 //!
 //! The pool (spawn) is libuv's threadpool.c: at most THREADS_MAX
 //! threads, started as work comes and none is idle, which then sleep on
 //! a condition variable for the next; one line of work, first in first
 //! out, under a mutex. A Job cancels work still in line when it is
 //! dropped (cancel gives it back), never work a thread took, which runs
-//! to its end, as uv_cancel. Once the work returned, the job's Done
-//! wakes the loop's Poll (WOKEN) or sets a Signal a component's Want
-//! names, and take gives the work back.
+//! to its end, as uv_cancel. Once the work returned, the job tells its
+//! Notify, and take gives the work back.
 //!
 //! Work is moved in and given back: a `Box<dyn Work + Send>`, owned, so
 //! it holds no reference into the caller's stack and nothing that may
@@ -36,16 +36,15 @@
 //! in atomics shared with it instead.
 //!
 //! start runs one Work on a thread of its own, with a stack of 2 MiB:
-//! such as a loop with its own Poll, made on the starting thread and
-//! moved in, with the Waker that tells it to end; join waits for it, for
-//! a thread that may block. Lock and Cond are the system's mutex and
+//! such as a loop with its own Io, which it makes there (an io_uring
+//! stays with the thread that made it), told to end by a Waker; join
+//! waits for it, for a thread that may block. Lock and Cond are the system's mutex and
 //! condition variable, pthread's on Linux and macOS, SRWLOCK and
 //! CONDITION_VARIABLE on Windows, for the pool and queue: a guard holds
 //! the lock while it lives, and a wait on a Cond is `#[rr::blocking]`, as
-//! join is, which rr refuses on a poll loop's path.
+//! join is, which rr refuses on the path of a loop marked rr::poll.
 
 // rr: checked(0.5.2)
-// rr: needs(poll)
 // rr: option(tests, one): Its tests, which rr test runs?
 // rr: choice(tests = yes, default): the tests, and the data files they read
 // rr: choice(tests = no): none
@@ -86,7 +85,6 @@ compile_error!("rr add cut thread without other: add it again with other in --op
 mod sys {
     //! The system side of thread: what the top of the file says it is, for each system.
 
-    use crate::base::poll::{Signal, Waker};
     use alloc::boxed::Box;
     use alloc::collections::VecDeque;
     use alloc::sync::Arc;
@@ -104,25 +102,16 @@ mod sys {
         fn run(&mut self);
     }
 
-    /// How the loop that spawned a Job learns it is done: told only after
-    /// the work returned, so that take then gives it back.
-    pub enum Done {
-        /// Wakes the loop's Poll: it sees WOKEN, and takes its jobs that
-        /// are done.
-        Wake(Waker),
-        /// Sets the signal: for a component whose Want names it, which a
-        /// loop follows in its Poll or block waits on.
-        Signal(Arc<Signal>),
+    /// How the loop that spawned a Job learns it is done: told on the
+    /// pool's thread only after the work returned, so that take then gives
+    /// it back. io's run tells the loop's Io, which hands the work back as
+    /// an Event.
+    pub trait Notify {
+        fn notify(&self);
     }
 
-    impl Done {
-        fn tell(&self) {
-            match self {
-                Done::Wake(waker) => waker.wake(),
-                Done::Signal(signal) => signal.set(),
-            }
-        }
-    }
+    /// A job's Notify, which the job and the pool's thread hold.
+    pub type Done = Arc<dyn Notify + Send + Sync>;
 
     /// Why no thread runs the work.
     // rr: section(tests = yes)
@@ -164,8 +153,7 @@ mod sys {
     // rr: escape(unsafe): work is reached by one thread at a time, as state
     // says: the thread that moved it from QUEUED to RUNNING, until it stores
     // DONE (Release); then, or once it moved it from QUEUED to CANCELLED, the
-    // Job alone, which reads state with Acquire first. done is Waker or
-    // Arc<Signal>, which any thread may use.
+    // Job alone, which reads state with Acquire first. done is Send and Sync.
     unsafe impl Sync for Shared {}
 
     /// Work spawn took for the pool: done says when it ran, take gives it
@@ -243,8 +231,9 @@ mod sys {
     /// order of the calls (libuv's threadpool.c: one line under a mutex, its
     /// threads asleep on a condition variable until work comes). done tells
     /// the caller's loop once the work returned; the Job gives it back.
-    /// Err when no thread could be started and none runs: work never runs.
-    pub fn spawn(work: Box<dyn Work + Send>, done: Done) -> Result<Job, Error> {
+    /// Err gives the work back, never run, when no thread could be started
+    /// and none runs: the system is out of memory or of threads.
+    pub fn spawn(work: Box<dyn Work + Send>, done: Done) -> Result<Job, Box<dyn Work + Send>> {
         // rr: escape(shared): the job and the pool's line hold it.
         let shared = Arc::new(Shared {
             state: AtomicU8::new(QUEUED),
@@ -264,7 +253,12 @@ mod sys {
             return Ok(job);
         }
         if POOL.unstart(&job.shared) {
-            return Err(Error::Start);
+            // Out of line and still QUEUED, so cancel takes it back.
+            return match job.cancel() {
+                Ok(unrun) => Err(unrun),
+                // rr: escape(panic): no thread took it, as unstart says.
+                Err(_) => unreachable!("work out of the pool's line was taken"),
+            };
         }
         Ok(job)
     }
@@ -383,12 +377,12 @@ mod sys {
                 work.run();
             }
             shared.state.store(DONE, Ordering::Release);
-            shared.done.tell();
+            shared.done.notify();
         }
     }
 
     /// A thread of its own, running one Work, such as a loop with its own
-    /// Poll: join waits for its end. Dropped, it is detached and runs on.
+    /// Io: join waits for its end. Dropped, it is detached and runs on.
     #[must_use]
     pub struct Thread {
         handle: Option<os::Handle>,
@@ -534,6 +528,17 @@ mod sys {
         use core::cell::UnsafeCell;
         use core::ffi::{c_int, c_void};
 
+        // rr: section(tests = yes)
+        /// A millisecond: struct timespec, a time_t and a long.
+        #[cfg(test)]
+        pub fn nap() {
+            let wanted = [0i64, 1_000_000];
+            // rr: escape(unsafe, discard): wanted is a timespec; a signal
+            // that ends it early ends a nap.
+            let _: c_int = unsafe { nanosleep(&raw const wanted, core::ptr::null_mut()) };
+        }
+        // rr: end(tests = yes)
+
         // rr: section(os = macos)
         /// pthread_t: a pointer on macOS, an unsigned long in glibc and musl.
         #[cfg(target_os = "macos")]
@@ -558,6 +563,11 @@ mod sys {
             ) -> c_int;
             #[must_use]
             fn pthread_detach(thread: Handle) -> c_int;
+            // rr: section(tests = yes)
+            #[cfg(test)]
+            #[must_use]
+            fn nanosleep(wanted: *const [i64; 2], left: *mut [i64; 2]) -> c_int;
+            // rr: end(tests = yes)
             #[must_use]
             fn pthread_join(thread: Handle, result: *mut *mut c_void) -> c_int;
             #[must_use]
@@ -762,16 +772,30 @@ mod sys {
     // rr: section(os = windows)
     #[cfg(target_os = "windows")]
     mod os {
-        use crate::base::poll::INFINITE;
         use core::cell::UnsafeCell;
         use core::ffi::c_void;
         use core::ptr::{null, null_mut};
 
         pub type Handle = *mut c_void;
 
+        /// winbase.h: a wait with no limit.
+        pub const INFINITE: u32 = 0xFFFF_FFFF;
+
+        // rr: section(tests = yes)
+        #[cfg(test)]
+        pub fn nap() {
+            // rr: escape(unsafe): Sleep takes a plain number.
+            unsafe { Sleep(1) }
+        }
+        // rr: end(tests = yes)
+
         #[link(name = "kernel32", kind = "raw-dylib")]
         // rr: escape(unsafe): each signature is kernel32's, from its documentation.
         unsafe extern "system" {
+            // rr: section(tests = yes)
+            #[cfg(test)]
+            fn Sleep(milliseconds: u32);
+            // rr: end(tests = yes)
             fn CreateThread(
                 attributes: *const c_void,
                 stack: usize,
@@ -915,11 +939,25 @@ mod sys {
     }
     // rr: end(os = windows)
 
+    // rr: section(os = windows)
+    /// Windows's wait with no limit, for io's.
+    #[cfg(target_os = "windows")]
+    pub use os::INFINITE;
+    // rr: end(os = windows)
+
     /// What a new thread runs: entry, on argument.
     struct Start {
         entry: fn(*mut c_void),
         argument: *mut c_void,
     }
+
+    // rr: section(tests = yes)
+    /// Sleeps a millisecond, for the tests.
+    #[cfg(test)]
+    pub fn nap() {
+        os::nap();
+    }
+    // rr: end(tests = yes)
 }
 
 pub use sys::*;
@@ -930,8 +968,7 @@ mod tests {
     //! thread's tests: the pool's line, its jobs as a loop takes them, a
     //! loop on a thread of its own, and the lock under them.
 
-    use super::{Done, Job, THREADS_MAX, Work, spawn, start};
-    use crate::base::poll::{Instant, Poll, Ready, Signal, Waker, Want, block, ready};
+    use super::{Cond, Job, Lock, Notify, THREADS_MAX, Work, nap, spawn, start};
     use alloc::boxed::Box;
     use alloc::sync::Arc;
     use alloc::vec::Vec;
@@ -951,18 +988,30 @@ mod tests {
     // rr: escape(shared): which jobs ran.
     static RAN: [AtomicBool; JOBS] = [const { AtomicBool::new(false) }; JOBS];
 
-    /// Waits a millisecond.
-    fn nap() {
-        let mut want = Want::READY;
-        want.timeout_ms = Some(1);
-        ready(&want);
-    }
-
     /// Waits up to five seconds for done.
     fn until(done: impl Fn() -> bool) -> bool {
         (0..5000).any(|_| {
             nap();
             done()
+        })
+    }
+
+    /// Counts what it is told, as a loop's Io would be woken.
+    struct Count {
+        told: AtomicUsize,
+    }
+
+    impl Notify for Count {
+        fn notify(&self) {
+            self.told.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn count() -> Arc<Count> {
+        // rr: escape(shared): the pool's threads tell it, the test reads it.
+        Arc::new(Count {
+            // rr: escape(shared): what it was told.
+            told: AtomicUsize::new(0),
         })
     }
 
@@ -984,26 +1033,28 @@ mod tests {
         }
     }
 
-    fn held(index: usize, waker: &Waker) -> Job {
-        // rr: escape(copy): each job wakes the test's Poll.
-        spawn(Box::new(Held { index }), Done::Wake(waker.clone())).unwrap()
+    fn held(index: usize, told: &Arc<Count>) -> Job {
+        // rr: escape(copy): each job tells the test's count.
+        let Ok(job) = spawn(Box::new(Held { index }), Arc::<Count>::clone(told)) else {
+            panic!("no thread for the pool");
+        };
+        job
     }
 
     /// More jobs than threads: THREADS_MAX run, the rest wait in line and
     /// run as threads free; one cancelled in line never runs, and is given
     /// back; nor one whose job is dropped there; one detached runs; one a
-    /// thread took is not cancelled.
+    /// thread took is not cancelled. Each that ran tells once.
     #[test]
     fn line() {
-        let mut poll = Poll::new().unwrap();
-        let waker = poll.waker(1);
+        let told = count();
         let mut jobs = Vec::new();
         for index in 0..JOBS - 3 {
-            jobs.push(held(index, &waker));
+            jobs.push(held(index, &told));
         }
-        let dropped = held(JOBS - 3, &waker);
-        let cancelled = held(JOBS - 2, &waker);
-        held(JOBS - 1, &waker).detach();
+        let dropped = held(JOBS - 3, &told);
+        let cancelled = held(JOBS - 2, &told);
+        held(JOBS - 1, &told).detach();
         assert!(until(|| NOW.load(Ordering::SeqCst) == THREADS_MAX));
         nap();
         assert_eq!(NOW.load(Ordering::SeqCst), THREADS_MAX);
@@ -1015,15 +1066,16 @@ mod tests {
         jobs.push(running);
         OPEN.store(true, Ordering::SeqCst);
         assert!(until(|| DONE.load(Ordering::SeqCst) == JOBS - 2));
+        assert!(until(|| told.told.load(Ordering::Acquire) == JOBS - 2));
         for _ in 0..50 {
             nap();
         }
         assert_eq!(DONE.load(Ordering::SeqCst), JOBS - 2);
+        assert_eq!(told.told.load(Ordering::Acquire), JOBS - 2);
         assert_eq!(MOST.load(Ordering::SeqCst), THREADS_MAX);
         assert!(!RAN[JOBS - 3].load(Ordering::SeqCst));
         assert!(!RAN[JOBS - 2].load(Ordering::SeqCst));
         assert!(RAN[JOBS - 1].load(Ordering::SeqCst));
-        poll.poll(Some(Instant::now().after_ms(1000)));
         for job in jobs {
             assert!(job.take().is_ok());
         }
@@ -1052,13 +1104,12 @@ mod tests {
         }
     }
 
-    /// A job wakes its loop's Poll once its work returned, and not before;
-    /// take refuses before, and gives the work back after, which lives
-    /// until the loop drops it.
+    /// A job tells its Notify once its work returned, and not before; take
+    /// refuses before, and gives the work back after, which lives until the
+    /// loop drops it.
     #[test]
-    fn wakes_its_loop() {
-        let mut poll = Poll::new().unwrap();
-        let waker = poll.waker(7);
+    fn tells_when_done() {
+        let told = count();
         // rr: escape(shared): the work's answer, which the test reads.
         let found = Arc::new(AtomicUsize::new(0));
         let sum = Sum {
@@ -1066,14 +1117,12 @@ mod tests {
             // rr: escape(copy): the work's holder of the answer.
             found: Arc::clone(&found),
         };
-        let mut job = spawn(Box::new(sum), Done::Wake(waker)).unwrap();
-        let end = Instant::now().after_ms(10_000);
-        while !job.done() {
-            assert!(!end.reached_by(Instant::now()));
-            for event in poll.poll(Some(end)) {
-                assert!(event.key == 7 && event.ready.woken());
-            }
-        }
+        // rr: escape(copy): the job's holder of the count.
+        let Ok(job) = spawn(Box::new(sum), Arc::<Count>::clone(&told)) else {
+            panic!("no thread for the pool");
+        };
+        assert!(until(|| told.told.load(Ordering::Acquire) == 1));
+        assert!(job.done());
         assert_eq!(found.load(Ordering::Acquire), 500_500);
         let before = SUMS_DROPPED.load(Ordering::SeqCst);
         let Ok(work) = job.take() else {
@@ -1082,89 +1131,55 @@ mod tests {
         assert_eq!(SUMS_DROPPED.load(Ordering::SeqCst), before);
         drop(work);
         assert_eq!(SUMS_DROPPED.load(Ordering::SeqCst), before + 1);
-        job = spawn(
-            Box::new(Sum {
-                up_to: 1,
-                // rr: escape(copy): the work's holder of the answer.
-                found: Arc::clone(&found),
-            }),
-            // rr: escape(shared): the job's signal, which nothing waits on.
-            Done::Signal(Arc::new(Signal::new().unwrap())),
-        )
-        .unwrap();
-        drop(job);
     }
 
-    /// A job sets the Signal a component's Want names once it is done.
-    #[test]
-    fn sets_a_signal() {
-        // rr: escape(shared): the job sets it, the test waits on it.
-        let signal = Arc::new(Signal::new().unwrap());
-        // rr: escape(shared): the work's answer.
-        let found = Arc::new(AtomicUsize::new(0));
-        let work = Sum {
-            up_to: 10,
-            // rr: escape(copy): the work's holder of the answer.
-            found: Arc::clone(&found),
-        };
-        // rr: escape(copy): the job's holder of the signal.
-        let job = spawn(Box::new(work), Done::Signal(Arc::clone(&signal))).unwrap();
-        let mut want = signal.want();
-        want.timeout_ms = Some(10_000);
-        block(&want);
-        assert!(job.done());
-        assert_eq!(found.load(Ordering::Acquire), 55);
-        assert!(job.take().is_ok());
-    }
-
-    /// A loop on a thread of its own: its Poll, made here, moved in; a
-    /// Waker tells it to end, and it counts its wakes.
+    /// A loop on a thread of its own, told to end by a flag under a lock,
+    /// as a queue tells its workers.
     struct Loop {
-        poll: Poll,
-        stop: Arc<AtomicBool>,
-        wakes: Arc<AtomicUsize>,
+        gate: Arc<Gate>,
+        turns: Arc<AtomicUsize>,
+    }
+
+    struct Gate {
+        lock: Lock,
+        changed: Cond,
+        stop: AtomicBool,
     }
 
     impl Work for Loop {
         fn run(&mut self) {
-            serve(self);
-        }
-    }
-
-    /// The loop, marked as a program marks its own.
-    #[cfg_attr(rr, rr::poll)]
-    fn serve(state: &mut Loop) {
-        let end = Instant::now().after_ms(10_000);
-        while !state.stop.load(Ordering::Acquire) && !end.reached_by(Instant::now()) {
-            for event in state.poll.poll(Some(end)) {
-                if event.ready.any(Ready::WOKEN) {
-                    state.wakes.fetch_add(1, Ordering::AcqRel);
-                }
+            let held = self.gate.lock.lock();
+            while !self.gate.stop.load(Ordering::Acquire) {
+                self.turns.fetch_add(1, Ordering::AcqRel);
+                self.gate.changed.wait(&held);
             }
         }
     }
 
-    /// A started thread runs its own loop until told to end, and is joined.
+    /// A started thread runs until told to end, and is joined.
     #[test]
     fn runs_a_loop() {
-        let mut poll = Poll::new().unwrap();
-        let waker = poll.waker(3);
-        // rr: escape(shared): the test tells the loop to end.
-        let stop = Arc::new(AtomicBool::new(false));
-        // rr: escape(shared): the loop counts its wakes.
-        let wakes = Arc::new(AtomicUsize::new(0));
+        // rr: escape(shared): the test and the loop hold it.
+        let gate = Arc::new(Gate {
+            lock: Lock::new(),
+            changed: Cond::new(),
+            stop: AtomicBool::new(false),
+        });
+        // rr: escape(shared): the loop counts its turns.
+        let turns = Arc::new(AtomicUsize::new(0));
         let thread = start(Box::new(Loop {
-            poll,
-            // rr: escape(copy): the loop's holder of the flag.
-            stop: Arc::clone(&stop),
+            // rr: escape(copy): the loop's holder of the gate.
+            gate: Arc::clone(&gate),
             // rr: escape(copy): the loop's holder of the count.
-            wakes: Arc::clone(&wakes),
+            turns: Arc::clone(&turns),
         }))
         .unwrap();
-        waker.wake();
-        assert!(until(|| wakes.load(Ordering::Acquire) >= 1));
-        stop.store(true, Ordering::Release);
-        waker.wake();
+        assert!(until(|| turns.load(Ordering::Acquire) >= 1));
+        {
+            let _held = gate.lock.lock();
+            gate.stop.store(true, Ordering::Release);
+            gate.changed.broadcast();
+        }
         assert_eq!(thread.join(), Ok(()));
     }
 }

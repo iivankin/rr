@@ -8,8 +8,9 @@
 //! fixed when the Io is made, which refuses one more by handing it back;
 //! an Op that cancel takes; errors by kind, IPv4 and IPv6.
 //!
-//! A loop makes one Io on its own thread (it stays there), starts what it
-//! wants, and waits:
+//! A loop makes one Io, or has it made and moved to its thread before its
+//! first wait (it stays there from then on), starts what it wants, and
+//! waits:
 //!
 //! ```text
 //! let mut io = Io::new(1024)?;
@@ -56,9 +57,11 @@
 //! operations running cancels them and waits for the system to let go of
 //! their buffers before it frees them.
 //!
-//! On Linux an Io is an io_uring of its own (one issuer, its work done
-//! when it waits: IORING_SETUP_SINGLE_ISSUER and DEFER_TASKRUN, so Linux
-//! 6.1 or later), and there is no other way: Io::new says why the system
+//! On Linux an Io is an io_uring of its own (one issuer, the thread of its
+//! first wait, which enables it, and its work done when it waits:
+//! IORING_SETUP_R_DISABLED, SINGLE_ISSUER and DEFER_TASKRUN, so Linux 6.1
+//! or later; a wait on another thread after is refused, EEXIST), and there
+//! is no other way: Io::new says why the system
 //! gives none (Unavailable): no io_uring in the kernel or a seccomp filter
 //! that says it has none, as gVisor's (Missing); io_uring_disabled = 2
 //! (Disabled) or 1 for a process outside io_uring_group (Group); a filter
@@ -81,6 +84,7 @@
 //! code for the rest.
 
 // rr: checked(0.5.2)
+// rr: needs(thread)
 // rr: option(tests, one): Its tests, which rr test runs?
 // rr: choice(tests = yes, default): the tests
 // rr: choice(tests = no): none
@@ -102,14 +106,32 @@ compile_error!("rr add cut io without macos: add it again with macos in --option
 compile_error!("rr add cut io without windows: add it again with windows in --option os");
 // rr: end(os = windows)
 
-pub use sys::{Done, Error, Event, Io, Listener, Op, Stream, Unavailable};
+pub use crate::base::thread::Work;
+pub use sys::{
+    AF_INET, AF_INET6, Done, Error, Event, Io, Listener, Op, SOCK_STREAM, Stream, Udp, Unavailable,
+    Waker,
+};
+
+// rr: section(os = linux macos)
+#[cfg(unix)]
+pub use sys::{EINTR, EINVAL, errno};
+// rr: end(os = linux macos)
+
+// rr: section(os = windows)
+/// Winsock, started once for the process, for what else asks it (resolve).
+#[cfg(windows)]
+pub use sys::startup;
+// rr: end(os = windows)
 
 mod sys {
     //! The system side of io: what the top of the file says it is, for each system.
 
+    use crate::base::thread::{self, Job, Lock, Notify, Work as Blocking};
     use alloc::boxed::Box;
     use alloc::collections::VecDeque;
+    use alloc::sync::Arc;
     use alloc::vec::Vec;
+    use core::cell::UnsafeCell;
     use core::mem;
     use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
     use core::time::Duration;
@@ -201,7 +223,7 @@ mod sys {
         /// Listens on an address; port 0 takes one the system picks
         /// (local says which).
         pub fn bind(address: SocketAddr, backlog: u32) -> Result<Listener, Error> {
-            let fd = Fd::new(os::open(&address)?);
+            let fd = Fd::new(os::open(&address, Kind::Stream)?);
             os::prepare(fd.raw, address.is_ipv6())?;
             let (bytes, length) = encode(&address);
             os::bind(fd.raw, bytes.get(..length).unwrap_or_default())?;
@@ -213,6 +235,37 @@ mod sys {
         pub fn local(&self) -> Option<SocketAddr> {
             os::local(self.fd.raw)
         }
+    }
+
+    /// A UDP socket, closed when it is dropped.
+    pub struct Udp {
+        fd: Fd,
+    }
+
+    impl Udp {
+        /// A socket on an address, which sends and receives datagrams; port
+        /// 0 takes one the system picks (local says which). An IPv6 one
+        /// takes IPv6 alone, and on Windows an ICMP refusal of what it sent
+        /// does not fail its next receive (SIO_UDP_CONNRESET off).
+        pub fn bind(address: SocketAddr) -> Result<Udp, Error> {
+            let fd = Fd::new(os::open(&address, Kind::Datagram)?);
+            os::datagram(fd.raw, address.is_ipv6())?;
+            let (bytes, length) = encode(&address);
+            os::bind(fd.raw, bytes.get(..length).unwrap_or_default())?;
+            Ok(Udp { fd })
+        }
+
+        #[must_use]
+        pub fn local(&self) -> Option<SocketAddr> {
+            os::local(self.fd.raw)
+        }
+    }
+
+    /// What a socket carries.
+    #[derive(Clone, Copy)]
+    enum Kind {
+        Stream,
+        Datagram,
     }
 
     /// A descriptor this owns, closed when it is dropped.
@@ -286,6 +339,26 @@ mod sys {
         },
         /// The time passed, unless canceled.
         Elapsed(Result<(), Error>),
+        /// The socket and its buffer, sent as one datagram, unless it failed.
+        SentTo {
+            udp: Udp,
+            buffer: Vec<u8>,
+            result: Result<(), Error>,
+        },
+        /// The work, back from thread's pool once it ran, or never run when
+        /// canceled in line.
+        Ran {
+            work: Box<dyn Blocking + Send>,
+            result: Result<(), Error>,
+        },
+        /// The socket, and its buffer with a datagram of so many bytes after
+        /// what it held, and who sent it; one longer than the room is cut
+        /// to it.
+        ReceivedFrom {
+            udp: Udp,
+            buffer: Vec<u8>,
+            result: Result<(usize, SocketAddr), Error>,
+        },
     }
 
     /// What a slot's operation works on while it runs.
@@ -297,6 +370,10 @@ mod sys {
         /// The stream, the buffer, and how much of it the system took.
         Send(Stream, Vec<u8>, usize),
         Timeout(Duration),
+        SendTo(Udp, Vec<u8>),
+        ReceiveFrom(Udp, Vec<u8>),
+        /// Work on thread's pool, which tells the Io when it returned.
+        Run(Job),
         /// Done: what the next Event hands back.
         Finished(Done),
     }
@@ -327,6 +404,13 @@ mod sys {
         #[cfg(windows)]
         accepted: [u8; 88],
         // rr: end(os = windows)
+        // rr: section(os = linux)
+        /// io_uring: a datagram's struct msghdr and its one struct iovec.
+        #[cfg(target_os = "linux")]
+        message: [u64; 7],
+        #[cfg(target_os = "linux")]
+        vector: [u64; 2],
+        // rr: end(os = linux)
         generation: u32,
         state: State,
         /// cancel asked the system to end it.
@@ -355,6 +439,12 @@ mod sys {
                 #[cfg(windows)]
                 accepted: [0; 88],
                 // rr: end(os = windows)
+                // rr: section(os = linux)
+                #[cfg(target_os = "linux")]
+                message: [0; 7],
+                #[cfg(target_os = "linux")]
+                vector: [0; 2],
+                // rr: end(os = linux)
                 generation: 0,
                 state: State::Free,
                 canceled: false,
@@ -375,7 +465,8 @@ mod sys {
                 Work::Connect(stream) | Work::Receive(stream, _) | Work::Send(stream, _, _) => {
                     Some(stream.fd.raw)
                 }
-                Work::Idle | Work::Timeout(_) | Work::Finished(_) => None,
+                Work::SendTo(udp, _) | Work::ReceiveFrom(udp, _) => Some(udp.fd.raw),
+                Work::Idle | Work::Timeout(_) | Work::Run(_) | Work::Finished(_) => None,
             }
         }
     }
@@ -387,17 +478,20 @@ mod sys {
     /// an errno.
     type Answer = Result<usize, i32>;
 
-    /// The operation's user data: its slot and that slot's generation, and
-    /// the top bit for a cancel's own, whose answer says nothing.
+    /// The operation's user data: its slot and that slot's generation; the
+    /// top bit for a cancel's own, whose answer says nothing, and the next
+    /// for a Waker's.
     fn user_data(index: u32, generation: u32) -> u64 {
         (u64::from(generation & GENERATIONS) << 32) | u64::from(index)
     }
 
-    const GENERATIONS: u32 = 0x7fff_ffff;
+    const GENERATIONS: u32 = 0x3fff_ffff;
     const CANCEL: u64 = 1 << 63;
+    /// The user data of what a Waker sets.
+    const WAKE: u64 = 1 << 62;
 
     fn parts(data: u64) -> Option<(usize, u32)> {
-        if data & CANCEL != 0 {
+        if data & (CANCEL | WAKE) != 0 {
             return None;
         }
         let index = usize::try_from(data & 0xffff_ffff).ok()?;
@@ -497,7 +591,49 @@ mod sys {
             (Work::Timeout(_), Err(code)) => {
                 (Work::Finished(Done::Elapsed(Err(os::error(code)))), false)
             }
-            (other @ (Work::Idle | Work::Finished(_)), _) => (other, false),
+            (Work::SendTo(udp, buffer), Err(code)) if os::again(code) && !canceled => {
+                (Work::SendTo(udp, buffer), true)
+            }
+            (Work::SendTo(udp, buffer), answer) => {
+                let result = answer.map(|_| ()).map_err(os::error);
+                (
+                    Work::Finished(Done::SentTo {
+                        udp,
+                        buffer,
+                        result,
+                    }),
+                    false,
+                )
+            }
+            (Work::ReceiveFrom(udp, mut buffer), Ok(count)) => {
+                os::filled(&mut buffer, count);
+                let filled = usize::try_from(slot.length).unwrap_or(0);
+                let from = slot.address.get(..filled).and_then(decode);
+                let result = from.map(|from| (count, from)).ok_or(Error::Other(0));
+                (
+                    Work::Finished(Done::ReceivedFrom {
+                        udp,
+                        buffer,
+                        result,
+                    }),
+                    false,
+                )
+            }
+            (Work::ReceiveFrom(udp, buffer), Err(code)) if os::again(code) && !canceled => {
+                (Work::ReceiveFrom(udp, buffer), true)
+            }
+            (Work::ReceiveFrom(udp, buffer), Err(code)) => {
+                let result = Err(os::error(code));
+                (
+                    Work::Finished(Done::ReceivedFrom {
+                        udp,
+                        buffer,
+                        result,
+                    }),
+                    false,
+                )
+            }
+            (other @ (Work::Idle | Work::Run(_) | Work::Finished(_)), _) => (other, false),
         };
         slot.work = work;
         if !again {
@@ -526,7 +662,71 @@ mod sys {
         /// The free slots, and those done, in the order they were.
         free: Vec<u32>,
         ready: VecDeque<u32>,
-        backend: backend::Backend,
+        /// A Waker was made: a wait with nothing running waits for it.
+        wakeable: bool,
+        /// The work of run that returned, by user data, which the pool's
+        /// threads put there; and the list taken from it at a wait.
+        finished: Arc<Finished>,
+        taken: Vec<u64>,
+        /// The system's side, on the heap, so that an Io is small to move
+        /// to its thread.
+        backend: Box<backend::Backend>,
+    }
+
+    /// What the pool's threads tell an Io: the user data of each run whose
+    /// work returned, under a lock.
+    struct Finished {
+        lock: Lock,
+        list: UnsafeCell<Vec<u64>>,
+    }
+
+    // rr: escape(unsafe): list is reached only under lock (Finished::push,
+    // Finished::take).
+    unsafe impl Sync for Finished {}
+
+    impl Finished {
+        fn push(&self, data: u64) {
+            let _held = self.lock.lock();
+            // rr: escape(unsafe): the lock is held: no one else touches the
+            // list.
+            let list = unsafe { &mut *self.list.get() };
+            list.push(data);
+        }
+
+        /// Moves the list into into, which was empty, and the list's room
+        /// with it.
+        fn take(&self, into: &mut Vec<u64>) {
+            let _held = self.lock.lock();
+            // rr: escape(unsafe): the lock is held: no one else touches the
+            // list.
+            mem::swap(unsafe { &mut *self.list.get() }, into);
+        }
+    }
+
+    /// A run's Notify: puts its user data in the Io's list and wakes it.
+    struct Returned {
+        finished: Arc<Finished>,
+        wake: Arc<backend::Wake>,
+        data: u64,
+    }
+
+    impl Notify for Returned {
+        fn notify(&self) {
+            self.finished.push(self.data);
+            self.wake.wake();
+        }
+    }
+
+    /// Wakes an Io's wait from another thread: wait returns, with what is
+    /// done, as when its timeout passes. Wakes before a wait are one.
+    pub struct Waker {
+        wake: Arc<backend::Wake>,
+    }
+
+    impl Waker {
+        pub fn wake(&self) {
+            self.wake.wake();
+        }
     }
 
     impl Io {
@@ -534,7 +734,7 @@ mod sys {
         /// 32768), on this thread.
         pub fn new(ops: usize) -> Result<Io, Error> {
             let ops = ops.clamp(1, OPS_MAX);
-            let backend = backend::Backend::new(u32::try_from(ops).unwrap_or(1))?;
+            let backend = Box::new(backend::Backend::new(u32::try_from(ops).unwrap_or(1))?);
             let mut slots = Vec::with_capacity(ops);
             slots.resize_with(ops, Slot::new);
             let mut free = Vec::with_capacity(ops);
@@ -545,6 +745,14 @@ mod sys {
                 slots: slots.into_boxed_slice(),
                 free,
                 ready: VecDeque::with_capacity(ops),
+                wakeable: false,
+                // rr: escape(shared): the Io and its runs' Notify hold it.
+                finished: Arc::new(Finished {
+                    lock: Lock::new(),
+                    // rr: escape(shared): the list, under the lock.
+                    list: UnsafeCell::new(Vec::with_capacity(ops)),
+                }),
+                taken: Vec::with_capacity(ops),
                 backend,
             })
         }
@@ -562,7 +770,7 @@ mod sys {
             let Some(index) = self.free.pop() else {
                 return Err(address);
             };
-            let fd = match os::open(&address) {
+            let fd = match os::open(&address, Kind::Stream) {
                 Ok(fd) => fd,
                 Err(error) => return Ok(self.finish(index, key, Done::Connected(Err(error)))),
             };
@@ -628,6 +836,89 @@ mod sys {
             Ok(self.start(index, key, Work::Send(stream, buffer, 0)))
         }
 
+        /// Sends buffer to address, as one datagram.
+        pub fn send_to(
+            &mut self,
+            udp: Udp,
+            buffer: Vec<u8>,
+            address: SocketAddr,
+            key: u64,
+        ) -> Result<Op, (Udp, Vec<u8>)> {
+            let Some(index) = self.free.pop() else {
+                return Err((udp, buffer));
+            };
+            if let Some(slot) = self.slots.get_mut(index as usize) {
+                let (bytes, length) = encode(&address);
+                slot.address = bytes;
+                slot.length = u32::try_from(length).unwrap_or(0);
+            }
+            Ok(self.start(index, key, Work::SendTo(udp, buffer)))
+        }
+
+        /// Receives a datagram into the room buffer has beyond its length.
+        pub fn receive_from(
+            &mut self,
+            udp: Udp,
+            buffer: Vec<u8>,
+            key: u64,
+        ) -> Result<Op, (Udp, Vec<u8>)> {
+            let Some(index) = self.free.pop() else {
+                return Err((udp, buffer));
+            };
+            if buffer.len() == buffer.capacity() {
+                let result = Err(Error::NoRoom);
+                return Ok(self.finish(
+                    index,
+                    key,
+                    Done::ReceivedFrom {
+                        udp,
+                        buffer,
+                        result,
+                    },
+                ));
+            }
+            Ok(self.start(index, key, Work::ReceiveFrom(udp, buffer)))
+        }
+
+        /// Runs work that blocks on thread's pool, as tokio's spawn_blocking
+        /// does: its Event hands it back once it returned. cancel keeps it
+        /// from starting while it waits in line, never once a thread took it.
+        pub fn run(
+            &mut self,
+            work: Box<dyn Blocking + Send>,
+            key: u64,
+        ) -> Result<Op, Box<dyn Blocking + Send>> {
+            let Some(index) = self.free.pop() else {
+                return Err(work);
+            };
+            let generation = self
+                .slots
+                .get(index as usize)
+                .map_or(0, |slot| slot.generation);
+            // rr: escape(shared): the pool's thread tells the Io through it.
+            let returned = Arc::new(Returned {
+                // rr: escape(copy): the run's holder of the list.
+                finished: Arc::clone(&self.finished),
+                wake: self.backend.waker(),
+                data: user_data(index, generation),
+            });
+            match thread::spawn(work, returned) {
+                Ok(job) => {
+                    if let Some(slot) = self.slots.get_mut(index as usize) {
+                        slot.key = key;
+                        slot.work = Work::Run(job);
+                        slot.state = State::Running;
+                    }
+                    Ok(Op { index, generation })
+                }
+                Err(work) => {
+                    // rr: escape(bound): the slot taken back, as it was.
+                    self.free.push(index);
+                    Err(work)
+                }
+            }
+        }
+
         /// Done when so much time has passed, on the system's monotonic clock.
         pub fn timeout(&mut self, after: Duration, key: u64) -> Result<Op, Duration> {
             match self.free.pop() {
@@ -647,6 +938,9 @@ mod sys {
             if slot.state != State::Running || slot.generation != generation || slot.canceled {
                 return false;
             }
+            if let Work::Run(_) = slot.work {
+                return self.unrun(index);
+            }
             slot.canceled = true;
             let data = user_data(index, generation);
             if self.backend.cancel(data, slot) {
@@ -657,18 +951,28 @@ mod sys {
             true
         }
 
+        /// What wakes this Io's wait from another thread.
+        pub fn waker(&mut self) -> Waker {
+            self.wakeable = true;
+            Waker {
+                wake: self.backend.waker(),
+            }
+        }
+
         /// Sends the system what was started and waits until something is
-        /// done or timeout passes (None: no limit; none when nothing
-        /// runs). How many Events wait for next.
+        /// done, a Waker wakes it or timeout passes (None: no limit; none
+        /// when nothing runs and no Waker was made). How many Events wait
+        /// for next.
         pub fn wait(&mut self, timeout: Option<Duration>) -> Result<usize, Error> {
             let running = self.slots.len() - self.free.len() - self.ready.len();
-            let timeout = if running == 0 || !self.ready.is_empty() {
+            let timeout = if (running == 0 && !self.wakeable) || !self.ready.is_empty() {
                 Some(Duration::ZERO)
             } else {
                 timeout
             };
             self.backend
                 .wait(&mut self.slots, &mut self.ready, timeout)?;
+            self.returned();
             Ok(self.ready.len())
         }
 
@@ -702,12 +1006,66 @@ mod sys {
             slot.key = key;
             slot.work = work;
             slot.state = State::Running;
-            if let Work::Accept(_) = slot.work {
+            if let Work::Accept(_) | Work::ReceiveFrom(..) = slot.work {
                 slot.length = u32::try_from(ADDRESS_BYTES).unwrap_or(0);
             }
             let generation = slot.generation;
             self.backend.submit(user_data(index, generation), slot);
             Op { index, generation }
+        }
+
+        /// Takes a run's work out of the pool's line, never run: whether it
+        /// was still there.
+        #[must_use]
+        fn unrun(&mut self, index: u32) -> bool {
+            let Some(slot) = self.slots.get_mut(index as usize) else {
+                return false;
+            };
+            let Work::Run(job) = mem::replace(&mut slot.work, Work::Idle) else {
+                return false;
+            };
+            match job.cancel() {
+                Ok(work) => {
+                    let result = Err(Error::Canceled);
+                    slot.work = Work::Finished(Done::Ran { work, result });
+                    slot.state = State::Ready;
+                    // rr: escape(bound): a slot is in ready once, and there
+                    // are as many as its capacity.
+                    self.ready.push_back(index);
+                    true
+                }
+                Err(job) => {
+                    slot.work = Work::Run(job);
+                    false
+                }
+            }
+        }
+
+        /// The runs whose work returned, done.
+        fn returned(&mut self) {
+            self.finished.take(&mut self.taken);
+            for data in self.taken.drain(..) {
+                let Some((index, slot)) = running(&mut self.slots, data) else {
+                    continue;
+                };
+                let Work::Run(job) = mem::replace(&mut slot.work, Work::Idle) else {
+                    continue;
+                };
+                match job.take() {
+                    Ok(work) => {
+                        let result = Ok(());
+                        slot.work = Work::Finished(Done::Ran { work, result });
+                    }
+                    Err(job) => {
+                        slot.work = Work::Run(job);
+                        continue;
+                    }
+                }
+                slot.state = State::Ready;
+                // rr: escape(bound): a slot is in ready once, and there are
+                // as many as its capacity.
+                self.ready.push_back(u32::try_from(index).unwrap_or(0));
+            }
         }
 
         /// An operation done before it is started, as a receive into no
@@ -734,6 +1092,23 @@ mod sys {
             self.backend.close(&mut self.slots);
         }
     }
+
+    /// The families and the stream type as the system numbers them, for
+    /// resolve.
+    pub use os::{AF_INET, AF_INET6, SOCK_STREAM};
+
+    // rr: section(os = linux macos)
+    /// The calling thread's errno, EINTR and EINVAL, for resolve and trust.
+    #[cfg(unix)]
+    pub use os::c::errno;
+    #[cfg(unix)]
+    pub use os::{EINTR, EINVAL};
+    // rr: end(os = linux macos)
+
+    // rr: section(os = windows)
+    #[cfg(windows)]
+    pub use os::startup;
+    // rr: end(os = windows)
 
     /// The bytes of a sockaddr_in6, the larger of the two.
     const ADDRESS_BYTES: usize = 28;
@@ -792,7 +1167,7 @@ mod sys {
     /// Linux and macOS: the C library's sockets.
     #[cfg(unix)]
     mod os {
-        use super::Error;
+        use super::{Error, Kind};
         use alloc::vec::Vec;
         use core::ffi::c_int;
         use core::net::SocketAddr;
@@ -856,6 +1231,30 @@ mod sys {
                 #[must_use]
                 pub fn recv(fd: c_int, buffer: *mut c_void, length: usize, flags: c_int) -> isize;
                 // rr: end(os = macos)
+                // rr: section(os = macos)
+                #[cfg(target_os = "macos")]
+                #[must_use]
+                pub fn sendto(
+                    fd: c_int,
+                    buffer: *const c_void,
+                    length: usize,
+                    flags: c_int,
+                    address: *const u8,
+                    address_length: u32,
+                ) -> isize;
+                // rr: end(os = macos)
+                // rr: section(os = macos)
+                #[cfg(target_os = "macos")]
+                #[must_use]
+                pub fn recvfrom(
+                    fd: c_int,
+                    buffer: *mut c_void,
+                    length: usize,
+                    flags: c_int,
+                    address: *mut u8,
+                    address_length: *mut u32,
+                ) -> isize;
+                // rr: end(os = macos)
                 #[must_use]
                 pub fn shutdown(fd: c_int, how: c_int) -> c_int;
                 #[must_use]
@@ -899,13 +1298,15 @@ mod sys {
         // Linux's from asm-generic, as x86_64 and aarch64 have them, macOS's
         // from its SDK.
         pub const AF_INET: u16 = 2;
-        const SOCK_STREAM: c_int = 1;
+        pub const SOCK_STREAM: c_int = 1;
+        const SOCK_DGRAM: c_int = 2;
         const IPPROTO_TCP: c_int = 6;
         const IPPROTO_IPV6: c_int = 41;
         const TCP_NODELAY: c_int = 1;
         const SHUT_WR: c_int = 1;
         const EPIPE: c_int = 32;
         pub const EINTR: c_int = 4;
+        pub const EINVAL: c_int = 22;
         // rr: section(os = linux)
         #[cfg(target_os = "linux")]
         pub use numbers::*;
@@ -924,7 +1325,6 @@ mod sys {
             pub const EPERM: c_int = 1;
             pub const EAGAIN: c_int = 11;
             pub const EBUSY: c_int = 16;
-            pub const EINVAL: c_int = 22;
             pub const ENOSYS: c_int = 38;
             pub const ETIME: c_int = 62;
             pub const ETIMEDOUT: c_int = 110;
@@ -1073,6 +1473,13 @@ mod sys {
         }
         // rr: end(os = linux)
 
+        fn socket_kind(kind: Kind) -> c_int {
+            match kind {
+                Kind::Stream => SOCK_STREAM,
+                Kind::Datagram => SOCK_DGRAM,
+            }
+        }
+
         fn domain(address: &SocketAddr) -> c_int {
             c_int::from(if address.is_ipv4() { AF_INET } else { AF_INET6 })
         }
@@ -1085,8 +1492,8 @@ mod sys {
         /// A new socket for address's family: non-blocking, closed on exec,
         /// in one call.
         #[cfg(target_os = "linux")]
-        pub fn open(address: &SocketAddr) -> Result<c_int, Error> {
-            let kind = SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC;
+        pub fn open(address: &SocketAddr, kind: Kind) -> Result<c_int, Error> {
+            let kind = socket_kind(kind) | SOCK_NONBLOCK | SOCK_CLOEXEC;
             // rr: escape(unsafe): socket takes plain numbers.
             let fd = unsafe { c::socket(domain(address), kind, 0) };
             check(fd)?;
@@ -1098,9 +1505,9 @@ mod sys {
         /// A new socket for address's family, made non-blocking, closed on
         /// exec and without SIGPIPE, as macOS has no flags for it at once.
         #[cfg(target_os = "macos")]
-        pub fn open(address: &SocketAddr) -> Result<c_int, Error> {
+        pub fn open(address: &SocketAddr, kind: Kind) -> Result<c_int, Error> {
             // rr: escape(unsafe): socket takes plain numbers.
-            let fd = unsafe { c::socket(domain(address), SOCK_STREAM, 0) };
+            let fd = unsafe { c::socket(domain(address), socket_kind(kind), 0) };
             check(fd)?;
             prepare_new(fd).inspect_err(|_| close(fd))?;
             Ok(fd)
@@ -1151,6 +1558,11 @@ mod sys {
         /// to it linger in TIME_WAIT; IPv6 alone on an IPv6 socket.
         pub fn prepare(fd: c_int, v6: bool) -> Result<(), Error> {
             option(fd, SOL_SOCKET, SO_REUSEADDR, 1)?;
+            datagram(fd, v6)
+        }
+
+        /// A datagram socket's options: IPv6 alone on an IPv6 socket.
+        pub fn datagram(fd: c_int, v6: bool) -> Result<(), Error> {
             if v6 {
                 option(fd, IPPROTO_IPV6, IPV6_V6ONLY, 1)?;
             }
@@ -1221,7 +1633,7 @@ mod sys {
     /// Windows: Winsock.
     #[cfg(windows)]
     mod os {
-        use super::Error;
+        use super::{Error, Kind};
         use alloc::vec::Vec;
         use core::net::SocketAddr;
         use core::ptr::null;
@@ -1309,6 +1721,30 @@ mod sys {
                     routine: *const c_void,
                 ) -> i32;
                 #[must_use]
+                pub fn WSARecvFrom(
+                    socket: usize,
+                    buffers: *const WsaBuf,
+                    count: u32,
+                    received: *mut u32,
+                    flags: *mut u32,
+                    from: *mut u8,
+                    from_length: *mut i32,
+                    overlapped: *mut c_void,
+                    routine: *const c_void,
+                ) -> i32;
+                #[must_use]
+                pub fn WSASendTo(
+                    socket: usize,
+                    buffers: *const WsaBuf,
+                    count: u32,
+                    sent: *mut u32,
+                    flags: u32,
+                    to: *const u8,
+                    to_length: i32,
+                    overlapped: *mut c_void,
+                    routine: *const c_void,
+                ) -> i32;
+                #[must_use]
                 pub fn WSAGetOverlappedResult(
                     socket: usize,
                     overlapped: *mut c_void,
@@ -1323,8 +1759,12 @@ mod sys {
         // WSAE* codes.
         pub const AF_INET: u16 = 2;
         pub const AF_INET6: u16 = 23;
-        const SOCK_STREAM: i32 = 1;
+        pub const SOCK_STREAM: i32 = 1;
+        const SOCK_DGRAM: i32 = 2;
         const IPPROTO_TCP: i32 = 6;
+        const IPPROTO_UDP: i32 = 17;
+        /// mstcpip.h: _WSAIOW(IOC_VENDOR, 12).
+        const SIO_UDP_CONNRESET: u32 = 0x9800_000C;
         const IPPROTO_IPV6: i32 = 41;
         const IPV6_V6ONLY: i32 = 27;
         const TCP_NODELAY: i32 = 1;
@@ -1424,28 +1864,24 @@ mod sys {
 
         /// A new socket of family for overlapped I/O, which no child
         /// process inherits; Err the system's code.
-        pub fn socket(family: u16) -> Result<usize, i32> {
+        pub fn socket(family: u16, kind: Kind) -> Result<usize, i32> {
             startup();
             let flags = WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT;
-            // rr: escape(unsafe): WSASocketW takes plain numbers.
-            let socket = unsafe {
-                c::WSASocketW(
-                    i32::from(family),
-                    SOCK_STREAM,
-                    IPPROTO_TCP,
-                    null(),
-                    0,
-                    flags,
-                )
+            let (kind, protocol) = match kind {
+                Kind::Stream => (SOCK_STREAM, IPPROTO_TCP),
+                Kind::Datagram => (SOCK_DGRAM, IPPROTO_UDP),
             };
+            // rr: escape(unsafe): WSASocketW takes plain numbers.
+            let socket =
+                unsafe { c::WSASocketW(i32::from(family), kind, protocol, null(), 0, flags) };
             if socket == INVALID_SOCKET {
                 return Err(last());
             }
             Ok(socket)
         }
 
-        pub fn open(address: &SocketAddr) -> Result<usize, Error> {
-            socket(if address.is_ipv4() { AF_INET } else { AF_INET6 }).map_err(error)
+        pub fn open(address: &SocketAddr, kind: Kind) -> Result<usize, Error> {
+            socket(if address.is_ipv4() { AF_INET } else { AF_INET6 }, kind).map_err(error)
         }
 
         pub fn option(socket: usize, level: i32, name: i32, value: &[u8]) -> Result<(), Error> {
@@ -1462,6 +1898,30 @@ mod sys {
                 option(socket, IPPROTO_IPV6, IPV6_V6ONLY, &1i32.to_le_bytes())?;
             }
             Ok(())
+        }
+
+        /// A datagram socket's options: IPv6 alone on an IPv6 socket, and
+        /// no WSAECONNRESET on a receive for an ICMP refusal of what it
+        /// sent before, as Go and libuv turn it off.
+        pub fn datagram(socket: usize, v6: bool) -> Result<(), Error> {
+            prepare(socket, v6)?;
+            let off = 0u32.to_le_bytes();
+            let mut returned = 0u32;
+            // rr: escape(unsafe): off is the BOOL the control takes.
+            let done = unsafe {
+                c::WSAIoctl(
+                    socket,
+                    SIO_UDP_CONNRESET,
+                    off.as_ptr().cast(),
+                    4,
+                    core::ptr::null_mut(),
+                    0,
+                    &raw mut returned,
+                    core::ptr::null_mut(),
+                    null(),
+                )
+            };
+            check(done)
         }
 
         pub fn no_delay(socket: usize) -> Result<(), Error> {
@@ -1553,8 +2013,10 @@ mod sys {
             EAGAIN, EBUSY, EINVAL, ENOSYS, EPERM, ETIME, MSG_NOSIGNAL, SOCK_CLOEXEC, SOCK_NONBLOCK,
             error,
         };
-        use super::{CANCEL, Error, Slot, State, Unavailable, Work, running, settle};
+        use super::{CANCEL, Error, Slot, State, Unavailable, WAKE, Work, running, settle};
+        use alloc::boxed::Box;
         use alloc::collections::VecDeque;
+        use alloc::sync::Arc;
         use core::ffi::{c_char, c_int, c_long, c_void};
         use core::ptr::null_mut;
         use core::sync::atomic::{AtomicU32, Ordering};
@@ -1581,6 +2043,10 @@ mod sys {
             #[must_use]
             fn read(fd: c_int, buffer: *mut c_void, length: usize) -> isize;
             #[must_use]
+            fn write(fd: c_int, buffer: *const c_void, length: usize) -> isize;
+            #[must_use]
+            fn eventfd(initial: u32, flags: c_int) -> c_int;
+            #[must_use]
             fn close(fd: c_int) -> c_int;
         }
 
@@ -1588,6 +2054,9 @@ mod sys {
         // numbers since 5.1), and liburing's io_uring.h.
         const SYS_SETUP: c_long = 425;
         const SYS_ENTER: c_long = 426;
+        const SYS_REGISTER: c_long = 427;
+        const REGISTER_ENABLE_RINGS: c_long = 12;
+        const SETUP_R_DISABLED: u32 = 1 << 6;
         const SETUP_CQSIZE: u32 = 1 << 3;
         const SETUP_CLAMP: u32 = 1 << 4;
         const SETUP_SUBMIT_ALL: u32 = 1 << 7;
@@ -1604,12 +2073,16 @@ mod sys {
         const OP_ACCEPT: u8 = 13;
         const OP_ASYNC_CANCEL: u8 = 14;
         const OP_CONNECT: u8 = 16;
+        const OP_READ: u8 = 22;
+        const OP_SENDMSG: u8 = 9;
+        const OP_RECVMSG: u8 = 10;
         const OP_SEND: u8 = 26;
         const OP_RECV: u8 = 27;
         // sys/mman.h's and fcntl.h's.
         const PROT_READ_WRITE: c_int = 0x3;
         const MAP_SHARED_POPULATE: c_int = 0x01 | 0x8000;
         const O_RDONLY_CLOEXEC: c_int = 0x8_0000;
+        const EFD_CLOEXEC: c_int = 0x8_0000;
         /// The most one receive or send asks of the system at once: len is
         /// a __u32.
         const CHUNK: usize = 1 << 30;
@@ -1693,6 +2166,43 @@ mod sys {
             cqes: *const Cqe,
             /// The submission tail not yet given to the kernel.
             tail: u32,
+            /// Whether the ring was enabled, by its first enter, for the
+            /// thread that made that.
+            enabled: bool,
+            /// What Wakers set, which the ring reads while the Io lives, into
+            /// count; whether that read is with the kernel, and whether the
+            /// Io is closing, when it is not read again.
+            wake: Arc<Wake>,
+            count: Box<[u8; 8]>,
+            listening: bool,
+            closing: bool,
+        }
+
+        // rr: escape(unsafe): the ring is the process's memory, which no
+        // thread owns; an Io is moved whole, never shared, and the kernel
+        // refuses (EEXIST) one moved after its first wait to another thread.
+        unsafe impl Send for Backend {}
+
+        /// An eventfd, blocking, so that the ring's read of it waits for a
+        /// write (a read of a non-blocking one is EAGAIN at once).
+        pub struct Wake {
+            fd: c_int,
+        }
+
+        impl Wake {
+            pub fn wake(&self) {
+                // A u64 in the host's order, little on x86_64 and aarch64.
+                let one = 1u64.to_le_bytes();
+                // rr: escape(unsafe, discard): one is 8 bytes; a counter at
+                // its most is set already.
+                let _: isize = unsafe { write(self.fd, one.as_ptr().cast(), 8) };
+            }
+        }
+
+        impl Drop for Wake {
+            fn drop(&mut self) {
+                close_ring(self.fd);
+            }
         }
 
         /// A pointer as the kernel takes it, a __u64: it reads and writes
@@ -1750,9 +2260,13 @@ mod sys {
                     sq_entries: 0,
                     // Room for each operation's answer and its cancel's.
                     cq_entries: ops.saturating_mul(2),
+                    // Disabled until its first wait, whose thread is then its
+                    // one issuer: an Io may be made on one thread and run
+                    // on another.
                     flags: SETUP_CQSIZE
                         | SETUP_CLAMP
                         | SETUP_SUBMIT_ALL
+                        | SETUP_R_DISABLED
                         | SETUP_SINGLE_ISSUER
                         | SETUP_DEFER_TASKRUN,
                     sq_thread_cpu: 0,
@@ -1775,10 +2289,50 @@ mod sys {
                     close_ring(fd);
                     return Err(Error::Unavailable(Unavailable::Old));
                 }
-                Backend::map(fd, &params).inspect_err(|_| close_ring(fd))
+                // rr: escape(unsafe): eventfd takes plain numbers.
+                let event = unsafe { eventfd(0, EFD_CLOEXEC) };
+                if event < 0 {
+                    let code = errno();
+                    close_ring(fd);
+                    return Err(error(code));
+                }
+                // rr: escape(shared): the Io and each Waker hold the eventfd.
+                let wake = Arc::new(Wake { fd: event });
+                let mut backend =
+                    Backend::map(fd, &params, wake).inspect_err(|_| close_ring(fd))?;
+                backend.arm();
+                Ok(backend)
             }
 
-            fn map(fd: c_int, p: &Params) -> Result<Backend, Error> {
+            pub fn waker(&self) -> Arc<Wake> {
+                // rr: escape(copy): a Waker holds the eventfd too.
+                Arc::clone(&self.wake)
+            }
+
+            /// Reads what Wakers set, once more.
+            fn arm(&mut self) {
+                let fd = self.wake.fd;
+                let addr = pointer(self.count.as_mut_ptr());
+                self.push(Sqe {
+                    opcode: OP_READ,
+                    flags: 0,
+                    ioprio: 0,
+                    fd,
+                    off: 0,
+                    addr,
+                    len: 8,
+                    op_flags: 0,
+                    user_data: WAKE,
+                    buf_index: 0,
+                    personality: 0,
+                    file_index: 0,
+                    addr3: 0,
+                    pad: 0,
+                });
+                self.listening = true;
+            }
+
+            fn map(fd: c_int, p: &Params, wake: Arc<Wake>) -> Result<Backend, Error> {
                 let sq_size = p.sq_off[6] as usize + p.sq_entries as usize * 4;
                 let cq_size = p.cq_off[5] as usize + p.cq_entries as usize * size_of::<Cqe>();
                 let ring_size = sq_size.max(cq_size);
@@ -1813,6 +2367,11 @@ mod sys {
                     cq_mask: p.cq_entries.wrapping_sub(1),
                     cqes: ring.wrapping_byte_add(p.cq_off[5] as usize).cast(),
                     tail: 0,
+                    enabled: false,
+                    wake,
+                    count: Box::new([0; 8]),
+                    listening: false,
+                    closing: false,
                 })
             }
 
@@ -1839,8 +2398,26 @@ mod sys {
             }
 
             /// Hands the kernel the entries pushed, and waits for at least
-            /// so many answers, or timeout.
+            /// so many answers, or timeout; the first enables the ring for
+            /// this thread, its one issuer from then on.
             fn enter(&mut self, wanted: u32, timeout: Option<Duration>) -> Result<(), Error> {
+                if !self.enabled {
+                    // rr: escape(unsafe): the call takes the ring and no
+                    // argument.
+                    let done = unsafe {
+                        syscall(
+                            SYS_REGISTER,
+                            c_long::from(self.fd),
+                            REGISTER_ENABLE_RINGS,
+                            null_mut::<c_void>(),
+                            c_long::from(0u8),
+                        )
+                    };
+                    if done < 0 {
+                        return Err(error(errno()));
+                    }
+                    self.enabled = true;
+                }
                 // rr: escape(unsafe): the tail is the program's
                 // to move, the kernel's to read.
                 unsafe { (*self.sq_tail).store(self.tail, Ordering::Release) }
@@ -1935,7 +2512,40 @@ mod sys {
                         sqe.addr = pointer(slot.time.as_ptr().cast());
                         sqe.len = 1;
                     }
-                    Work::Idle | Work::Finished(_) => return,
+                    Work::SendTo(_, buffer) => {
+                        sqe.opcode = OP_SENDMSG;
+                        slot.vector = [pointer(buffer.as_ptr()), buffer.len() as u64];
+                        slot.message = [
+                            pointer(slot.address.as_ptr()),
+                            u64::from(slot.length),
+                            pointer(slot.vector.as_ptr().cast()),
+                            1,
+                            0,
+                            0,
+                            0,
+                        ];
+                        sqe.addr = pointer(slot.message.as_ptr().cast());
+                        sqe.len = 1;
+                        sqe.op_flags = MSG_NOSIGNAL;
+                    }
+                    Work::ReceiveFrom(_, buffer) => {
+                        sqe.opcode = OP_RECVMSG;
+                        let room = buffer.spare_capacity_mut();
+                        slot.vector = [pointer(room.as_mut_ptr().cast()), room.len() as u64];
+                        // msg_namelen, then its padding, in the second word.
+                        slot.message = [
+                            pointer(slot.address.as_mut_ptr()),
+                            u64::from(slot.length),
+                            pointer(slot.vector.as_ptr().cast()),
+                            1,
+                            0,
+                            0,
+                            0,
+                        ];
+                        sqe.addr = pointer(slot.message.as_ptr().cast());
+                        sqe.len = 1;
+                    }
+                    Work::Idle | Work::Run(_) | Work::Finished(_) => return,
                 }
                 self.push(sqe);
             }
@@ -1944,6 +2554,11 @@ mod sys {
             /// any other's.
             #[must_use]
             pub fn cancel(&mut self, data: u64, _slot: &mut Slot) -> bool {
+                self.cancel_data(data);
+                false
+            }
+
+            fn cancel_data(&mut self, data: u64) {
                 self.push(Sqe {
                     opcode: OP_ASYNC_CANCEL,
                     flags: 0,
@@ -1960,7 +2575,6 @@ mod sys {
                     addr3: 0,
                     pad: 0,
                 });
-                false
             }
 
             pub fn wait(
@@ -1982,7 +2596,7 @@ mod sys {
                 let mut head = unsafe { (*self.cq_head).load(Ordering::Relaxed) };
                 // rr: escape(unsafe): the tail is the kernel's.
                 let tail = unsafe { (*self.cq_tail).load(Ordering::Acquire) };
-                while head != tail {
+                for _ in 0..tail.wrapping_sub(head) {
                     let entry = self.cqes.wrapping_add((head & self.cq_mask) as usize);
                     // rr: escape(unsafe): the entry is within those mapped,
                     // which the kernel wrote before it moved the tail.
@@ -1992,9 +2606,21 @@ mod sys {
                         ..
                     } = unsafe { entry.read() };
                     head = head.wrapping_add(1);
+                    if data == WAKE {
+                        self.listening = false;
+                        if !self.closing {
+                            self.arm();
+                        }
+                        continue;
+                    }
                     let Some((index, slot)) = running(slots, data) else {
                         continue;
                     };
+                    if let Work::ReceiveFrom(..) = slot.work {
+                        // The msg_namelen recvmsg wrote, the low half of the
+                        // second word on a little-endian target.
+                        slot.length = u32::try_from(slot.message[1] & 0xffff_ffff).unwrap_or(0);
+                    }
                     let answer = match (res, &slot.work) {
                         (res, Work::Timeout(_)) if res == -ETIME => Ok(0),
                         (res, _) if res >= 0 => Ok(res.cast_unsigned() as usize),
@@ -2012,29 +2638,55 @@ mod sys {
             }
 
             /// Cancels every operation and waits until the kernel answered
-            /// each, so that none writes a buffer freed after.
+            /// each, so that none writes a buffer freed after: nothing is
+            /// settled or started again, as the Io is going.
             pub fn close(&mut self, slots: &mut [Slot]) {
+                self.closing = true;
+                if self.listening {
+                    self.cancel_data(WAKE);
+                }
                 for (index, slot) in slots.iter_mut().enumerate() {
                     if slot.state == State::Running {
-                        slot.canceled = true;
                         let data =
                             super::user_data(u32::try_from(index).unwrap_or(0), slot.generation);
-                        // rr: escape(discard): an io_uring cancel answers
-                        // later, as the operation it ends.
-                        let _: bool = self.cancel(data, slot);
+                        self.cancel_data(data);
                     }
                 }
-                let mut ready = VecDeque::new();
-                // Each turn takes an answer, or waits a second for one: a
+                // Each turn takes answers, or waits a second for one: a
                 // canceled operation answers at once.
-                for _ in 0..slots.len().saturating_mul(2).saturating_add(8) {
-                    if !slots.iter().any(|s| s.state == State::Running) {
-                        break;
-                    }
+                let turns = slots.len().saturating_mul(2).saturating_add(8);
+                let mut turn = 0;
+                while turn < turns
+                    && (self.listening || slots.iter().any(|s| s.state == State::Running))
+                {
+                    turn += 1;
                     if self.enter(1, Some(Duration::from_secs(1))).is_err() {
-                        break;
+                        return;
                     }
-                    self.reap(slots, &mut ready);
+                    // rr: escape(unsafe): the head is the program's to
+                    // move.
+                    let mut head = unsafe { (*self.cq_head).load(Ordering::Relaxed) };
+                    // rr: escape(unsafe): the tail is the kernel's.
+                    let tail = unsafe { (*self.cq_tail).load(Ordering::Acquire) };
+                    for _ in 0..tail.wrapping_sub(head) {
+                        let entry = self.cqes.wrapping_add((head & self.cq_mask) as usize);
+                        // rr: escape(unsafe): the entry is within those mapped,
+                        // which the kernel wrote before it moved the tail.
+                        let Cqe {
+                            user_data: data, ..
+                        } = unsafe { entry.read() };
+                        head = head.wrapping_add(1);
+                        if data == WAKE {
+                            self.listening = false;
+                        } else if let Some((_, slot)) = running(slots, data) {
+                            slot.state = State::Ready;
+                        } else {
+                            // A cancel's own answer, or one already taken.
+                        }
+                    }
+                    // rr: escape(unsafe): the head is the program's to move,
+                    // the kernel's to read.
+                    unsafe { (*self.cq_head).store(head, Ordering::Release) }
                 }
             }
         }
@@ -2092,8 +2744,9 @@ mod sys {
     mod backend {
         use super::os::c::{self, errno};
         use super::os::{EAGAIN, EINPROGRESS, F_SETFD, FD_CLOEXEC, SO_ERROR, SOL_SOCKET, error};
-        use super::{Answer, Error, Slot, Work, running, settle};
+        use super::{Answer, Error, Slot, WAKE, Work, running, settle};
         use alloc::collections::VecDeque;
+        use alloc::sync::Arc;
         use alloc::vec::Vec;
         use core::ffi::{c_int, c_void};
         use core::ptr::{null, null_mut, without_provenance_mut};
@@ -2138,7 +2791,10 @@ mod sys {
         const EVFILT_READ: i16 = -1;
         const EVFILT_WRITE: i16 = -2;
         const EVFILT_TIMER: i16 = -7;
+        const EVFILT_USER: i16 = -10;
         const EV_ADD: u16 = 0x1;
+        const EV_CLEAR: u16 = 0x20;
+        const NOTE_TRIGGER: u32 = 0x0100_0000;
         const EV_DELETE: u16 = 0x2;
         const EV_ONESHOT: u16 = 0x10;
         const EV_ERROR: u16 = 0x4000;
@@ -2163,10 +2819,42 @@ mod sys {
             }
         }
 
-        pub struct Backend {
+        /// The kqueue, which the Io and each Waker hold: a Waker triggers
+        /// its user filter.
+        pub struct Wake {
             kq: c_int,
-            /// The operations to try at the next wait, by user data.
+        }
+
+        impl Wake {
+            pub fn wake(&self) {
+                let mut trigger = change(0, EVFILT_USER, 0, WAKE);
+                trigger.fflags = NOTE_TRIGGER;
+                // rr: escape(unsafe, discard): one change, no events asked
+                // for; the filter is added with the kqueue, so a trigger is
+                // refused only for a kqueue gone, which nothing waits on.
+                let _: c_int =
+                    unsafe { kevent(self.kq, &raw const trigger, 1, null_mut(), 0, null()) };
+            }
+        }
+
+        impl Drop for Wake {
+            fn drop(&mut self) {
+                super::os::close(self.kq);
+            }
+        }
+
+        // rr: escape(unsafe): a kqueue is the process's, which any thread
+        // may wait on; changes and events are scratch whose udata are user
+        // data, not pointers. An Io is moved whole, never shared.
+        unsafe impl Send for Backend {}
+
+        pub struct Backend {
+            queue: Arc<Wake>,
+            kq: c_int,
+            /// The operations to try at the next wait, by user data, which
+            /// takes them into trying first.
             pending: VecDeque<u64>,
+            trying: VecDeque<u64>,
             /// The filters to add at the next wait.
             changes: Vec<Kevent>,
             /// What a wait takes from the kqueue: BATCH entries.
@@ -2180,22 +2868,34 @@ mod sys {
                 if kq < 0 {
                     return Err(error(errno()));
                 }
+                // rr: escape(shared): the Io and each Waker hold the kqueue.
+                let queue = Arc::new(Wake { kq });
                 // rr: escape(unsafe): kq is open; fork drops a kqueue, exec
                 // does not.
                 if unsafe { c::fcntl(kq, F_SETFD, FD_CLOEXEC) } != 0 {
-                    let code = errno();
-                    super::os::close(kq);
-                    return Err(error(code));
+                    return Err(error(errno()));
+                }
+                let user = change(0, EVFILT_USER, EV_ADD | EV_CLEAR, WAKE);
+                // rr: escape(unsafe): one change, no events asked for.
+                if unsafe { kevent(kq, &raw const user, 1, null_mut(), 0, null()) } != 0 {
+                    return Err(error(errno()));
                 }
                 let ops = ops as usize;
                 let mut events = Vec::with_capacity(BATCH);
                 events.resize_with(BATCH, || change(0, 0, 0, 0));
                 Ok(Backend {
+                    queue,
                     kq,
                     pending: VecDeque::with_capacity(ops),
+                    trying: VecDeque::with_capacity(ops),
                     changes: Vec::with_capacity(ops),
                     events,
                 })
+            }
+
+            pub fn waker(&self) -> Arc<Wake> {
+                // rr: escape(copy): a Waker holds the kqueue too.
+                Arc::clone(&self.queue)
             }
 
             pub fn submit(&mut self, data: u64, slot: &mut Slot) {
@@ -2245,10 +2945,9 @@ mod sys {
                 ready: &mut VecDeque<u32>,
                 timeout: Option<Duration>,
             ) -> Result<(), Error> {
-                for _ in 0..self.pending.len() {
-                    let Some(data) = self.pending.pop_front() else {
-                        break;
-                    };
+                // What is tried and still pending waits for the next wait.
+                core::mem::swap(&mut self.pending, &mut self.trying);
+                while let Some(data) = self.trying.pop_front() {
                     self.attempt(slots, ready, data);
                 }
                 let timeout = if ready.is_empty() {
@@ -2314,11 +3013,15 @@ mod sys {
                     let answer = perform(slot);
                     if let Err(EAGAIN) = answer {
                         let filter = match slot.work {
-                            Work::Accept(_) | Work::Receive(..) => EVFILT_READ,
+                            Work::Accept(_) | Work::Receive(..) | Work::ReceiveFrom(..) => {
+                                EVFILT_READ
+                            }
                             Work::Idle
                             | Work::Connect(_)
                             | Work::Send(..)
+                            | Work::SendTo(..)
                             | Work::Timeout(_)
+                            | Work::Run(_)
                             | Work::Finished(_) => EVFILT_WRITE,
                         };
                         let ident = ident(slot.fd().unwrap_or(-1));
@@ -2405,7 +3108,39 @@ mod sys {
                     let got = unsafe { c::send(fd, rest.as_ptr().cast(), rest.len(), 0) };
                     answer(got)
                 }
-                Work::Idle | Work::Timeout(_) | Work::Finished(_) => Ok(0),
+                Work::SendTo(_, buffer) => {
+                    // rr: escape(unsafe): buffer holds its length; address a
+                    // sockaddr of length bytes.
+                    let got = unsafe {
+                        c::sendto(
+                            fd,
+                            buffer.as_ptr().cast(),
+                            buffer.len(),
+                            0,
+                            slot.address.as_ptr(),
+                            slot.length,
+                        )
+                    };
+                    answer(got)
+                }
+                Work::ReceiveFrom(_, buffer) => {
+                    slot.length = super::os::length(&slot.address);
+                    let room = buffer.spare_capacity_mut();
+                    // rr: escape(unsafe): room is the buffer's spare
+                    // capacity; address holds length bytes.
+                    let got = unsafe {
+                        c::recvfrom(
+                            fd,
+                            room.as_mut_ptr().cast(),
+                            room.len(),
+                            0,
+                            slot.address.as_mut_ptr(),
+                            &raw mut slot.length,
+                        )
+                    };
+                    answer(got)
+                }
+                Work::Idle | Work::Timeout(_) | Work::Run(_) | Work::Finished(_) => Ok(0),
             }
         }
 
@@ -2441,12 +3176,6 @@ mod sys {
                 code => Err(code),
             }
         }
-
-        impl Drop for Backend {
-            fn drop(&mut self) {
-                super::os::close(self.kq);
-            }
-        }
     }
     // rr: end(os = macos)
 
@@ -2458,7 +3187,9 @@ mod sys {
         use super::os::c::{self, WsaBuf};
         use super::os::{ABORTED, FOREIGN, SOL_SOCKET, WSA_IO_PENDING, last, socket};
         use super::{Answer, Error, Raw, Slot, State, Work, running, settle, user_data};
+        use crate::base::thread::INFINITE;
         use alloc::collections::VecDeque;
+        use alloc::sync::Arc;
         use alloc::vec::Vec;
         use core::ffi::c_void;
         use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -2517,6 +3248,13 @@ mod sys {
                 alertable: i32,
             ) -> i32;
             #[must_use]
+            fn PostQueuedCompletionStatus(
+                port: *mut c_void,
+                transferred: u32,
+                key: usize,
+                overlapped: *mut c_void,
+            ) -> i32;
+            #[must_use]
             fn CancelIoEx(file: *mut c_void, overlapped: *mut c_void) -> i32;
             #[must_use]
             fn CloseHandle(handle: *mut c_void) -> i32;
@@ -2533,7 +3271,6 @@ mod sys {
         const SO_UPDATE_ACCEPT_CONTEXT: i32 = 0x700B;
         const SO_UPDATE_CONNECT_CONTEXT: i32 = 0x7010;
         const WAIT_TIMEOUT: u32 = 258;
-        const INFINITE: u32 = 0xFFFF_FFFF;
         /// WSAID_ACCEPTEX and WSAID_CONNECTEX, as GUIDs lie in memory.
         const ACCEPTEX: [u8; 16] = guid(
             0xb536_7df1,
@@ -2564,14 +3301,47 @@ mod sys {
             without_provenance_mut(socket)
         }
 
+        /// The completion port, which the Io and each Waker hold: a Waker
+        /// posts a completion of no operation to it.
+        pub struct Wake {
+            port: usize,
+        }
+
+        impl Wake {
+            fn port(&self) -> *mut c_void {
+                handle(self.port)
+            }
+
+            pub fn wake(&self) {
+                // rr: escape(unsafe, discard): a post without an OVERLAPPED,
+                // which a wait passes over; a port that refuses one is gone.
+                let _: i32 = unsafe { PostQueuedCompletionStatus(self.port(), 0, 0, null_mut()) };
+            }
+        }
+
+        impl Drop for Wake {
+            fn drop(&mut self) {
+                // rr: escape(unsafe, discard): the port is this value's own;
+                // close releases it whatever it answers.
+                let _: i32 = unsafe { CloseHandle(self.port()) };
+            }
+        }
+
+        // rr: escape(unsafe): a completion port is the process's, which any
+        // thread may wait on; entries are scratch whose pointers name the
+        // Io's slots. An Io is moved whole, never shared.
+        unsafe impl Send for Backend {}
+
         pub struct Backend {
-            port: *mut c_void,
+            queue: Arc<Wake>,
             accept_ex: AcceptEx,
             connect_ex: ConnectEx,
             entries: Vec<Entry>,
             /// Operations the system refused at once, which post nothing:
-            /// their answers, at the next wait.
+            /// their answers, at the next wait, which takes them into
+            /// retried first.
             refused: VecDeque<(u64, i32)>,
+            retried: VecDeque<(u64, i32)>,
             /// The running timeouts by deadline, soonest first.
             timers: Vec<(u64, u64)>,
             /// QueryPerformanceFrequency's ticks a second.
@@ -2605,7 +3375,9 @@ mod sys {
 
         impl Backend {
             pub fn new(ops: u32) -> Result<Backend, Error> {
-                let probe = super::Fd::new(socket(super::os::AF_INET).map_err(super::os::error)?);
+                let probe = super::Fd::new(
+                    socket(super::os::AF_INET, super::Kind::Stream).map_err(super::os::error)?,
+                );
                 let mut accept_ex: Option<AcceptEx> = None;
                 let mut connect_ex: Option<ConnectEx> = None;
                 extension(probe.raw, &ACCEPTEX, (&raw mut accept_ex).cast())?;
@@ -2633,14 +3405,21 @@ mod sys {
                 });
                 let ops = ops as usize;
                 Ok(Backend {
-                    port,
+                    // rr: escape(shared): the Io and each Waker hold the port.
+                    queue: Arc::new(Wake { port: port.addr() }),
                     accept_ex,
                     connect_ex,
                     entries,
                     refused: VecDeque::with_capacity(ops),
+                    retried: VecDeque::with_capacity(ops),
                     timers: Vec::with_capacity(ops),
                     frequency: u64::try_from(frequency).unwrap_or(1).max(1),
                 })
+            }
+
+            pub fn waker(&self) -> Arc<Wake> {
+                // rr: escape(copy): a Waker holds the port too.
+                Arc::clone(&self.queue)
             }
 
             /// Now on the monotonic clock, in nanoseconds.
@@ -2651,13 +3430,14 @@ mod sys {
                 // LARGE_INTEGER; the call cannot fail from Windows XP on.
                 let _: i32 = unsafe { QueryPerformanceCounter(&raw mut count) };
                 let ticks = u128::from(u64::try_from(count).unwrap_or(0));
-                u64::try_from(ticks * 1_000_000_000 / u128::from(self.frequency)).unwrap_or(0)
+                let nanos = (ticks * 1_000_000_000).checked_div(u128::from(self.frequency));
+                nanos.map_or(0, |nanos| u64::try_from(nanos).unwrap_or(u64::MAX))
             }
 
             /// Puts the socket in this port, once: one in another's is
             /// refused.
             fn associate(&self, fd: &mut super::Fd) -> Result<(), i32> {
-                let port = self.port.addr();
+                let port = self.queue.port;
                 if fd.port == port {
                     return Ok(());
                 }
@@ -2666,7 +3446,8 @@ mod sys {
                 }
                 // rr: escape(unsafe): the socket is open; a SOCKET is a
                 // handle.
-                let done = unsafe { CreateIoCompletionPort(handle(fd.raw), self.port, 0, 0) };
+                let done =
+                    unsafe { CreateIoCompletionPort(handle(fd.raw), self.queue.port(), 0, 0) };
                 if done.is_null() {
                     return Err(FOREIGN);
                 }
@@ -2707,7 +3488,7 @@ mod sys {
                                     super::os::AF_INET6
                                 }
                             });
-                        let accepting = socket(family)?;
+                        let accepting = socket(family, super::Kind::Stream)?;
                         slot.accepting = Some(accepting);
                         let mut received = 0u32;
                         // rr: escape(unsafe): accepted holds both addresses;
@@ -2798,7 +3579,58 @@ mod sys {
                             )
                         }
                     }
-                    Work::Idle | Work::Timeout(_) | Work::Finished(_) => return Ok(()),
+                    Work::SendTo(udp, buffer) => {
+                        self.associate(&mut udp.fd)?;
+                        let parts = WsaBuf {
+                            len: u32::try_from(buffer.len()).unwrap_or(u32::MAX),
+                            buf: buffer.as_mut_ptr(),
+                        };
+                        let to = i32::try_from(slot.length).unwrap_or(0);
+                        // rr: escape(unsafe): the WSABUF names the buffer and
+                        // address a sockaddr of to bytes, both the slot's
+                        // until the answer.
+                        unsafe {
+                            c::WSASendTo(
+                                udp.fd.raw,
+                                &raw const parts,
+                                1,
+                                null_mut(),
+                                0,
+                                slot.address.as_ptr(),
+                                to,
+                                overlapped,
+                                null(),
+                            )
+                        }
+                    }
+                    Work::ReceiveFrom(udp, buffer) => {
+                        self.associate(&mut udp.fd)?;
+                        let room = buffer.spare_capacity_mut();
+                        let parts = WsaBuf {
+                            len: u32::try_from(room.len()).unwrap_or(u32::MAX),
+                            buf: room.as_mut_ptr().cast(),
+                        };
+                        let mut flags = 0u32;
+                        // rr: escape(unsafe): the WSABUF names the buffer's
+                        // room, and the address and its length (an int, as
+                        // length is) are the slot's until the answer.
+                        unsafe {
+                            c::WSARecvFrom(
+                                udp.fd.raw,
+                                &raw const parts,
+                                1,
+                                null_mut(),
+                                &raw mut flags,
+                                slot.address.as_mut_ptr(),
+                                (&raw mut slot.length).cast(),
+                                overlapped,
+                                null(),
+                            )
+                        }
+                    }
+                    Work::Idle | Work::Timeout(_) | Work::Run(_) | Work::Finished(_) => {
+                        return Ok(());
+                    }
                 };
                 if done == 0 {
                     return Ok(());
@@ -2835,10 +3667,9 @@ mod sys {
                 ready: &mut VecDeque<u32>,
                 timeout: Option<Duration>,
             ) -> Result<(), Error> {
-                for _ in 0..self.refused.len() {
-                    let Some((data, code)) = self.refused.pop_front() else {
-                        break;
-                    };
+                // What is refused again waits for the next wait.
+                core::mem::swap(&mut self.refused, &mut self.retried);
+                while let Some((data, code)) = self.retried.pop_front() {
                     self.answer(slots, ready, data, Err(code));
                 }
                 let now = self.now();
@@ -2855,39 +3686,20 @@ mod sys {
                         .unwrap_or(INFINITE - 1)
                         .min(INFINITE - 1)
                 });
-                let mut removed = 0u32;
-                let count = u32::try_from(self.entries.len()).unwrap_or(0);
-                // rr: escape(unsafe): entries holds count entries.
-                let got = unsafe {
-                    GetQueuedCompletionStatusEx(
-                        self.port,
-                        self.entries.as_mut_ptr(),
-                        count,
-                        &raw mut removed,
-                        milliseconds,
-                        0,
-                    )
-                };
-                if got == 0 {
-                    // rr: escape(unsafe): the thread's last error.
-                    let code = unsafe { GetLastError() };
-                    if code != WAIT_TIMEOUT {
-                        return Err(Error::Other(i32::try_from(code).unwrap_or(0)));
-                    }
-                    removed = 0;
-                }
+                let removed = self.dequeue(milliseconds)?;
                 let base = slots.as_ptr().addr();
-                for i in 0..(removed as usize).min(self.entries.len()) {
+                for i in 0..removed {
                     let Some(entry) = self.entries.get(i) else {
                         break;
                     };
-                    let offset = entry.overlapped.addr().wrapping_sub(base);
-                    let index = offset / size_of::<Slot>();
+                    let Some(index) = slot_of(base, entry.overlapped) else {
+                        continue;
+                    };
                     let (status, transferred) = (entry.internal, entry.transferred);
                     let Some(slot) = slots.get_mut(index) else {
                         continue;
                     };
-                    if offset % size_of::<Slot>() != 0 || slot.state != State::Running {
+                    if slot.state != State::Running {
                         continue;
                     }
                     let data = user_data(u32::try_from(index).unwrap_or(0), slot.generation);
@@ -2896,6 +3708,32 @@ mod sys {
                 }
                 self.expire(slots, ready);
                 Ok(())
+            }
+
+            /// Takes what the port has, waiting so many milliseconds for it:
+            /// how many entries it filled.
+            fn dequeue(&mut self, milliseconds: u32) -> Result<usize, Error> {
+                let mut removed = 0u32;
+                let count = u32::try_from(self.entries.len()).unwrap_or(0);
+                // rr: escape(unsafe): entries holds count entries.
+                let got = unsafe {
+                    GetQueuedCompletionStatusEx(
+                        self.queue.port(),
+                        self.entries.as_mut_ptr(),
+                        count,
+                        &raw mut removed,
+                        milliseconds,
+                        0,
+                    )
+                };
+                if got != 0 {
+                    return Ok((removed as usize).min(self.entries.len()));
+                }
+                // rr: escape(unsafe): the thread's last error.
+                match unsafe { GetLastError() } {
+                    WAIT_TIMEOUT => Ok(0),
+                    code => Err(Error::Other(i32::try_from(code).unwrap_or(0))),
+                }
             }
 
             /// Settles an operation as the system answered it, and starts it
@@ -2932,32 +3770,58 @@ mod sys {
             }
 
             /// Cancels every operation and waits until the port answered
-            /// each, so that none writes a buffer freed after.
+            /// each, so that none writes a buffer freed after: nothing is
+            /// settled or started again, as the Io is going.
             pub fn close(&mut self, slots: &mut [Slot]) {
-                for (index, slot) in slots.iter_mut().enumerate() {
-                    if slot.state == State::Running {
-                        slot.canceled = true;
-                        let data = user_data(u32::try_from(index).unwrap_or(0), slot.generation);
-                        // rr: escape(discard): what is not ended at once
-                        // answers through the port.
-                        let _: bool = self.cancel(data, slot);
+                self.timers.clear();
+                for slot in slots.iter_mut() {
+                    if slot.state != State::Running {
+                        continue;
                     }
+                    let Some(fd) = slot.fd() else {
+                        slot.state = State::Ready;
+                        continue;
+                    };
+                    let overlapped = slot.overlapped.as_mut_ptr().cast::<c_void>();
+                    // rr: escape(unsafe, discard): the OVERLAPPED is the
+                    // operation's; one done already answers as it would.
+                    let _: i32 = unsafe { CancelIoEx(handle(fd), overlapped) };
                 }
-                let mut ready = VecDeque::new();
                 // Each turn takes answers, or waits a second for one: an
                 // aborted operation answers at once.
-                for _ in 0..slots.len().saturating_mul(2).saturating_add(8) {
-                    if !slots.iter().any(|s| s.state == State::Running) {
-                        break;
-                    }
-                    if self
-                        .wait(slots, &mut ready, Some(Duration::from_secs(1)))
-                        .is_err()
-                    {
-                        break;
+                let turns = slots.len().saturating_mul(2).saturating_add(8);
+                let mut turn = 0;
+                while turn < turns && slots.iter().any(|s| s.state == State::Running) {
+                    turn += 1;
+                    let Ok(removed) = self.dequeue(1000) else {
+                        return;
+                    };
+                    let base = slots.as_ptr().addr();
+                    for i in 0..removed {
+                        let Some(entry) = self.entries.get(i) else {
+                            break;
+                        };
+                        let Some(slot) =
+                            slot_of(base, entry.overlapped).and_then(|index| slots.get_mut(index))
+                        else {
+                            continue;
+                        };
+                        slot.state = State::Ready;
+                        if let Some(accepting) = slot.accepting.take() {
+                            super::os::close(accepting);
+                        }
                     }
                 }
             }
+        }
+
+        /// The slot whose OVERLAPPED, its first field, is at overlapped, for
+        /// slots at base; None for one not in them, as a Waker's post is.
+        fn slot_of(base: usize, overlapped: *mut c_void) -> Option<usize> {
+            let offset = overlapped.addr().checked_sub(base)?;
+            let size = size_of::<Slot>();
+            (offset.checked_rem(size)? == 0).then_some(())?;
+            offset.checked_div(size)
         }
 
         /// What a completion says of its operation; an accept's socket made
@@ -3011,16 +3875,11 @@ mod sys {
                 Work::Idle
                 | Work::Receive(..)
                 | Work::Send(..)
+                | Work::SendTo(..)
+                | Work::ReceiveFrom(..)
                 | Work::Timeout(_)
+                | Work::Run(_)
                 | Work::Finished(_) => Ok(transferred as usize),
-            }
-        }
-
-        impl Drop for Backend {
-            fn drop(&mut self) {
-                // rr: escape(unsafe, discard): the port is this value's own;
-                // close releases it whatever it answers.
-                let _: i32 = unsafe { CloseHandle(self.port) };
             }
         }
     }
@@ -3033,9 +3892,12 @@ mod tests {
     //! io's tests on real sockets: TCP over loopback, a server and its
     //! clients in one Io, as a loop runs them.
 
-    use super::{Done, Error, Event, Io, Listener, Stream, Unavailable};
+    use super::{Done, Error, Event, Io, Listener, Stream, Udp, Unavailable, Work};
+    use alloc::boxed::Box;
+    use alloc::sync::Arc;
     use alloc::vec::Vec;
     use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+    use core::sync::atomic::{AtomicU64, Ordering};
     use core::time::Duration;
     use test::Bencher;
 
@@ -3380,11 +4242,154 @@ mod tests {
         drop(io);
     }
 
+    #[test]
+    fn datagrams_both_families() {
+        for address in [v4(), v6()] {
+            let mut io = io(8);
+            let one = Udp::bind(address).unwrap();
+            let two = Udp::bind(address).unwrap();
+            let (from, to) = (one.local().unwrap(), two.local().unwrap());
+            let mut bytes = Vec::with_capacity(8);
+            bytes.extend_from_slice(b"ping");
+            assert!(io.send_to(one, bytes, to, CLIENT).is_ok());
+            assert!(io.receive_from(two, Vec::with_capacity(64), SERVER).is_ok());
+            for _ in 0..2 {
+                let event = next(&mut io);
+                if let Done::SentTo { result, .. } = event.done {
+                    result.unwrap();
+                } else if let Done::ReceivedFrom { buffer, result, .. } = event.done {
+                    let (count, sender) = result.unwrap();
+                    assert_eq!((count, &buffer[..]), (4, &b"ping"[..]));
+                    assert_eq!(sender, from);
+                } else {
+                    panic!("not a datagram");
+                }
+            }
+        }
+    }
+
+    /// A datagram longer than the room is cut to it; the next is whole.
+    #[test]
+    fn datagram_cut_to_the_room() {
+        let mut io = io(8);
+        let one = Udp::bind(v4()).unwrap();
+        let two = Udp::bind(v4()).unwrap();
+        let to = two.local().unwrap();
+        let mut long = Vec::with_capacity(16);
+        long.extend_from_slice(b"0123456789");
+        assert!(io.send_to(one, long, to, CLIENT).is_ok());
+        let Done::SentTo { udp, result, .. } = next(&mut io).done else {
+            panic!("not a send");
+        };
+        result.unwrap();
+        assert!(io.receive_from(two, Vec::with_capacity(4), SERVER).is_ok());
+        let Done::ReceivedFrom { buffer, .. } = next(&mut io).done else {
+            panic!("not a receive");
+        };
+        assert_eq!(buffer, b"0123");
+        drop(udp);
+    }
+
+    /// Work that blocks runs on thread's pool, and comes back as an Event
+    /// with what it found; one canceled in line never runs.
+    #[test]
+    fn runs_work_that_blocks() {
+        let mut io = io(8);
+        // rr: escape(shared): what the work found, which the test reads.
+        let found = Arc::new(AtomicU64::new(0));
+        let sum = Sum {
+            up_to: 1000,
+            // rr: escape(copy): the work's holder of what it finds.
+            found: Arc::clone(&found),
+        };
+        assert!(io.run(Box::new(sum), 5).is_ok());
+        let event = next(&mut io);
+        assert_eq!(event.key, 5);
+        let Done::Ran { result, .. } = event.done else {
+            panic!("not a run");
+        };
+        assert_eq!(result, Ok(()));
+        assert_eq!(found.load(Ordering::Acquire), 500_500);
+    }
+
+    struct Sum {
+        up_to: u64,
+        found: Arc<AtomicU64>,
+    }
+
+    impl Work for Sum {
+        fn run(&mut self) {
+            self.found.store((1..=self.up_to).sum(), Ordering::Release);
+        }
+    }
+
+    /// A wake ends a wait with nothing running, and wakes before it are
+    /// one: the next wait sleeps its timeout.
+    #[test]
+    fn woken() {
+        let mut io = io(8);
+        let waker = io.waker();
+        waker.wake();
+        waker.wake();
+        assert_eq!(io.wait(None), Ok(0));
+        assert_eq!(io.wait(Some(Duration::from_millis(20))), Ok(0));
+        let other = io.waker();
+        other.wake();
+        assert!(io.timeout(Duration::from_secs(60), 1).is_ok());
+        assert_eq!(io.wait(None), Ok(0));
+    }
+
     /// What Io::new says where Linux gives no io_uring, as a loop shows it.
     #[test]
     fn unavailable_says_why() {
         let error = Error::Unavailable(Unavailable::Denied);
         assert_ne!(error, Error::Unavailable(Unavailable::Missing));
+    }
+
+    /// One byte to one server of a hundred, each with a receive waiting,
+    /// and its receive started again: what a loop of many idle connections
+    /// pays for the one that speaks (net's one_of_a_thousand, with fewer,
+    /// as macOS gives a process 256 descriptors).
+    #[bench]
+    fn one_of_a_hundred(b: &mut Bencher) {
+        const PAIRS: u64 = 100;
+        let mut io = io(2 * 100 + 8);
+        let mut clients = Vec::new();
+        let mut listeners = Vec::new();
+        for key in 0..PAIRS {
+            let (server, client, listener) = pair(&mut io, v4());
+            assert!(io.receive(server, Vec::with_capacity(16), key).is_ok());
+            clients.push(Some(client));
+            listeners.push(listener);
+        }
+        let mut turn = 0u64;
+        let mut out = Some(Vec::with_capacity(16));
+        b.iter(|| {
+            let key = turn % PAIRS;
+            turn += 1;
+            let index = usize::try_from(key).unwrap();
+            let mut bytes = out.take().unwrap();
+            bytes.clear();
+            bytes.push(1);
+            let client = clients[index].take().unwrap();
+            assert!(io.send(client, bytes, CLIENT + PAIRS).is_ok());
+            for _ in 0..2 {
+                let event = next(&mut io);
+                if let Done::Sent { stream, buffer, .. } = event.done {
+                    clients[index] = Some(stream);
+                    out = Some(buffer);
+                } else if let Done::Received {
+                    stream, mut buffer, ..
+                } = event.done
+                {
+                    buffer.clear();
+                    assert!(io.receive(stream, buffer, event.key).is_ok());
+                } else {
+                    panic!("another operation");
+                }
+            }
+        });
+        drop(listeners);
     }
 
     /// One byte there and back over loopback, as a loop of one connection
