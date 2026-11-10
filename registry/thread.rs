@@ -533,9 +533,13 @@ mod sys {
         #[cfg(test)]
         pub fn nap() {
             let wanted = [0i64, 1_000_000];
-            // rr: escape(unsafe, discard): wanted is a timespec; a signal
-            // that ends it early ends a nap.
-            let _: c_int = unsafe { nanosleep(&raw const wanted, core::ptr::null_mut()) };
+            // rr: escape(unsafe): wanted is a timespec; a signal that ends it
+            // early ends a nap.
+            unsafe {
+                // rr: escape(discard): wanted is a timespec; a signal that ends
+                // it early ends a nap.
+                let _: c_int = nanosleep(&raw const wanted, core::ptr::null_mut());
+            }
         }
         // rr: end(tests = yes)
 
@@ -552,7 +556,8 @@ mod sys {
         // glibc before 2.34 keeps the threads in libpthread; later ones and
         // musl keep them in libc, and glibc's libpthread is then empty.
         #[cfg_attr(all(target_os = "linux", target_env = "gnu"), link(name = "pthread"))]
-        // rr: escape(unsafe): each signature is the C library's, from its headers.
+        // rr: escape(unsafe): each signature is the C library's, from its
+        // headers.
         unsafe extern "C" {
             #[must_use]
             fn pthread_create(
@@ -790,7 +795,8 @@ mod sys {
         // rr: end(tests = yes)
 
         #[link(name = "kernel32", kind = "raw-dylib")]
-        // rr: escape(unsafe): each signature is kernel32's, from its documentation.
+        // rr: escape(unsafe): each signature is kernel32's, from its
+        // documentation.
         unsafe extern "system" {
             // rr: section(tests = yes)
             #[cfg(test)]

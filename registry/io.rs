@@ -1179,7 +1179,8 @@ mod sys {
             use core::ffi::{c_int, c_void};
 
             #[link(name = "c")]
-            // rr: escape(unsafe): each signature is the C library's, from its headers.
+            // rr: escape(unsafe): each signature is the C library's, from its
+            // headers.
             unsafe extern "C" {
                 #[must_use]
                 pub fn socket(domain: c_int, kind: c_int, protocol: c_int) -> c_int;
@@ -1548,7 +1549,8 @@ mod sys {
         fn option(fd: c_int, level: c_int, name: c_int, value: c_int) -> Result<(), Error> {
             // An int in the host's order, little on every target.
             let bytes = value.to_le_bytes();
-            // rr: escape(unsafe): bytes holds an int, as each option here takes.
+            // rr: escape(unsafe): bytes holds an int, as each option here
+            // takes.
             let done =
                 unsafe { c::setsockopt(fd, level, name, bytes.as_ptr().cast(), length(&bytes)) };
             check(done)
@@ -1621,7 +1623,8 @@ mod sys {
         pub fn close(fd: c_int) {
             // rr: escape(unsafe): fd is its owner's, closed once, by its drop.
             unsafe {
-                // rr: escape(discard): close releases the descriptor whatever it
+                // rr: escape(discard): close releases the descriptor whatever
+                // it
                 // answers; no one is left to tell.
                 let _: c_int = c::close(fd);
             }
@@ -1653,7 +1656,8 @@ mod sys {
             }
 
             #[link(name = "ws2_32", kind = "raw-dylib")]
-            // rr: escape(unsafe): each signature is ws2_32's, from its documentation.
+            // rr: escape(unsafe): each signature is ws2_32's, from its
+            // documentation.
             unsafe extern "system" {
                 #[must_use]
                 pub fn WSAStartup(version: u16, data: *mut u8) -> i32;
@@ -2023,7 +2027,8 @@ mod sys {
         use core::time::Duration;
 
         #[link(name = "c")]
-        // rr: escape(unsafe): each signature is the C library's, from its headers.
+        // rr: escape(unsafe): each signature is the C library's, from its
+        // headers.
         unsafe extern "C" {
             #[must_use]
             fn syscall(number: c_long, ...) -> c_long;
@@ -2193,9 +2198,13 @@ mod sys {
             pub fn wake(&self) {
                 // A u64 in the host's order, little on x86_64 and aarch64.
                 let one = 1u64.to_le_bytes();
-                // rr: escape(unsafe, discard): one is 8 bytes; a counter at
-                // its most is set already.
-                let _: isize = unsafe { write(self.fd, one.as_ptr().cast(), 8) };
+                // rr: escape(unsafe): one is 8 bytes; a counter at its most is
+                // set already.
+                unsafe {
+                    // rr: escape(discard): one is 8 bytes; a counter at its
+                    // most is set already.
+                    let _: isize = write(self.fd, one.as_ptr().cast(), 8);
+                }
             }
         }
 
@@ -2772,7 +2781,8 @@ mod sys {
         }
 
         #[link(name = "c")]
-        // rr: escape(unsafe): each signature is the C library's, from its headers.
+        // rr: escape(unsafe): each signature is the C library's, from its
+        // headers.
         unsafe extern "C" {
             #[must_use]
             fn kqueue() -> c_int;
@@ -2829,11 +2839,15 @@ mod sys {
             pub fn wake(&self) {
                 let mut trigger = change(0, EVFILT_USER, 0, WAKE);
                 trigger.fflags = NOTE_TRIGGER;
-                // rr: escape(unsafe, discard): one change, no events asked
-                // for; the filter is added with the kqueue, so a trigger is
-                // refused only for a kqueue gone, which nothing waits on.
-                let _: c_int =
-                    unsafe { kevent(self.kq, &raw const trigger, 1, null_mut(), 0, null()) };
+                // rr: escape(unsafe): one change, no events asked for; the
+                // filter is added with the kqueue, so a trigger is refused only
+                // for a kqueue gone, which nothing waits on.
+                unsafe {
+                    // rr: escape(discard): one change, no events asked for; the
+                    // filter is added with the kqueue, so a trigger is refused
+                    // only for a kqueue gone, which nothing waits on.
+                    let _: c_int = kevent(self.kq, &raw const trigger, 1, null_mut(), 0, null());
+                }
             }
         }
 
@@ -2926,10 +2940,13 @@ mod sys {
                         ident(slot.fd().unwrap_or(-1))
                     };
                     let delete = change(ident, filter, EV_DELETE, data);
-                    // rr: escape(unsafe, discard): one change, no events
-                    // asked for; a filter gone already is what was wanted.
-                    let _: c_int =
-                        unsafe { kevent(self.kq, &raw const delete, 1, null_mut(), 0, null()) };
+                    // rr: escape(unsafe): one change, no events asked for; a
+                    // filter gone already is what was wanted.
+                    unsafe {
+                        // rr: escape(discard): one change, no events asked for;
+                        // a filter gone already is what was wanted.
+                        let _: c_int = kevent(self.kq, &raw const delete, 1, null_mut(), 0, null());
+                    }
                     // A change not yet made goes with the operation.
                     self.changes.retain(|c| c.udata.addr() as u64 != data);
                 }
@@ -3229,7 +3246,8 @@ mod sys {
         ) -> i32;
 
         #[link(name = "kernel32", kind = "raw-dylib")]
-        // rr: escape(unsafe): each signature is kernel32's, from its documentation.
+        // rr: escape(unsafe): each signature is kernel32's, from its
+        // documentation.
         unsafe extern "system" {
             #[must_use]
             fn CreateIoCompletionPort(
@@ -3313,17 +3331,25 @@ mod sys {
             }
 
             pub fn wake(&self) {
-                // rr: escape(unsafe, discard): a post without an OVERLAPPED,
-                // which a wait passes over; a port that refuses one is gone.
-                let _: i32 = unsafe { PostQueuedCompletionStatus(self.port(), 0, 0, null_mut()) };
+                // rr: escape(unsafe): a post without an OVERLAPPED, which a
+                // wait passes over; a port that refuses one is gone.
+                unsafe {
+                    // rr: escape(discard): a post without an OVERLAPPED, which
+                    // a wait passes over; a port that refuses one is gone.
+                    let _: i32 = PostQueuedCompletionStatus(self.port(), 0, 0, null_mut());
+                }
             }
         }
 
         impl Drop for Wake {
             fn drop(&mut self) {
-                // rr: escape(unsafe, discard): the port is this value's own;
-                // close releases it whatever it answers.
-                let _: i32 = unsafe { CloseHandle(self.port()) };
+                // rr: escape(unsafe): the port is this value's own; close
+                // releases it whatever it answers.
+                unsafe {
+                    // rr: escape(discard): the port is this value's own; close
+                    // releases it whatever it answers.
+                    let _: i32 = CloseHandle(self.port());
+                }
             }
         }
 
@@ -3393,9 +3419,13 @@ mod sys {
                     return Err(Error::Other(i32::try_from(code).unwrap_or(0)));
                 }
                 let mut frequency = 0i64;
-                // rr: escape(unsafe, discard): frequency is a local
-                // LARGE_INTEGER; the call cannot fail from Windows XP on.
-                let _: i32 = unsafe { QueryPerformanceFrequency(&raw mut frequency) };
+                // rr: escape(unsafe): frequency is a local LARGE_INTEGER; the
+                // call cannot fail from Windows XP on.
+                unsafe {
+                    // rr: escape(discard): frequency is a local LARGE_INTEGER;
+                    // the call cannot fail from Windows XP on.
+                    let _: i32 = QueryPerformanceFrequency(&raw mut frequency);
+                }
                 let mut entries = Vec::with_capacity(BATCH);
                 entries.resize_with(BATCH, || Entry {
                     key: 0,
@@ -3426,9 +3456,13 @@ mod sys {
             #[must_use]
             fn now(&self) -> u64 {
                 let mut count = 0i64;
-                // rr: escape(unsafe, discard): count is a local
-                // LARGE_INTEGER; the call cannot fail from Windows XP on.
-                let _: i32 = unsafe { QueryPerformanceCounter(&raw mut count) };
+                // rr: escape(unsafe): count is a local LARGE_INTEGER; the call
+                // cannot fail from Windows XP on.
+                unsafe {
+                    // rr: escape(discard): count is a local LARGE_INTEGER; the
+                    // call cannot fail from Windows XP on.
+                    let _: i32 = QueryPerformanceCounter(&raw mut count);
+                }
                 let ticks = u128::from(u64::try_from(count).unwrap_or(0));
                 let nanos = (ticks * 1_000_000_000).checked_div(u128::from(self.frequency));
                 nanos.map_or(0, |nanos| u64::try_from(nanos).unwrap_or(u64::MAX))
@@ -3653,10 +3687,15 @@ mod sys {
                 }
                 if let Some(fd) = slot.fd() {
                     let overlapped = slot.overlapped.as_mut_ptr().cast::<c_void>();
-                    // rr: escape(unsafe, discard): the OVERLAPPED is the
-                    // operation's; one done already is not found, and its
-                    // answer comes as it would.
-                    let _: i32 = unsafe { CancelIoEx(handle(fd), overlapped) };
+                    // rr: escape(unsafe): the OVERLAPPED is the operation's;
+                    // one done already is not found, and its answer comes as it
+                    // would.
+                    unsafe {
+                        // rr: escape(discard): the OVERLAPPED is the
+                        // operation's; one done already is not found, and its
+                        // answer comes as it would.
+                        let _: i32 = CancelIoEx(handle(fd), overlapped);
+                    }
                 }
                 false
             }
@@ -3783,9 +3822,13 @@ mod sys {
                         continue;
                     };
                     let overlapped = slot.overlapped.as_mut_ptr().cast::<c_void>();
-                    // rr: escape(unsafe, discard): the OVERLAPPED is the
-                    // operation's; one done already answers as it would.
-                    let _: i32 = unsafe { CancelIoEx(handle(fd), overlapped) };
+                    // rr: escape(unsafe): the OVERLAPPED is the operation's;
+                    // one done already answers as it would.
+                    unsafe {
+                        // rr: escape(discard): the OVERLAPPED is the
+                        // operation's; one done already answers as it would.
+                        let _: i32 = CancelIoEx(handle(fd), overlapped);
+                    }
                 }
                 // Each turn takes answers, or waits a second for one: an
                 // aborted operation answers at once.
