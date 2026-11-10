@@ -98,7 +98,9 @@ jobs:
         shell: bash
         run: |
           case "$RUNNER_OS" in Linux) os=linux ;; macOS) os=macos ;; Windows) os=windows ;; esac
-          case "$(uname -m)" in x86_64|AMD64) arch=x86_64 ;; *) arch=aarch64 ;; esac
+          # The runner's own: Git's bash on Windows on Arm is an x64 one,
+          # whose uname says x86_64.
+          case "$RUNNER_ARCH" in X64) arch=x86_64 ;; ARM64) arch=aarch64 ;; *) arch=other ;; esac
           names=$(ls registry/*.rs | sed 's|registry/||; s|\.rs$||')
           OPTIONS="os=$os arch=$arch" scripts/registry-check.sh "$RUNNER_TEMP/registry-cut" $names
       - name: Every component, without its tests
