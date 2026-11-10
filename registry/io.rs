@@ -3910,7 +3910,15 @@ mod sys {
                     Ok(accepting)
                 }
                 Work::Connect(_) => {
-                    match super::os::option(fd, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, &[]) {
+                    // The socket itself as the option's value, as Go's
+                    // net/fd_windows.go gives it.
+                    let own: Raw = fd;
+                    match super::os::option(
+                        fd,
+                        SOL_SOCKET,
+                        SO_UPDATE_CONNECT_CONTEXT,
+                        &own.to_le_bytes(),
+                    ) {
                         Ok(()) => Ok(0),
                         Err(_) => Err(last()),
                     }
