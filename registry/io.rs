@@ -3289,6 +3289,8 @@ mod sys {
         const SO_UPDATE_ACCEPT_CONTEXT: i32 = 0x700B;
         const SO_UPDATE_CONNECT_CONTEXT: i32 = 0x7010;
         const WAIT_TIMEOUT: u32 = 258;
+        /// winerror.h: a datagram longer than the buffer given for it.
+        const WSAEMSGSIZE: i32 = 10040;
         /// WSAID_ACCEPTEX and WSAID_CONNECTEX, as GUIDs lie in memory.
         const ACCEPTEX: [u8; 16] = guid(
             0xb536_7df1,
@@ -3882,7 +3884,15 @@ mod sys {
                 let done = unsafe {
                     c::WSAGetOverlappedResult(fd, overlapped, &raw mut count, 0, &raw mut flags)
                 };
-                return Err(if done != 0 { ABORTED } else { last() });
+                if done != 0 {
+                    return Err(ABORTED);
+                }
+                // A datagram longer than the room fills it and says so; it is
+                // cut to the room, as Linux and macOS cut it.
+                return match (last(), &slot.work) {
+                    (WSAEMSGSIZE, Work::ReceiveFrom(..)) => Ok(count as usize),
+                    (code, _) => Err(code),
+                };
             }
             match &slot.work {
                 Work::Accept(_) => {
