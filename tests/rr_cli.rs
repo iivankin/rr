@@ -246,39 +246,30 @@ fn fuz_cannot_override_native_output_through_an_argument_file() {
 fn add_copies_a_component_and_what_it_needs_and_keeps_changed_code() {
     let project = Project::new();
     let registry = project.0.join("registry");
-    fs::create_dir_all(registry.join("hash")).unwrap();
-    fs::create_dir_all(registry.join("tls")).unwrap();
+    fs::create_dir_all(&registry).unwrap();
     fs::write(
-        registry.join("hash/hash.json"),
-        r#"{"name": "hash", "rr": "0.0.1", "files": [{"path": "mod.rs"}, {"path": "sys.rs"}]}"#,
+        registry.join("hash.rs"),
+        "//! Hashes.\n\n// rr: checked(0.0.1)\n\npub fn hash() {}\n\nmod sys {\n    pub fn fast() {}\n}\n",
     )
     .unwrap();
-    fs::write(registry.join("hash/mod.rs"), "mod sys;\npub fn hash() {}\n").unwrap();
-    fs::write(registry.join("hash/sys.rs"), "pub fn fast() {}\n").unwrap();
-    fs::write(
-        registry.join("tls/tls.json"),
-        r#"{"name": "tls", "dependencies": ["hash"], "files": [{"path": "mod.rs", "content": "pub fn tls() {}\n"}]}"#,
-    )
-    .unwrap();
+    fs::write(registry.join("tls.rs"), "// rr: needs(hash)\npub fn tls() {}\n").unwrap();
     fs::create_dir(project.0.join("src")).unwrap();
     fs::write(project.0.join("src/main.rs"), "mod greet;\n").unwrap();
 
-    // Each component in its own directory under src/base/, declared in
-    // base/mod.rs; the root is told to declare base.
-    let output = project.rr(&["add", "registry/tls/tls.json"]);
+    // Each component in its own file under src/base/, declared in
+    // base/mod.rs, its header replaced by what added it; the root is told
+    // to declare base.
+    let output = project.rr(&["add", "registry/tls.rs"]);
     success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(
-        fs::read_to_string(project.0.join("src/base/hash/mod.rs")).unwrap(),
-        "mod sys;\npub fn hash() {}\n"
+    let hash = format!(
+        "//! Hashes.\n\n// rr: added(hash, rr {})\n\npub fn hash() {{}}\n\nmod sys {{\n    pub fn fast() {{}}\n}}\n",
+        rr_version()
     );
+    assert_eq!(fs::read_to_string(project.0.join("src/base/hash.rs")).unwrap(), hash);
     assert_eq!(
-        fs::read_to_string(project.0.join("src/base/hash/sys.rs")).unwrap(),
-        "pub fn fast() {}\n"
-    );
-    assert_eq!(
-        fs::read_to_string(project.0.join("src/base/tls/mod.rs")).unwrap(),
-        "pub fn tls() {}\n"
+        fs::read_to_string(project.0.join("src/base/tls.rs")).unwrap(),
+        format!("// rr: added(tls, rr {})\npub fn tls() {{}}\n", rr_version())
     );
     let base = fs::read_to_string(project.0.join("src/base/mod.rs")).unwrap();
     assert!(base.contains("pub mod hash;\npub mod tls;\n"), "{base}");
@@ -289,85 +280,161 @@ fn add_copies_a_component_and_what_it_needs_and_keeps_changed_code() {
     // file the project changed stops the add, before anything is
     // written, until --overwrite.
     fs::write(project.0.join("src/main.rs"), "mod base;\nmod greet;\n").unwrap();
-    let output = project.rr(&["add", "registry/tls/tls.json"]);
+    let output = project.rr(&["add", "registry/tls.rs"]);
     success(&output);
     assert!(!String::from_utf8_lossy(&output.stdout).contains("Declare"));
     assert_eq!(fs::read_to_string(project.0.join("src/base/mod.rs")).unwrap(), base);
-    fs::write(project.0.join("src/base/hash/mod.rs"), "pub fn mine() {}\n").unwrap();
-    fs::remove_file(project.0.join("src/base/tls/mod.rs")).unwrap();
-    let output = project.rr(&["add", "registry/tls/tls.json"]);
+    fs::write(project.0.join("src/base/hash.rs"), "pub fn mine() {}\n").unwrap();
+    fs::remove_file(project.0.join("src/base/tls.rs")).unwrap();
+    let output = project.rr(&["add", "registry/tls.rs"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("--overwrite"));
-    assert!(!project.0.join("src/base/tls/mod.rs").exists());
-    success(&project.rr(&["add", "--overwrite", "registry/tls/tls.json"]));
-    assert_eq!(
-        fs::read_to_string(project.0.join("src/base/hash/mod.rs")).unwrap(),
-        "mod sys;\npub fn hash() {}\n"
-    );
+    assert!(!project.0.join("src/base/tls.rs").exists());
+    success(&project.rr(&["add", "--overwrite", "registry/tls.rs"]));
+    assert_eq!(fs::read_to_string(project.0.join("src/base/hash.rs")).unwrap(), hash);
 
-    // A component that needs a newer rr, or writes outside its
-    // directory, is refused.
-    fs::create_dir_all(registry.join("new")).unwrap();
-    fs::write(
-        registry.join("new/new.json"),
-        r#"{"name": "new", "rr": "99.0.0", "files": []}"#,
-    )
-    .unwrap();
-    let output = project.rr(&["add", "registry/new/new.json"]);
+    // A component that needs a newer rr, brings a file not its own, or
+    // was added by rr 0.5 as a directory, is refused.
+    fs::write(registry.join("new.rs"), "// rr: checked(99.0.0)\n").unwrap();
+    let output = project.rr(&["add", "registry/new.rs"]);
     assert!(String::from_utf8_lossy(&output.stderr).contains("needs rr 99.0.0"));
-    fs::create_dir_all(registry.join("out")).unwrap();
-    fs::write(
-        registry.join("out/out.json"),
-        r#"{"name": "out", "files": [{"path": "../evil.rs", "content": ""}]}"#,
-    )
-    .unwrap();
-    let output = project.rr(&["add", "registry/out/out.json"]);
-    assert!(String::from_utf8_lossy(&output.stderr).contains("leaves the source directory"));
-    assert!(!project.0.join("src/base/evil.rs").exists());
+    fs::write(registry.join("out.rs"), "// rr: file(../evil.rs)\n").unwrap();
+    let output = project.rr(&["add", "registry/out.rs"]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not a file of out's own"));
+    assert!(!project.0.join("src/base/out.rs").exists());
+    fs::create_dir_all(project.0.join("src/base/old")).unwrap();
+    fs::write(project.0.join("src/base/old/mod.rs"), "").unwrap();
+    fs::write(registry.join("old.rs"), "pub fn old() {}\n").unwrap();
+    let output = project.rr(&["add", "registry/old.rs"]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("one file now"));
+}
+
+fn rr_version() -> String {
+    let rr_cli = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/rr_cli.rs")).unwrap();
+    let line = rr_cli.lines().find(|l| l.starts_with("pub const VERSION")).unwrap();
+    line.split('"').nth(1).unwrap().to_owned()
 }
 
 #[test]
-fn add_asks_its_questions_through_options_and_puts_scripts_in_scripts() {
+fn add_cuts_what_its_options_leave_out_and_adds_what_they_need() {
     let project = Project::new();
     let registry = project.0.join("registry");
-    for name in ["system", "builtin", "tls"] {
-        fs::create_dir_all(registry.join(name)).unwrap();
-    }
+    fs::create_dir_all(&registry).unwrap();
     for name in ["system", "builtin"] {
-        fs::write(
-            registry.join(format!("{name}/{name}.json")),
-            format!(r#"{{"name": "{name}", "files": [{{"path": "mod.rs", "content": "pub fn {name}() {{}}\n"}}]}}"#),
-        )
-        .unwrap();
+        fs::write(registry.join(format!("{name}.rs")), format!("pub fn {name}() {{}}\n")).unwrap();
     }
+    fs::write(registry.join("tls-vectors.txt"), "vectors\n").unwrap();
     fs::write(
-        registry.join("tls/tls.json"),
-        r#"{"name": "tls", "files": [{"path": "mod.rs", "content": ""}, {"path": "gen.py", "target": "scripts", "content": "print(1)\n"}],
-            "options": [{"name": "roots", "question": "Which roots?", "default": "system", "choices": [
-                {"value": "system", "dependencies": ["system"]},
-                {"value": "builtin", "dependencies": ["builtin"]},
-                {"value": "none"}]}]}"#,
+        registry.join("tls.rs"),
+        "//! TLS.\n\
+         // rr: option(roots, one): Which roots?\n\
+         // rr: choice(roots = system, default, needs(system)): the system's\n\
+         // rr: choice(roots = builtin, needs(builtin)): its own\n\
+         // rr: choice(roots = none): the caller's\n\
+         // rr: option(os, many): Which systems?\n\
+         // rr: choice(os = linux, default)\n\
+         // rr: choice(os = macos, default)\n\
+         // rr: choice(os = windows)\n\
+         // rr: option(tests, one): Tests?\n\
+         // rr: choice(tests = yes, default)\n\
+         // rr: choice(tests = no)\n\
+         // rr: file(tls-vectors.txt, tests = yes)\n\
+         \n\
+         pub fn tls() {}\n\
+         \n\
+         // rr: section(os = linux macos)\n\
+         fn unix() {}\n\
+         \n\
+         // rr: section(os = macos)\n\
+         fn macos() {}\n\
+         // rr: end(os = macos)\n\
+         // rr: end(os = linux macos)\n\
+         \n\
+         // rr: section(os = windows)\n\
+         fn windows() {}\n\
+         // rr: end(os = windows)\n\
+         \n\
+         // rr: unless(os = windows)\n\
+         #[cfg(windows)]\n\
+         compile_error!(\"no windows\");\n\
+         // rr: end(os = windows)\n\
+         \n\
+         // rr: section(tests = yes)\n\
+         mod tests {}\n\
+         // rr: end(tests = yes)\n",
     )
     .unwrap();
-    // Without a terminal the default is taken, and the way to choose said.
-    let output = project.rr(&["add", "registry/tls/tls.json"]);
+    // Without a terminal the defaults are taken, and the way to choose
+    // said; what they leave out is cut, with the blank line before it.
+    let output = project.rr(&["add", "registry/tls.rs"]);
     success(&output);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--option roots=VALUE"), "{stdout}");
-    assert!(stdout.contains("rr add: system, tls (roots=system)"), "{stdout}");
-    assert!(project.0.join("src/base/system/mod.rs").is_file());
-    assert!(!project.0.join("src/base/builtin").exists());
-    assert_eq!(
-        fs::read_to_string(project.0.join("scripts/gen.py")).unwrap(),
-        "print(1)\n"
+    assert!(stdout.contains("--option os=A,B"), "{stdout}");
+    assert!(
+        stdout.contains("rr add: system, tls (roots=system os=linux,macos tests=yes)"),
+        "{stdout}"
     );
-    assert!(!project.0.join("src/base/tls/gen.py").exists());
+    assert!(project.0.join("src/base/system.rs").is_file());
+    assert!(!project.0.join("src/base/builtin.rs").exists());
+    assert_eq!(
+        fs::read_to_string(project.0.join("src/base/tls-vectors.txt")).unwrap(),
+        "vectors\n"
+    );
+    assert_eq!(
+        fs::read_to_string(project.0.join("src/base/tls.rs")).unwrap(),
+        format!(
+            "//! TLS.\n// rr: added(tls, rr {}; roots = system; os = linux macos; tests = yes)\n\n\
+             pub fn tls() {{}}\n\nfn unix() {{}}\n\nfn macos() {{}}\n\n\
+             #[cfg(windows)]\ncompile_error!(\"no windows\");\n\nmod tests {{}}\n",
+            rr_version()
+        )
+    );
 
-    success(&project.rr(&["add", "--option", "roots=builtin", "registry/tls/tls.json"]));
-    assert!(project.0.join("src/base/builtin/mod.rs").is_file());
-    let output = project.rr(&["add", "--option", "roots=other", "registry/tls/tls.json"]);
+    let project2 = Project::new();
+    fs::create_dir_all(project2.0.join("registry")).unwrap();
+    for entry in fs::read_dir(&registry).unwrap() {
+        let entry = entry.unwrap();
+        fs::copy(entry.path(), project2.0.join("registry").join(entry.file_name())).unwrap();
+    }
+    let output = project2.rr(&[
+        "add",
+        "--option",
+        "roots=builtin",
+        "--option",
+        "os=windows",
+        "--option",
+        "tests=no",
+        "registry/tls.rs",
+    ]);
+    success(&output);
+    assert!(project2.0.join("src/base/builtin.rs").is_file());
+    assert!(!project2.0.join("src/base/tls-vectors.txt").exists());
+    assert_eq!(
+        fs::read_to_string(project2.0.join("src/base/tls.rs")).unwrap(),
+        format!(
+            "//! TLS.\n// rr: added(tls, rr {}; roots = builtin; os = windows; tests = no)\n\n\
+             pub fn tls() {{}}\n\nfn windows() {{}}\n",
+            rr_version()
+        )
+    );
+    let output = project2.rr(&["add", "--option", "roots=other", "registry/tls.rs"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("one of system, builtin, none"));
+    let output = project2.rr(&["add", "--option", "roots=system,none", "registry/tls.rs"]);
+    assert!(!output.status.success());
+
+    // A mark that is not closed, or names what the header does not ask,
+    // is refused.
+    fs::write(registry.join("bad.rs"), "// rr: section(os = linux)\nfn f() {}\n").unwrap();
+    let output = project.rr(&["add", "registry/bad.rs"]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not an option"));
+    fs::write(registry.join("bad.rs"), "fn f() {}\n// rr: needs(system)\n").unwrap();
+    let output = project.rr(&["add", "registry/bad.rs"]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("belongs in the header"));
+    fs::write(registry.join("bad.rs"), "// rr: need(system)\nfn f() {}\n").unwrap();
+    let output = project.rr(&["add", "registry/bad.rs"]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("is not one of"));
 }
 
 #[test]

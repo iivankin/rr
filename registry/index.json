@@ -1,122 +1,407 @@
 {
   "components": [
     {
-      "name": "aesgcm",
-      "description": "AES-128-GCM and AES-256-GCM (NIST SP 800-38D, TLS 1.3's 12-byte nonce and 16-byte tag), sealed and opened in place, on AES and carry-less multiply instructions where the CPU has them and constant-time portable code elsewhere; a SealingKey and an OpeningKey that number their own nonces (IV XOR the record's number, as TLS 1.3) and refuse past 2^64 - 1, seal_with_nonce and open_with_nonce for a nonce of the caller's, a tag that must be used, key schedules wiped when dropped.",
       "dependencies": [
         "cpu"
+      ],
+      "description": "AES-128-GCM and AES-256-GCM (NIST SP 800-38D, TLS 1.3's 12-byte nonce and 16-byte tag), sealed and opened in place, on AES and carry-less multiply instructions where the CPU has them and constant-time portable code elsewhere; a SealingKey and an OpeningKey that number their own nonces (IV XOR the record's number, as TLS 1.3) and refuse past 2^64 - 1, seal_with_nonce and open_with_nonce for a nonce of the caller's, a tag that must be used, key schedules wiped when dropped.",
+      "name": "aesgcm",
+      "options": [
+        {
+          "choices": [
+            "yes",
+            "no"
+          ],
+          "default": "yes",
+          "name": "tests"
+        },
+        {
+          "choices": [
+            "linux",
+            "macos",
+            "windows"
+          ],
+          "default": "linux,macos,windows",
+          "name": "os"
+        },
+        {
+          "choices": [
+            "x86_64",
+            "aarch64",
+            "other"
+          ],
+          "default": "x86_64,aarch64,other",
+          "name": "arch"
+        }
       ]
     },
     {
-      "name": "cpu",
+      "dependencies": [],
       "description": "What the CPU has of the instructions the components use (AES, carry-less multiply, SHA-256, SHA-512, VAES), asked once for the process, as Features only it names.",
-      "dependencies": []
+      "name": "cpu",
+      "options": [
+        {
+          "choices": [
+            "yes",
+            "no"
+          ],
+          "default": "yes",
+          "name": "tests"
+        },
+        {
+          "choices": [
+            "linux",
+            "macos",
+            "windows"
+          ],
+          "default": "linux,macos,windows",
+          "name": "os"
+        },
+        {
+          "choices": [
+            "x86_64",
+            "aarch64",
+            "other"
+          ],
+          "default": "x86_64,aarch64,other",
+          "name": "arch"
+        }
+      ]
     },
     {
-      "name": "digest",
+      "dependencies": [],
       "description": "A digest that names its hash, SHA-256, SHA-384 or SHA-512, at its length: what a signature verifier (ecdsa, rsa) takes instead of bytes of any length.",
-      "dependencies": []
+      "name": "digest",
+      "options": [
+        {
+          "choices": [
+            "yes",
+            "no"
+          ],
+          "default": "yes",
+          "name": "tests"
+        }
+      ]
     },
     {
-      "name": "ecdh",
-      "description": "P-256 Diffie-Hellman for TLS 1.3's key share (SEC 1, NIST SP 800-56A): a secret's uncompressed public point and the x-coordinate shared with a peer's, peers off the curve refused; constant time over the secret, with complete addition formulas and masked table reads; a Secret made from random's seed, a PublicKey checked as a point, and a SharedSecret only a key derivation takes.",
       "dependencies": [
         "random"
+      ],
+      "description": "P-256 Diffie-Hellman for TLS 1.3's key share (SEC 1, NIST SP 800-56A): a secret's uncompressed public point and the x-coordinate shared with a peer's, peers off the curve refused; constant time over the secret, with complete addition formulas and masked table reads; a Secret made from random's seed, a PublicKey checked as a point, and a SharedSecret only a key derivation takes.",
+      "name": "ecdh",
+      "options": [
+        {
+          "choices": [
+            "yes",
+            "no"
+          ],
+          "default": "yes",
+          "name": "tests"
+        }
       ]
     },
     {
-      "name": "ecdsa",
-      "description": "ECDSA signature verification on P-256, P-384 and P-521 (FIPS 186-4, SEC 1) of a digest that names its hash, answering which part is wrong (key, encoding, signature): strict DER signatures, uncompressed keys checked on the curve, Montgomery field arithmetic with P-256's special reduction and NAF double-scalar multiplies.",
       "dependencies": [
         "digest"
+      ],
+      "description": "ECDSA signature verification on P-256, P-384 and P-521 (FIPS 186-4, SEC 1) of a digest that names its hash, answering which part is wrong (key, encoding, signature): strict DER signatures, uncompressed keys checked on the curve, Montgomery field arithmetic with P-256's special reduction and NAF double-scalar multiplies.",
+      "name": "ecdsa",
+      "options": [
+        {
+          "choices": [
+            "yes",
+            "no"
+          ],
+          "default": "yes",
+          "name": "tests"
+        }
       ]
     },
     {
-      "name": "http1",
+      "dependencies": [],
       "description": "HTTP/1.1 client side (RFC 9112) without I/O, one Response for each connection: requests written into a buffer and noted in order, pipelined or not, their bodies through an Upload that counts Content-Length and writes the chunked framing; an incremental response parser that takes any split of the input and hands body bytes back uncopied, for Content-Length, chunked and close-delimited bodies, the head readable once final, a close told clean or abrupt, and every misuse refused with a reason.",
-      "dependencies": []
+      "name": "http1",
+      "options": [
+        {
+          "choices": [
+            "yes",
+            "no"
+          ],
+          "default": "yes",
+          "name": "tests"
+        }
+      ]
     },
     {
-      "name": "mlkem",
-      "description": "ML-KEM-768 (FIPS 203) for TLS's X25519MLKEM768: key generation from a 64-byte seed, encapsulation with the modulus check, decapsulation with implicit rejection, constant time over secrets; its own Keccak (SHA3-256, SHA3-512, SHAKE128, SHAKE256); keys generated in place from random's seed, encapsulation from random's seed, a SharedSecret only a key derivation takes, secrets wiped.",
       "dependencies": [
         "random"
+      ],
+      "description": "ML-KEM-768 (FIPS 203) for TLS's X25519MLKEM768: key generation from a 64-byte seed, encapsulation with the modulus check, decapsulation with implicit rejection, constant time over secrets; its own Keccak (SHA3-256, SHA3-512, SHAKE128, SHAKE256); keys generated in place from random's seed, encapsulation from random's seed, a SharedSecret only a key derivation takes, secrets wiped.",
+      "name": "mlkem",
+      "options": [
+        {
+          "choices": [
+            "yes",
+            "no"
+          ],
+          "default": "yes",
+          "name": "tests"
+        }
       ]
     },
     {
-      "name": "net",
-      "description": "TCP over the system's sockets for a loop that serves many: a Listener and the Streams it accepts or that connect out, non-blocking, closed on exec or never inherited, no SIGPIPE; each owns its socket and its Owned entry in a poll Poll, which close removes before the socket is closed, once; a Stream remembers how its connection went, and a read or write before it is made is NotConnected on every system; errors by kind, IPv4 and IPv6. For a loop on each core: listeners that share an address on Linux (SO_REUSEPORT, bind_shared), refused as Unbalanced on macOS and Windows, where one loop accepts a Handoff, a socket in no Poll, for another thread's loop to adopt.",
       "dependencies": [
         "poll"
+      ],
+      "description": "TCP over the system's sockets for a loop that serves many: a Listener and the Streams it accepts or that connect out, non-blocking, closed on exec or never inherited, no SIGPIPE; each owns its socket and its Owned entry in a poll Poll, which close removes before the socket is closed, once; a Stream remembers how its connection went, and a read or write before it is made is NotConnected on every system; errors by kind, IPv4 and IPv6. For a loop on each core: listeners that share an address on Linux (SO_REUSEPORT, bind_shared), refused as Unbalanced on macOS and Windows, where one loop accepts a Handoff, a socket in no Poll, for another thread's loop to adopt.",
+      "name": "net",
+      "options": [
+        {
+          "choices": [
+            "yes",
+            "no"
+          ],
+          "default": "yes",
+          "name": "tests"
+        },
+        {
+          "choices": [
+            "linux",
+            "macos",
+            "windows"
+          ],
+          "default": "linux,macos,windows",
+          "name": "os"
+        }
       ]
     },
     {
-      "name": "poll",
+      "dependencies": [],
       "description": "What a program's loop waits on, in mio's words, for the program and every component that works while it runs: a Poll of any number of descriptors (sockets on Windows), each with its Interest and a key, and deadlines on the monotonic clock (one moved a little later left where it is filed, as nginx does), level-triggered on epoll (Linux), kqueue (macOS), socket notifications (Windows from build 20348: Server 2022, Windows 11) or WSAPoll (Windows 10, Server 2019, or a layered provider over TCP), what is ready reported as Events of Ready, the same on every system, and every refusal as a PollError; tokens of one Poll refused by another; Owned entries that only close takes out, closing the descriptor once; a Waker for other threads; a component's Want (up to two descriptors and a timeout), which a Poll follows or block waits on alone; and a Signal, the close-on-exec pipe (Linux and macOS) or non-inherited loopback socket pair (Windows) another thread makes readable. Formerly wait.",
-      "dependencies": []
+      "name": "poll",
+      "options": [
+        {
+          "choices": [
+            "yes",
+            "no"
+          ],
+          "default": "yes",
+          "name": "tests"
+        },
+        {
+          "choices": [
+            "linux",
+            "macos",
+            "windows"
+          ],
+          "default": "linux,macos,windows",
+          "name": "os"
+        }
+      ]
     },
     {
-      "name": "queue",
-      "description": "A bounded queue between threads for a loop on each core: net Handoffs, accepted sockets in no Poll, with a tag, from the thread that accepts to a worker's loop, whose Poll each push wakes; a line under the system's mutex with condition variables for threads that may block, no lock-free code; a push to a full queue refused at once with the connection given back; Closed once every Sender is gone. Its tests run a server on N threads, a Poll each, over SO_REUSEPORT listeners on Linux and an accept thread that hands off on macOS and Windows, and bench its connections a second.",
       "dependencies": [
         "poll",
         "thread",
         "net"
+      ],
+      "description": "A bounded queue between threads for a loop on each core: net Handoffs, accepted sockets in no Poll, with a tag, from the thread that accepts to a worker's loop, whose Poll each push wakes; a line under the system's mutex with condition variables for threads that may block, no lock-free code; a push to a full queue refused at once with the connection given back; Closed once every Sender is gone. Its tests run a server on N threads, a Poll each, over SO_REUSEPORT listeners on Linux and an accept thread that hands off on macOS and Windows, and bench its connections a second.",
+      "name": "queue",
+      "options": [
+        {
+          "choices": [
+            "yes",
+            "no"
+          ],
+          "default": "yes",
+          "name": "tests"
+        }
       ]
     },
     {
-      "name": "random",
+      "dependencies": [],
       "description": "The system's randomness: arc4random_buf on macOS, getrandom(2) on Linux (/dev/urandom before 3.17), ProcessPrng on Windows; seeds of 32 and 64 bytes that only it makes, which keys are made from, wiped when dropped.",
-      "dependencies": []
+      "name": "random",
+      "options": [
+        {
+          "choices": [
+            "yes",
+            "no"
+          ],
+          "default": "yes",
+          "name": "tests"
+        },
+        {
+          "choices": [
+            "linux",
+            "macos",
+            "windows"
+          ],
+          "default": "linux,macos,windows",
+          "name": "os"
+        }
+      ]
     },
     {
-      "name": "resolve",
-      "description": "Host lookup that never blocks the caller's loop, one API on Linux, macOS and Windows: start, poll, take the addresses (socket_addr keeps a link-local one's interface), drop to cancel. The system answers: mDNSResponder through DNSServiceGetAddrInfo on macOS, on a socket the caller's poll waits on, sorted by RFC 6724 as getaddrinfo sorts; GetAddrInfoExW on Windows, asynchronous and cancellable, its callback signalling the caller's poll; the C library's getaddrinfo on Linux, on thread's pool, where a lookup cancelled after it started runs on to the system's timeout.",
       "dependencies": [
         "poll",
         "thread"
+      ],
+      "description": "Host lookup that never blocks the caller's loop, one API on Linux, macOS and Windows: start, poll, take the addresses (socket_addr keeps a link-local one's interface), drop to cancel. The system answers: mDNSResponder through DNSServiceGetAddrInfo on macOS, on a socket the caller's poll waits on, sorted by RFC 6724 as getaddrinfo sorts; GetAddrInfoExW on Windows, asynchronous and cancellable, its callback signalling the caller's poll; the C library's getaddrinfo on Linux, on thread's pool, where a lookup cancelled after it started runs on to the system's timeout.",
+      "name": "resolve",
+      "options": [
+        {
+          "choices": [
+            "yes",
+            "no"
+          ],
+          "default": "yes",
+          "name": "tests"
+        },
+        {
+          "choices": [
+            "linux",
+            "macos",
+            "windows"
+          ],
+          "default": "linux,macos,windows",
+          "name": "os"
+        }
       ]
     },
     {
-      "name": "roots",
-      "description": "Mozilla's trust anchors for TLS servers from NSS's certdata.txt at a release tag (MPL 2.0), with Mozilla's distrust-after dates and Chrome's announced distrusts of roots Mozilla still trusts, embedded as PEM and loaded into an x509::Store, with the name constraints Firefox imposes on TUBITAK's root, with Mozilla's OneCRL revocations (intermediates and roots refused anywhere on a path), and policy(): that distrust alone, as an x509::Policy, to lay over the system's anchors or screen a path the system verified; scripts/roots-gen.py rebuilds the file from a newer tag.",
       "dependencies": [
         "x509"
+      ],
+      "description": "Mozilla's trust anchors for TLS servers from NSS's certdata.txt at a release tag (MPL 2.0), with Mozilla's distrust-after dates and Chrome's announced distrusts of roots Mozilla still trusts, embedded as PEM and loaded into an x509::Store, with the name constraints Firefox imposes on TUBITAK's root, with Mozilla's OneCRL revocations (intermediates and roots refused anywhere on a path), and policy(): that distrust alone, as an x509::Policy, to lay over the system's anchors or screen a path the system verified; registry/gen/roots-gen.py rebuilds the data from a newer tag.",
+      "name": "roots",
+      "options": [
+        {
+          "choices": [
+            "yes",
+            "no"
+          ],
+          "default": "yes",
+          "name": "tests"
+        }
       ]
     },
     {
-      "name": "rsa",
-      "description": "RSA signature verification (RFC 8017): RSASSA-PKCS1-v1_5 and RSASSA-PSS with MGF1 and a salt of the hash's length, SHA-256, SHA-384 or SHA-512, for moduli of 2048 to 8192 bits and exponents of at most 33 bits, of a digest that names its hash, answering which part is wrong (key, encoding, signature).",
       "dependencies": [
         "digest",
         "sha256",
         "sha384"
+      ],
+      "description": "RSA signature verification (RFC 8017): RSASSA-PKCS1-v1_5 and RSASSA-PSS with MGF1 and a salt of the hash's length, SHA-256, SHA-384 or SHA-512, for moduli of 2048 to 8192 bits and exponents of at most 33 bits, of a digest that names its hash, answering which part is wrong (key, encoding, signature).",
+      "name": "rsa",
+      "options": [
+        {
+          "choices": [
+            "yes",
+            "no"
+          ],
+          "default": "yes",
+          "name": "tests"
+        }
       ]
     },
     {
-      "name": "sha256",
+      "dependencies": [
+        "cpu"
+      ],
       "description": "SHA-256 (FIPS 180-4), HMAC-SHA256 (RFC 2104) with a constant-time verify, and HKDF-SHA256 (RFC 5869) whose Expand takes only the Prk Extract makes, wiped when dropped; with SHA instructions where the CPU has them.",
-      "dependencies": [
-        "cpu"
+      "name": "sha256",
+      "options": [
+        {
+          "choices": [
+            "yes",
+            "no"
+          ],
+          "default": "yes",
+          "name": "tests"
+        },
+        {
+          "choices": [
+            "linux",
+            "macos",
+            "windows"
+          ],
+          "default": "linux,macos,windows",
+          "name": "os"
+        },
+        {
+          "choices": [
+            "x86_64",
+            "aarch64",
+            "other"
+          ],
+          "default": "x86_64,aarch64,other",
+          "name": "arch"
+        }
       ]
     },
     {
-      "name": "sha384",
+      "dependencies": [
+        "cpu"
+      ],
       "description": "SHA-384 and SHA-512 (FIPS 180-4) as digest384 and digest512, HMAC-SHA384 and HMAC-SHA512 (RFC 2104) with a constant-time verify, and HKDF-SHA384 (RFC 5869) whose Expand takes only its Prk; with SHA512 instructions where the CPU has them.",
-      "dependencies": [
-        "cpu"
+      "name": "sha384",
+      "options": [
+        {
+          "choices": [
+            "yes",
+            "no"
+          ],
+          "default": "yes",
+          "name": "tests"
+        },
+        {
+          "choices": [
+            "x86_64",
+            "aarch64",
+            "other"
+          ],
+          "default": "x86_64,aarch64,other",
+          "name": "arch"
+        }
       ]
     },
     {
-      "name": "thread",
-      "description": "Threads for a program whose loops wait on a poll::Poll, as libuv gives them: a pool of at most 32 threads for work that blocks (libuv's threadpool: started as work comes, asleep on a condition variable, one first-in-first-out line under a mutex), its work a Box<dyn Work + Send> moved in and given back once it ran, a Job that cancels work still in line when dropped and wakes the loop's Poll or sets a Signal when done; threads of their own for loops on other cores, with a 2 MiB stack, joined by a blocking join; and the system's mutex and condition variable (pthread on Linux and macOS, SRWLOCK and CONDITION_VARIABLE on Windows), held by a guard.",
       "dependencies": [
         "poll"
+      ],
+      "description": "Threads for a program whose loops wait on a poll::Poll, as libuv gives them: a pool of at most 32 threads for work that blocks (libuv's threadpool: started as work comes, asleep on a condition variable, one first-in-first-out line under a mutex), its work a Box<dyn Work + Send> moved in and given back once it ran, a Job that cancels work still in line when dropped and wakes the loop's Poll or sets a Signal when done; threads of their own for loops on other cores, with a 2 MiB stack, joined by a blocking join; and the system's mutex and condition variable (pthread on Linux and macOS, SRWLOCK and CONDITION_VARIABLE on Windows), held by a guard.",
+      "name": "thread",
+      "options": [
+        {
+          "choices": [
+            "yes",
+            "no"
+          ],
+          "default": "yes",
+          "name": "tests"
+        },
+        {
+          "choices": [
+            "linux",
+            "macos",
+            "windows"
+          ],
+          "default": "linux,macos,windows",
+          "name": "os"
+        },
+        {
+          "choices": [
+            "x86_64",
+            "aarch64",
+            "other"
+          ],
+          "default": "x86_64,aarch64,other",
+          "name": "arch"
+        }
       ]
     },
     {
-      "name": "tls",
-      "description": "A TLS 1.3 client (RFC 9846) without I/O: TLS_AES_128_GCM_SHA256 and TLS_AES_256_GCM_SHA384 with X25519MLKEM768 and X25519 key shares and P-256 on a retry, ECDSA and RSA-PSS server signatures, SNI, ALPN, middlebox compatibility, HelloRetryRequest, KeyUpdate and close_notify; bytes in any split, application records opened in place in the receive buffer and sealed in place in the pending one; counts that must be used, loud errors for a step a loop forgets, eof that refuses a truncation, a caller's verdict as an x509::Approval bound to the leaf and host, and secrets wiped; its randomness drawn from random, records numbered by aesgcm's keys.",
       "dependencies": [
         "random",
         "sha256",
@@ -127,44 +412,93 @@
         "ecdh",
         "x509"
       ],
+      "description": "A TLS 1.3 client (RFC 9846) without I/O: TLS_AES_128_GCM_SHA256 and TLS_AES_256_GCM_SHA384 with X25519MLKEM768 and X25519 key shares and P-256 on a retry, ECDSA and RSA-PSS server signatures, SNI, ALPN, middlebox compatibility, HelloRetryRequest, KeyUpdate and close_notify; bytes in any split, application records opened in place in the receive buffer and sealed in place in the pending one; counts that must be used, loud errors for a step a loop forgets, eof that refuses a truncation, a caller's verdict as an x509::Approval bound to the leaf and host, and secrets wiped; its randomness drawn from random, records numbered by aesgcm's keys.",
+      "name": "tls",
       "options": [
         {
-          "name": "roots",
-          "default": "system",
           "choices": [
             "system",
             "system-mozilla",
             "mozilla",
             "none"
-          ]
+          ],
+          "default": "system",
+          "name": "roots"
+        },
+        {
+          "choices": [
+            "yes",
+            "no"
+          ],
+          "default": "yes",
+          "name": "tests"
         }
       ]
     },
     {
-      "name": "trust",
-      "description": "TLS server authentication by the operating system's trust, as Go's crypto/x509 does it: macOS's SecTrustEvaluateWithError and Windows's CertGetCertificateChain with the SSL policy, on thread's pool, whose Signal a poll loop waits on, and on Linux x509::verify against the system's anchors (its bundle and certificate directories, or SSL_CERT_FILE and SSL_CERT_DIR, read through the C library); SSL_CERT_FILE and SSL_CERT_DIR replace the system's verifier on macOS and Windows too, as in Go 1.27; a policy such as roots::policy (OneCRL, distrust dates) screens the path whichever verifies. system() also loads the anchors themselves on all three: macOS's trust domains with their SSL trust settings, Windows's ROOT store less what is disabled for server authentication or Disallowed. A check answers with an x509::Approval; verify_blocking is for threads that may block.",
       "dependencies": [
         "x509",
         "poll",
         "thread"
+      ],
+      "description": "TLS server authentication by the operating system's trust, as Go's crypto/x509 does it: macOS's SecTrustEvaluateWithError and Windows's CertGetCertificateChain with the SSL policy, on thread's pool, whose Signal a poll loop waits on, and on Linux x509::verify against the system's anchors (its bundle and certificate directories, or SSL_CERT_FILE and SSL_CERT_DIR, read through the C library); SSL_CERT_FILE and SSL_CERT_DIR replace the system's verifier on macOS and Windows too, as in Go 1.27; a policy such as roots::policy (OneCRL, distrust dates) screens the path whichever verifies. system() also loads the anchors themselves on all three: macOS's trust domains with their SSL trust settings, Windows's ROOT store less what is disabled for server authentication or Disallowed. A check answers with an x509::Approval; verify_blocking is for threads that may block.",
+      "name": "trust",
+      "options": [
+        {
+          "choices": [
+            "yes",
+            "no"
+          ],
+          "default": "yes",
+          "name": "tests"
+        },
+        {
+          "choices": [
+            "linux",
+            "macos",
+            "windows"
+          ],
+          "default": "linux,macos,windows",
+          "name": "os"
+        }
       ]
     },
     {
-      "name": "x25519",
-      "description": "X25519 key agreement (RFC 7748): a constant-time Montgomery ladder over five 51-bit limbs; a Secret made from random's seed, a PublicKey, and a SharedSecret only a key derivation takes, refused for a peer of small order.",
       "dependencies": [
         "random"
+      ],
+      "description": "X25519 key agreement (RFC 7748): a constant-time Montgomery ladder over five 51-bit limbs; a Secret made from random's seed, a PublicKey, and a SharedSecret only a key derivation takes, refused for a peer of small order.",
+      "name": "x25519",
+      "options": [
+        {
+          "choices": [
+            "yes",
+            "no"
+          ],
+          "default": "yes",
+          "name": "tests"
+        }
       ]
     },
     {
-      "name": "x509",
-      "description": "X.509 (RFC 5280) for TLS server authentication without I/O: a strict DER parser that borrows the certificate, a store of trust anchors from PEM or DER, and chain verification for a host at a given time, with paths built through intermediates in any order, name constraints as Go enforces them, bounded depth and signature checks (ECDSA P-256, P-384, P-521; RSA of 2048 to 8192 bits, PKCS #1 and PSS; SHA-256, SHA-384, SHA-512), serverAuth required where ExtKeyUsage is present (anyExtendedKeyUsage counts nowhere, as in Firefox and webpki), a CA refused as a leaf, directoryName constraints as Chrome compares them and other forms failing closed, Mozilla's name constraints imposed on a CA's name, v1 and self-signed anchors as Go and Firefox take them, a policy of revocations and distrust dates to lay over other anchors or screen a path another verifier built, and the leaf's key for TLS 1.3's CertificateVerify; verification yields an Approval of the leaf for the host that only x509 and trust make, and a Policy, distrust without trust, is a type of its own.",
       "dependencies": [
         "digest",
         "sha256",
         "sha384",
         "ecdsa",
         "rsa"
+      ],
+      "description": "X.509 (RFC 5280) for TLS server authentication without I/O: a strict DER parser that borrows the certificate, a store of trust anchors from PEM or DER, and chain verification for a host at a given time, with paths built through intermediates in any order, name constraints as Go enforces them, bounded depth and signature checks (ECDSA P-256, P-384, P-521; RSA of 2048 to 8192 bits, PKCS #1 and PSS; SHA-256, SHA-384, SHA-512), serverAuth required where ExtKeyUsage is present (anyExtendedKeyUsage counts nowhere, as in Firefox and webpki), a CA refused as a leaf, directoryName constraints as Chrome compares them and other forms failing closed, Mozilla's name constraints imposed on a CA's name, v1 and self-signed anchors as Go and Firefox take them, a policy of revocations and distrust dates to lay over other anchors or screen a path another verifier built, and the leaf's key for TLS 1.3's CertificateVerify; verification yields an Approval of the leaf for the host that only x509 and trust make, and a Policy, distrust without trust, is a type of its own.",
+      "name": "x509",
+      "options": [
+        {
+          "choices": [
+            "yes",
+            "no"
+          ],
+          "default": "yes",
+          "name": "tests"
+        }
       ]
     }
   ]

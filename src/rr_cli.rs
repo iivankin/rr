@@ -8,6 +8,9 @@ mod workspace;
 #[path = "rr_cli/add.rs"]
 mod add;
 
+#[path = "rr_cli/component.rs"]
+mod component;
+
 #[path = "rr_cli/fuz.rs"]
 mod fuz;
 

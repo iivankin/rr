@@ -12,6 +12,8 @@ on:
     paths:
       - 'registry/**'
       - 'scripts/registry-check.sh'
+      - 'src/rr_cli/add.rs'
+      - 'src/rr_cli/component.rs'
       - '.github/workflows/rr-registry.yml'
   workflow_dispatch:
 
@@ -55,14 +57,49 @@ jobs:
         run: |
           ./install.ps1
           Add-Content -Path $env:GITHUB_PATH -Value (Split-Path (Get-Command rr).Source)
+      - name: rr add of this checkout
+        # The components are in the format this checkout's rr add reads
+        # (one file each, cut by its options): until a release has it, the
+        # checks run on the published rr and the adds on this one, built
+        # against the same toolchain, whose libraries it loads from there.
+        shell: bash
+        run: |
+          # Git's GNU link would stand before Visual Studio's linker in bash.
+          if [ "$RUNNER_OS" = Windows ]; then mv /usr/bin/link.exe /usr/bin/gnu-link.exe; fi
+          RUSTC_BOOTSTRAP=1 CARGO_TARGET_DIR="$RUNNER_TEMP/rr-target" cargo build --locked --release --bin rr
+          sysroot=$(rustc --print sysroot | tr -d '\r')
+          bin="$RUNNER_TEMP/rr-target/release/rr"
+          if [ "$RUNNER_OS" = Windows ]; then sysroot=$(cygpath -u "$sysroot"); bin=$(cygpath -u "$bin"); fi
+          {
+            echo '#!/bin/sh'
+            echo "PATH=\"$sysroot/bin:\$PATH\" LD_LIBRARY_PATH=\"$sysroot/lib\" DYLD_LIBRARY_PATH=\"$sysroot/lib\" exec \"$bin\" \"\$@\""
+          } > "$RUNNER_TEMP/rr-add"
+          chmod +x "$RUNNER_TEMP/rr-add"
+          "$RUNNER_TEMP/rr-add" --version
+          echo "RRADD=$(cd "$RUNNER_TEMP" && pwd)/rr-add" >> "$GITHUB_ENV"
       - name: Files a script writes, as it writes them
         if: matrix.runner == 'ubuntu-24.04'
         run: |
-          python3 registry/ecdsa/ecdsa-gen.py --check
-          python3 registry/rsa/rsa-gen.py --check
+          python3 registry/gen/ecdsa-gen.py --check
+          python3 registry/gen/rsa-gen.py --check
+          cp registry/index.json "$RUNNER_TEMP/index.json"
+          "$RRADD" add --index registry
+          cmp registry/index.json "$RUNNER_TEMP/index.json"
       - name: Every component, together
         shell: bash
         run: |
           rr --version
-          names=$(ls -d registry/*/ | sed 's|registry/||; s|/$||')
+          names=$(ls registry/*.rs | sed 's|registry/||; s|\.rs$||')
           scripts/registry-check.sh "$RUNNER_TEMP/registry" $names
+      - name: Every component, cut to this system and CPU
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in Linux) os=linux ;; macOS) os=macos ;; Windows) os=windows ;; esac
+          case "$(uname -m)" in x86_64|AMD64) arch=x86_64 ;; *) arch=aarch64 ;; esac
+          names=$(ls registry/*.rs | sed 's|registry/||; s|\.rs$||')
+          OPTIONS="os=$os arch=$arch" scripts/registry-check.sh "$RUNNER_TEMP/registry-cut" $names
+      - name: Every component, without its tests
+        shell: bash
+        run: |
+          names=$(ls registry/*.rs | sed 's|registry/||; s|\.rs$||')
+          OPTIONS="tests=no" scripts/registry-check.sh "$RUNNER_TEMP/registry-bare" $names

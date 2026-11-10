@@ -118,25 +118,30 @@ with tempfile.TemporaryDirectory(prefix="rr-smoke-", dir=os.environ.get("TMPDIR"
     registry = Path(__file__).resolve().parent.parent / "registry"
     run("init", "components")
     components = root / "components"
-    names = sorted(p.stem for p in registry.glob("*/*.json") if p.stem == p.parent.name)
-    # The index rr add --list reads is the components' own.
-    subprocess.run([sys.executable, str(registry.parent / "scripts" / "registry-index.py"), "--check"], check=True)
+    names = sorted(p.stem for p in registry.glob("*.rs"))
+    # The index rr add --list reads is the components' own headers.
+    before = (registry / "index.json").read_text()
+    run("add", "--index", str(registry))
+    if (registry / "index.json").read_text() != before:
+        raise AssertionError("registry/index.json is stale; rr add --index registry writes it")
     listed = run("add", "--list", str(registry / "index.json")).stdout
     assert all(f"{name}  " in listed for name in names) and "asks: --option roots=" in listed, listed
-    for name in names:
-        done = subprocess.run([str(rr), "add", str(registry / name / f"{name}.json")], cwd=components, env=env,
-                              text=True, encoding="utf-8", errors="replace", capture_output=True)
-        if done.returncode != 0:
-            raise AssertionError(f"rr add {name}\n{done.stdout}\n{done.stderr}")
-    # rr add declared each in src/base/mod.rs; the root declares base.
+    done = subprocess.run([str(rr), "add", "--yes", *(str(registry / f"{name}.rs") for name in names)],
+                          cwd=components, env=env, text=True, encoding="utf-8", errors="replace",
+                          capture_output=True)
+    if done.returncode != 0:
+        raise AssertionError(f"rr add\n{done.stdout}\n{done.stderr}")
+    # rr add declared each in src/base/mod.rs; the root declares base. What
+    # rr add wrote, rr fmt leaves as it is.
+    base = components / "src" / "base"
+    added = {f: f.read_text() for f in base.glob("*.rs") if f.name != "mod.rs"}
     main = components / "src" / "main.rs"
     text = main.read_text()
     main.write_text(text.replace("mod greet;\n", "mod base;\nmod greet;\n", 1))
     run("fmt", "components/src/main.rs")
-    for f in (components / "src" / "base").rglob("*.rs"):
-        source = registry / f.relative_to(components / "src" / "base")
-        if source.is_file() and source.read_text() != f.read_text():
-            raise AssertionError(f"rr fmt changes registry/{source.relative_to(registry)}")
+    for f, text in added.items():
+        if f.read_text() != text:
+            raise AssertionError(f"rr fmt changes {f.name} as rr add wrote it")
     for targets in (("check", "lint"), ("test",), ("bench",)):
         done = subprocess.run(["make", f"RR={link}", *targets], cwd=components, env=env,
                               text=True, encoding="utf-8", errors="replace", capture_output=True)

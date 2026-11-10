@@ -68,28 +68,33 @@ with the rules for whoever changes the code: format with rr fmt, then rr check
 and rr lint, after every change. `init --lib` writes src/lib.rs alone. No manifest
 is created.
 
-`rr add COMPONENT...` copies code from a registry into src/base/NAME/, as
-shadcn copies a component: the project then owns it, and src/base/ keeps
-it apart from what the project wrote. rr add declares each component in
-src/base/mod.rs and says when the crate root still needs `mod base;`. A
-component is a directory of a registry, NAME/, with NAME.json in it: its
-name, the rr it was checked with, the components it needs and its files,
-which sit beside it as they go into src/base/NAME/ (its unsafe in
-sys.rs). COMPONENT is a name in rr's registry (registry/ in this
-repository at this release's tag, fetched from GitHub with curl),
-`@scope/name` in a registry that rr.json maps to its root
-(`{"registries": {"@acme": "https://…/registry"}}`), or a component's
-JSON by URL or path; a component's dependencies are directories beside
-its own. A component may put scripts in scripts/ and
-ask questions whose answers add components (tls: where its trusted
-roots come from); at a terminal rr add asks, `--option NAME=VALUE`
-answers, and `--yes` or a run without a terminal takes the defaults and
-says how to choose. A file that exists and differs stops the
-add before anything is written, unless `--overwrite`; a component that
-needs a newer rr, or a path outside its directory, is refused.
+`rr add COMPONENT...` copies code from a registry into src/base/NAME.rs,
+as shadcn copies a component: the project then owns it, and src/base/
+keeps it apart from what the project wrote. rr add declares each
+component in src/base/mod.rs and says when the crate root still needs
+`mod base;`. A component is one Rust file of a registry, NAME.rs, as an
+stb library is one header: its header, `// rr:` lines before its code,
+names the rr it was checked with, the components it needs, data files
+beside it, and its questions, each `one` or `many` of its choices; its
+body has sections that the answers keep or cut, so that a project gets
+the code of the systems and CPUs it builds for and, if it wants them,
+the tests. Its unsafe is in a `mod sys` inside it. COMPONENT is a name
+in rr's registry (registry/ in this repository at this release's tag,
+fetched from GitHub with curl), `@scope/name` in a registry that rr.json
+maps to its root (`{"registries": {"@acme": "https://…/registry"}}`), or
+a component's file by URL or path; a component's dependencies are files
+beside its own. At a terminal rr add asks, `--option NAME=A,B` answers
+for every component that asks NAME (`os=linux,macos`, `tests=no`), and
+`--yes` or a run without a terminal takes the defaults and says how to
+choose; what is cut leaves a `compile_error!` for a build on a system or
+CPU that was not chosen. A file that exists and differs stops the add
+before anything is written, unless `--overwrite`; a component that needs
+a newer rr, a data file not its own, or a component rr 0.5 added as a
+directory, is refused. `rr add --index DIR` writes a registry's
+index.json from its components' headers.
 registry/README.md says what a component of
 rr's registry is: no I/O of its own, so one serves a blocking loop, a
-poll loop or a thread; its own errors; unsafe only in sys; and the
+poll loop or a thread; its own errors; unsafe only in its sys module; and the
 template's checks, which scripts/registry-check.sh runs on it.
 
 ## Targets

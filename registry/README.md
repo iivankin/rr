@@ -2,13 +2,16 @@
 
 Components `rr add` copies into a project as its own code, the way shadcn
 copies a component: the project owns the copy, reads it and changes it.
-Each goes into src/base/NAME/, apart from what the project wrote, and rr
-add declares it in src/base/mod.rs; the crate root declares `mod base;`.
+Each is one Rust file, as an stb library is one header: it goes into
+src/base/NAME.rs, apart from what the project wrote, cut to what the
+project chose (its systems, its CPUs, its tests), and rr add declares it
+in src/base/mod.rs; the crate root declares `mod base;`.
 
-    rr add tls                  # this registry
-    rr add @acme/geo            # a registry rr.json names
-    rr add ./x/tls/tls.json     # a component's JSON, by path or URL
-    rr add --list               # what this registry has (index.json)
+    rr add tls                          # this registry
+    rr add tls --option os=linux        # only the code Linux builds
+    rr add @acme/geo                    # a registry rr.json names
+    rr add ./x/geo.rs                   # a component's file, by path or URL
+    rr add --list                       # what this registry has (index.json)
 
 ## Components
 
@@ -43,49 +46,65 @@ Poll::poll; wait::spawn is thread::spawn, with a Work moved in.
 
 ## A component
 
-A directory, NAME/, as it goes into src/base/NAME/: NAME.json, mod.rs,
-the component's other files, and its unsafe in sys.rs, the module rr
-lets touch the system. A script that writes a table sits beside them.
+One file, NAME.rs, as it goes into src/base/NAME.rs. Its `//!` docs say
+what it is, the first paragraph of them what `rr add --list` prints; its
+unsafe is in a `mod sys { ... }` inside it, the module rr lets touch the
+system. A header, `// rr:` lines among the comments before the first
+line of code, says what rr add needs:
 
-```json
-{
-  "name": "aesgcm",
-  "description": "AES-128-GCM (RFC 5116), with AES and GHASH instructions where the CPU has them.",
-  "rr": "0.5.2",
-  "dependencies": ["cpu"],
-  "files": [{ "path": "mod.rs" }, { "path": "sys.rs" }]
-}
+```rust
+//! ECDSA signature verification on P-256, P-384 and P-521 ...
+
+// rr: checked(0.5.2)
+// rr: needs(digest)
+// rr: option(os, many): Which systems does it build for?
+// rr: choice(os = linux, default): Linux
+// rr: choice(os = macos, default): macOS
+// rr: choice(os = windows, default): Windows
+// rr: option(roots, one): Where does TLS take the roots it trusts from?
+// rr: choice(roots = system, default, needs(trust)): the system's
+// rr: choice(roots = none): a store the program fills
+// rr: option(tests, one): Its tests, which rr test runs?
+// rr: choice(tests = yes, default): the tests, and the data files they read
+// rr: choice(tests = no): none
+// rr: file(ecdsa-wycheproof.txt, tests = yes)
 ```
 
-- `rr`: the rr the component was checked with; an older rr refuses it.
-- `dependencies`: names in the same registry (directories beside this
-  one), `@scope/name`, or URLs.
-- `files`: `path` under src/base/NAME/, or under `scripts/` with
-  `"target": "scripts"`; the text is `content`, or the file at `path`
-  beside the JSON.
-- `options`: questions whose answers add components, as shadcn's
-  prompts do. tls asks where its trusted roots come from:
+- `checked`: the rr the component was checked with; an older rr refuses
+  it.
+- `needs`: names in the same registry (files beside this one),
+  `@scope/name`, or URLs. A choice can need more, as a roots choice
+  needs trust or roots.
+- `option`: a question, `one` (a single choice) or `many` (any of its
+  choices, at least one), and its `choice`s, those marked `default`
+  taken without a terminal. An option's name means the same in every
+  component, and one answer serves all that ask it: `--option
+  os=linux,macos` cuts each component to those two systems.
+- `file`: data beside it, named NAME-… or NAME.…, that goes beside it in
+  src/base/, when its condition holds: the standards' test vectors with
+  the tests, Mozilla's roots always.
 
-```json
-"options": [{
-  "name": "roots", "question": "Where does TLS take the roots it trusts from?",
-  "default": "system",
-  "choices": [
-    { "value": "system", "description": "…", "dependencies": ["trust"] },
-    { "value": "mozilla", "description": "…", "dependencies": ["roots"] },
-    { "value": "none", "description": "…" }
-  ]
-}]
-```
+The body is kept or cut by the answers: what is between `// rr:
+section(os = linux macos)` and `// rr: end(os = linux macos)` stays when
+either is chosen, what is between `// rr: unless(os = windows)` and its
+end only when that is not. They nest. Each item under `#[cfg]` of a
+system or a CPU stands in a section of it; each item only tests or fuzz
+targets have, in `section(tests = yes)`; and for each system or CPU that
+can be cut, an `unless` holds a `compile_error!` that says to add the
+component again with it, so that a build where it was cut fails loudly
+at once. What rr add writes has no header and no marks, and one line,
+`// rr: added(ecdsa, rr 0.5.2; os = linux; tests = yes)`, that says what
+was chosen.
 
-  At a terminal rr add asks; `--option roots=mozilla` answers, and
-  `--yes` or a run without a terminal (an agent's) takes the default and
-  prints how to choose.
+At a terminal rr add asks; `--option NAME=A,B` answers, and `--yes` or
+a run without a terminal (an agent's) takes the defaults and prints how
+to choose.
 
 `rr add` refuses a file that exists and differs, unless `--overwrite`,
 and says when the crate root still needs `mod base;`. A registry of your
-own is any place that serves such directories, with index.json at its
-root: rr.json maps a scope to that root,
+own is any place that serves such files, with index.json at its root
+(`rr add --index DIR` writes it from their headers): rr.json maps a
+scope to that root,
 
 ```json
 { "registries": { "@acme": "https://acme.dev/registry" } }
@@ -154,18 +173,18 @@ change is a line of the program.
   makes a seed of a standard's vector by Seed32::for_tests, which only
   cfg(test) and cfg(fuzzing) have. A protocol that needs randomness of
   its own, as tls's ClientHello does, draws it from random, with a test
-  constructor beside for its replays. random's sys.rs is the one place
+  constructor beside for its replays. random's sys module is the one place
   that asks the system, which never blocks once the system's pool is
   ready at boot; random::wipe is the volatile wipe the others share.
 - **Its own errors.** A component does not name the project's error type;
   it returns its own small enum.
 - **Unsafe only in sys.** CPU instructions (AES, SHA, carry-less
-  multiply) are in the component's sys.rs behind a safe function that
-  says whether it ran; `cpu` says what the CPU has. The portable code is
-  always there and passes the same vectors. What talks to the system
-  (poll, thread, resolve, trust, cpu) is all in its sys.rs, through the C
-  library on Linux and macOS and the system's DLLs on Windows; mod.rs
-  says what it is and exports it.
+  multiply) are in the component's sys module behind a safe function
+  that says whether it ran; `cpu` says what the CPU has. The portable
+  code is always there and passes the same vectors. What talks to the
+  system (poll, thread, resolve, trust, cpu) is all in its sys module,
+  through the C library on Linux and macOS and the system's DLLs on
+  Windows; the top of the file says what it is and exports it.
 - **Arithmetic that cannot overflow, or says it wraps.** The template
   builds without overflow checks, as Cargo's release profile does, so
   nothing stops an overflow there. Arithmetic meant to wrap is written
@@ -173,20 +192,21 @@ change is a line of the program.
   bounds that keep it in range, or `checked_*` returns the error.
 - **One style, except generated tables.** `#[rustfmt::skip]` stands
   only on a constant a script writes, under a comment naming the script
-  and the test that recomputes it. The script sits beside the component
-  (registry/NAME/NAME-gen.py). It goes to the project's scripts/ only when
-  what it writes goes stale there (roots-gen.py: Mozilla's roots); a
-  table that a standard fixes stays in the registry.
+  and the test that recomputes it. The script is in registry/gen/, with
+  the inputs it reads, and writes into the component's file (splice.py:
+  a module in place, formatted by rr fmt); rr add copies neither. One
+  whose data goes stale says how to run it on a project's copy
+  (roots-gen.py --out src/base/roots.pem: Mozilla's roots).
 - **Checked as the template checks a program.** Each file passes rr
   check, lint, fmt and test with the template's flags; its tests carry
   the standard's vectors, its bench the cost of one operation, and what
   parses input from a peer has a fuzz target under cfg(fuzzing).
 
-index.json lists the components for `rr add --list`;
-`scripts/registry-index.py` writes it from their JSON, and `--check`
-says whether it is current. `scripts/registry-check.sh DIR NAME...` adds
-components to a fresh project and runs those checks; with `TARGETS`,
-other targets whose standard library rustup added, it checks them for
-each target too. The
-Registry workflow runs it on each host for every push that changes
-registry/.
+index.json lists the components for `rr add --list`; `rr add --index
+registry` writes it from their headers. `scripts/registry-check.sh DIR
+NAME...` adds components to a fresh project and runs those checks; with
+`OPTIONS` (`os=linux arch=x86_64`, `tests=no`) it adds them so cut, and
+with `TARGETS`, other targets whose standard library rustup added, it
+checks them for each target too. The Registry workflow runs it on each
+host for every push that changes registry/: every component whole, cut
+to the host's system and CPU, and without its tests.

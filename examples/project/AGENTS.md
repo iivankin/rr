@@ -20,8 +20,10 @@ operation, and the simple design is rarely the first one.
 
 - Look at `rr add --list` before writing what a library would give:
   rr's registry may have it. rr add copies a component into
-  src/base/NAME/: the project's own code from then on, which it reads
-  and changes, kept apart from what the project wrote.
+  src/base/NAME.rs, one file cut to the systems, CPUs and tests the
+  project chose (`--option os=linux`): the project's own code from then
+  on, which it reads and changes, kept apart from what the project
+  wrote. A compile_error! from it names the option to add it again with.
 - Sketch the cost. For network, disk, memory and CPU, estimate bandwidth
   and latency per event and in total. Look first at the slowest
   resource, weighted by how often it is used. Run make time and make
@@ -126,7 +128,7 @@ operation, and the simple design is rarely the first one.
   Windows through kernel32.dll. A C function is declared as its
   header declares it, word for word; one that takes a variable number
   of arguments ends in `...`, or its arguments go where the callee does
-  not look. A component in src/base/ keeps its own unsafe in its sys.rs.
+  not look. A component in src/base/ keeps its own unsafe in its `mod sys`.
 - Time, randomness and every byte from outside come through src/sys/,
   so that a simulation can stand in for the system: a test drives the
   event loop with a seeded fake of it (connections that stall, cut or
