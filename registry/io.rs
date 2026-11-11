@@ -1893,7 +1893,8 @@ mod sys {
             self.let_go();
             self.submit();
             let running = self.slots.len() - self.free.len() - self.ready.len() - self.held;
-            let timeout = if (running == 0 && !self.wakeable) || !self.ready.is_empty() {
+            let waiting = !self.ready.is_empty() || !self.backend.pool.filled.is_empty();
+            let timeout = if (running == 0 && !self.wakeable) || waiting {
                 Some(Duration::ZERO)
             } else {
                 timeout
@@ -5111,7 +5112,9 @@ mod sys {
                 while let Some(data) = self.trying.pop_front() {
                     self.attempt(slots, ready, data);
                 }
-                let timeout = if ready.is_empty() {
+                // What was tried filled chunks or finished: the loop takes
+                // it now, not after the next event.
+                let timeout = if ready.is_empty() && self.pool.filled.is_empty() {
                     timeout
                 } else {
                     Some(Duration::ZERO)
@@ -5984,7 +5987,7 @@ mod sys {
                     let until = deadline.saturating_sub(now);
                     wait = Some(wait.map_or(until, |w| w.min(until)));
                 }
-                if !ready.is_empty() {
+                if !ready.is_empty() || !self.pool.filled.is_empty() {
                     wait = Some(0);
                 }
                 let milliseconds = wait.map_or(INFINITE, |ns| {
@@ -7015,6 +7018,29 @@ mod tests {
             panic!("not the end");
         };
         assert_eq!(result, Ok(()));
+    }
+
+    /// What a peer sent before a receive into chunks started is there at
+    /// the wait that starts it: the wait does not sleep on it until the
+    /// next event (kqueue reads it before it waits, IOCP may too).
+    #[test]
+    fn chunks_there_at_once() {
+        let mut io = chunked(8, 8, 64);
+        let (server, client, _listener) = pair(&mut io, v4());
+        send(&mut io, &client, b"early", CLIENT);
+        sent(&next(&mut io));
+        assert!(io.receive(&server, Room::Chunks, SERVER).is_ok());
+        let start = super::sys::now();
+        assert!(io.wait(Some(Duration::from_secs(2))).is_ok());
+        let mut waited = io.next();
+        if waited.is_none() {
+            // io_uring answers at the wait after the one that submits.
+            assert!(io.wait(Some(Duration::from_secs(2))).is_ok());
+            waited = io.next();
+        }
+        assert!(matches!(waited.map(|e| e.done), Some(Done::Chunk(_))));
+        let took = super::sys::now().saturating_sub(start);
+        assert!(took < 1_000_000_000, "{took} ns");
     }
 
     /// Chunks smaller than what came take it in turn, in order, each given
