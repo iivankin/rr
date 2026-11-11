@@ -108,7 +108,7 @@ compile_error!("rr add cut io without windows: add it again with windows in --op
 
 pub use crate::base::thread::Work;
 pub use sys::{
-    AF_INET, AF_INET6, Chunk, Done, Error, Event, Io, Listener, Op, SOCK_STREAM, Stream, Udp,
+    AF_INET, AF_INET6, Chunk, Done, Error, Event, Io, Listener, Op, SOCK_STREAM, Stream, Turn, Udp,
     Unavailable, Waker,
 };
 
@@ -167,6 +167,10 @@ mod sys {
         /// receive_many: no chunk was free for what came (or the Io has
         /// none): give chunks back and receive again.
         NoChunks,
+        /// Listener::bind_shared where the system does not spread
+        /// connections among listeners of one address: macOS gives them all
+        /// to the one bound last, Windows shares none.
+        Unbalanced,
         /// Io::new: the system has no way to run one.
         Unavailable(Unavailable),
         /// Anything else: the system's code (errno).
@@ -228,8 +232,28 @@ mod sys {
         /// Listens on an address; port 0 takes one the system picks
         /// (local says which).
         pub fn bind(address: SocketAddr, backlog: u32) -> Result<Listener, Error> {
+            Listener::bind_in(address, backlog, false)
+        }
+
+        /// Listens on an address beside other listeners of this user on it,
+        /// one for each loop, and the kernel spreads the connections among
+        /// them: Linux's SO_REUSEPORT (since 3.9). macOS gives them all to
+        /// the listener bound last and Windows shares none, and both are
+        /// refused (Unbalanced): accept on one thread there, and hand the
+        /// streams to the others (queue).
+        pub fn bind_shared(address: SocketAddr, backlog: u32) -> Result<Listener, Error> {
+            if !os::BALANCED {
+                return Err(Error::Unbalanced);
+            }
+            Listener::bind_in(address, backlog, true)
+        }
+
+        fn bind_in(address: SocketAddr, backlog: u32, shared: bool) -> Result<Listener, Error> {
             let fd = Fd::new(os::open(&address, Kind::Stream)?);
             os::prepare(fd.raw, address.is_ipv6())?;
+            if shared {
+                os::share(fd.raw)?;
+            }
             let (bytes, length) = encode(&address);
             os::bind(fd.raw, bytes.get(..length).unwrap_or_default())?;
             os::listen(fd.raw, backlog)?;
@@ -312,6 +336,15 @@ mod sys {
     pub struct Op {
         index: u32,
         generation: u32,
+    }
+
+    /// The slowest turn of a loop since slowest_turn last asked: how long
+    /// it took, from a wait's return to the next wait, and the key of the
+    /// last Event the loop took in it, the work of which, as like as not,
+    /// took the time.
+    pub struct Turn {
+        pub took: Duration,
+        pub key: u64,
     }
 
     /// An operation done, with the key it was started with.
@@ -873,6 +906,12 @@ mod sys {
         /// threads put there; and the list taken from it at a wait.
         finished: Arc<Finished>,
         taken: Vec<u64>,
+        /// When the last wait returned, on the monotonic clock (0 before
+        /// the first), the key of the last Event taken since, and the
+        /// slowest turn: a turn is the program's work between two waits.
+        turned: u64,
+        last_key: u64,
+        slowest: Option<Turn>,
         /// The system's side, on the heap, so that an Io is small to move
         /// to its thread.
         backend: Box<backend::Backend>,
@@ -976,6 +1015,9 @@ mod sys {
                     list: UnsafeCell::new(Vec::with_capacity(ops)),
                 }),
                 taken: Vec::with_capacity(ops),
+                turned: 0,
+                last_key: 0,
+                slowest: None,
                 backend,
             })
         }
@@ -1322,6 +1364,7 @@ mod sys {
         /// when nothing runs and no Waker was made). How many Events wait
         /// for next.
         pub fn wait(&mut self, timeout: Option<Duration>) -> Result<usize, Error> {
+            self.turn();
             let running = self.slots.len() - self.free.len() - self.ready.len();
             let timeout = if (running == 0 && !self.wakeable) || !self.ready.is_empty() {
                 Some(Duration::ZERO)
@@ -1331,13 +1374,42 @@ mod sys {
             self.backend
                 .wait(&mut self.slots, &mut self.ready, timeout)?;
             self.returned();
+            self.turned = backend::Backend::now();
             Ok(self.ready.len())
+        }
+
+        /// The turn that ends with this wait, kept when it is the slowest.
+        fn turn(&mut self) {
+            if self.turned == 0 {
+                return;
+            }
+            let took = Duration::from_nanos(backend::Backend::now().saturating_sub(self.turned));
+            if self
+                .slowest
+                .as_ref()
+                .is_none_or(|slowest| took > slowest.took)
+            {
+                self.slowest = Some(Turn {
+                    took,
+                    key: self.last_key,
+                });
+            }
+        }
+
+        /// The slowest turn of the loop since this was last asked, which it
+        /// forgets: a turn longer than the program allows (a few
+        /// milliseconds) is work for run, as the other connections of the
+        /// loop wait while it runs. A test asserts it; a server logs it.
+        #[must_use]
+        pub fn slowest_turn(&mut self) -> Option<Turn> {
+            self.slowest.take()
         }
 
         /// The next operation done, which frees its slot.
         #[must_use]
         pub fn next(&mut self) -> Option<Event> {
             if let Some((key, id, length)) = self.backend.pool.filled.pop_front() {
+                self.last_key = key;
                 let chunk = Chunk {
                     io: self.id,
                     id,
@@ -1375,6 +1447,7 @@ mod sys {
             if let Some((owner, generation)) = owner {
                 self.sent_on(owner, generation);
             }
+            self.last_key = key;
             Some(Event { key, done })
         }
 
@@ -1515,6 +1588,14 @@ mod sys {
     #[cfg(windows)]
     pub use os::startup;
     // rr: end(os = windows)
+
+    // rr: section(tests = yes)
+    /// Now on the monotonic clock, in nanoseconds, for the tests.
+    #[cfg(test)]
+    pub fn now() -> u64 {
+        backend::Backend::now()
+    }
+    // rr: end(tests = yes)
 
     /// The bytes of a sockaddr_in6, the larger of the two.
     const ADDRESS_BYTES: usize = 28;
@@ -1725,6 +1806,7 @@ mod sys {
             pub const AF_INET6: u16 = 10;
             pub const SOL_SOCKET: c_int = 1;
             pub const SO_REUSEADDR: c_int = 2;
+            pub const SO_REUSEPORT: c_int = 15;
             pub const IPV6_V6ONLY: c_int = 26;
             pub const SOCK_NONBLOCK: c_int = 0x800;
             pub const SOCK_CLOEXEC: c_int = 0x8_0000;
@@ -1986,6 +2068,34 @@ mod sys {
         pub fn no_delay(fd: c_int) -> Result<(), Error> {
             option(fd, IPPROTO_TCP, TCP_NODELAY, 1)
         }
+
+        // rr: section(os = linux)
+        /// Whether the kernel spreads connections among listeners that share
+        /// an address: Linux's SO_REUSEPORT does; macOS's gives them to the
+        /// one bound last.
+        #[cfg(target_os = "linux")]
+        pub const BALANCED: bool = true;
+        // rr: end(os = linux)
+        // rr: section(os = macos)
+        #[cfg(target_os = "macos")]
+        pub const BALANCED: bool = false;
+        // rr: end(os = macos)
+
+        // rr: section(os = linux)
+        /// Lets other listeners of this user bind the address beside it.
+        #[cfg(target_os = "linux")]
+        pub fn share(fd: c_int) -> Result<(), Error> {
+            option(fd, SOL_SOCKET, SO_REUSEPORT, 1)
+        }
+        // rr: end(os = linux)
+
+        // rr: section(os = macos)
+        /// Never reached: BALANCED refuses first.
+        #[cfg(target_os = "macos")]
+        pub fn share(_fd: c_int) -> Result<(), Error> {
+            Err(Error::Unbalanced)
+        }
+        // rr: end(os = macos)
 
         pub fn bind(fd: c_int, address: &[u8]) -> Result<(), Error> {
             // rr: escape(unsafe): address is a sockaddr of its length.
@@ -2341,6 +2451,15 @@ mod sys {
                 )
             };
             check(done)
+        }
+
+        /// Windows has no option that spreads connections among listeners
+        /// of one address.
+        pub const BALANCED: bool = false;
+
+        /// Never reached: BALANCED refuses first.
+        pub fn share(_socket: usize) -> Result<(), Error> {
+            Err(Error::Unbalanced)
         }
 
         pub fn no_delay(socket: usize) -> Result<(), Error> {
@@ -2857,6 +2976,12 @@ mod sys {
                     chunk_ring: null_mut(),
                     chunk_tail: 0,
                 })
+            }
+
+            /// Now on the monotonic clock, in nanoseconds.
+            #[must_use]
+            pub fn now() -> u64 {
+                monotonic_ns()
             }
 
             /// Registers the ring of chunks, group 0, and gives it every chunk.
@@ -3448,6 +3573,9 @@ mod sys {
         unsafe extern "C" {
             #[must_use]
             fn kqueue() -> c_int;
+            /// clockid_t is an enum, an int.
+            #[must_use]
+            fn clock_gettime_nsec_np(clock: c_int) -> u64;
             #[must_use]
             fn kevent(
                 kq: c_int,
@@ -3610,6 +3738,14 @@ mod sys {
 
             pub fn give_back(&mut self, id: u16) {
                 self.pool.put(id);
+            }
+
+            /// Now on the monotonic clock (CLOCK_UPTIME_RAW, time.h), in
+            /// nanoseconds.
+            #[must_use]
+            pub fn now() -> u64 {
+                // rr: escape(unsafe): the call takes a clock's number.
+                unsafe { clock_gettime_nsec_np(8) }
             }
 
             /// Reads what a receive_many's socket has into free chunks, at
@@ -4198,8 +4334,6 @@ mod sys {
             retried: VecDeque<(u64, i32)>,
             /// The running timeouts by deadline, soonest first.
             timers: Vec<(u64, u64)>,
-            /// QueryPerformanceFrequency's ticks a second.
-            frequency: u64,
             /// The chunks receive_many reads into, one WSARecv at a time.
             pub pool: Pool,
         }
@@ -4248,14 +4382,6 @@ mod sys {
                     let code = unsafe { GetLastError() };
                     return Err(Error::Other(i32::try_from(code).unwrap_or(0)));
                 }
-                let mut frequency = 0i64;
-                // rr: escape(unsafe): frequency is a local LARGE_INTEGER; the
-                // call cannot fail from Windows XP on.
-                unsafe {
-                    // rr: escape(discard): frequency is a local LARGE_INTEGER;
-                    // the call cannot fail from Windows XP on.
-                    let _: i32 = QueryPerformanceFrequency(&raw mut frequency);
-                }
                 let mut entries = Vec::with_capacity(BATCH);
                 entries.resize_with(BATCH, || Entry {
                     key: 0,
@@ -4273,7 +4399,6 @@ mod sys {
                     refused: VecDeque::with_capacity(ops),
                     retried: VecDeque::with_capacity(ops),
                     timers: Vec::with_capacity(ops),
-                    frequency: u64::try_from(frequency).unwrap_or(1).max(1),
                     pool,
                 })
             }
@@ -4289,18 +4414,23 @@ mod sys {
 
             /// Now on the monotonic clock, in nanoseconds.
             #[must_use]
-            fn now(&self) -> u64 {
-                let mut count = 0i64;
-                // rr: escape(unsafe): count is a local LARGE_INTEGER; the call
-                // cannot fail from Windows XP on.
+            pub fn now() -> u64 {
+                let (mut count, mut frequency) = (0i64, 0i64);
+                // rr: escape(unsafe): count is a local LARGE_INTEGER.
                 unsafe {
-                    // rr: escape(discard): count is a local LARGE_INTEGER; the
-                    // call cannot fail from Windows XP on.
+                    // rr: escape(discard): the call cannot fail from Windows
+                    // XP on.
                     let _: i32 = QueryPerformanceCounter(&raw mut count);
                 }
+                // rr: escape(unsafe): frequency is a local LARGE_INTEGER.
+                unsafe {
+                    // rr: escape(discard): nor this one.
+                    let _: i32 = QueryPerformanceFrequency(&raw mut frequency);
+                }
                 let ticks = u128::from(u64::try_from(count).unwrap_or(0));
-                let nanos = (ticks * 1_000_000_000).checked_div(u128::from(self.frequency));
-                nanos.map_or(0, |nanos| u64::try_from(nanos).unwrap_or(u64::MAX))
+                let hertz = u128::from(u64::try_from(frequency).unwrap_or(1).max(1));
+                let nanos = (ticks * 1_000_000_000).checked_div(hertz).unwrap_or(0);
+                u64::try_from(nanos).unwrap_or(u64::MAX)
             }
 
             /// Puts the socket in this port, once: one in another's is
@@ -4328,7 +4458,7 @@ mod sys {
                 slot.overlapped = [0; 4];
                 if let Work::Timeout(after) = slot.work {
                     let nanos = u64::try_from(after.as_nanos()).unwrap_or(u64::MAX);
-                    let deadline = self.now().saturating_add(nanos);
+                    let deadline = Backend::now().saturating_add(nanos);
                     let at = self.timers.partition_point(|&(d, _)| d <= deadline);
                     // rr: escape(bound): one entry for each running timeout,
                     // and there are as many as the table.
@@ -4339,7 +4469,7 @@ mod sys {
                     let limit = slot
                         .limit
                         .map_or(0, |l| u64::try_from(l.as_nanos()).unwrap_or(u64::MAX));
-                    let deadline = self.now().saturating_add(limit);
+                    let deadline = Backend::now().saturating_add(limit);
                     let at = self.timers.partition_point(|&(d, _)| d <= deadline);
                     // rr: escape(bound): one entry for each running operation
                     // at most.
@@ -4598,7 +4728,7 @@ mod sys {
                 while let Some((data, code)) = self.retried.pop_front() {
                     self.answer(slots, ready, data, Err(code));
                 }
-                let now = self.now();
+                let now = Backend::now();
                 let mut wait = timeout.map(|t| u64::try_from(t.as_nanos()).unwrap_or(u64::MAX));
                 if let Some(&(deadline, _)) = self.timers.first() {
                     let until = deadline.saturating_sub(now);
@@ -4730,7 +4860,7 @@ mod sys {
 
             /// Ends the timeouts whose deadlines passed, soonest first.
             fn expire(&mut self, slots: &mut [Slot], ready: &mut VecDeque<u32>) {
-                let now = self.now();
+                let now = Backend::now();
                 let passed = self.timers.partition_point(|&(d, _)| d <= now);
                 for (_, data) in self.timers.drain(..passed) {
                     let Some((index, slot)) = running(slots, data) else {
@@ -5475,6 +5605,44 @@ mod tests {
             panic!("not the end");
         };
         assert_eq!(result, Err(Error::NoChunks));
+    }
+
+    /// Listeners that share an address, where the kernel spreads the
+    /// connections among them (Linux); refused where it does not.
+    #[test]
+    fn shares_an_address() {
+        let first = Listener::bind_shared(v4(), 16);
+        if cfg!(not(target_os = "linux")) {
+            assert_eq!(first.err().map(|_| ()), Some(()));
+            assert!(matches!(
+                Listener::bind_shared(v4(), 16),
+                Err(Error::Unbalanced)
+            ));
+            return;
+        }
+        let first = first.unwrap();
+        let at = first.local().unwrap();
+        let second = Listener::bind_shared(at, 16).unwrap();
+        assert_eq!(second.local(), Some(at));
+        assert!(matches!(Listener::bind(at, 16), Err(Error::InUse)));
+    }
+
+    /// The slowest turn says how long the program worked between two
+    /// waits, and the key of the Event it worked on.
+    #[test]
+    fn slowest_turn() {
+        let mut io = io(8);
+        assert!(io.timeout(Duration::ZERO, 3).is_ok());
+        let event = next(&mut io);
+        assert_eq!(event.key, 3);
+        // Work of the program's own, a turn of 20 ms or more.
+        let start = super::sys::now();
+        while super::sys::now().saturating_sub(start) < 20_000_000 {}
+        assert_eq!(io.wait(Some(Duration::ZERO)), Ok(0));
+        let turn = io.slowest_turn().unwrap();
+        assert!(turn.took >= Duration::from_millis(20), "{:?}", turn.took);
+        assert_eq!(turn.key, 3);
+        assert!(io.slowest_turn().is_none());
     }
 
     /// A wake ends a wait with nothing running, and wakes before it are

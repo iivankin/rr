@@ -1,7 +1,8 @@
 //! Threads for a program whose loops wait on an io::Io, as libuv gives
-//! them: a pool of at most 32 threads for work that blocks (libuv's
-//! threadpool: started as work comes, asleep on a condition variable, one
-//! first-in-first-out line under a mutex), its work a Box<dyn Work + Send>
+//! them: a pool for work that blocks, as tokio's spawn_blocking has it, of
+//! at most 512 threads by default (pool sets it), each of which ends after
+//! 10 s without work (started as work comes, asleep on a condition
+//! variable, one first-in-first-out line under a mutex, as libuv's), its work a Box<dyn Work + Send>
 //! moved in and given back once it ran, a Job that cancels work still in line
 //! when dropped and tells a Notify when done (io's run does, which wakes the
 //! loop's Io); threads of their own for loops on other cores, with a 2 MiB
@@ -15,10 +16,11 @@
 //! done tells its Notify from the pool's thread, as io's run wakes the
 //! loop's Io, and the loop takes it.
 //!
-//! The pool (spawn) is libuv's threadpool.c: at most THREADS_MAX
-//! threads, started as work comes and none is idle, which then sleep on
-//! a condition variable for the next; one line of work, first in first
-//! out, under a mutex. A Job cancels work still in line when it is
+//! The pool (spawn) is libuv's threadpool.c with tokio's limits: at most
+//! 512 threads by default (pool sets it, up to THREADS_MAX), started as
+//! work comes and none is idle, which then sleep on a condition variable
+//! for the next and end after 10 s without it; one line of work, first in
+//! first out, under a mutex. A Job cancels work still in line when it is
 //! dropped (cancel gives it back), never work a thread took, which runs
 //! to its end, as uv_cancel. Once the work returned, the job tells its
 //! Notify, and take gives the work back.
@@ -91,7 +93,7 @@ mod sys {
     use core::cell::UnsafeCell;
     use core::ffi::c_void;
     use core::marker::PhantomData;
-    use core::sync::atomic::{AtomicU8, Ordering};
+    use core::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
     /// Work for another thread: what it needs, moved in with it, and what it
     /// finds, kept in it. run runs once, on a thread of the pool (spawn) or
@@ -126,11 +128,34 @@ mod sys {
         Join,
     }
 
-    /// The most threads the pool runs at once, as libuv's default pool
-    /// holds 4 and at most 1024 (UV_THREADPOOL_SIZE): enough for lookups and
-    /// chain checks that wait on the network, few enough to start. More work
-    /// waits its turn, first in first out.
-    pub const THREADS_MAX: usize = 32;
+    /// The most threads pool lets the pool run at once, as libuv's pool
+    /// holds at most 1024 (UV_THREADPOOL_SIZE).
+    pub const THREADS_MAX: usize = 1024;
+
+    // rr: escape(shared): the pool's limits, which pool sets for the process
+    // and its threads read: at most so many threads at once, as tokio's
+    // blocking pool holds 512 by default (max_blocking_threads), each of
+    // which ends once it waited so long for work, 10 s as tokio's do
+    // (thread_keep_alive). More work waits its turn, first in first out.
+    static MOST: AtomicUsize = AtomicUsize::new(512);
+    // rr: escape(shared): likewise.
+    static IDLE_MS: AtomicU32 = AtomicU32::new(10_000);
+
+    /// How many threads the pool runs now, idle or not.
+    #[must_use]
+    pub fn threads() -> usize {
+        POOL.threads()
+    }
+
+    /// Sets how many threads the pool runs at most (1 to THREADS_MAX) and
+    /// how long one waits for work before it ends: tokio's
+    /// max_blocking_threads and thread_keep_alive. Threads running stay
+    /// until they are idle so long.
+    pub fn pool(most: usize, idle: core::time::Duration) {
+        MOST.store(most.clamp(1, THREADS_MAX), Ordering::Release);
+        let ms = u32::try_from(idle.as_millis()).unwrap_or(u32::MAX).max(1);
+        IDLE_MS.store(ms, Ordering::Release);
+    }
 
     /// The stack of every thread started here, as Rust's std gives its own
     /// threads: macOS gives a thread 512 KiB, musl 128 KiB.
@@ -227,7 +252,7 @@ mod sys {
     }
 
     /// Runs work on a thread of the pool: a new one while fewer than
-    /// THREADS_MAX run and none is idle, else the first that is free, in the
+    /// the pool's most run and none is idle, else the first that is free, in the
     /// order of the calls (libuv's threadpool.c: one line under a mutex, its
     /// threads asleep on a condition variable until work comes). done tells
     /// the caller's loop once the work returned; the Job gives it back.
@@ -315,12 +340,19 @@ mod sys {
                     more.signal();
                     return;
                 }
-                if line.threads < THREADS_MAX {
+                if line.threads < MOST.load(Ordering::Acquire) {
                     line.threads += 1;
                     start = true;
                 }
             });
             start
+        }
+
+        /// How many threads the pool runs now, idle or not.
+        fn threads(&self) -> usize {
+            let mut count = 0;
+            self.locked(|line, _| count = line.threads);
+            count
         }
 
         /// The thread for shared did not start; when none runs, shared is
@@ -338,32 +370,39 @@ mod sys {
             taken
         }
 
-        /// The first in line; asleep until there is one.
-        fn next(&self) -> Arc<Shared> {
+        /// The first in line, asleep until there is one; None once the
+        /// thread waited IDLE_MS for it, and is to end.
+        #[must_use]
+        fn next(&self) -> Option<Arc<Shared>> {
             let held = self.lock.lock();
             loop {
                 // rr: escape(unsafe): the lock is held: no one else touches
                 // the line.
                 let line = unsafe { &mut *self.line.get() };
                 if let Some(first) = line.queue.pop_front() {
-                    return first;
+                    return Some(first);
                 }
                 line.idle += 1;
-                self.more.wait(&held);
+                let timed_out = self.more.wait_for(&held, IDLE_MS.load(Ordering::Acquire));
                 // rr: escape(unsafe): the lock is held again.
                 let again = unsafe { &mut *self.line.get() };
                 again.idle -= 1;
+                if timed_out && again.queue.is_empty() {
+                    again.threads -= 1;
+                    return None;
+                }
             }
         }
     }
 
-    /// A thread of the pool: the work in line, one after another, for the
-    /// life of the process, as libuv's threads; work cancelled in line is
-    /// passed over.
+    /// A thread of the pool: the work in line, one after another, until it
+    /// waited IDLE_MS for more, as tokio's blocking threads; work cancelled
+    /// in line is passed over.
     fn pooled(_argument: *mut c_void) {
-        // rr: escape(loop): the pool's threads serve until the process ends.
         loop {
-            let shared = POOL.next();
+            let Some(shared) = POOL.next() else {
+                return;
+            };
             let taken = shared
                 .state
                 .compare_exchange(QUEUED, RUNNING, Ordering::AcqRel, Ordering::Acquire)
@@ -520,6 +559,13 @@ mod sys {
         pub fn wait(&self, held: &Guard<'_>) {
             self.os.wait(&held.lock.os);
         }
+
+        /// As wait, for at most ms milliseconds: whether that time passed.
+        #[cfg_attr(rr, rr::blocking)]
+        #[must_use]
+        pub fn wait_for(&self, held: &Guard<'_>, ms: u32) -> bool {
+            self.os.wait_for(&held.lock.os, ms)
+        }
     }
 
     // rr: section(os = linux macos)
@@ -587,6 +633,14 @@ mod sys {
             fn pthread_mutex_unlock(mutex: *mut Words) -> c_int;
             #[must_use]
             fn pthread_cond_wait(cond: *mut Words, mutex: *mut Words) -> c_int;
+            #[must_use]
+            fn pthread_cond_timedwait(
+                cond: *mut Words,
+                mutex: *mut Words,
+                until: *const [i64; 2],
+            ) -> c_int;
+            #[must_use]
+            fn clock_gettime(clock: c_int, time: *mut [i64; 2]) -> c_int;
             #[must_use]
             fn pthread_cond_signal(cond: *mut Words) -> c_int;
             #[must_use]
@@ -702,6 +756,31 @@ mod sys {
                 // rr: escape(unsafe): this thread holds mutex, the one the
                 // waits on this condition variable take.
                 check(unsafe { pthread_cond_wait(self.0.get(), mutex.0.get()) });
+            }
+
+            /// At most ms: the deadline is on CLOCK_REALTIME (0 on Linux and
+            /// macOS), as a condition variable made statically keeps it, and a
+            /// change of the clock moves it; whether it passed.
+            #[must_use]
+            pub fn wait_for(&self, mutex: &Mutex, ms: u32) -> bool {
+                let mut now = [0i64; 2];
+                // rr: escape(unsafe): now is a struct timespec.
+                if unsafe { clock_gettime(0, &raw mut now) } != 0 {
+                    self.wait(mutex);
+                    return false;
+                }
+                let [seconds, nanoseconds] = now;
+                let nanoseconds = nanoseconds + i64::from(ms % 1000) * 1_000_000;
+                let until = [
+                    seconds + i64::from(ms / 1000) + nanoseconds / 1_000_000_000,
+                    nanoseconds % 1_000_000_000,
+                ];
+                // rr: escape(unsafe): this thread holds mutex, the one the
+                // waits on this condition variable take; until is a timespec.
+                let done = unsafe {
+                    pthread_cond_timedwait(self.0.get(), mutex.0.get(), &raw const until)
+                };
+                done != 0
             }
         }
 
@@ -889,6 +968,17 @@ mod sys {
                         SleepConditionVariableSRW(self.0.get(), mutex.0.get(), INFINITE, 0);
                 }
             }
+
+            /// At most ms: whether that time passed, as the call fails then
+            /// (ERROR_TIMEOUT).
+            #[must_use]
+            pub fn wait_for(&self, mutex: &Mutex, ms: u32) -> bool {
+                // rr: escape(unsafe): this thread holds mutex exclusive, the
+                // one the waits on this condition variable take.
+                let woken =
+                    unsafe { SleepConditionVariableSRW(self.0.get(), mutex.0.get(), ms, 0) };
+                woken == 0
+            }
         }
 
         extern "system" fn begin(argument: *mut c_void) -> u32 {
@@ -974,13 +1064,16 @@ mod tests {
     //! thread's tests: the pool's line, its jobs as a loop takes them, a
     //! loop on a thread of its own, and the lock under them.
 
-    use super::{Cond, Job, Lock, Notify, THREADS_MAX, Work, nap, spawn, start};
+    use super::{Cond, Job, Lock, Notify, Work, nap, pool, spawn, start, threads};
     use alloc::boxed::Box;
     use alloc::sync::Arc;
     use alloc::vec::Vec;
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use core::time::Duration;
 
-    const JOBS: usize = THREADS_MAX + 8;
+    /// The threads the line's test lets the pool run.
+    const THREADS: usize = 32;
+    const JOBS: usize = THREADS + 8;
 
     // The line's jobs' record, which their threads write.
     // rr: escape(shared): the jobs running now.
@@ -1047,12 +1140,13 @@ mod tests {
         job
     }
 
-    /// More jobs than threads: THREADS_MAX run, the rest wait in line and
+    /// More jobs than threads: THREADS run, the rest wait in line and
     /// run as threads free; one cancelled in line never runs, and is given
     /// back; nor one whose job is dropped there; one detached runs; one a
     /// thread took is not cancelled. Each that ran tells once.
     #[test]
     fn line() {
+        pool(THREADS, Duration::from_secs(10));
         let told = count();
         let mut jobs = Vec::new();
         for index in 0..JOBS - 3 {
@@ -1061,9 +1155,9 @@ mod tests {
         let dropped = held(JOBS - 3, &told);
         let cancelled = held(JOBS - 2, &told);
         held(JOBS - 1, &told).detach();
-        assert!(until(|| NOW.load(Ordering::SeqCst) == THREADS_MAX));
+        assert!(until(|| NOW.load(Ordering::SeqCst) == THREADS));
         nap();
-        assert_eq!(NOW.load(Ordering::SeqCst), THREADS_MAX);
+        assert_eq!(NOW.load(Ordering::SeqCst), THREADS);
         assert!(cancelled.cancel().is_ok());
         drop(dropped);
         let running = jobs.swap_remove(0);
@@ -1078,12 +1172,30 @@ mod tests {
         }
         assert_eq!(DONE.load(Ordering::SeqCst), JOBS - 2);
         assert_eq!(told.told.load(Ordering::Acquire), JOBS - 2);
-        assert_eq!(MOST.load(Ordering::SeqCst), THREADS_MAX);
+        assert_eq!(MOST.load(Ordering::SeqCst), THREADS);
         assert!(!RAN[JOBS - 3].load(Ordering::SeqCst));
         assert!(!RAN[JOBS - 2].load(Ordering::SeqCst));
         assert!(RAN[JOBS - 1].load(Ordering::SeqCst));
         for job in jobs {
             assert!(job.take().is_ok());
+        }
+    }
+
+    /// A thread that waited the pool's idle time for work ends; one starts
+    /// again for the next work.
+    #[test]
+    fn idle_threads_end() {
+        pool(4, Duration::from_millis(50));
+        let told = count();
+        for _ in 0..2 {
+            // rr: escape(copy): each job tells the test's count.
+            let Ok(job) = spawn(Box::new(Held { index: 0 }), Arc::<Count>::clone(&told)) else {
+                panic!("no thread for the pool");
+            };
+            OPEN.store(true, Ordering::SeqCst);
+            assert!(until(|| job.done()));
+            assert!(job.take().is_ok());
+            assert!(until(|| threads() == 0));
         }
     }
 

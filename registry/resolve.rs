@@ -37,7 +37,7 @@
 //! - Windows: GetAddrInfoW, as Go and libuv ask it.
 //!
 //! Each blocks its thread, so a lookup runs on io's pool (thread's): at
-//! most thread::THREADS_MAX at once, the rest in line. One canceled in
+//! most as many as thread's pool runs at once, the rest in line. One canceled in
 //! line never asks; one a thread took runs on to the system's timeout
 //! (resolv.conf's timeout and attempts on Linux), and its answer is
 //! dropped.
