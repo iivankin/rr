@@ -488,7 +488,10 @@ mod tests {
             | Done::Elapsed(_)
             | Done::Ran { .. }
             | Done::SentTo { .. }
-            | Done::ReceivedFrom { .. } => panic!("not a worker's operation"),
+            | Done::ReceivedFrom { .. }
+            | Done::Chunk(_)
+            | Done::Stopped { .. }
+            | Done::SentChunk(_) => panic!("not a worker's operation"),
         }
     }
 
@@ -636,7 +639,10 @@ mod tests {
                     | Done::Elapsed(_)
                     | Done::Ran { .. }
                     | Done::SentTo { .. }
-                    | Done::ReceivedFrom { .. } => panic!("not a client's operation"),
+                    | Done::ReceivedFrom { .. }
+                    | Done::Chunk(_)
+                    | Done::Stopped { .. }
+                    | Done::SentChunk(_) => panic!("not a client's operation"),
                 }
             }
             done += batch;
