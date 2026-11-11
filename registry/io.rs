@@ -114,19 +114,19 @@ compile_error!("rr add cut io without windows: add it again with windows in --op
 
 pub use crate::base::thread::Work;
 pub use sys::{
-    AF_INET, AF_INET6, Chunk, Done, Error, Event, File, Io, Listener, Op, Open, SOCK_STREAM,
-    Stream, Turn, Udp, Unavailable, Waker,
+    AF_INET, AF_INET6, Chunk, Done, EACCES, ENOENT, Error, Event, File, Io, Listener, Op, Open,
+    SOCK_STREAM, Stream, Turn, Udp, Unavailable, Waker,
 };
 
 // rr: section(os = linux macos)
 #[cfg(unix)]
-pub use sys::{EINTR, EINVAL, errno};
+pub use sys::{EINTR, EINVAL, O_CLOEXEC, errno};
 // rr: end(os = linux macos)
 
 // rr: section(os = windows)
 /// Winsock, started once for the process, for what else asks it (resolve).
 #[cfg(windows)]
-pub use sys::startup;
+pub use sys::{GENERIC_READ, OPEN_EXISTING, startup};
 // rr: end(os = windows)
 
 mod sys {
@@ -1998,17 +1998,24 @@ mod sys {
     /// resolve.
     pub use os::{AF_INET, AF_INET6, SOCK_STREAM};
 
+    /// errno.h's ENOENT, the same on Linux and macOS, as trust's loader
+    /// counts a file that is not there on every system.
+    pub const ENOENT: i32 = 2;
+    /// errno.h's EACCES, likewise.
+    pub const EACCES: i32 = 13;
+
     // rr: section(os = linux macos)
     /// The calling thread's errno, EINTR and EINVAL, for resolve and trust.
     #[cfg(unix)]
     pub use os::c::errno;
     #[cfg(unix)]
-    pub use os::{EINTR, EINVAL};
+    pub use os::{EINTR, EINVAL, O_CLOEXEC};
     // rr: end(os = linux macos)
 
     // rr: section(os = windows)
+    /// Winsock's start, and CreateFileW's numbers, for resolve and trust.
     #[cfg(windows)]
-    pub use os::startup;
+    pub use os::{GENERIC_READ, OPEN_EXISTING, startup};
     // rr: end(os = windows)
 
     // rr: section(tests = yes)
@@ -2229,8 +2236,8 @@ mod sys {
         const SHUT_WR: c_int = 1;
         const EPIPE: c_int = 32;
         pub const EINTR: c_int = 4;
-        const ENOENT: c_int = 2;
-        const EACCES: c_int = 13;
+        use super::EACCES;
+        use super::ENOENT;
         /// EPERM, the same on Linux and macOS.
         const EPERM_: c_int = 1;
         /// fcntl.h's mode of a file open makes: rw-r--r--.
@@ -3096,7 +3103,7 @@ mod sys {
                 disposition: u32,
                 flags: u32,
                 template: *mut core::ffi::c_void,
-            ) -> usize;
+            ) -> *mut core::ffi::c_void;
             #[must_use]
             fn ReadFile(
                 file: *mut core::ffi::c_void,
@@ -3122,12 +3129,12 @@ mod sys {
         }
 
         // winnt.h's, fileapi.h's and winerror.h's.
-        const GENERIC_READ: u32 = 0x8000_0000;
+        pub const GENERIC_READ: u32 = 0x8000_0000;
         const GENERIC_WRITE: u32 = 0x4000_0000;
         /// FILE_SHARE_READ, WRITE and DELETE, as Rust's std shares a file.
         const SHARE_ALL: u32 = 0x7;
         const CREATE_ALWAYS: u32 = 2;
-        const OPEN_EXISTING: u32 = 3;
+        pub const OPEN_EXISTING: u32 = 3;
         const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
         const ERROR_FILE_NOT_FOUND: u32 = 2;
         const ERROR_PATH_NOT_FOUND: u32 = 3;
@@ -3205,10 +3212,10 @@ mod sys {
                     };
                     // rr: escape(sentinel): INVALID_HANDLE_VALUE, Windows's
                     // word for none.
-                    let result = if file == usize::MAX {
+                    let result = if file.addr() == usize::MAX {
                         Err(file_error())
                     } else {
-                        Ok(File { raw: file })
+                        Ok(File { raw: file.addr() })
                     };
                     Done::Opened { path, result }
                 }

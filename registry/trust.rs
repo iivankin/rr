@@ -831,7 +831,7 @@ mod sys {
         };
         /// The most directories SSL_CERT_DIR names that are read.
         const DIRECTORIES_MAX: usize = 64;
-        pub const ENOENT: i32 = 2;
+        pub use crate::base::io::ENOENT;
 
         /// The file system, as the loader needs it.
         pub trait Files {
@@ -917,7 +917,7 @@ mod sys {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     mod posix {
         use super::disk::Files;
-        use crate::base::io::{EINTR, EINVAL};
+        use crate::base::io::{EINTR, EINVAL, O_CLOEXEC};
         use alloc::vec::Vec;
         use core::ffi::{CStr, c_char, c_int, c_void};
 
@@ -1004,16 +1004,8 @@ mod sys {
         }
 
         // fcntl.h's, dirent.h's and errno.h's, the same on Linux and macOS;
-        // O_CLOEXEC, each system's own.
+        // O_CLOEXEC, each system's own, io's.
         const O_RDONLY: c_int = 0;
-        // rr: section(os = macos)
-        #[cfg(target_os = "macos")]
-        const O_CLOEXEC: c_int = 0x100_0000;
-        // rr: end(os = macos)
-        // rr: section(os = linux)
-        #[cfg(target_os = "linux")]
-        const O_CLOEXEC: c_int = 0x8_0000;
-        // rr: end(os = linux)
         const DT_UNKNOWN: u8 = 0;
         const DT_LNK: u8 = 10;
         const EFBIG: i32 = 27;
@@ -2301,9 +2293,8 @@ mod sys {
         }
 
         // winnt.h's, winbase.h's and winerror.h's.
-        const GENERIC_READ: u32 = 0x8000_0000;
+        use crate::base::io::{GENERIC_READ, OPEN_EXISTING};
         const FILE_SHARE_READ_WRITE: u32 = 3;
-        const OPEN_EXISTING: u32 = 3;
         const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
         const ERROR_FILE_NOT_FOUND: i32 = 2;
         const ERROR_PATH_NOT_FOUND: i32 = 3;
@@ -2567,7 +2558,7 @@ mod sys {
 
         /// x509's test certificates: anchors, intermediates and leaves.
         const TESTS: &[u8] = include_bytes!("x509-tests.pem");
-        const EACCES: i32 = 13;
+        use crate::base::io::EACCES;
 
         /// A file's path, and its text or the error reading it gives.
         type File<'a> = (&'a [u8], Result<&'a [u8], i32>);
