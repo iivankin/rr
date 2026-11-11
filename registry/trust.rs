@@ -2811,7 +2811,7 @@ mod sys {
                 let chain: Vec<&[u8]> = certificates.iter().map(Vec::as_slice).collect();
                 let approval = trust.verify_blocking(&chain, host, TEST_NOW).unwrap();
                 assert!(approval.approves(chain[0], host), "{host}");
-                let mut io = crate::base::io::Io::new(4).unwrap();
+                let mut io = crate::base::io::Io::new(4, 0, 0).unwrap();
                 let (mut check, _op) = trust.check(&mut io, &chain, host, TEST_NOW, 1).unwrap();
                 let result = (0..1000)
                     .find_map(|_| {

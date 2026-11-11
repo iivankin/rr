@@ -567,7 +567,7 @@ mod sys {
         #[test]
         fn localhost() {
             assert!(loopback(&resolve(b"localhost").unwrap()));
-            let mut io = Io::new(4).unwrap();
+            let mut io = Io::new(4, 0, 0).unwrap();
             let (lookup, _op) = Lookup::start(&mut io, b"localhost", 9).unwrap();
             for _ in 0..1000 {
                 io.wait(Some(Duration::from_millis(10))).unwrap();
@@ -586,7 +586,7 @@ mod sys {
         /// a lookup dropped lets go of what it would find.
         #[test]
         fn canceled_and_dropped() {
-            let mut io = Io::new(4).unwrap();
+            let mut io = Io::new(4, 0, 0).unwrap();
             let (lookup, op) = Lookup::start(&mut io, b"localhost", 1).unwrap();
             let canceled = io.cancel(&op);
             for _ in 0..1000 {

@@ -1,67 +1,80 @@
 //! Completion I/O for a loop on each core, after TigerBeetle's: an Io takes
 //! operations, each with a key the loop picks, and hands each back once,
-//! done, as an Event the loop takes by next: TCP (accept, connect, receive,
-//! send, each within a time if asked), receive_many into the Io's own
-//! chunks (io_uring's multishot receive into a ring of buffers) with
-//! send_chunk, UDP, timeouts, files (open, read_at, write_at, sync), and
-//! work that blocks on thread's pool (run, as tokio's spawn_blocking). It
-//! runs on io_uring (Linux 6.1 and later; nothing else there), kqueue
-//! (macOS) or an I/O completion port (Windows). What an operation works on
-//! (a Listener, a Stream, a File, a buffer) is moved in and comes back in
-//! its Event, so nothing the system still writes is in the loop's hands; a
-//! table of operations fixed when the Io is made refuses one more by
-//! handing it back; an Op that cancel takes; a Waker for other threads;
-//! listeners that share an address on Linux (bind_shared); the slowest turn
-//! of the loop, which says what belongs on run; errors by kind.
+//! done, as an Event the loop takes by next: TCP connections the Io holds
+//! (Conn: accept, connect, receive into the Io's chunks as data comes, as
+//! io_uring's multishot receive into a ring of buffers does, or once into
+//! a buffer; sends in their order beside a receive, a chunk sent on with no
+//! copy; close once what was sent is sent), UDP, timeouts, files (open,
+//! read_at, write_at, sync), and work that blocks on thread's pool (run, as
+//! tokio's spawn_blocking). It runs on io_uring (Linux 6.1 and later;
+//! nothing else there), kqueue (macOS) or an I/O completion port
+//! (Windows). What an operation works on (a Listener, a buffer, a File) is
+//! moved in and comes back in its Event, so nothing the system still
+//! writes is in the loop's hands; a table of slots fixed when the Io is
+//! made refuses one more operation by handing it back; an Op that limit
+//! gives a time and cancel ends; a Waker for other threads; listeners that
+//! share an address on Linux (bind_shared); the slowest turn of the loop;
+//! errors by kind.
 //!
 //! A loop makes one Io, or has it made and moved to its thread before its
 //! first wait (it stays there from then on), starts what it wants, and
 //! waits:
 //!
 //! ```text
-//! let mut io = Io::new(1024)?;
+//! let mut io = Io::new(4096, 4096, 2048)?;          // slots, chunks of 2 KiB
 //! let listener = Listener::bind(address, 128)?;
-//! let accepting = io.accept(listener, ACCEPT)?;     // Err hands it back
+//! io.accept(listener, ACCEPT)?;                     // Err hands it back
 //! loop {
 //!     io.wait(None)?;
 //!     while let Some(event) = io.next() {
 //!         match event.done {
-//!             Done::Accepted { listener, result } => ...,
-//!             Done::Received { stream, buffer, result } => ...,
+//!             Done::Accepted { listener, result } => ..., // a Conn: receive on it
+//!             Done::Chunk(chunk) => ...,                  // io.bytes(&chunk)
+//!             Done::Sent { buffer, result } => ...,
 //!             ...
 //!         }
 //!     }
 //! }
 //! ```
 //!
-//! Nothing calls back: wait sends the system what was started since the
+//! Nothing calls back: wait hands the system what was started since the
 //! last wait and sleeps until something is done (or its timeout passes),
 //! and next takes what is done, in the order it was, one Event at a time,
 //! its key the operation's. An Event owns what its operation was handed:
-//! an accept hands back its Listener and the Stream it took, a receive its
-//! Stream and its buffer with what was read after what it held, a send
-//! both when all of the buffer is sent, or when it failed. A receive reads
-//! into the room the buffer has beyond its length, up to its capacity: a
-//! buffer without room is NoRoom at once, as its Ok(0) would read as the
-//! peer's end. A send never stops part way: it is done when the system
-//! took every byte.
+//! an accept hands back its Listener and the Conn it took, a receive into
+//! a buffer the buffer with what was read after what it held, a send its
+//! buffer once all of it is sent, or when it failed. A receive into a
+//! buffer reads into the room it has beyond its length, up to its
+//! capacity: a buffer without room is NoRoom at once, as its Ok(0) would
+//! read as the peer's end. A send never stops part way: it is done when
+//! the system took every byte.
+//!
+//! A Conn is a slot of the table that holds a connection: its descriptor
+//! stays in the Io, and the operations on it name it. One receive runs on
+//! a Conn at a time (another is Busy), and sends on it run beside it, one
+//! after another in the order they were started: each is whole on the
+//! wire before the next starts, and Data::End ends what it sends after
+//! them. close ends a Conn: its receive is canceled, what was sent is
+//! sent, and it is closed when nothing works on it; a Conn dropped is
+//! closed so at the next wait. release takes its Stream out for another
+//! thread's Io to adopt (queue), once nothing works on it.
 //!
 //! An operation is in the Io from its start to the next that hands back
-//! its Event, and a slot of the table holds it all that time: a full table
-//! refuses one more and hands back what it was given (Err), and the loop
-//! takes Events, which frees their slots, before it starts more. One
-//! Event at most waits for each slot, so the Io never holds more than its
-//! table. Each Stream and Listener is in one operation at a time, as it is
-//! moved in: two receives on one stream, whose order the system would not
-//! keep, cannot be written.
+//! its Event, and a slot of the table holds it all that time; a Conn holds
+//! one more, from the accept or connect that makes it (which takes both at
+//! its start) until it is closed: a full table refuses one more and hands
+//! back what it was given (Err), and the loop takes Events, which frees
+//! their slots, before it starts more. One Event at most waits for each
+//! slot, so the Io never holds more than its table.
 //!
 //! The Op a start returns names its operation until its Event is taken.
-//! cancel ends it early: its Event comes with Canceled, and with what it
-//! was handed. An operation the system finished before the cancel reached
-//! it comes as finished. Dropping an Op cancels nothing: the operation
-//! runs to its end, and its Event comes all the same. An Io dropped with
-//! operations running cancels them and waits for the system to let go of
-//! their buffers before it frees them.
+//! limit gives it so long, before the wait that hands it to the system,
+//! and ends it then with TimedOut. cancel ends it early: its Event comes
+//! with Canceled, and with what it was handed. An operation the system
+//! finished before the cancel reached it comes as finished. Dropping an
+//! Op cancels nothing: the operation runs to its end, and its Event comes
+//! all the same. An Io dropped with operations running cancels them and
+//! waits for the system to let go of their buffers before it frees them.
 //!
 //! On Linux an Io is an io_uring of its own (one issuer, the thread of its
 //! first wait, which enables it, and its work done when it waits:
@@ -81,13 +94,13 @@
 //! (close-on-exec); small writes go at once (TCP_NODELAY), and a send to a
 //! peer that is gone is an error, not SIGPIPE. A Listener's address may be
 //! taken again while old connections linger (SO_REUSEADDR), and an IPv6
-//! one takes IPv6 alone (IPV6_V6ONLY). A Stream is closed when it is
-//! dropped. A Stream or Listener is the process's: it may go to another
+//! one takes IPv6 alone (IPV6_V6ONLY). A Stream, Listener or Udp is closed
+//! when it is dropped, and is the process's: it may go to another
 //! thread's Io, as a loop on each core hands connections on.
 //!
 //! Errors come as the kinds a loop acts on: refused, reset, timed out,
-//! unreachable, the address in use, canceled, no room, and the system's
-//! code for the rest.
+//! unreachable, the address in use, canceled, no room, busy, late, and the
+//! system's code for the rest.
 
 // rr: checked(0.5.2)
 // rr: needs(thread)
@@ -114,8 +127,8 @@ compile_error!("rr add cut io without windows: add it again with windows in --op
 
 pub use crate::base::thread::Work;
 pub use sys::{
-    AF_INET, AF_INET6, Chunk, Done, EACCES, ENOENT, Error, Event, File, Io, Listener, Op, Open,
-    SOCK_STREAM, Stream, Turn, Udp, Unavailable, Waker,
+    AF_INET, AF_INET6, Chunk, Conn, Data, Done, EACCES, ENOENT, Error, Event, File, Io, Listener,
+    Op, Open, Room, SOCK_STREAM, Stream, Turn, Udp, Unavailable, Waker,
 };
 
 // rr: section(os = linux macos)
@@ -140,7 +153,7 @@ mod sys {
     use core::cell::UnsafeCell;
     use core::mem;
     use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-    use core::sync::atomic::{AtomicU32, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use core::time::Duration;
     use os::Raw;
 
@@ -166,13 +179,22 @@ mod sys {
         /// A receive into a buffer without room, whose Ok(0) could not be
         /// told from the peer's end.
         NoRoom,
-        /// Windows: a stream or listener another Io ran first; a socket
-        /// stays in the completion port it was first in. Everywhere: a
-        /// Chunk given to another Io than its own.
+        /// A Conn or Chunk of another Io. Windows: a stream, listener or
+        /// socket another Io ran first, as a socket stays in the
+        /// completion port it was first in.
         Foreign,
-        /// receive_many: no chunk was free for what came (or the Io has
-        /// none): give chunks back and receive again.
+        /// receive into Room::Chunks: no chunk was free for what came (or
+        /// the Io has none): give chunks back and receive again.
         NoChunks,
+        /// A receive on a Conn whose receive runs (its Event not yet
+        /// taken): the system would not keep the order of two.
+        Busy,
+        /// limit on an operation the system already has: limit comes
+        /// before the next wait.
+        Late,
+        /// limit on an operation no time ends: a timeout, run, a file's,
+        /// a receive into Room::Chunks (timeout and cancel end that).
+        NoLimit,
         /// No such file or directory.
         NotFound,
         /// The system denies it: a file's permissions.
@@ -210,7 +232,8 @@ mod sys {
         Old,
     }
 
-    /// A TCP connection, closed when it is dropped.
+    /// A TCP connection out of any Io, closed when it is dropped: what
+    /// release gives, for another thread's Io to adopt (queue).
     pub struct Stream {
         fd: Fd,
     }
@@ -227,12 +250,50 @@ mod sys {
         pub fn peer(&self) -> Option<SocketAddr> {
             os::peer(self.fd.raw)
         }
+    }
 
-        /// Ends what it sends: the peer then reads its end; it still
-        /// receives.
-        pub fn finish(&self) -> Result<(), Error> {
-            os::finish(self.fd.raw)
+    /// A TCP connection an Io holds: accept, connect and adopt give one,
+    /// receive and send work on it, close (or dropping it) ends it once
+    /// what was sent on it is sent, release takes its Stream out.
+    #[must_use = "a Conn dropped is closed at the next wait"]
+    pub struct Conn {
+        io: u32,
+        index: u32,
+        generation: u32,
+        /// Where a Conn dropped says so, for its Io's next wait; None once
+        /// close or release took it.
+        gone: Option<Arc<Finished>>,
+    }
+
+    impl Drop for Conn {
+        fn drop(&mut self) {
+            if let Some(gone) = self.gone.take() {
+                gone.push(user_data(self.index, self.generation));
+            }
         }
+    }
+
+    /// Where a receive reads into.
+    pub enum Room {
+        /// The Io's chunks, as data comes, until the peer ends, an error
+        /// or cancel: an Event of Chunk for each part, then Stopped. On
+        /// io_uring a multishot receive into a ring of the chunks the
+        /// kernel picks from (IORING_RECV_MULTISHOT, PBUF_RING).
+        Chunks,
+        /// The room the buffer has beyond its length, once: Received.
+        Buffer(Vec<u8>),
+    }
+
+    /// What a send sends, after what was sent on the Conn before it.
+    pub enum Data {
+        /// All of the buffer.
+        Bytes(Vec<u8>),
+        /// All of a chunk of this Io, which is the Io's again once sent:
+        /// what was received passed on with no copy.
+        Chunk(Chunk),
+        /// The end of what the Conn sends: the peer reads its end; the
+        /// Conn still receives.
+        End,
     }
 
     /// A socket that listens for connections, closed when it is dropped.
@@ -392,20 +453,19 @@ mod sys {
         /// The listener, and the connection it took and its peer.
         Accepted {
             listener: Listener,
-            result: Result<(Stream, SocketAddr), Error>,
+            result: Result<(Conn, SocketAddr), Error>,
         },
         /// The connection made.
-        Connected(Result<Stream, Error>),
-        /// The stream, and its buffer with so many bytes read after what it
-        /// held; Ok(0) is the peer's end.
+        Connected(Result<Conn, Error>),
+        /// A receive into Room::Buffer: the buffer with so many bytes read
+        /// after what it held; Ok(0) is the peer's end.
         Received {
-            stream: Stream,
             buffer: Vec<u8>,
             result: Result<usize, Error>,
         },
-        /// The stream and its buffer, all of which was sent, unless it failed.
+        /// A send: its buffer (empty for a chunk or End), all of it sent,
+        /// unless it failed.
         Sent {
-            stream: Stream,
             buffer: Vec<u8>,
             result: Result<(), Error>,
         },
@@ -417,21 +477,15 @@ mod sys {
             buffer: Vec<u8>,
             result: Result<(), Error>,
         },
-        /// What came on a receive_many, in a chunk of the Io's: its bytes
-        /// are bytes(&chunk), until it is given back (give_back, or
-        /// send_chunk, which gives it back once sent). More come with the
-        /// same key until Stopped.
+        /// What came on a receive into Room::Chunks, in a chunk of the Io's:
+        /// its bytes are bytes(&chunk), until it is given back (give_back,
+        /// or a send of it, which gives it back once sent). More come with
+        /// the same key until Stopped.
         Chunk(Chunk),
-        /// A receive_many is over: the stream, and Ok when the peer ended
-        /// what it sends; Canceled, NoChunks or another error else. It comes
-        /// after the stream's chunks, and after each send_chunk on it.
-        Stopped {
-            stream: Stream,
-            result: Result<(), Error>,
-        },
-        /// A send_chunk is done, all of the chunk sent unless it failed; the
-        /// chunk is the Io's again.
-        SentChunk(Result<(), Error>),
+        /// A receive into Room::Chunks is over, after its chunks: Ok when
+        /// the peer ended what it sends; Canceled, NoChunks or another
+        /// error else.
+        Stopped(Result<(), Error>),
         /// The path, and the file opened.
         Opened {
             path: Vec<u8>,
@@ -475,28 +529,33 @@ mod sys {
     /// What a slot's operation works on while it runs.
     enum Work {
         Idle,
+        /// A connection the Io holds (State::Held): its stream, while it
+        /// is not reserved for an accept or connect yet to answer.
+        Conn(Stream),
         Accept(Listener),
-        Connect(Stream),
-        Receive(Stream, Vec<u8>),
-        /// The stream, the buffer, and how much of it the system took.
-        Send(Stream, Vec<u8>, usize),
+        /// The operations on a Conn work on its descriptor, which the Conn
+        /// keeps open until each of them is done.
+        Connect(Raw),
+        Receive(Raw, Vec<u8>),
+        /// The descriptor, the buffer, and how much of it the system took.
+        Send(Raw, Vec<u8>, usize),
         Timeout(Duration),
         SendTo(Udp, Vec<u8>),
         ReceiveFrom(Udp, Vec<u8>),
         /// Work on thread's pool, which tells the Io when it returned.
         Run(Job),
-        /// A multishot receive into the Io's chunks; the stream stays until
-        /// it is over and the sends on it are done.
-        ReceiveMany(Stream),
-        /// A chunk sent on a receive_many's stream: its descriptor, which the
-        /// receive keeps open until this is done, the chunk, its length,
-        /// and how much of it the system took.
+        /// A multishot receive into the Io's chunks.
+        ReceiveMany(Raw),
+        /// A chunk sent: the descriptor, the chunk, its length, and how
+        /// much of it the system took.
         SendChunk {
             fd: Raw,
             id: u16,
             length: u32,
             sent: u32,
         },
+        /// Data::End, done in the Io when the sends before it are.
+        End(Raw),
         /// A file's operation, the kernel's on io_uring: the path with its
         /// NUL and how; the file, the buffer, the offset (and how much a
         /// write wrote).
@@ -509,15 +568,22 @@ mod sys {
         FileRun(Job, Arc<FileCell>),
         /// Done: what the next Event hands back.
         Finished(Done),
+        /// An accept done, whose connection next puts in the slot reserved
+        /// for it, and a connect done, whose slot holds its stream.
+        Took(Listener, Result<(Stream, SocketAddr), Error>),
+        Made(Result<(), Error>),
     }
 
     #[derive(PartialEq)]
     enum State {
         Free,
-        /// Started, with the system.
+        /// Started: staged for the next wait, waiting in its Conn's line of
+        /// sends, or with the system.
         Running,
         /// Done, waiting in ready for next.
         Ready,
+        /// A connection's slot, or one an accept or connect reserved.
+        Held,
     }
 
     /// One operation of the table. A slot does not move while the Io lives
@@ -551,15 +617,27 @@ mod sys {
         /// kqueue: a connect begun, or the filter it waits on.
         begun: bool,
         armed: Option<i16>,
-        /// receive_many: the send_chunks running on its stream, and how it
-        /// ended, while they run; IOCP: the chunk its receive fills.
-        sends: u32,
-        ending: Option<Result<(), Error>>,
+        /// A send of a chunk, which next gives back, and IOCP: the chunk a
+        /// receive into chunks fills.
         chunk: Option<u16>,
-        /// send_chunk: the receive_many whose stream it sends on, by slot
-        /// and generation.
+        /// An operation on a Conn: its slot and generation; an accept's or
+        /// connect's: the slot reserved for its connection.
         owner: Option<(u32, u32)>,
-        /// How long the operation may take (receive_within and its kin),
+        /// Staged: started since the last wait, which hands it to the
+        /// system; queued: a send waiting for those before it on its Conn,
+        /// and the send after it.
+        staged: bool,
+        queued: bool,
+        after: Option<u32>,
+        /// A Conn's: how many operations work on it, its receive running,
+        /// its first send and last, and whether it is closed once the
+        /// operations are done.
+        users: u32,
+        receiving: Option<u32>,
+        sending: Option<u32>,
+        last: Option<u32>,
+        closing: bool,
+        /// How long the operation may take (limit),
         /// whether that time passed, whether its timer is set (kqueue,
         /// IOCP), and when it ends on the monotonic clock (io_uring).
         limit: Option<Duration>,
@@ -598,10 +676,16 @@ mod sys {
                 canceled: false,
                 begun: false,
                 armed: None,
-                sends: 0,
-                ending: None,
                 chunk: None,
                 owner: None,
+                staged: false,
+                queued: false,
+                after: None,
+                users: 0,
+                receiving: None,
+                sending: None,
+                last: None,
+                closing: false,
                 limit: None,
                 expired: false,
                 limited: false,
@@ -618,19 +702,23 @@ mod sys {
         fn fd(&self) -> Option<Raw> {
             match &self.work {
                 Work::Accept(listener) => Some(listener.fd.raw),
-                Work::Connect(stream) | Work::Receive(stream, _) | Work::Send(stream, _, _) => {
-                    Some(stream.fd.raw)
-                }
+                Work::Connect(fd)
+                | Work::Receive(fd, _)
+                | Work::Send(fd, _, _)
+                | Work::ReceiveMany(fd)
+                | Work::SendChunk { fd, .. }
+                | Work::End(fd) => Some(*fd),
                 Work::SendTo(udp, _) | Work::ReceiveFrom(udp, _) => Some(udp.fd.raw),
-                Work::ReceiveMany(stream) => Some(stream.fd.raw),
                 Work::Read(file, ..) | Work::Write(file, ..) | Work::Sync(file) => Some(file.raw),
-                Work::SendChunk { fd, .. } => Some(*fd),
                 Work::Idle
+                | Work::Conn(_)
                 | Work::Timeout(_)
                 | Work::Run(_)
                 | Work::Open(..)
                 | Work::FileRun(..)
-                | Work::Finished(_) => None,
+                | Work::Finished(_)
+                | Work::Took(..)
+                | Work::Made(_) => None,
             }
         }
     }
@@ -701,43 +789,32 @@ mod sys {
         let (work, again) = match (work, answer) {
             (Work::Accept(listener), Ok(fd)) => {
                 let result = adopt(fd, &slot.address, slot.length);
-                (Work::Finished(Done::Accepted { listener, result }), false)
+                (Work::Took(listener, result), false)
             }
             (Work::Accept(listener), Err(code)) if os::passing(code) && !canceled => {
                 (Work::Accept(listener), true)
             }
             (Work::Accept(listener), Err(code)) => {
-                let result = Err(os::error(code));
-                (Work::Finished(Done::Accepted { listener, result }), false)
+                (Work::Took(listener, Err(os::error(code))), false)
             }
-            (Work::Connect(stream), Ok(_)) => (Work::Finished(Done::Connected(Ok(stream))), false),
-            (Work::Connect(_), Err(code)) => {
-                (Work::Finished(Done::Connected(Err(os::error(code)))), false)
-            }
-            (Work::Receive(stream, mut buffer), Ok(count)) => {
+            (Work::Connect(_), Ok(_)) => (Work::Made(Ok(())), false),
+            (Work::Connect(_), Err(code)) => (Work::Made(Err(os::error(code))), false),
+            (Work::Receive(_, mut buffer), Ok(count)) => {
                 os::filled(&mut buffer, count);
-                let done = Done::Received {
-                    stream,
-                    buffer,
-                    result: Ok(count),
-                };
-                (Work::Finished(done), false)
+                let result = Ok(count);
+                (Work::Finished(Done::Received { buffer, result }), false)
             }
-            (Work::Receive(stream, buffer), Err(code)) if os::again(code) && !canceled => {
-                (Work::Receive(stream, buffer), true)
+            (Work::Receive(fd, buffer), Err(code)) if os::again(code) && !canceled => {
+                (Work::Receive(fd, buffer), true)
             }
-            (Work::Receive(stream, buffer), Err(code)) => {
-                let done = Done::Received {
-                    stream,
-                    buffer,
-                    result: Err(os::error(code)),
-                };
-                (Work::Finished(done), false)
+            (Work::Receive(_, buffer), Err(code)) => {
+                let result = Err(os::error(code));
+                (Work::Finished(Done::Received { buffer, result }), false)
             }
-            (Work::Send(stream, buffer, sent), Ok(count)) => {
+            (Work::Send(fd, buffer, sent), Ok(count)) => {
                 let sent = sent.saturating_add(count);
                 if sent < buffer.len() && count > 0 && !canceled {
-                    (Work::Send(stream, buffer, sent), true)
+                    (Work::Send(fd, buffer, sent), true)
                 } else {
                     let result = if sent < buffer.len() {
                         Err(if canceled {
@@ -748,26 +825,15 @@ mod sys {
                     } else {
                         Ok(())
                     };
-                    (
-                        Work::Finished(Done::Sent {
-                            stream,
-                            buffer,
-                            result,
-                        }),
-                        false,
-                    )
+                    (Work::Finished(Done::Sent { buffer, result }), false)
                 }
             }
-            (Work::Send(stream, buffer, sent), Err(code)) if os::again(code) && !canceled => {
-                (Work::Send(stream, buffer, sent), true)
+            (Work::Send(fd, buffer, sent), Err(code)) if os::again(code) && !canceled => {
+                (Work::Send(fd, buffer, sent), true)
             }
-            (Work::Send(stream, buffer, _), Err(code)) => {
-                let done = Done::Sent {
-                    stream,
-                    buffer,
-                    result: Err(os::error(code)),
-                };
-                (Work::Finished(done), false)
+            (Work::Send(_, buffer, _), Err(code)) => {
+                let result = Err(os::error(code));
+                (Work::Finished(Done::Sent { buffer, result }), false)
             }
             (Work::Timeout(_), Ok(_)) => (Work::Finished(Done::Elapsed(Ok(()))), false),
             (Work::Timeout(_), Err(code)) => {
@@ -843,14 +909,24 @@ mod sys {
                     } else {
                         Ok(())
                     };
-                    (Work::Finished(Done::SentChunk(result)), false)
+                    let buffer = Vec::new();
+                    (Work::Finished(Done::Sent { buffer, result }), false)
                 }
             }
             (work @ Work::SendChunk { .. }, Err(code)) if os::again(code) && !canceled => {
                 (work, true)
             }
             (Work::SendChunk { .. }, Err(code)) => {
-                (Work::Finished(Done::SentChunk(Err(os::error(code)))), false)
+                let (buffer, result) = (Vec::new(), Err(os::error(code)));
+                (Work::Finished(Done::Sent { buffer, result }), false)
+            }
+            (Work::End(_), answer) => {
+                let (buffer, result) = (Vec::new(), answer.map(|_| ()).map_err(os::error));
+                (Work::Finished(Done::Sent { buffer, result }), false)
+            }
+            (Work::ReceiveMany(_), answer) => {
+                let result = answer.map(|_| ()).map_err(os::error);
+                (Work::Finished(Done::Stopped(result)), false)
             }
             (Work::Open(mut path, _), answer) => {
                 path.pop();
@@ -922,10 +998,12 @@ mod sys {
             }
             (
                 other @ (Work::Idle
+                | Work::Conn(_)
                 | Work::Run(_)
-                | Work::ReceiveMany(_)
                 | Work::FileRun(..)
-                | Work::Finished(_)),
+                | Work::Finished(_)
+                | Work::Took(..)
+                | Work::Made(_)),
                 _,
             ) => (other, false),
         };
@@ -936,24 +1014,15 @@ mod sys {
         again
     }
 
-    /// Ends a receive_many as the system said, its stream handed back
-    /// (true), or once the send_chunks on it are done (false, ending kept).
-    #[must_use]
-    fn end_many(slot: &mut Slot, result: Result<(), Error>) -> bool {
-        if slot.sends > 0 {
-            slot.ending.get_or_insert(result);
-            return false;
-        }
-        let Work::ReceiveMany(stream) = mem::replace(&mut slot.work, Work::Idle) else {
-            return false;
-        };
-        slot.work = Work::Finished(Done::Stopped { stream, result });
+    /// Ends a receive into chunks as the system said: its Event is
+    /// Stopped.
+    fn stop(slot: &mut Slot, result: Result<(), Error>) {
+        slot.work = Work::Finished(Done::Stopped(result));
         slot.state = State::Ready;
-        true
     }
 
-    /// A chunk of an Io's, which receive_many filled: the program's until it
-    /// gives it back or sends it. It names its Io, which refuses another's.
+    /// A chunk of an Io's, which a receive into Room::Chunks filled: the
+    /// program's until it gives it back or sends it. It names its Io, which refuses another's.
     #[must_use = "a chunk is the Io's again only once given back or sent"]
     pub struct Chunk {
         io: u32,
@@ -961,10 +1030,10 @@ mod sys {
         length: u32,
     }
 
-    /// The chunks of an Io, which receive_many fills: count of size bytes,
-    /// in one block that never moves; the ids free (kqueue, IOCP; io_uring
-    /// keeps them in its ring), and the chunks filled and not yet handed
-    /// out, with their keys and lengths.
+    /// The chunks of an Io, which receives into Room::Chunks fill: count
+    /// of size bytes, in one block that never moves; the ids free (kqueue,
+    /// IOCP; io_uring keeps them in its ring), and the chunks filled and
+    /// not yet handed out, with their keys and lengths.
     pub struct Pool {
         bytes: Box<[u8]>,
         size: usize,
@@ -1041,17 +1110,22 @@ mod sys {
     }
 
     pub struct Io {
-        /// Which Io this is, as its chunks name it.
+        /// Which Io this is, as its chunks and Conns name it.
         id: u32,
         slots: Box<[Slot]>,
-        /// The free slots, and those done, in the order they were.
+        /// The free slots, those done, in the order they were, those
+        /// started since the last wait, and how many hold connections.
         free: Vec<u32>,
         ready: VecDeque<u32>,
+        staged: Vec<u32>,
+        held: usize,
         /// A Waker was made: a wait with nothing running waits for it.
         wakeable: bool,
         /// The work of run that returned, by user data, which the pool's
-        /// threads put there; and the list taken from it at a wait.
+        /// threads put there; the Conns dropped, which their Drop puts
+        /// there; and the list taken from either at a wait.
         finished: Arc<Finished>,
+        gone: Arc<Finished>,
         taken: Vec<u64>,
         /// When the last wait returned, on the monotonic clock (0 before
         /// the first), the key of the last Event taken since, and the
@@ -1069,6 +1143,9 @@ mod sys {
     struct Finished {
         lock: Lock,
         list: UnsafeCell<Vec<u64>>,
+        /// The list holds something: a wait with nothing there takes no
+        /// lock.
+        filled: AtomicBool,
     }
 
     // rr: escape(unsafe): list is reached only under lock (Finished::push,
@@ -1082,12 +1159,17 @@ mod sys {
             // list.
             let list = unsafe { &mut *self.list.get() };
             list.push(data);
+            self.filled.store(true, Ordering::Release);
         }
 
         /// Moves the list into into, which was empty, and the list's room
-        /// with it.
+        /// with it. One pushed as this looks finds it at the next wait.
         fn take(&self, into: &mut Vec<u64>) {
+            if !self.filled.load(Ordering::Acquire) {
+                return;
+            }
             let _held = self.lock.lock();
+            self.filled.store(false, Ordering::Relaxed);
             // rr: escape(unsafe): the lock is held: no one else touches the
             // list.
             mem::swap(unsafe { &mut *self.list.get() }, into);
@@ -1210,45 +1292,55 @@ mod sys {
     }
 
     impl Io {
-        /// An Io of so many operations at once (at least 1, at most
-        /// 32768), on this thread.
-        pub fn new(ops: usize) -> Result<Io, Error> {
-            Io::with_chunks(ops, 0, 0)
-        }
-
-        /// An Io of so many operations, and chunks of size bytes for its
-        /// receive_many (count at most 32768, a power of two on Linux,
-        /// rounded up; none when 0).
-        pub fn with_chunks(ops: usize, count: usize, size: usize) -> Result<Io, Error> {
-            let ops = ops.clamp(1, OPS_MAX);
-            let count = if count == 0 {
+        /// An Io of so many slots (at least 2, at most 32768), each an
+        /// operation running or a connection it holds, and of chunks of
+        /// size bytes for receives into Room::Chunks (count at most 32768,
+        /// a power of two on Linux, rounded up; none when 0), on this
+        /// thread.
+        pub fn new(slots: usize, chunks: usize, size: usize) -> Result<Io, Error> {
+            let ops = slots.clamp(2, OPS_MAX);
+            let count = if chunks == 0 {
                 0
             } else {
-                count.clamp(1, CHUNKS_MAX).next_power_of_two()
+                chunks.clamp(1, CHUNKS_MAX).next_power_of_two()
             };
             let size = size.clamp(1, u32::MAX as usize);
             let pool = Pool::new(count, size);
             let backend = Box::new(backend::Backend::new(
-                u32::try_from(ops).unwrap_or(1),
+                u32::try_from(ops).unwrap_or(2),
                 pool,
             )?);
-            let mut slots = Vec::with_capacity(ops);
-            slots.resize_with(ops, Slot::new);
+            let mut table = Vec::with_capacity(ops);
+            table.resize_with(ops, Slot::new);
             let mut free = Vec::with_capacity(ops);
             for index in (0..ops).rev() {
                 free.push(u32::try_from(index).unwrap_or(0));
             }
             Ok(Io {
                 id: NEXT_IO.fetch_add(1, Ordering::Relaxed),
-                slots: slots.into_boxed_slice(),
+                slots: table.into_boxed_slice(),
                 free,
                 ready: VecDeque::with_capacity(ops),
+                staged: Vec::with_capacity(ops),
+                held: 0,
                 wakeable: false,
                 // rr: escape(shared): the Io and its runs' Notify hold it.
                 finished: Arc::new(Finished {
                     lock: Lock::new(),
                     // rr: escape(shared): the list, under the lock.
                     list: UnsafeCell::new(Vec::with_capacity(ops)),
+                    // rr: escape(shared): whether the list holds anything,
+                    // which the loop reads unlocked.
+                    filled: AtomicBool::new(false),
+                }),
+                // rr: escape(shared): the Io and its Conns hold it.
+                gone: Arc::new(Finished {
+                    lock: Lock::new(),
+                    // rr: escape(shared): the list, under the lock.
+                    list: UnsafeCell::new(Vec::with_capacity(ops)),
+                    // rr: escape(shared): whether the list holds anything,
+                    // which the loop reads unlocked.
+                    filled: AtomicBool::new(false),
                 }),
                 taken: Vec::with_capacity(ops),
                 turned: 0,
@@ -1258,68 +1350,42 @@ mod sys {
             })
         }
 
-        /// Accepts the next connection on listener.
+        /// Accepts the next connection on listener, into a slot of its own
+        /// it takes at once: two slots, or Err with the listener.
         pub fn accept(&mut self, listener: Listener, key: u64) -> Result<Op, Listener> {
-            match self.free.pop() {
-                Some(index) => Ok(self.start(index, key, Work::Accept(listener), None)),
-                None => Err(listener),
-            }
+            let Some((index, reserved)) = self.two() else {
+                return Err(listener);
+            };
+            Ok(self.start(index, key, Work::Accept(listener), Some(reserved)))
         }
 
-        /// Connects to address.
+        /// Connects to address, from a slot of its own it takes at once: two
+        /// slots, or Err with the address.
         pub fn connect(&mut self, address: SocketAddr, key: u64) -> Result<Op, SocketAddr> {
-            self.connect_in(address, key, None)
-        }
-
-        /// Connects to address, or gives up with TimedOut once after passed.
-        pub fn connect_within(
-            &mut self,
-            address: SocketAddr,
-            after: Duration,
-            key: u64,
-        ) -> Result<Op, SocketAddr> {
-            self.connect_in(address, key, Some(after))
-        }
-
-        /// Receives as receive does, or gives up with TimedOut, buffer as it
-        /// was, once after passed.
-        pub fn receive_within(
-            &mut self,
-            stream: Stream,
-            buffer: Vec<u8>,
-            after: Duration,
-            key: u64,
-        ) -> Result<Op, (Stream, Vec<u8>)> {
-            self.receive_in(stream, buffer, key, Some(after))
-        }
-
-        /// Sends as send does, or gives up with TimedOut once after passed
-        /// since it started, however much was sent by then.
-        pub fn send_within(
-            &mut self,
-            stream: Stream,
-            buffer: Vec<u8>,
-            after: Duration,
-            key: u64,
-        ) -> Result<Op, (Stream, Vec<u8>)> {
-            self.send_in(stream, buffer, key, Some(after))
-        }
-
-        fn connect_in(
-            &mut self,
-            address: SocketAddr,
-            key: u64,
-            limit: Option<Duration>,
-        ) -> Result<Op, SocketAddr> {
-            let Some(index) = self.free.pop() else {
+            let Some((index, reserved)) = self.two() else {
                 return Err(address);
             };
+            let (conn, generation) = reserved;
             let fd = match os::open(&address, Kind::Stream) {
                 Ok(fd) => fd,
-                Err(error) => return Ok(self.finish(index, key, Done::Connected(Err(error)))),
+                Err(error) => {
+                    self.free_slot(conn);
+                    return Ok(self.finish(index, key, Done::Connected(Err(error))));
+                }
             };
             let stream = Stream { fd: Fd::new(fd) };
-            if let Err(error) = os::no_delay(stream.fd.raw) {
+            if let Some(slot) = self.slots.get_mut(conn as usize) {
+                slot.work = Work::Conn(stream);
+            }
+            let raw = match self.attach(conn, generation) {
+                Ok(raw) => raw,
+                Err(error) => {
+                    self.free_slot(conn);
+                    return Ok(self.finish(index, key, Done::Connected(Err(error))));
+                }
+            };
+            if let Err(error) = os::no_delay(raw) {
+                self.free_slot(conn);
                 return Ok(self.finish(index, key, Done::Connected(Err(error))));
             }
             if let Some(slot) = self.slots.get_mut(index as usize) {
@@ -1327,133 +1393,219 @@ mod sys {
                 slot.address = bytes;
                 slot.length = u32::try_from(length).unwrap_or(0);
             }
-            Ok(self.start(index, key, Work::Connect(stream), limit))
+            Ok(self.start(index, key, Work::Connect(raw), Some(reserved)))
         }
 
-        /// Receives into the room buffer has beyond its length.
-        pub fn receive(
-            &mut self,
-            stream: Stream,
-            buffer: Vec<u8>,
-            key: u64,
-        ) -> Result<Op, (Stream, Vec<u8>)> {
-            self.receive_in(stream, buffer, key, None)
-        }
-
-        fn receive_in(
-            &mut self,
-            stream: Stream,
-            buffer: Vec<u8>,
-            key: u64,
-            limit: Option<Duration>,
-        ) -> Result<Op, (Stream, Vec<u8>)> {
-            let Some(index) = self.free.pop() else {
-                return Err((stream, buffer));
-            };
-            if buffer.len() == buffer.capacity() {
-                let result = Err(Error::NoRoom);
-                return Ok(self.finish(
-                    index,
-                    key,
-                    Done::Received {
-                        stream,
-                        buffer,
-                        result,
-                    },
-                ));
-            }
-            Ok(self.start(index, key, Work::Receive(stream, buffer), limit))
-        }
-
-        /// Sends all of buffer.
-        pub fn send(
-            &mut self,
-            stream: Stream,
-            buffer: Vec<u8>,
-            key: u64,
-        ) -> Result<Op, (Stream, Vec<u8>)> {
-            self.send_in(stream, buffer, key, None)
-        }
-
-        fn send_in(
-            &mut self,
-            stream: Stream,
-            buffer: Vec<u8>,
-            key: u64,
-            limit: Option<Duration>,
-        ) -> Result<Op, (Stream, Vec<u8>)> {
-            let Some(index) = self.free.pop() else {
-                return Err((stream, buffer));
-            };
-            if buffer.is_empty() {
-                let result = Ok(());
-                return Ok(self.finish(
-                    index,
-                    key,
-                    Done::Sent {
-                        stream,
-                        buffer,
-                        result,
-                    },
-                ));
-            }
-            Ok(self.start(index, key, Work::Send(stream, buffer, 0), limit))
-        }
-
-        /// Receives what stream brings into the Io's chunks, as it comes,
-        /// until the peer ends, an error, or cancel: an Event of Chunk with
-        /// key for each part, then Stopped with the stream. On io_uring a
-        /// multishot receive into a ring of the chunks the kernel picks
-        /// from (IORING_RECV_MULTISHOT, IORING_REGISTER_PBUF_RING): no
-        /// receive to start again for each part. Send on the stream meanwhile
-        /// with send_chunk.
-        pub fn receive_many(&mut self, stream: Stream, key: u64) -> Result<Op, Stream> {
+        /// Holds stream, which another Io released or queue brought, as a
+        /// Conn of this one; Err hands it back when the table is full.
+        pub fn adopt(&mut self, stream: Stream) -> Result<Conn, Stream> {
             let Some(index) = self.free.pop() else {
                 return Err(stream);
             };
-            if self.backend.pool.count == 0 {
-                let result = Err(Error::NoChunks);
-                return Ok(self.finish(index, key, Done::Stopped { stream, result }));
-            }
-            Ok(self.start(index, key, Work::ReceiveMany(stream), None))
+            let generation = self.hold(index, Work::Conn(stream));
+            Ok(self.conn(index, generation))
         }
 
-        /// Sends chunk on the stream of receiving, a receive_many of this Io
-        /// that runs, and gives it back once sent: its Event is SentChunk.
-        /// Err hands the chunk back: a full table, receiving over, or a
-        /// chunk of another Io.
-        pub fn send_chunk(&mut self, receiving: &Op, chunk: Chunk, key: u64) -> Result<Op, Chunk> {
-            if chunk.io != self.id {
-                return Err(chunk);
+        /// Takes conn's stream out of the Io, for another to adopt; Err
+        /// hands conn back while an operation works on it.
+        pub fn release(&mut self, mut conn: Conn) -> Result<Stream, Conn> {
+            let index = conn.index;
+            let Some(slot) = self.held_mut(&conn) else {
+                return Err(conn);
+            };
+            if slot.users > 0 || !matches!(slot.work, Work::Conn(_)) {
+                return Err(conn);
             }
-            let (index, generation) = (receiving.index, receiving.generation);
-            let fd = match self.slots.get(index as usize) {
-                Some(owner)
-                    if owner.state == State::Running
-                        && owner.generation == generation
-                        && owner.ending.is_none() =>
-                {
-                    owner.fd()
+            let Work::Conn(stream) = mem::replace(&mut slot.work, Work::Idle) else {
+                return Err(conn);
+            };
+            conn.gone = None;
+            self.free_slot(index);
+            Ok(stream)
+        }
+
+        /// conn's stream, for its addresses; None for another Io's.
+        #[must_use]
+        pub fn stream(&self, conn: &Conn) -> Option<&Stream> {
+            let slot = self.held(conn)?;
+            let Work::Conn(stream) = &slot.work else {
+                return None;
+            };
+            Some(stream)
+        }
+
+        /// Ends conn: its receive is canceled, what was sent on it is sent
+        /// (cancel each send to end it sooner), and it is closed once each
+        /// operation on it is done. A Conn dropped is closed so at the next
+        /// wait.
+        pub fn close(&mut self, mut conn: Conn) {
+            if conn.io != self.id {
+                // Dropped here, it is its own Io's to close.
+                return;
+            }
+            conn.gone = None;
+            self.close_at(conn.index, conn.generation);
+        }
+
+        /// Receives on conn into room: Room::Chunks as data comes, until
+        /// Stopped; Room::Buffer once, Received. One receive at a time runs
+        /// on a Conn (another is Busy); sends run beside it. Err hands room
+        /// back when the table is full.
+        pub fn receive(&mut self, conn: &Conn, room: Room, key: u64) -> Result<Op, Room> {
+            let Some(index) = self.free.pop() else {
+                return Err(room);
+            };
+            let refused = match (&room, self.held(conn)) {
+                (_, None) => Some(Error::Foreign),
+                (_, Some(slot)) if slot.receiving.is_some() => Some(Error::Busy),
+                (Room::Buffer(buffer), _) if buffer.len() == buffer.capacity() => {
+                    Some(Error::NoRoom)
                 }
+                (Room::Chunks, _) if self.backend.pool.count == 0 => Some(Error::NoChunks),
                 _ => None,
             };
-            let (Some(fd), Some(slot)) = (fd, self.free.pop()) else {
-                return Err(chunk);
+            let fd = match refused.map_or_else(|| self.attach(conn.index, conn.generation), Err) {
+                Ok(fd) => fd,
+                Err(error) => {
+                    let done = match room {
+                        Room::Chunks => Done::Stopped(Err(error)),
+                        Room::Buffer(buffer) => Done::Received {
+                            buffer,
+                            result: Err(error),
+                        },
+                    };
+                    return Ok(self.finish(index, key, done));
+                }
             };
-            if let Some(owner) = self.slots.get_mut(index as usize) {
-                owner.sends = owner.sends.saturating_add(1);
+            if let Some(slot) = self.slots.get_mut(conn.index as usize) {
+                slot.users = slot.users.saturating_add(1);
+                slot.receiving = Some(index);
             }
-            if let Some(sending) = self.slots.get_mut(slot as usize) {
-                sending.chunk = Some(chunk.id);
-                sending.owner = Some((index, generation));
-            }
-            let work = Work::SendChunk {
-                fd,
-                id: chunk.id,
-                length: chunk.length,
-                sent: 0,
+            let work = match room {
+                Room::Chunks => Work::ReceiveMany(fd),
+                Room::Buffer(buffer) => Work::Receive(fd, buffer),
             };
-            Ok(self.start(slot, key, work, None))
+            let owner = Some((conn.index, conn.generation));
+            Ok(self.start(index, key, work, owner))
+        }
+
+        /// Sends data on conn, after what was sent on it before: its Event
+        /// is Sent once all of it is. Err hands data back when the table is
+        /// full, or for a chunk of another Io.
+        pub fn send(&mut self, conn: &Conn, data: Data, key: u64) -> Result<Op, Data> {
+            if let Data::Chunk(chunk) = &data {
+                if chunk.io != self.id {
+                    return Err(data);
+                }
+            }
+            let Some(index) = self.free.pop() else {
+                return Err(data);
+            };
+            let fd = match self.attach(conn.index, conn.generation) {
+                Ok(fd) => fd,
+                Err(error) => {
+                    let buffer = match data {
+                        Data::Bytes(buffer) => buffer,
+                        Data::Chunk(chunk) => {
+                            self.backend.give_back(chunk.id);
+                            Vec::new()
+                        }
+                        Data::End => Vec::new(),
+                    };
+                    let result = Err(error);
+                    return Ok(self.finish(index, key, Done::Sent { buffer, result }));
+                }
+            };
+            let (work, chunk) = match data {
+                Data::Bytes(buffer) => (Work::Send(fd, buffer, 0), None),
+                Data::Chunk(chunk) => {
+                    let work = Work::SendChunk {
+                        fd,
+                        id: chunk.id,
+                        length: chunk.length,
+                        sent: 0,
+                    };
+                    (work, Some(chunk.id))
+                }
+                Data::End => (Work::End(fd), None),
+            };
+            let owner = (conn.index, conn.generation);
+            let last = match self.slots.get_mut(conn.index as usize) {
+                Some(slot) => {
+                    slot.users = slot.users.saturating_add(1);
+                    let last = slot.last.replace(index);
+                    if last.is_none() {
+                        slot.sending = Some(index);
+                    }
+                    last
+                }
+                None => None,
+            };
+            if let Some(slot) = self.slots.get_mut(index as usize) {
+                slot.chunk = chunk;
+            }
+            let Some(before) = last else {
+                return Ok(self.start(index, key, work, Some(owner)));
+            };
+            // It waits for the send before it, which stages it once done.
+            if let Some(slot) = self.slots.get_mut(before as usize) {
+                slot.after = Some(index);
+            }
+            let generation = match self.slots.get_mut(index as usize) {
+                Some(slot) => {
+                    slot.key = key;
+                    slot.work = work;
+                    slot.state = State::Running;
+                    slot.owner = Some(owner);
+                    slot.queued = true;
+                    slot.generation
+                }
+                None => 0,
+            };
+            Ok(Op { index, generation })
+        }
+
+        /// Gives op so long from when the system has it, or ends it with
+        /// TimedOut, what it was handed as it then is: on io_uring a linked
+        /// timeout (IORING_OP_LINK_TIMEOUT), a timer elsewhere. It comes
+        /// before the next wait (Late after) and goes on accept, connect, a
+        /// receive into Room::Buffer, a send, send_to and receive_from
+        /// (NoLimit on the others).
+        pub fn limit(&mut self, op: &Op, after: Duration) -> Result<(), Error> {
+            let Some(slot) = self.slots.get_mut(op.index as usize) else {
+                return Err(Error::Late);
+            };
+            if slot.state != State::Running || slot.generation != op.generation {
+                return Err(Error::Late);
+            }
+            match slot.work {
+                Work::Accept(_)
+                | Work::Connect(_)
+                | Work::Receive(..)
+                | Work::Send(..)
+                | Work::SendChunk { .. }
+                | Work::SendTo(..)
+                | Work::ReceiveFrom(..) => {}
+                Work::Idle
+                | Work::Conn(_)
+                | Work::Timeout(_)
+                | Work::Run(_)
+                | Work::ReceiveMany(_)
+                | Work::End(_)
+                | Work::Open(..)
+                | Work::Read(..)
+                | Work::Write(..)
+                | Work::Sync(_)
+                | Work::FileRun(..)
+                | Work::Finished(_)
+                | Work::Took(..)
+                | Work::Made(_) => return Err(Error::NoLimit),
+            }
+            if !slot.staged && !slot.queued {
+                return Err(Error::Late);
+            }
+            slot.limit = Some(after);
+            Ok(())
         }
 
         /// The bytes of a chunk of this Io; None for another's.
@@ -1462,8 +1614,8 @@ mod sys {
             (chunk.io == self.id).then(|| self.backend.pool.slice(chunk.id, chunk.length))
         }
 
-        /// Gives a chunk back for receive_many to fill again; Err for
-        /// another Io's, which is handed back.
+        /// Gives a chunk back for receives to fill again; Err for another
+        /// Io's, which is handed back.
         pub fn give_back(&mut self, chunk: Chunk) -> Result<(), Chunk> {
             if chunk.io != self.id {
                 return Err(chunk);
@@ -1489,7 +1641,7 @@ mod sys {
         }
 
         /// Reads the file at offset into the room buffer has beyond its
-        /// length, as receive reads a stream; Ok(0) is its end.
+        /// length, as a receive into Room::Buffer reads; Ok(0) is its end.
         pub fn read_at(
             &mut self,
             file: File,
@@ -1667,7 +1819,6 @@ mod sys {
                     Ok(Op { index, generation })
                 }
                 Err(work) => {
-                    // rr: escape(bound): the slot taken back, as it was.
                     self.free.push(index);
                     Err(work)
                 }
@@ -1683,10 +1834,15 @@ mod sys {
         }
 
         /// Ends op early: true when it was running; false when it is done
-        /// already (its Event waits, or was taken).
+        /// already (its Event waits, or was taken). A send waiting for those
+        /// before it on its Conn ends when they are done.
         #[must_use]
         pub fn cancel(&mut self, op: &Op) -> bool {
-            let (index, generation) = (op.index, op.generation);
+            self.cancel_at(op.index, op.generation)
+        }
+
+        #[must_use]
+        fn cancel_at(&mut self, index: u32, generation: u32) -> bool {
             let Some(slot) = self.slots.get_mut(index as usize) else {
                 return false;
             };
@@ -1697,6 +1853,20 @@ mod sys {
                 return self.unrun(index);
             }
             slot.canceled = true;
+            if slot.queued {
+                return true;
+            }
+            if slot.staged {
+                // The system never had it.
+                slot.staged = false;
+                // rr: escape(discard): a canceled operation is never tried
+                // again.
+                let _: bool = settle(slot, Err(os::CANCELED));
+                // rr: escape(bound): a slot is in ready once, and there are
+                // as many as its capacity.
+                self.ready.push_back(index);
+                return true;
+            }
             let data = user_data(index, generation);
             if self.backend.cancel(data, slot) {
                 // rr: escape(bound): a slot is in ready once, and there are
@@ -1720,7 +1890,9 @@ mod sys {
         /// for next.
         pub fn wait(&mut self, timeout: Option<Duration>) -> Result<usize, Error> {
             self.turn();
-            let running = self.slots.len() - self.free.len() - self.ready.len();
+            self.let_go();
+            self.submit();
+            let running = self.slots.len() - self.free.len() - self.ready.len() - self.held;
             let timeout = if (running == 0 && !self.wakeable) || !self.ready.is_empty() {
                 Some(Duration::ZERO)
             } else {
@@ -1731,6 +1903,36 @@ mod sys {
             self.returned();
             self.turned = backend::Backend::now();
             Ok(self.ready.len())
+        }
+
+        /// Hands the system what was started since the last wait.
+        fn submit(&mut self) {
+            let mut at = 0;
+            while let Some(&index) = self.staged.get(at) {
+                at += 1;
+                let Some(slot) = self.slots.get_mut(index as usize) else {
+                    continue;
+                };
+                if slot.state != State::Running || !slot.staged {
+                    continue;
+                }
+                slot.staged = false;
+                self.backend.submit(user_data(index, slot.generation), slot);
+            }
+            self.staged.clear();
+        }
+
+        /// Closes the Conns dropped since the last wait.
+        fn let_go(&mut self) {
+            self.gone.take(&mut self.taken);
+            let mut at = 0;
+            while let Some(&data) = self.taken.get(at) {
+                at += 1;
+                if let Some((index, generation)) = parts(data) {
+                    self.close_at(u32::try_from(index).unwrap_or(u32::MAX), generation);
+                }
+            }
+            self.taken.clear();
         }
 
         /// The turn that ends with this wait, kept when it is the slowest.
@@ -1777,59 +1979,251 @@ mod sys {
             }
             let index = self.ready.pop_front()?;
             let slot = self.slots.get_mut(index as usize)?;
-            let Work::Finished(done) = mem::replace(&mut slot.work, Work::Idle) else {
-                return None;
+            let work = mem::replace(&mut slot.work, Work::Idle);
+            let (key, given, owner, after) = (
+                slot.key,
+                slot.chunk.take(),
+                slot.owner.take(),
+                slot.after.take(),
+            );
+            self.free_slot(index);
+            if let Some(id) = given {
+                self.backend.give_back(id);
+            }
+            let done = match work {
+                Work::Finished(done) => {
+                    if let Some(owner) = owner {
+                        self.done_on(owner, index, after);
+                    }
+                    done
+                }
+                Work::Took(listener, result) => {
+                    let result = self.took(owner, result);
+                    Done::Accepted { listener, result }
+                }
+                Work::Made(result) => Done::Connected(self.made(owner, result)),
+                Work::Idle
+                | Work::Conn(_)
+                | Work::Accept(_)
+                | Work::Connect(_)
+                | Work::Receive(..)
+                | Work::Send(..)
+                | Work::Timeout(_)
+                | Work::SendTo(..)
+                | Work::ReceiveFrom(..)
+                | Work::Run(_)
+                | Work::ReceiveMany(_)
+                | Work::SendChunk { .. }
+                | Work::End(_)
+                | Work::Open(..)
+                | Work::Read(..)
+                | Work::Write(..)
+                | Work::Sync(_)
+                | Work::FileRun(..) => return None,
             };
-            let (given, owner) = (slot.chunk.take(), slot.owner.take());
+            self.last_key = key;
+            Some(Event { key, done })
+        }
+
+        /// An accept's connection, put in the slot reserved for it.
+        fn took(
+            &mut self,
+            reserved: Option<(u32, u32)>,
+            result: Result<(Stream, SocketAddr), Error>,
+        ) -> Result<(Conn, SocketAddr), Error> {
+            let Some((index, generation)) = reserved else {
+                return Err(Error::Other(0));
+            };
+            match result {
+                Ok((stream, peer)) => {
+                    if let Some(slot) = self.slots.get_mut(index as usize) {
+                        slot.work = Work::Conn(stream);
+                    }
+                    Ok((self.conn(index, generation), peer))
+                }
+                Err(error) => {
+                    self.free_slot(index);
+                    Err(error)
+                }
+            }
+        }
+
+        /// A connect's connection, in the slot it holds, or that slot freed.
+        fn made(
+            &mut self,
+            reserved: Option<(u32, u32)>,
+            result: Result<(), Error>,
+        ) -> Result<Conn, Error> {
+            let Some((index, generation)) = reserved else {
+                return Err(Error::Other(0));
+            };
+            match result {
+                Ok(()) => Ok(self.conn(index, generation)),
+                Err(error) => {
+                    self.free_slot(index);
+                    Err(error)
+                }
+            }
+        }
+
+        /// An operation on a Conn is done: the next send in its line is
+        /// staged, and a Conn closed with nothing more on it goes.
+        fn done_on(&mut self, owner: (u32, u32), index: u32, after: Option<u32>) {
+            let (conn, generation) = owner;
+            let Some(slot) = self.slots.get_mut(conn as usize) else {
+                return;
+            };
+            if slot.state != State::Held || slot.generation != generation {
+                return;
+            }
+            slot.users = slot.users.saturating_sub(1);
+            if slot.receiving == Some(index) {
+                slot.receiving = None;
+            }
+            let mut next = None;
+            if slot.sending == Some(index) {
+                slot.sending = after;
+                if after.is_none() {
+                    slot.last = None;
+                }
+                next = after;
+            }
+            let gone = slot.closing && slot.users == 0;
+            if let Some(next) = next {
+                self.stage(next);
+            }
+            if gone {
+                self.free_slot(conn);
+            }
+        }
+
+        /// Ends the Conn in slot index: its receive canceled, and the slot
+        /// freed once nothing works on it.
+        fn close_at(&mut self, index: u32, generation: u32) {
+            let Some(slot) = self.slots.get_mut(index as usize) else {
+                return;
+            };
+            if slot.state != State::Held || slot.generation != generation || slot.closing {
+                return;
+            }
+            slot.closing = true;
+            if slot.users == 0 {
+                self.free_slot(index);
+                return;
+            }
+            let Some(receiving) = slot.receiving else {
+                return;
+            };
+            let running = self
+                .slots
+                .get(receiving as usize)
+                .map_or(0, |receive| receive.generation);
+            // rr: escape(discard): one done already ends as it would.
+            let _: bool = self.cancel_at(receiving, running);
+        }
+
+        /// The slot of a Conn of this Io's that holds it.
+        fn held(&self, conn: &Conn) -> Option<&Slot> {
+            let slot = self.slots.get(conn.index as usize)?;
+            (conn.io == self.id && slot.state == State::Held && slot.generation == conn.generation)
+                .then_some(slot)
+        }
+
+        #[must_use]
+        fn held_mut(&mut self, conn: &Conn) -> Option<&mut Slot> {
+            let id = self.id;
+            let slot = self.slots.get_mut(conn.index as usize)?;
+            (conn.io == id && slot.state == State::Held && slot.generation == conn.generation)
+                .then_some(slot)
+        }
+
+        /// The descriptor of the Conn in slot index, its socket put in this
+        /// Io's completion port on Windows (once; a descriptor needs no tie
+        /// to a ring or a kqueue): Foreign for another's.
+        fn attach(&mut self, index: u32, generation: u32) -> Result<Raw, Error> {
+            let slot = self.slots.get_mut(index as usize).ok_or(Error::Foreign)?;
+            if slot.state != State::Held || slot.generation != generation {
+                return Err(Error::Foreign);
+            }
+            let Work::Conn(stream) = &mut slot.work else {
+                return Err(Error::Foreign);
+            };
+            // rr: section(os = windows)
+            #[cfg(windows)]
+            self.backend.attach(&mut stream.fd)?;
+            // rr: end(os = windows)
+            Ok(stream.fd.raw)
+        }
+
+        /// Two free slots: one for an operation, one held for the
+        /// connection it makes, by slot and generation.
+        #[must_use]
+        fn two(&mut self) -> Option<(u32, (u32, u32))> {
+            if self.free.len() < 2 {
+                return None;
+            }
+            let index = self.free.pop()?;
+            let reserved = self.free.pop()?;
+            let generation = self.hold(reserved, Work::Idle);
+            Some((index, (reserved, generation)))
+        }
+
+        /// Holds a free slot for a connection: its generation.
+        #[must_use]
+        fn hold(&mut self, index: u32, work: Work) -> u32 {
+            let Some(slot) = self.slots.get_mut(index as usize) else {
+                return 0;
+            };
+            self.held = self.held.saturating_add(1);
+            slot.state = State::Held;
+            slot.work = work;
+            slot.generation
+        }
+
+        fn conn(&self, index: u32, generation: u32) -> Conn {
+            Conn {
+                io: self.id,
+                index,
+                generation,
+                // rr: escape(copy): the Conn's holder of where it says it
+                // was dropped.
+                gone: Some(Arc::clone(&self.gone)),
+            }
+        }
+
+        /// Frees a slot, done or held: what it holds is dropped, a
+        /// connection's stream closed with it.
+        fn free_slot(&mut self, index: u32) {
+            let Some(slot) = self.slots.get_mut(index as usize) else {
+                return;
+            };
+            if slot.state == State::Held {
+                self.held = self.held.saturating_sub(1);
+            }
+            slot.work = Work::Idle;
             slot.state = State::Free;
             slot.generation = slot.generation.wrapping_add(1) & GENERATIONS;
             slot.canceled = false;
             slot.begun = false;
             slot.armed = None;
+            slot.chunk = None;
+            slot.owner = None;
+            slot.staged = false;
+            slot.queued = false;
+            slot.after = None;
+            slot.users = 0;
+            slot.receiving = None;
+            slot.sending = None;
+            slot.last = None;
+            slot.closing = false;
             slot.limit = None;
             slot.expired = false;
             slot.limited = false;
             slot.until = 0;
-            slot.sends = 0;
-            slot.ending = None;
-            let key = slot.key;
-            // rr: escape(bound): a slot is free or taken, and there are as
-            // many as its capacity.
             self.free.push(index);
-            if let (Some(id), Some(_)) = (given, owner) {
-                self.backend.give_back(id);
-            }
-            if let Some((owner, generation)) = owner {
-                self.sent_on(owner, generation);
-            }
-            self.last_key = key;
-            Some(Event { key, done })
         }
 
-        /// A send_chunk on owner's stream is done: the receive_many that
-        /// ended while it ran ends now, with the last.
-        fn sent_on(&mut self, owner: u32, generation: u32) {
-            let Some(slot) = self.slots.get_mut(owner as usize) else {
-                return;
-            };
-            if slot.generation != generation || slot.state != State::Running {
-                return;
-            }
-            slot.sends = slot.sends.saturating_sub(1);
-            if slot.sends > 0 {
-                return;
-            }
-            let Some(result) = slot.ending.take() else {
-                return;
-            };
-            if end_many(slot, result) {
-                // rr: escape(bound): a slot is in ready once, and there are
-                // as many as its capacity.
-                self.ready.push_back(owner);
-            }
-        }
-
-        fn start(&mut self, index: u32, key: u64, work: Work, limit: Option<Duration>) -> Op {
+        fn start(&mut self, index: u32, key: u64, work: Work, owner: Option<(u32, u32)>) -> Op {
             let Some(slot) = self.slots.get_mut(index as usize) else {
                 return Op {
                     index,
@@ -1839,13 +2233,45 @@ mod sys {
             slot.key = key;
             slot.work = work;
             slot.state = State::Running;
-            slot.limit = limit;
+            slot.owner = owner;
             if let Work::Accept(_) | Work::ReceiveFrom(..) = slot.work {
                 slot.length = u32::try_from(ADDRESS_BYTES).unwrap_or(0);
             }
             let generation = slot.generation;
-            self.backend.submit(user_data(index, generation), slot);
+            self.stage(index);
             Op { index, generation }
+        }
+
+        /// Hands a running operation to the next wait; a send's Data::End
+        /// is done here, and one canceled while it waited in line ends.
+        fn stage(&mut self, index: u32) {
+            let Some(slot) = self.slots.get_mut(index as usize) else {
+                return;
+            };
+            slot.queued = false;
+            if let (Work::End(fd), false) = (&slot.work, slot.canceled) {
+                let result = os::finish(*fd);
+                let buffer = Vec::new();
+                slot.work = Work::Finished(Done::Sent { buffer, result });
+                slot.state = State::Ready;
+                // rr: escape(bound): a slot is in ready once, and there are
+                // as many as its capacity.
+                self.ready.push_back(index);
+                return;
+            }
+            if slot.canceled {
+                // rr: escape(discard): a canceled operation is never tried
+                // again.
+                let _: bool = settle(slot, Err(os::CANCELED));
+                // rr: escape(bound): a slot is in ready once, and there are
+                // as many as its capacity.
+                self.ready.push_back(index);
+                return;
+            }
+            slot.staged = true;
+            // rr: escape(bound): a slot is staged once, and there are as
+            // many as its capacity.
+            self.staged.push(index);
         }
 
         /// Takes a run's work out of the pool's line, never run: whether it
@@ -1874,6 +2300,7 @@ mod sys {
                     return true;
                 }
                 other @ (Work::Idle
+                | Work::Conn(_)
                 | Work::Accept(_)
                 | Work::Connect(_)
                 | Work::Receive(..)
@@ -1883,11 +2310,14 @@ mod sys {
                 | Work::ReceiveFrom(..)
                 | Work::ReceiveMany(_)
                 | Work::SendChunk { .. }
+                | Work::End(_)
                 | Work::Open(..)
                 | Work::Read(..)
                 | Work::Write(..)
                 | Work::Sync(_)
-                | Work::Finished(_)) => {
+                | Work::Finished(_)
+                | Work::Took(..)
+                | Work::Made(_)) => {
                     slot.work = other;
                     return false;
                 }
@@ -1934,6 +2364,7 @@ mod sys {
                         continue;
                     }
                     other @ (Work::Idle
+                    | Work::Conn(_)
                     | Work::Accept(_)
                     | Work::Connect(_)
                     | Work::Receive(..)
@@ -1943,11 +2374,14 @@ mod sys {
                     | Work::ReceiveFrom(..)
                     | Work::ReceiveMany(_)
                     | Work::SendChunk { .. }
+                    | Work::End(_)
                     | Work::Open(..)
                     | Work::Read(..)
                     | Work::Write(..)
                     | Work::Sync(_)
-                    | Work::Finished(_)) => {
+                    | Work::Finished(_)
+                    | Work::Took(..)
+                    | Work::Made(_)) => {
                         slot.work = other;
                         continue;
                     }
@@ -1990,6 +2424,12 @@ mod sys {
 
     impl Drop for Io {
         fn drop(&mut self) {
+            // What the system never had needs no answer from it.
+            for slot in &mut self.slots {
+                if slot.state == State::Running && (slot.staged || slot.queued) {
+                    slot.state = State::Ready;
+                }
+            }
             self.backend.close(&mut self.slots);
         }
     }
@@ -3309,8 +3749,7 @@ mod sys {
             error,
         };
         use super::{
-            CANCEL, Error, LIMIT, Pool, Slot, State, Unavailable, WAKE, Work, end_many, running,
-            settle,
+            CANCEL, Error, LIMIT, Pool, Slot, State, Unavailable, WAKE, Work, running, settle,
         };
         use alloc::boxed::Box;
         use alloc::collections::VecDeque;
@@ -4044,7 +4483,14 @@ mod sys {
                         sqe.len = length.saturating_sub(*sent);
                         sqe.op_flags = MSG_NOSIGNAL;
                     }
-                    Work::Idle | Work::Run(_) | Work::FileRun(..) | Work::Finished(_) => return,
+                    Work::Idle
+                    | Work::Conn(_)
+                    | Work::End(_)
+                    | Work::Run(_)
+                    | Work::FileRun(..)
+                    | Work::Finished(_)
+                    | Work::Took(..)
+                    | Work::Made(_) => return,
                 }
                 let Some(limit) = slot.limit else {
                     self.push(sqe);
@@ -4203,9 +4649,8 @@ mod sys {
                     _ if res == -ENOBUFS => Err(Error::NoChunks),
                     _ => Err(error(res.saturating_neg())),
                 };
-                if end_many(slot, result) {
-                    ready.push_back(u32::try_from(index).unwrap_or(0));
-                }
+                super::stop(slot, result);
+                ready.push_back(u32::try_from(index).unwrap_or(0));
             }
 
             /// Cancels every operation and waits until the kernel answered
@@ -4324,7 +4769,7 @@ mod sys {
     mod backend {
         use super::os::c::{self, errno};
         use super::os::{EAGAIN, EINPROGRESS, F_SETFD, FD_CLOEXEC, SO_ERROR, SOL_SOCKET, error};
-        use super::{Answer, Error, Pool, Slot, WAKE, Work, end_many, running, settle};
+        use super::{Answer, Error, Pool, Slot, WAKE, Work, running, settle, stop};
         use alloc::collections::VecDeque;
         use alloc::sync::Arc;
         use alloc::vec::Vec;
@@ -4449,7 +4894,7 @@ mod sys {
             changes: Vec<Kevent>,
             /// What a wait takes from the kqueue: BATCH entries.
             events: Vec<Kevent>,
-            /// The chunks receive_many reads into.
+            /// The chunks a receive into Room::Chunks reads into.
             pub pool: Pool,
         }
 
@@ -4532,7 +4977,7 @@ mod sys {
                 unsafe { clock_gettime_nsec_np(8) }
             }
 
-            /// Reads what a receive_many's socket has into free chunks, at
+            /// Reads what a chunked receive's socket has into free chunks, at
             /// most TRIES of them a turn, as other operations are tried; its
             /// filter stays (not EV_ONESHOT) until it is over.
             fn drain_many(
@@ -4588,8 +5033,7 @@ mod sys {
                 }
             }
 
-            /// Ends a receive_many: its filter goes, and it is over now or
-            /// once the sends on its stream are done.
+            /// Ends a chunked receive: its filter goes, and it is over.
             fn end(
                 &mut self,
                 slot: &mut Slot,
@@ -4602,9 +5046,8 @@ mod sys {
                     self.delete(ident(fd), armed, data);
                     self.changes.retain(|c| c.udata.addr() as u64 != data);
                 }
-                if end_many(slot, result) {
-                    push_ready(ready, index);
-                }
+                stop(slot, result);
+                push_ready(ready, index);
             }
 
             /// Deletes what the kqueue waits on for an operation, at once.
@@ -4637,7 +5080,8 @@ mod sys {
                         self.delete(ident(fd), armed, data);
                         self.changes.retain(|c| c.udata.addr() as u64 != data);
                     }
-                    return end_many(slot, Err(Error::Canceled));
+                    stop(slot, Err(Error::Canceled));
+                    return true;
                 }
                 if let Some(filter) = slot.armed.take() {
                     let ident = if filter == EVFILT_TIMER {
@@ -4762,6 +5206,10 @@ mod sys {
                             | Work::ReceiveFrom(..)
                             | Work::ReceiveMany(_) => EVFILT_READ,
                             Work::Idle
+                            | Work::Conn(_)
+                            | Work::End(_)
+                            | Work::Took(..)
+                            | Work::Made(_)
                             | Work::Connect(_)
                             | Work::Send(..)
                             | Work::SendChunk { .. }
@@ -4903,6 +5351,10 @@ mod sys {
                     answer(got)
                 }
                 Work::Idle
+                | Work::Conn(_)
+                | Work::End(_)
+                | Work::Took(..)
+                | Work::Made(_)
                 | Work::Timeout(_)
                 | Work::Run(_)
                 | Work::ReceiveMany(_)
@@ -4958,7 +5410,7 @@ mod sys {
         use super::os::c::{self, WsaBuf};
         use super::os::{ABORTED, FOREIGN, SOL_SOCKET, WSA_IO_PENDING, last, socket};
         use super::{
-            Answer, Error, Pool, Raw, Slot, State, Work, end_many, running, settle, user_data,
+            Answer, Error, Pool, Raw, Slot, State, Work, running, settle, stop, user_data,
         };
         use crate::base::thread::INFINITE;
         use alloc::collections::VecDeque;
@@ -5128,7 +5580,8 @@ mod sys {
             retried: VecDeque<(u64, i32)>,
             /// The running timeouts by deadline, soonest first.
             timers: Vec<(u64, u64)>,
-            /// The chunks receive_many reads into, one WSARecv at a time.
+            /// The chunks a receive into Room::Chunks reads into, one WSARecv
+            /// at a time.
             pub pool: Pool,
         }
 
@@ -5227,6 +5680,12 @@ mod sys {
                 u64::try_from(nanos).unwrap_or(u64::MAX)
             }
 
+            /// Puts a Conn's socket in this port, once: Foreign when it is in
+            /// another's.
+            pub fn attach(&self, fd: &mut super::Fd) -> Result<(), Error> {
+                self.associate(fd).map_err(super::os::error)
+            }
+
             /// Puts the socket in this port, once: one in another's is
             /// refused.
             fn associate(&self, fd: &mut super::Fd) -> Result<(), i32> {
@@ -5311,8 +5770,7 @@ mod sys {
                         };
                         if accepted != 0 { 0 } else { -1 }
                     }
-                    Work::Connect(stream) => {
-                        self.associate(&mut stream.fd)?;
+                    Work::Connect(fd) => {
                         let any = if super::os::family_of(&slot.address) == Some(super::os::AF_INET)
                         {
                             SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
@@ -5320,16 +5778,13 @@ mod sys {
                             SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
                         };
                         let (bytes, length) = super::encode(&any);
-                        super::os::bind_code(
-                            stream.fd.raw,
-                            bytes.get(..length).unwrap_or_default(),
-                        )?;
+                        super::os::bind_code(*fd, bytes.get(..length).unwrap_or_default())?;
                         let named = i32::try_from(slot.length).unwrap_or(0);
                         // rr: escape(unsafe): address holds a sockaddr of
                         // length bytes; the OVERLAPPED is the slot's.
                         let connected = unsafe {
                             (self.connect_ex)(
-                                stream.fd.raw,
+                                *fd,
                                 slot.address.as_ptr(),
                                 named,
                                 null(),
@@ -5340,8 +5795,7 @@ mod sys {
                         };
                         if connected != 0 { 0 } else { -1 }
                     }
-                    Work::Receive(stream, buffer) => {
-                        self.associate(&mut stream.fd)?;
+                    Work::Receive(fd, buffer) => {
                         let room = buffer.spare_capacity_mut();
                         let parts = WsaBuf {
                             len: u32::try_from(room.len()).unwrap_or(u32::MAX),
@@ -5352,7 +5806,7 @@ mod sys {
                         // room, which the slot holds until the answer.
                         unsafe {
                             c::WSARecv(
-                                stream.fd.raw,
+                                *fd,
                                 &raw const parts,
                                 1,
                                 null_mut(),
@@ -5362,8 +5816,7 @@ mod sys {
                             )
                         }
                     }
-                    Work::Send(stream, buffer, sent) => {
-                        self.associate(&mut stream.fd)?;
+                    Work::Send(fd, buffer, sent) => {
                         let rest = buffer.get_mut(*sent..).unwrap_or_default();
                         let parts = WsaBuf {
                             len: u32::try_from(rest.len()).unwrap_or(u32::MAX),
@@ -5372,15 +5825,7 @@ mod sys {
                         // rr: escape(unsafe): the WSABUF names the rest of
                         // the buffer, which the slot holds until the answer.
                         unsafe {
-                            c::WSASend(
-                                stream.fd.raw,
-                                &raw const parts,
-                                1,
-                                null_mut(),
-                                0,
-                                overlapped,
-                                null(),
-                            )
+                            c::WSASend(*fd, &raw const parts, 1, null_mut(), 0, overlapped, null())
                         }
                     }
                     Work::SendTo(udp, buffer) => {
@@ -5432,8 +5877,7 @@ mod sys {
                             )
                         }
                     }
-                    Work::ReceiveMany(stream) => {
-                        self.associate(&mut stream.fd)?;
+                    Work::ReceiveMany(fd) => {
                         // No chunk free: a receive of no bytes, which answers
                         // once something came.
                         let id = self.pool.take();
@@ -5453,7 +5897,7 @@ mod sys {
                         // the pool, the operation's until its answer.
                         unsafe {
                             c::WSARecv(
-                                stream.fd.raw,
+                                *fd,
                                 &raw const parts,
                                 1,
                                 null_mut(),
@@ -5481,6 +5925,10 @@ mod sys {
                         }
                     }
                     Work::Idle
+                    | Work::Conn(_)
+                    | Work::End(_)
+                    | Work::Took(..)
+                    | Work::Made(_)
                     | Work::Timeout(_)
                     | Work::Run(_)
                     | Work::Open(..)
@@ -5621,7 +6069,7 @@ mod sys {
                 ready.push_back(u32::try_from(index).unwrap_or(0));
             }
 
-            /// A receive_many's answer: its chunk filled and the next started,
+            /// A chunked receive's answer: its chunk filled and the next started,
             /// or its end, the chunk given back.
             fn many(
                 &mut self,
@@ -5655,9 +6103,8 @@ mod sys {
                 if let Some(id) = slot.chunk.take().or(id) {
                     self.pool.put(id);
                 }
-                if end_many(slot, result) {
-                    ready.push_back(u32::try_from(index).unwrap_or(0));
-                }
+                stop(slot, result);
+                ready.push_back(u32::try_from(index).unwrap_or(0));
             }
 
             /// Ends the timeouts whose deadlines passed, soonest first.
@@ -5821,6 +6268,10 @@ mod sys {
                     }
                 }
                 Work::Idle
+                | Work::Conn(_)
+                | Work::End(_)
+                | Work::Took(..)
+                | Work::Made(_)
                 | Work::Receive(..)
                 | Work::Send(..)
                 | Work::SendTo(..)
@@ -5847,7 +6298,9 @@ mod tests {
     //! io's tests on real sockets: TCP over loopback, a server and its
     //! clients in one Io, as a loop runs them.
 
-    use super::{Done, Error, Event, File, Io, Listener, Open, Stream, Udp, Unavailable, Work};
+    use super::{
+        Conn, Data, Done, Error, Event, File, Io, Listener, Open, Room, Udp, Unavailable, Work,
+    };
     use alloc::boxed::Box;
     use alloc::sync::Arc;
     use alloc::vec::Vec;
@@ -5862,8 +6315,12 @@ mod tests {
     const CLIENT: u64 = 4;
     const TURN: Duration = Duration::from_millis(10);
 
-    fn io(ops: usize) -> Io {
-        match Io::new(ops) {
+    fn io(slots: usize) -> Io {
+        chunked(slots, 0, 0)
+    }
+
+    fn chunked(slots: usize, chunks: usize, size: usize) -> Io {
+        match Io::new(slots, chunks, size) {
             Ok(io) => io,
             Err(Error::Unavailable(why)) => panic!("no io_uring: {why:?}"),
             Err(e) => panic!("Io::new: {e:?}"),
@@ -5891,7 +6348,7 @@ mod tests {
 
     /// A connection to a listener on address: the server's end, the
     /// client's, and the listener.
-    fn pair(io: &mut Io, address: SocketAddr) -> (Stream, Stream, Listener) {
+    fn pair(io: &mut Io, address: SocketAddr) -> (Conn, Conn, Listener) {
         let bound = Listener::bind(address, 16).unwrap();
         let at = bound.local().unwrap();
         assert!(io.accept(bound, ACCEPT).is_ok());
@@ -5900,9 +6357,9 @@ mod tests {
         for _ in 0..2 {
             let event = next(io);
             if let Done::Accepted { listener, result } = event.done {
-                let (stream, peer) = result.unwrap();
+                let (conn, peer) = result.unwrap();
                 assert_eq!(peer.ip(), at.ip());
-                server = Some(stream);
+                server = Some(conn);
                 listening = Some(listener);
             } else if let Done::Connected(result) = event.done {
                 client = Some(result.unwrap());
@@ -5913,36 +6370,36 @@ mod tests {
         (server.unwrap(), client.unwrap(), listening.unwrap())
     }
 
-    fn send(io: &mut Io, stream: Stream, bytes: &[u8], key: u64) {
-        let mut buffer = Vec::with_capacity(bytes.len());
+    fn send(io: &mut Io, conn: &Conn, bytes: &[u8], key: u64) {
         // rr: escape(copy): the send owns its buffer.
-        buffer.extend_from_slice(bytes);
-        assert!(io.send(stream, buffer, key).is_ok());
+        assert!(io.send(conn, Data::Bytes(Vec::from(bytes)), key).is_ok());
     }
 
-    fn receive(io: &mut Io, stream: Stream, room: usize, key: u64) {
-        assert!(io.receive(stream, Vec::with_capacity(room), key).is_ok());
+    fn receive(io: &mut Io, conn: &Conn, room: usize, key: u64) {
+        let room = Room::Buffer(Vec::with_capacity(room));
+        assert!(io.receive(conn, room, key).is_ok());
     }
 
-    fn sent(event: Event) -> Stream {
-        let Done::Sent { stream, result, .. } = event.done else {
+    /// A buffer that holds a 7, with room for more.
+    fn seven() -> Vec<u8> {
+        let mut buffer = Vec::with_capacity(16);
+        buffer.push(7);
+        buffer
+    }
+
+    fn sent(event: &Event) {
+        let Done::Sent { result, .. } = &event.done else {
             panic!("not a send");
         };
-        result.unwrap();
-        stream
+        assert_eq!(*result, Ok(()));
     }
 
-    fn received(event: Event) -> (Stream, Vec<u8>) {
-        let Done::Received {
-            stream,
-            buffer,
-            result,
-        } = event.done
-        else {
+    fn received(event: Event) -> Vec<u8> {
+        let Done::Received { buffer, result } = event.done else {
             panic!("not a receive");
         };
         assert_eq!(result.unwrap(), buffer.len());
-        (stream, buffer)
+        buffer
     }
 
     #[test]
@@ -5950,27 +6407,28 @@ mod tests {
         for address in [v4(), v6()] {
             let mut io = io(8);
             let (server, client, _listener) = pair(&mut io, address);
-            send(&mut io, client, b"hello", CLIENT);
-            receive(&mut io, server, 64, SERVER);
-            let (mut back, mut served) = (None, None);
+            send(&mut io, &client, b"hello", CLIENT);
+            receive(&mut io, &server, 64, SERVER);
             for _ in 0..2 {
                 let event = next(&mut io);
                 if event.key == CLIENT {
-                    back = Some(sent(event));
+                    sent(&event);
                 } else {
-                    let (stream, buffer) = received(event);
-                    assert_eq!(buffer, b"hello");
-                    served = Some(stream);
+                    assert_eq!(received(event), b"hello");
                 }
             }
-            send(&mut io, served.unwrap(), b"back", SERVER);
-            receive(&mut io, back.unwrap(), 64, CLIENT);
+            send(&mut io, &server, b"back", SERVER);
+            receive(&mut io, &client, 64, CLIENT);
             for _ in 0..2 {
                 let event = next(&mut io);
                 if event.key == CLIENT {
-                    assert_eq!(received(event).1, b"back");
+                    assert_eq!(received(event), b"back");
                 }
             }
+            assert_eq!(
+                io.stream(&client).unwrap().peer(),
+                io.stream(&server).unwrap().local()
+            );
         }
     }
 
@@ -5978,21 +6436,100 @@ mod tests {
     fn appends_after_what_it_holds() {
         let mut io = io(8);
         let (server, client, _listener) = pair(&mut io, v4());
-        send(&mut io, client, b"two", CLIENT);
-        let _client = sent(next(&mut io));
+        send(&mut io, &client, b"two", CLIENT);
+        sent(&next(&mut io));
         let mut buffer = Vec::with_capacity(16);
         buffer.extend_from_slice(b"one ");
-        assert!(io.receive(server, buffer, SERVER).is_ok());
+        assert!(io.receive(&server, Room::Buffer(buffer), SERVER).is_ok());
         let Done::Received {
             buffer: got,
             result,
-            ..
         } = next(&mut io).done
         else {
             panic!("not a receive");
         };
         assert_eq!(result, Ok(3));
         assert_eq!(got, b"one two");
+    }
+
+    /// A receive runs while the Conn sends: each way at once, as a
+    /// WebSocket or HTTP/2 connection is; a second receive is Busy.
+    #[test]
+    fn both_ways_at_once() {
+        let mut io = io(16);
+        let (server, client, _listener) = pair(&mut io, v4());
+        receive(&mut io, &server, 64, SERVER);
+        receive(&mut io, &server, 64, 9);
+        let Done::Received { result, .. } = next(&mut io).done else {
+            panic!("not a receive");
+        };
+        assert_eq!(result, Err(Error::Busy));
+        send(&mut io, &server, b"from the server", SERVER + 10);
+        receive(&mut io, &client, 64, CLIENT);
+        let (mut heard, mut said) = (false, false);
+        while !heard || !said {
+            let event = next(&mut io);
+            match event.key {
+                CLIENT => {
+                    assert_eq!(received(event), b"from the server");
+                    send(&mut io, &client, b"and back", CLIENT + 10);
+                }
+                SERVER => {
+                    assert_eq!(received(event), b"and back");
+                    heard = true;
+                }
+                _ => {
+                    sent(&event);
+                    said |= true;
+                }
+            }
+        }
+    }
+
+    /// Sends on a Conn go in the order they were started, each whole,
+    /// however the system takes them; End goes after them.
+    #[test]
+    fn sends_in_order() {
+        let mut io = io(64);
+        let (server, client, _listener) = pair(&mut io, v4());
+        let parts = 32u8;
+        let size = 256 << 10;
+        for part in 0..parts {
+            let mut bytes = Vec::with_capacity(size);
+            bytes.resize(size, part);
+            let key = 100 + u64::from(part);
+            assert!(io.send(&client, Data::Bytes(bytes), key).is_ok());
+        }
+        assert!(io.send(&client, Data::End, 99).is_ok());
+        receive(&mut io, &server, 64 << 10, SERVER);
+        let (mut got, mut keys, mut ended) = (Vec::new(), Vec::new(), false);
+        while !ended {
+            let event = next(&mut io);
+            if event.key != SERVER {
+                keys.push(event.key);
+                sent(&event);
+                continue;
+            }
+            let part = received(event);
+            ended = part.is_empty();
+            got.extend_from_slice(&part);
+            if !ended {
+                receive(&mut io, &server, 64 << 10, SERVER);
+            }
+        }
+        while keys.len() < usize::from(parts) + 1 {
+            let event = next(&mut io);
+            keys.push(event.key);
+            sent(&event);
+        }
+        assert_eq!(got.len(), usize::from(parts) * size);
+        for (i, chunk) in got.chunks(size).enumerate() {
+            assert!(chunk.iter().all(|&b| usize::from(b) == i));
+        }
+        // rr: escape(copy): the keys in the order the sends started.
+        let mut order: Vec<u64> = (100..100 + u64::from(parts)).collect();
+        order.push(99);
+        assert_eq!(keys, order);
     }
 
     #[test]
@@ -6006,13 +6543,13 @@ mod tests {
         }
     }
 
+    /// cancel ends a receive with the system and a timeout, and one not
+    /// yet handed to it; each comes back with what it was given.
     #[test]
     fn cancel() {
         let mut io = io(8);
-        let (server, _client, _listener) = pair(&mut io, v4());
-        let mut held = Vec::with_capacity(16);
-        held.push(7);
-        let Ok(receiving) = io.receive(server, held, SERVER) else {
+        let (server, client, _listener) = pair(&mut io, v4());
+        let Ok(receiving) = io.receive(&server, Room::Buffer(seven()), SERVER) else {
             panic!("full");
         };
         let Ok(timer) = io.timeout(Duration::from_secs(60), CLIENT) else {
@@ -6022,13 +6559,16 @@ mod tests {
         assert!(io.cancel(&receiving));
         assert!(io.cancel(&timer));
         assert!(!io.cancel(&timer));
+        let Ok(staged) = io.receive(&client, Room::Buffer(Vec::with_capacity(8)), 9) else {
+            panic!("full");
+        };
+        assert!(io.cancel(&staged));
         let mut seen = 0;
-        for _ in 0..2 {
+        for _ in 0..3 {
             let event = next(&mut io);
-            if let Done::Received { buffer, result, .. } = event.done {
+            if let Done::Received { buffer, result } = event.done {
                 assert_eq!(result, Err(Error::Canceled));
-                assert_eq!(buffer, [7]);
-                seen |= 1;
+                seen |= if buffer == [7] { 1 } else { 4 };
             } else if let Done::Elapsed(result) = event.done {
                 assert_eq!(result, Err(Error::Canceled));
                 seen |= 2;
@@ -6036,48 +6576,84 @@ mod tests {
                 panic!("another operation");
             }
         }
-        assert_eq!(seen, 3);
+        assert_eq!(seen, 7);
     }
 
-    /// A receive within a time gives up with TimedOut once it passed, its
-    /// buffer as it was; one the peer answers in time receives; a send
-    /// within a time sends.
+    /// A send canceled while it waits for those before it on its Conn
+    /// ends when they are done, never sent.
     #[test]
-    fn within() {
+    fn cancel_in_line() {
         let mut io = io(8);
         let (server, client, _listener) = pair(&mut io, v4());
-        let mut held = Vec::with_capacity(16);
-        held.push(7);
+        send(&mut io, &client, b"first", 1);
+        let Ok(second) = io.send(&client, Data::Bytes(Vec::from(*b"second")), 2) else {
+            panic!("full");
+        };
+        assert!(io.cancel(&second));
+        send(&mut io, &client, b" third", 3);
+        let mut results = Vec::new();
+        for _ in 0..3 {
+            let event = next(&mut io);
+            let Done::Sent { result, .. } = event.done else {
+                panic!("not a send");
+            };
+            results.push((event.key, result));
+        }
+        assert_eq!(
+            results,
+            [(1, Ok(())), (2, Err(Error::Canceled)), (3, Ok(()))]
+        );
+        receive(&mut io, &server, 64, SERVER);
+        let mut got = received(next(&mut io));
+        while got.len() < 11 {
+            receive(&mut io, &server, 64, SERVER);
+            got.extend_from_slice(&received(next(&mut io)));
+        }
+        assert_eq!(got, b"first third");
+    }
+
+    /// limit ends a receive with TimedOut once its time passed, its buffer
+    /// as it was; one the peer answers in time receives; limit after the
+    /// wait that handed an operation to the system is Late, and on a
+    /// timeout NoLimit.
+    #[test]
+    fn limit() {
+        let mut io = io(8);
+        let (server, client, _listener) = pair(&mut io, v4());
         let quick = Duration::from_millis(30);
-        assert!(io.receive_within(server, held, quick, SERVER).is_ok());
-        let Done::Received {
-            stream: quiet,
-            buffer,
-            result,
-        } = next(&mut io).done
-        else {
+        let Ok(op) = io.receive(&server, Room::Buffer(seven()), SERVER) else {
+            panic!("full");
+        };
+        assert_eq!(io.limit(&op, quick), Ok(()));
+        let Done::Received { buffer, result } = next(&mut io).done else {
             panic!("not a receive");
         };
         assert_eq!(result, Err(Error::TimedOut));
         assert_eq!(buffer, [7]);
         let long = Duration::from_secs(10);
-        assert!(
-            io.receive_within(quiet, Vec::with_capacity(16), long, SERVER)
-                .is_ok()
-        );
-        let mut bytes = Vec::with_capacity(4);
-        bytes.extend_from_slice(b"late");
-        assert!(io.send_within(client, bytes, long, CLIENT).is_ok());
+        let Ok(answered) = io.receive(&server, Room::Buffer(Vec::with_capacity(16)), SERVER) else {
+            panic!("full");
+        };
+        assert_eq!(io.limit(&answered, long), Ok(()));
+        let Ok(sending) = io.send(&client, Data::Bytes(Vec::from(*b"late")), CLIENT) else {
+            panic!("full");
+        };
+        assert_eq!(io.limit(&sending, long), Ok(()));
+        assert_eq!(io.wait(Some(Duration::ZERO)).map(|_| ()), Ok(()));
+        assert_eq!(io.limit(&answered, long), Err(Error::Late));
         for _ in 0..2 {
             let event = next(&mut io);
             if event.key == CLIENT {
-                let _client = sent(event);
+                sent(&event);
             } else {
-                assert_eq!(received(event).1, b"late");
+                assert_eq!(received(event), b"late");
             }
         }
         // The time of one done in time does not end another in its slot.
-        assert!(io.timeout(Duration::from_millis(60), 9).is_ok());
+        let Ok(timer) = io.timeout(Duration::from_millis(60), 9) else {
+            panic!("full");
+        };
+        assert_eq!(io.limit(&timer, long), Err(Error::NoLimit));
         assert_eq!(next(&mut io).key, 9);
     }
 
@@ -6092,26 +6668,32 @@ mod tests {
         assert!(!io.cancel(&timer));
     }
 
+    /// A full table hands back what it was given; an accept takes two
+    /// slots, its own and its connection's.
     #[test]
     fn full_table_hands_back() {
-        let mut io = io(2);
+        let mut io = io(3);
         assert!(io.timeout(Duration::from_secs(60), 1).is_ok());
         assert!(io.timeout(Duration::from_secs(60), 2).is_ok());
-        let three = Duration::from_secs(3);
-        assert_eq!(io.timeout(three, 3).err(), Some(three));
         let listener = Listener::bind(v4(), 1).unwrap();
         let at = listener.local();
         let Err(back) = io.accept(listener, 4) else {
             panic!("room in a full table");
         };
         assert_eq!(back.local(), at);
+        assert!(io.timeout(Duration::from_secs(60), 3).is_ok());
+        let three = Duration::from_secs(3);
+        assert_eq!(io.timeout(three, 3).err(), Some(three));
     }
 
     #[test]
     fn no_room() {
         let mut io = io(8);
         let (server, _client, _listener) = pair(&mut io, v4());
-        assert!(io.receive(server, Vec::new(), SERVER).is_ok());
+        assert!(
+            io.receive(&server, Room::Buffer(Vec::new()), SERVER)
+                .is_ok()
+        );
         let Done::Received { result, .. } = next(&mut io).done else {
             panic!("not a receive");
         };
@@ -6131,22 +6713,102 @@ mod tests {
         assert_eq!(result.err(), Some(Error::Refused));
     }
 
+    /// A Conn closed, or dropped, ends: its peer reads its end.
     #[test]
     fn peer_end() {
         let mut io = io(8);
         let (server, client, _listener) = pair(&mut io, v4());
-        drop(client);
-        receive(&mut io, server, 16, SERVER);
-        assert!(received(next(&mut io)).1.is_empty());
+        io.close(client);
+        receive(&mut io, &server, 16, SERVER);
+        assert!(received(next(&mut io)).is_empty());
+        let (second, dropped, _bound) = pair(&mut io, v4());
+        drop(dropped);
+        receive(&mut io, &second, 16, SERVER);
+        assert!(received(next(&mut io)).is_empty());
     }
 
+    /// End ends what a Conn sends; it still receives.
     #[test]
-    fn finish_ends_what_it_sends() {
+    fn end_ends_what_it_sends() {
         let mut io = io(8);
         let (server, client, _listener) = pair(&mut io, v4());
-        client.finish().unwrap();
-        receive(&mut io, server, 16, SERVER);
-        assert!(received(next(&mut io)).1.is_empty());
+        assert!(io.send(&client, Data::End, CLIENT).is_ok());
+        sent(&next(&mut io));
+        receive(&mut io, &server, 16, SERVER);
+        assert!(received(next(&mut io)).is_empty());
+        send(&mut io, &server, b"still", SERVER);
+        receive(&mut io, &client, 16, CLIENT);
+        for _ in 0..2 {
+            let event = next(&mut io);
+            if event.key == CLIENT {
+                assert_eq!(received(event), b"still");
+            }
+        }
+    }
+
+    /// A Conn closed after a send closes once all of it is sent: none of
+    /// it is lost.
+    #[test]
+    fn close_after_send() {
+        let mut io = io(8);
+        let (server, client, _listener) = pair(&mut io, v4());
+        let size = 4 << 20;
+        let mut bytes = Vec::with_capacity(size);
+        bytes.resize(size, 5);
+        assert!(io.send(&server, Data::Bytes(bytes), SERVER).is_ok());
+        io.close(server);
+        let (mut got, mut ended, mut done) = (0, false, false);
+        receive(&mut io, &client, 64 << 10, CLIENT);
+        while !ended || !done {
+            let event = next(&mut io);
+            if event.key == SERVER {
+                sent(&event);
+                done = true;
+                continue;
+            }
+            let part = received(event);
+            ended = part.is_empty();
+            got += part.len();
+            if !ended {
+                receive(&mut io, &client, 64 << 10, CLIENT);
+            }
+        }
+        assert_eq!(got, size);
+    }
+
+    /// A Conn's stream is released for another Io to adopt, not while an
+    /// operation works on it; a Conn of another Io is Foreign there. (A
+    /// stream an Io ran stays in its completion port on Windows: one goes
+    /// to another loop before its first operation, as queue hands it.)
+    #[test]
+    fn release_and_adopt() {
+        let mut io = io(16);
+        let (busy, _peer, _bound) = pair(&mut io, v4());
+        let Ok(op) = io.receive(&busy, Room::Buffer(Vec::with_capacity(8)), SERVER) else {
+            panic!("full");
+        };
+        let Err(_busy) = io.release(busy) else {
+            panic!("released while it receives");
+        };
+        assert!(io.cancel(&op));
+        let _canceled = next(&mut io);
+        let (server, client, _listener) = pair(&mut io, v4());
+        let Ok(stream) = io.release(server) else {
+            panic!("not released");
+        };
+        let mut other = chunked(8, 0, 0);
+        let Ok(adopted) = other.adopt(stream) else {
+            panic!("not adopted");
+        };
+        receive(&mut other, &client, 8, 7);
+        let Done::Received { result, .. } = next(&mut other).done else {
+            panic!("not a receive");
+        };
+        assert_eq!(result, Err(Error::Foreign));
+        send(&mut io, &client, b"moved", CLIENT);
+        sent(&next(&mut io));
+        receive(&mut other, &adopted, 8, SERVER);
+        assert_eq!(received(next(&mut other)), b"moved");
     }
 
     /// A send larger than what the system buffers ends when the peer has
@@ -6161,25 +6823,25 @@ mod tests {
         for (i, b) in buffer.iter_mut().enumerate() {
             *b = u8::try_from(i % 251).unwrap();
         }
-        assert!(io.send(client, buffer, CLIENT).is_ok());
-        receive(&mut io, server, 64 << 10, SERVER);
+        assert!(io.send(&client, Data::Bytes(buffer), CLIENT).is_ok());
+        receive(&mut io, &server, 64 << 10, SERVER);
         let mut got = 0usize;
         let mut done = false;
         while !done || got < size {
             let event = next(&mut io);
             if event.key == CLIENT {
-                let _client = sent(event);
+                sent(&event);
                 done = true;
                 continue;
             }
-            let (stream, part) = received(event);
+            let part = received(event);
             assert!(!part.is_empty());
             for (i, &b) in part.iter().enumerate() {
                 assert_eq!(usize::from(b), (got + i) % 251);
             }
             got += part.len();
             if got < size {
-                receive(&mut io, stream, 64 << 10, SERVER);
+                receive(&mut io, &server, 64 << 10, SERVER);
             }
         }
         assert_eq!(got, size);
@@ -6188,7 +6850,7 @@ mod tests {
     #[test]
     fn many_connections() {
         let count = 64;
-        let mut io = io(2 * count + 2);
+        let mut io = io(4 * count + 4);
         let bound = Listener::bind(v4(), 128).unwrap();
         let at = bound.local().unwrap();
         assert!(io.accept(bound, ACCEPT).is_ok());
@@ -6209,17 +6871,17 @@ mod tests {
                 panic!("not a connection");
             }
         }
-        for stream in connected {
-            send(&mut io, stream, b"x", CLIENT);
+        for conn in &connected {
+            send(&mut io, conn, b"x", CLIENT);
         }
-        for stream in accepted {
-            receive(&mut io, stream, 4, SERVER);
+        for conn in &accepted {
+            receive(&mut io, conn, 4, SERVER);
         }
         let mut bytes = 0;
         for _ in 0..2 * count {
             let event = next(&mut io);
             if event.key == SERVER {
-                bytes += received(event).1.len();
+                bytes += received(event).len();
             }
         }
         assert_eq!(bytes, count);
@@ -6229,13 +6891,14 @@ mod tests {
     /// let go of them.
     #[test]
     fn dropped_running() {
-        let mut io = io(8);
+        let mut io = io(16);
         let (server, client, listener) = pair(&mut io, v4());
-        receive(&mut io, server, 1 << 16, SERVER);
-        receive(&mut io, client, 1 << 16, CLIENT);
+        receive(&mut io, &server, 1 << 16, SERVER);
+        receive(&mut io, &client, 1 << 16, CLIENT);
         assert!(io.accept(listener, ACCEPT).is_ok());
         assert!(io.timeout(Duration::from_secs(60), 9).is_ok());
         assert_eq!(io.wait(Some(Duration::ZERO)), Ok(0));
+        send(&mut io, &server, b"never handed", 5);
         drop(io);
     }
 
@@ -6320,39 +6983,35 @@ mod tests {
         }
     }
 
-    /// What a peer sends comes in chunks of the Io's, as it comes, which
-    /// send_chunk sends back; the peer's end stops the receive, after the
-    /// send, with the stream.
+    /// What a peer sends comes in chunks of the Io's, as it comes, which a
+    /// send sends back with no copy; the peer's end stops the receive.
     #[test]
     fn chunks_echo() {
-        let mut io = Io::with_chunks(8, 8, 64).unwrap();
+        let mut io = chunked(8, 8, 64);
         let (server, client, _listener) = pair(&mut io, v4());
-        let Ok(receiving) = io.receive_many(server, SERVER) else {
-            panic!("full");
-        };
-        send(&mut io, client, b"hello", CLIENT);
-        let mut back = None;
-        let mut sent = false;
-        while !sent || back.is_none() {
+        assert!(io.receive(&server, Room::Chunks, SERVER).is_ok());
+        send(&mut io, &client, b"hello", CLIENT);
+        let mut back = false;
+        let mut sent_back = false;
+        while !sent_back || !back {
             let event = next(&mut io);
             if let Done::Chunk(chunk) = event.done {
                 assert_eq!(io.bytes(&chunk), Some(&b"hello"[..]));
-                assert!(io.send_chunk(&receiving, chunk, 7).is_ok());
-            } else if let Done::SentChunk(result) = event.done {
-                assert_eq!(event.key, 7);
-                result.unwrap();
-                sent = true;
-            } else if let Done::Sent { stream, .. } = event.done {
-                back = Some(stream);
+                assert!(io.send(&server, Data::Chunk(chunk), 7).is_ok());
+            } else if event.key == 7 {
+                sent(&event);
+                sent_back = true;
+            } else if event.key == CLIENT {
+                sent(&event);
+                back = true;
             } else {
                 panic!("another operation");
             }
         }
-        receive(&mut io, back.unwrap(), 16, CLIENT);
-        let (peer, buffer) = received(next(&mut io));
-        assert_eq!(buffer, b"hello");
-        drop(peer);
-        let Done::Stopped { result, .. } = next(&mut io).done else {
+        receive(&mut io, &client, 16, CLIENT);
+        assert_eq!(received(next(&mut io)), b"hello");
+        io.close(client);
+        let Done::Stopped(result) = next(&mut io).done else {
             panic!("not the end");
         };
         assert_eq!(result, Ok(()));
@@ -6363,37 +7022,37 @@ mod tests {
     /// io_uring's ENOBUFS does.
     #[test]
     fn chunks_in_turn_and_none_free() {
-        let mut io = Io::with_chunks(8, 4, 4).unwrap();
+        let mut io = chunked(8, 4, 4);
         let (server, client, _listener) = pair(&mut io, v4());
-        assert!(io.receive_many(server, SERVER).is_ok());
-        send(&mut io, client, b"0123456789", CLIENT);
+        assert!(io.receive(&server, Room::Chunks, SERVER).is_ok());
+        send(&mut io, &client, b"0123456789", CLIENT);
         let mut got = Vec::new();
-        let mut sender = None;
-        while got.len() < 10 || sender.is_none() {
+        let mut done = false;
+        while got.len() < 10 || !done {
             let event = next(&mut io);
             if let Done::Chunk(chunk) = event.done {
                 got.extend_from_slice(io.bytes(&chunk).unwrap());
                 assert!(io.give_back(chunk).is_ok());
-            } else if let Done::Sent { stream, .. } = event.done {
-                sender = Some(stream);
+            } else if event.key == CLIENT {
+                sent(&event);
+                done = true;
             } else {
                 panic!("another operation");
             }
         }
         assert_eq!(got, b"0123456789");
-        send(&mut io, sender.unwrap(), b"ab", CLIENT);
+        send(&mut io, &client, b"ab", CLIENT);
         let mut held = Vec::new();
         loop {
             let event = next(&mut io);
             if let Done::Chunk(chunk) = event.done {
                 held.push(chunk);
-            } else if let Done::Sent { stream, .. } = event.done {
-                send(&mut io, stream, b"cdefghijklmnop", CLIENT);
-            } else if let Done::Stopped { result, .. } = event.done {
+            } else if let Done::Stopped(result) = event.done {
                 assert_eq!(result, Err(Error::NoChunks));
                 break;
             } else {
-                panic!("another operation");
+                sent(&event);
+                send(&mut io, &client, b"cdefghijklmnop", CLIENT);
             }
         }
         for chunk in held {
@@ -6401,17 +7060,30 @@ mod tests {
         }
     }
 
-    /// An Io without chunks stops a receive_many at once; a chunk of
+    /// An Io without chunks stops a receive into them at once; a chunk of
     /// another Io is refused.
     #[test]
     fn chunks_refused() {
         let mut io = io(8);
-        let (server, _client, _listener) = pair(&mut io, v4());
-        assert!(io.receive_many(server, SERVER).is_ok());
-        let Done::Stopped { result, .. } = next(&mut io).done else {
+        let (server, client, _listener) = pair(&mut io, v4());
+        assert!(io.receive(&server, Room::Chunks, SERVER).is_ok());
+        let Done::Stopped(result) = next(&mut io).done else {
             panic!("not the end");
         };
         assert_eq!(result, Err(Error::NoChunks));
+        let mut other = chunked(8, 4, 16);
+        let (there, peer, _bound) = pair(&mut other, v4());
+        assert!(other.receive(&there, Room::Chunks, SERVER).is_ok());
+        send(&mut other, &peer, b"x", CLIENT);
+        let chunk = loop {
+            if let Done::Chunk(chunk) = next(&mut other).done {
+                break chunk;
+            }
+        };
+        let Err(Data::Chunk(chunk)) = io.send(&client, Data::Chunk(chunk), 1) else {
+            panic!("another Io's chunk sent");
+        };
+        assert!(io.give_back(chunk).is_err());
     }
 
     /// Listeners that share an address, where the kernel spreads the
@@ -6538,18 +7210,20 @@ mod tests {
 
     /// One byte to one server of a hundred, each with a receive waiting,
     /// and its receive started again: what a loop of many idle connections
-    /// pays for the one that speaks (net's one_of_a_thousand, with fewer,
-    /// as macOS gives a process 256 descriptors).
+    /// pays for the one that speaks (with a hundred, as macOS gives a
+    /// process 256 descriptors).
     #[bench]
     fn one_of_a_hundred(b: &mut Bencher) {
         const PAIRS: u64 = 100;
-        let mut io = io(2 * 100 + 8);
+        let mut io = io(4 * 100 + 8);
         let mut clients = Vec::new();
+        let mut servers = Vec::new();
         let mut listeners = Vec::new();
         for key in 0..PAIRS {
             let (server, client, listener) = pair(&mut io, v4());
-            assert!(io.receive(server, Vec::with_capacity(16), key).is_ok());
-            clients.push(Some(client));
+            receive(&mut io, &server, 16, key);
+            servers.push(server);
+            clients.push(client);
             listeners.push(listener);
         }
         let mut turn = 0u64;
@@ -6561,19 +7235,21 @@ mod tests {
             let mut bytes = out.take().unwrap();
             bytes.clear();
             bytes.push(1);
-            let client = clients[index].take().unwrap();
-            assert!(io.send(client, bytes, CLIENT + PAIRS).is_ok());
+            assert!(
+                io.send(&clients[index], Data::Bytes(bytes), CLIENT + PAIRS)
+                    .is_ok()
+            );
             for _ in 0..2 {
                 let event = next(&mut io);
-                if let Done::Sent { stream, buffer, .. } = event.done {
-                    clients[index] = Some(stream);
+                if let Done::Sent { buffer, .. } = event.done {
                     out = Some(buffer);
-                } else if let Done::Received {
-                    stream, mut buffer, ..
-                } = event.done
-                {
+                } else if let Done::Received { mut buffer, .. } = event.done {
                     buffer.clear();
-                    assert!(io.receive(stream, buffer, event.key).is_ok());
+                    let at = usize::try_from(event.key).unwrap();
+                    assert!(
+                        io.receive(&servers[at], Room::Buffer(buffer), event.key)
+                            .is_ok()
+                    );
                 } else {
                     panic!("another operation");
                 }
@@ -6588,23 +7264,20 @@ mod tests {
     fn round_trip(b: &mut Bencher) {
         let mut io = io(8);
         let (server, client, _listener) = pair(&mut io, v4());
-        let (mut server, mut client) = (Some(server), Some(client));
         let (mut out, mut room) = (Some(Vec::with_capacity(64)), Some(Vec::with_capacity(64)));
         b.iter(|| {
             let mut bytes = out.take().unwrap();
             bytes.clear();
             bytes.push(1);
-            assert!(io.send(client.take().unwrap(), bytes, CLIENT).is_ok());
+            assert!(io.send(&client, Data::Bytes(bytes), CLIENT).is_ok());
             let mut into = room.take().unwrap();
             into.clear();
-            assert!(io.receive(server.take().unwrap(), into, SERVER).is_ok());
+            assert!(io.receive(&server, Room::Buffer(into), SERVER).is_ok());
             for _ in 0..2 {
                 let event = next(&mut io);
-                if let Done::Sent { stream, buffer, .. } = event.done {
-                    client = Some(stream);
+                if let Done::Sent { buffer, .. } = event.done {
                     out = Some(buffer);
-                } else if let Done::Received { stream, buffer, .. } = event.done {
-                    server = Some(stream);
+                } else if let Done::Received { buffer, .. } = event.done {
                     room = Some(buffer);
                 } else {
                     panic!("another operation");

@@ -7,10 +7,11 @@
 //! and bench its connections a second.
 //!
 //! A queue between threads, for a loop on each core: it carries an
-//! accepted connection (an io::Stream, which no Io ran yet) and a tag from
-//! the thread that accepts to a worker's loop, whose Io each push wakes;
-//! the worker pops it after its wait and starts receiving on it in its
-//! own Io, the only one it ever runs in (on Windows a socket stays in the
+//! accepted connection (an io::Stream, released from the accepting Io
+//! before any operation ran on it) and a tag from the thread that accepts
+//! to a worker's loop, whose Io each push wakes; the worker pops it after
+//! its wait, adopts it as a Conn and starts receiving on it in its own Io,
+//! the only one it ever runs in (on Windows a socket stays in the
 //! completion port it first ran in). That is how a server spreads its
 //! connections over its cores, as no system but Linux does it itself.
 //!
@@ -287,7 +288,7 @@ mod tests {
     //! thread hands each connection to a worker's queue, round robin.
 
     use super::{CAPACITY_MAX, Closed, Error, Push, Receiver, Sender, channel};
-    use crate::base::io::{Done, Event, Io, Listener, Stream};
+    use crate::base::io::{Conn, Data, Done, Event, Io, Listener, Room, Stream};
     use crate::base::thread::{Thread, Work, start};
     use alloc::boxed::Box;
     use alloc::sync::Arc;
@@ -323,10 +324,11 @@ mod tests {
         panic!("no event in ten seconds");
     }
 
-    /// count connections accepted on a listener of their own, which no Io
-    /// ran; and their clients, which keep them open.
-    fn accepted(count: usize) -> (Vec<Stream>, Vec<Stream>) {
-        let mut io = Io::new(2 * count + 2).unwrap();
+    /// count connections accepted on a listener of their own, released
+    /// before any operation ran on them; and the Io of their clients,
+    /// which keep them open.
+    fn accepted(count: usize) -> (Vec<Stream>, Io, Vec<Conn>) {
+        let mut io = Io::new(4 * count + 4, 0, 0).unwrap();
         let bound = Listener::bind(loopback(), 16).unwrap();
         let at = bound.local().unwrap();
         assert!(io.accept(bound, ACCEPT).is_ok());
@@ -337,7 +339,10 @@ mod tests {
         while servers.len() < count || clients.len() < count {
             let event = next(&mut io);
             if let Done::Accepted { listener, result } = event.done {
-                servers.push(result.unwrap().0);
+                let Ok(stream) = io.release(result.unwrap().0) else {
+                    panic!("not released");
+                };
+                servers.push(stream);
                 if servers.len() < count {
                     assert!(io.accept(listener, ACCEPT).is_ok());
                 }
@@ -347,7 +352,7 @@ mod tests {
                 panic!("not a connection");
             }
         }
-        (servers, clients)
+        (servers, io, clients)
     }
 
     /// A queue takes what its capacity holds and refuses the rest at once,
@@ -356,14 +361,14 @@ mod tests {
     /// gone refuses pushes. A capacity of 0 is refused.
     #[test]
     fn line() {
-        let mut io = Io::new(4).unwrap();
+        let mut io = Io::new(4, 0, 0).unwrap();
         assert!(matches!(channel(0, io.waker()), Err(Error::Capacity)));
         assert!(matches!(
             channel(CAPACITY_MAX + 1, io.waker()),
             Err(Error::Capacity)
         ));
         let (sender, receiver) = channel(2, io.waker()).unwrap();
-        let (mut streams, _clients) = accepted(3);
+        let (mut streams, _peers, _clients) = accepted(3);
         let third = streams.pop().unwrap();
         for (tag, stream) in streams.into_iter().enumerate() {
             assert!(sender.push(stream, u64::try_from(tag).unwrap()).is_ok());
@@ -392,9 +397,9 @@ mod tests {
     /// for the end when its last sender goes.
     #[test]
     fn blocks_until_pushed() {
-        let mut io = Io::new(4).unwrap();
+        let mut io = Io::new(4, 0, 0).unwrap();
         let (sender, receiver) = channel(4, io.waker()).unwrap();
-        let (mut streams, _clients) = accepted(1);
+        let (mut streams, _peers, _clients) = accepted(1);
         // rr: escape(shared): the waiting thread counts what it took.
         let taken = Arc::new(AtomicUsize::new(0));
         let thread = start(Box::new(Taker {
@@ -426,10 +431,12 @@ mod tests {
     /// A worker: its Io, made on the test's thread and moved to its own
     /// before its first wait, and its queue; it echoes what each connection
     /// sends until its queue closes, and counts the connections it served.
+    /// Its connections are by their key.
     struct Worker {
         io: Io,
         receiver: Receiver,
         served: Arc<AtomicUsize>,
+        conns: Vec<Option<Conn>>,
     }
 
     impl Work for Worker {
@@ -447,9 +454,26 @@ mod tests {
             worker.io.wait(Some(Duration::from_secs(10))).unwrap();
             loop {
                 match worker.receiver.pop() {
-                    Ok(Some((stream, tag))) => {
-                        let room = Vec::with_capacity(256);
-                        assert!(worker.io.receive(stream, room, tag).is_ok());
+                    Ok(Some((stream, _tag))) => {
+                        let Ok(conn) = worker.io.adopt(stream) else {
+                            panic!("a full table");
+                        };
+                        // A key a closed connection left, or a new one, as
+                        // many as the Io holds.
+                        let at = match worker.conns.iter().position(Option::is_none) {
+                            Some(at) => at,
+                            None if worker.conns.len() < 4 * AT_ONCE => {
+                                worker.conns.push(None);
+                                worker.conns.len() - 1
+                            }
+                            None => panic!("more connections than the Io holds"),
+                        };
+                        let key = u64::try_from(at).unwrap();
+                        let room = Room::Buffer(Vec::with_capacity(256));
+                        assert!(worker.io.receive(&conn, room, key).is_ok());
+                        if let Some(free) = worker.conns.get_mut(at) {
+                            *free = Some(conn);
+                        }
                         open += 1;
                     }
                     Ok(None) => break,
@@ -460,28 +484,38 @@ mod tests {
                 }
             }
             while let Some(event) = worker.io.next() {
-                open -= echo(&mut worker.io, event, &worker.served);
+                open -= echo(worker, event);
             }
         }
     }
 
-    /// Sends back what a connection received, and closes it once that is
-    /// sent: the server closes first, so that TIME_WAIT stays on its side,
-    /// where its one port is, and not on the clients' ephemeral ports,
-    /// which a bench of many connections would use up. 1 when one closed.
-    fn echo(io: &mut Io, event: Event, served: &AtomicUsize) -> usize {
+    /// Sends back what a connection received and closes it, which ends it
+    /// once that is sent: the server closes first, so that TIME_WAIT stays
+    /// on its side, where its one port is, and not on the clients'
+    /// ephemeral ports, which a bench of many connections would use up. 1
+    /// when one closed.
+    fn echo(worker: &mut Worker, event: Event) -> usize {
+        let index = usize::try_from(event.key).unwrap();
         match event.done {
-            Done::Received {
-                stream,
-                buffer,
-                result: Ok(count),
-            } if count > 0 => {
-                assert!(io.send(stream, buffer, event.key).is_ok());
-                0
-            }
-            Done::Received { .. } | Done::Sent { .. } => {
-                served.fetch_add(1, Ordering::AcqRel);
+            Done::Received { buffer, result } => {
+                let Some(conn) = worker.conns.get_mut(index).and_then(Option::take) else {
+                    panic!("no such connection");
+                };
+                if result.is_ok_and(|count| count > 0) {
+                    assert!(
+                        worker
+                            .io
+                            .send(&conn, Data::Bytes(buffer), event.key)
+                            .is_ok()
+                    );
+                }
+                worker.io.close(conn);
+                worker.served.fetch_add(1, Ordering::AcqRel);
                 1
+            }
+            Done::Sent { result, .. } => {
+                assert!(result.is_ok());
+                0
             }
             Done::Accepted { .. }
             | Done::Connected(_)
@@ -490,8 +524,7 @@ mod tests {
             | Done::SentTo { .. }
             | Done::ReceivedFrom { .. }
             | Done::Chunk(_)
-            | Done::Stopped { .. }
-            | Done::SentChunk(_)
+            | Done::Stopped(_)
             | Done::Opened { .. }
             | Done::Read { .. }
             | Done::Written { .. }
@@ -526,8 +559,11 @@ mod tests {
                     panic!("not an accept");
                 };
                 assert!(acceptor.io.accept(listener, ACCEPT).is_ok());
-                let Ok((stream, _peer)) = result else {
+                let Ok((conn, _peer)) = result else {
                     continue;
+                };
+                let Ok(stream) = acceptor.io.release(conn) else {
+                    panic!("not released");
                 };
                 let count = acceptor.senders.len();
                 let tag = u64::try_from(next).unwrap();
@@ -554,7 +590,7 @@ mod tests {
         let address = listener.local().unwrap();
         let (mut senders, mut workers) = (Vec::new(), Vec::new());
         for _ in 0..WORKERS {
-            let mut io = Io::new(4 * AT_ONCE).unwrap();
+            let mut io = Io::new(4 * AT_ONCE, 0, 0).unwrap();
             let (sender, receiver) = channel(AT_ONCE, io.waker()).unwrap();
             senders.push(sender);
             // rr: escape(shared): the worker counts, the test reads.
@@ -564,13 +600,14 @@ mod tests {
                 receiver,
                 // rr: escape(copy): the worker's holder of the count.
                 served: Arc::clone(&served),
+                conns: Vec::new(),
             };
             workers.push((start(Box::new(worker)).unwrap(), served));
         }
         // rr: escape(shared): the test tells the acceptor to end.
         let stop = Arc::new(AtomicBool::new(false));
         let acceptor = Acceptor {
-            io: Io::new(4).unwrap(),
+            io: Io::new(4, 0, 0).unwrap(),
             listener: Some(listener),
             senders,
             // rr: escape(copy): the acceptor's holder of the flag.
@@ -598,46 +635,50 @@ mod tests {
         served
     }
 
-    /// count clients of address, AT_ONCE at a time, each sending MESSAGE,
-    /// reading it back, and then the server's end.
+    /// count clients of address, AT_ONCE at a time, each sending MESSAGE
+    /// as it receives, reading it back, and then the server's end; each by
+    /// its key in conns.
     fn clients(io: &mut Io, address: SocketAddr, count: usize) {
         let mut done = 0;
+        let mut conns: Vec<Option<Conn>> = Vec::with_capacity(AT_ONCE);
         while done < count {
             let batch = AT_ONCE.min(count - done);
-            for _ in 0..batch {
-                assert!(io.connect(address, 0).is_ok());
+            conns.clear();
+            for key in 0..batch {
+                assert!(io.connect(address, u64::try_from(key).unwrap()).is_ok());
+                conns.push(None);
             }
             let mut left = batch;
             while left > 0 {
                 let event = next(io);
+                let index = usize::try_from(event.key).unwrap();
                 match event.done {
                     Done::Connected(result) => {
-                        let mut bytes = Vec::with_capacity(MESSAGE.len());
-                        bytes.extend_from_slice(MESSAGE);
-                        assert!(io.send(result.unwrap(), bytes, 0).is_ok());
+                        let conn = result.unwrap();
+                        let bytes = Data::Bytes(Vec::from(MESSAGE));
+                        assert!(io.send(&conn, bytes, event.key).is_ok());
+                        let room = Room::Buffer(Vec::with_capacity(64));
+                        assert!(io.receive(&conn, room, event.key).is_ok());
+                        if let Some(at) = conns.get_mut(index) {
+                            *at = Some(conn);
+                        }
                     }
-                    Done::Sent {
-                        stream,
-                        mut buffer,
-                        result,
-                    } => {
-                        result.unwrap();
-                        buffer.clear();
-                        assert!(io.receive(stream, buffer, 0).is_ok());
-                    }
-                    Done::Received {
-                        stream,
-                        buffer,
-                        result,
-                    } => {
+                    Done::Sent { result, .. } => result.unwrap(),
+                    Done::Received { mut buffer, result } => {
+                        let Some(conn) = conns.get_mut(index).and_then(Option::take) else {
+                            panic!("no such connection");
+                        };
                         if result.unwrap() == 0 {
+                            io.close(conn);
                             left -= 1;
                             continue;
                         }
                         assert_eq!(buffer, MESSAGE);
-                        let mut rest = buffer;
-                        rest.clear();
-                        assert!(io.receive(stream, rest, 0).is_ok());
+                        buffer.clear();
+                        assert!(io.receive(&conn, Room::Buffer(buffer), event.key).is_ok());
+                        if let Some(at) = conns.get_mut(index) {
+                            *at = Some(conn);
+                        }
                     }
                     Done::Accepted { .. }
                     | Done::Elapsed(_)
@@ -645,8 +686,7 @@ mod tests {
                     | Done::SentTo { .. }
                     | Done::ReceivedFrom { .. }
                     | Done::Chunk(_)
-                    | Done::Stopped { .. }
-                    | Done::SentChunk(_)
+                    | Done::Stopped(_)
                     | Done::Opened { .. }
                     | Done::Read { .. }
                     | Done::Written { .. }
@@ -661,7 +701,7 @@ mod tests {
     #[test]
     fn every_worker_serves() {
         let server = server();
-        let mut io = Io::new(4 * AT_ONCE).unwrap();
+        let mut io = Io::new(4 * AT_ONCE, 0, 0).unwrap();
         clients(&mut io, server.address, 8 * WORKERS);
         drop(io);
         let served = stop(server);
@@ -673,7 +713,7 @@ mod tests {
     #[bench]
     fn connections(b: &mut Bencher) {
         let server = server();
-        let mut io = Io::new(4 * AT_ONCE).unwrap();
+        let mut io = Io::new(4 * AT_ONCE, 0, 0).unwrap();
         b.iter(|| clients(&mut io, server.address, AT_ONCE));
         drop(io);
         drop(stop(server));
