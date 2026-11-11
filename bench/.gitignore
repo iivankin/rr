@@ -1,0 +1,10 @@
+# What build.sh and the runs make.
+/rr/build/
+/load/load
+/*/server
+/c-uring/liburing/
+/tokio/target/
+/monoio/target/
+/zig/.tools/
+/zig/.zig-cache/
+/results/
