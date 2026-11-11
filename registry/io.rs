@@ -108,8 +108,8 @@ compile_error!("rr add cut io without windows: add it again with windows in --op
 
 pub use crate::base::thread::Work;
 pub use sys::{
-    AF_INET, AF_INET6, Done, Error, Event, Io, Listener, Op, SOCK_STREAM, Stream, Udp, Unavailable,
-    Waker,
+    AF_INET, AF_INET6, Chunk, Done, Error, Event, Io, Listener, Op, SOCK_STREAM, Stream, Udp,
+    Unavailable, Waker,
 };
 
 // rr: section(os = linux macos)
@@ -134,6 +134,7 @@ mod sys {
     use core::cell::UnsafeCell;
     use core::mem;
     use core::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+    use core::sync::atomic::{AtomicU32, Ordering};
     use core::time::Duration;
     use os::Raw;
 
@@ -160,8 +161,12 @@ mod sys {
         /// told from the peer's end.
         NoRoom,
         /// Windows: a stream or listener another Io ran first; a socket
-        /// stays in the completion port it was first in.
+        /// stays in the completion port it was first in. Everywhere: a
+        /// Chunk given to another Io than its own.
         Foreign,
+        /// receive_many: no chunk was free for what came (or the Io has
+        /// none): give chunks back and receive again.
+        NoChunks,
         /// Io::new: the system has no way to run one.
         Unavailable(Unavailable),
         /// Anything else: the system's code (errno).
@@ -345,6 +350,21 @@ mod sys {
             buffer: Vec<u8>,
             result: Result<(), Error>,
         },
+        /// What came on a receive_many, in a chunk of the Io's: its bytes
+        /// are bytes(&chunk), until it is given back (give_back, or
+        /// send_chunk, which gives it back once sent). More come with the
+        /// same key until Stopped.
+        Chunk(Chunk),
+        /// A receive_many is over: the stream, and Ok when the peer ended
+        /// what it sends; Canceled, NoChunks or another error else. It comes
+        /// after the stream's chunks, and after each send_chunk on it.
+        Stopped {
+            stream: Stream,
+            result: Result<(), Error>,
+        },
+        /// A send_chunk is done, all of the chunk sent unless it failed; the
+        /// chunk is the Io's again.
+        SentChunk(Result<(), Error>),
         /// The work, back from thread's pool once it ran, or never run when
         /// canceled in line.
         Ran {
@@ -374,6 +394,18 @@ mod sys {
         ReceiveFrom(Udp, Vec<u8>),
         /// Work on thread's pool, which tells the Io when it returned.
         Run(Job),
+        /// A multishot receive into the Io's chunks; the stream stays until
+        /// it is over and the sends on it are done.
+        ReceiveMany(Stream),
+        /// A chunk sent on a receive_many's stream: its descriptor, which the
+        /// receive keeps open until this is done, the chunk, its length,
+        /// and how much of it the system took.
+        SendChunk {
+            fd: Raw,
+            id: u16,
+            length: u32,
+            sent: u32,
+        },
         /// Done: what the next Event hands back.
         Finished(Done),
     }
@@ -418,6 +450,14 @@ mod sys {
         /// kqueue: a connect begun, or the filter it waits on.
         begun: bool,
         armed: Option<i16>,
+        /// receive_many: the send_chunks running on its stream, and how it
+        /// ended, while they run; IOCP: the chunk its receive fills.
+        sends: u32,
+        ending: Option<Result<(), Error>>,
+        chunk: Option<u16>,
+        /// send_chunk: the receive_many whose stream it sends on, by slot
+        /// and generation.
+        owner: Option<(u32, u32)>,
         /// How long the operation may take (receive_within and its kin),
         /// whether that time passed, whether its timer is set (kqueue,
         /// IOCP), and when it ends on the monotonic clock (io_uring).
@@ -457,6 +497,10 @@ mod sys {
                 canceled: false,
                 begun: false,
                 armed: None,
+                sends: 0,
+                ending: None,
+                chunk: None,
+                owner: None,
                 limit: None,
                 expired: false,
                 limited: false,
@@ -477,6 +521,8 @@ mod sys {
                     Some(stream.fd.raw)
                 }
                 Work::SendTo(udp, _) | Work::ReceiveFrom(udp, _) => Some(udp.fd.raw),
+                Work::ReceiveMany(stream) => Some(stream.fd.raw),
+                Work::SendChunk { fd, .. } => Some(*fd),
                 Work::Idle | Work::Timeout(_) | Work::Run(_) | Work::Finished(_) => None,
             }
         }
@@ -484,6 +530,12 @@ mod sys {
 
     /// The table: as many slots as the Io was made with, at most this many.
     const OPS_MAX: usize = 32_768;
+    /// The most chunks an Io has: their ids are u16, and io_uring's ring of
+    /// them holds at most this many.
+    const CHUNKS_MAX: usize = 32_768;
+
+    // rr: escape(shared): each Io's number, for its chunks, from any thread.
+    static NEXT_IO: AtomicU32 = AtomicU32::new(1);
 
     /// What the system says of an operation: a count or a descriptor, or
     /// an errno.
@@ -656,13 +708,141 @@ mod sys {
                     false,
                 )
             }
-            (other @ (Work::Idle | Work::Run(_) | Work::Finished(_)), _) => (other, false),
+            (
+                Work::SendChunk {
+                    fd,
+                    id,
+                    length,
+                    sent,
+                },
+                Ok(count),
+            ) => {
+                let sent = sent.saturating_add(u32::try_from(count).unwrap_or(u32::MAX));
+                if sent < length && count > 0 && !canceled {
+                    let more = Work::SendChunk {
+                        fd,
+                        id,
+                        length,
+                        sent,
+                    };
+                    (more, true)
+                } else {
+                    let result = if sent < length {
+                        Err(if canceled {
+                            Error::Canceled
+                        } else {
+                            Error::Reset
+                        })
+                    } else {
+                        Ok(())
+                    };
+                    (Work::Finished(Done::SentChunk(result)), false)
+                }
+            }
+            (work @ Work::SendChunk { .. }, Err(code)) if os::again(code) && !canceled => {
+                (work, true)
+            }
+            (Work::SendChunk { .. }, Err(code)) => {
+                (Work::Finished(Done::SentChunk(Err(os::error(code)))), false)
+            }
+            (other @ (Work::Idle | Work::Run(_) | Work::ReceiveMany(_) | Work::Finished(_)), _) => {
+                (other, false)
+            }
         };
         slot.work = work;
         if !again {
             slot.state = State::Ready;
         }
         again
+    }
+
+    /// Ends a receive_many as the system said, its stream handed back
+    /// (true), or once the send_chunks on it are done (false, ending kept).
+    #[must_use]
+    fn end_many(slot: &mut Slot, result: Result<(), Error>) -> bool {
+        if slot.sends > 0 {
+            slot.ending.get_or_insert(result);
+            return false;
+        }
+        let Work::ReceiveMany(stream) = mem::replace(&mut slot.work, Work::Idle) else {
+            return false;
+        };
+        slot.work = Work::Finished(Done::Stopped { stream, result });
+        slot.state = State::Ready;
+        true
+    }
+
+    /// A chunk of an Io's, which receive_many filled: the program's until it
+    /// gives it back or sends it. It names its Io, which refuses another's.
+    #[must_use = "a chunk is the Io's again only once given back or sent"]
+    pub struct Chunk {
+        io: u32,
+        id: u16,
+        length: u32,
+    }
+
+    /// The chunks of an Io, which receive_many fills: count of size bytes,
+    /// in one block that never moves; the ids free (kqueue, IOCP; io_uring
+    /// keeps them in its ring), and the chunks filled and not yet handed
+    /// out, with their keys and lengths.
+    pub struct Pool {
+        bytes: Box<[u8]>,
+        size: usize,
+        count: usize,
+        free: Vec<u16>,
+        filled: VecDeque<(u64, u16, u32)>,
+    }
+
+    impl Pool {
+        fn new(count: usize, size: usize) -> Pool {
+            let mut bytes = Vec::new();
+            bytes.resize(count.saturating_mul(size), 0u8);
+            let mut free = Vec::with_capacity(count);
+            for id in (0..count).rev() {
+                free.push(u16::try_from(id).unwrap_or(0));
+            }
+            Pool {
+                bytes: bytes.into_boxed_slice(),
+                size,
+                count,
+                free,
+                filled: VecDeque::with_capacity(count),
+            }
+        }
+
+        /// The first byte of chunk id, for the system to write.
+        fn at(&mut self, id: u16) -> *mut u8 {
+            let start = usize::from(id)
+                .saturating_mul(self.size)
+                .min(self.bytes.len());
+            self.bytes.as_mut_ptr().wrapping_add(start)
+        }
+
+        fn slice(&self, id: u16, length: u32) -> &[u8] {
+            let start = usize::from(id).saturating_mul(self.size);
+            let end = start
+                .saturating_add(length as usize)
+                .min(start.saturating_add(self.size));
+            self.bytes.get(start..end).unwrap_or_default()
+        }
+
+        /// Hands out a filled chunk of key, at most one for each chunk.
+        fn fill(&mut self, key: u64, id: u16, length: u32) {
+            if self.filled.len() < self.count {
+                self.filled.push_back((key, id, length));
+            }
+        }
+
+        #[must_use]
+        fn take(&mut self) -> Option<u16> {
+            self.free.pop()
+        }
+
+        fn put(&mut self, id: u16) {
+            if self.free.len() < self.count {
+                self.free.push(id);
+            }
+        }
     }
 
     /// The connection an accept took, made as every stream here is, and
@@ -681,6 +861,8 @@ mod sys {
     }
 
     pub struct Io {
+        /// Which Io this is, as its chunks name it.
+        id: u32,
         slots: Box<[Slot]>,
         /// The free slots, and those done, in the order they were.
         free: Vec<u32>,
@@ -756,8 +938,25 @@ mod sys {
         /// An Io of so many operations at once (at least 1, at most
         /// 32768), on this thread.
         pub fn new(ops: usize) -> Result<Io, Error> {
+            Io::with_chunks(ops, 0, 0)
+        }
+
+        /// An Io of so many operations, and chunks of size bytes for its
+        /// receive_many (count at most 32768, a power of two on Linux,
+        /// rounded up; none when 0).
+        pub fn with_chunks(ops: usize, count: usize, size: usize) -> Result<Io, Error> {
             let ops = ops.clamp(1, OPS_MAX);
-            let backend = Box::new(backend::Backend::new(u32::try_from(ops).unwrap_or(1))?);
+            let count = if count == 0 {
+                0
+            } else {
+                count.clamp(1, CHUNKS_MAX).next_power_of_two()
+            };
+            let size = size.clamp(1, u32::MAX as usize);
+            let pool = Pool::new(count, size);
+            let backend = Box::new(backend::Backend::new(
+                u32::try_from(ops).unwrap_or(1),
+                pool,
+            )?);
             let mut slots = Vec::with_capacity(ops);
             slots.resize_with(ops, Slot::new);
             let mut free = Vec::with_capacity(ops);
@@ -765,6 +964,7 @@ mod sys {
                 free.push(u32::try_from(index).unwrap_or(0));
             }
             Ok(Io {
+                id: NEXT_IO.fetch_add(1, Ordering::Relaxed),
                 slots: slots.into_boxed_slice(),
                 free,
                 ready: VecDeque::with_capacity(ops),
@@ -922,6 +1122,78 @@ mod sys {
             Ok(self.start(index, key, Work::Send(stream, buffer, 0), limit))
         }
 
+        /// Receives what stream brings into the Io's chunks, as it comes,
+        /// until the peer ends, an error, or cancel: an Event of Chunk with
+        /// key for each part, then Stopped with the stream. On io_uring a
+        /// multishot receive into a ring of the chunks the kernel picks
+        /// from (IORING_RECV_MULTISHOT, IORING_REGISTER_PBUF_RING): no
+        /// receive to start again for each part. Send on the stream meanwhile
+        /// with send_chunk.
+        pub fn receive_many(&mut self, stream: Stream, key: u64) -> Result<Op, Stream> {
+            let Some(index) = self.free.pop() else {
+                return Err(stream);
+            };
+            if self.backend.pool.count == 0 {
+                let result = Err(Error::NoChunks);
+                return Ok(self.finish(index, key, Done::Stopped { stream, result }));
+            }
+            Ok(self.start(index, key, Work::ReceiveMany(stream), None))
+        }
+
+        /// Sends chunk on the stream of receiving, a receive_many of this Io
+        /// that runs, and gives it back once sent: its Event is SentChunk.
+        /// Err hands the chunk back: a full table, receiving over, or a
+        /// chunk of another Io.
+        pub fn send_chunk(&mut self, receiving: &Op, chunk: Chunk, key: u64) -> Result<Op, Chunk> {
+            if chunk.io != self.id {
+                return Err(chunk);
+            }
+            let (index, generation) = (receiving.index, receiving.generation);
+            let fd = match self.slots.get(index as usize) {
+                Some(owner)
+                    if owner.state == State::Running
+                        && owner.generation == generation
+                        && owner.ending.is_none() =>
+                {
+                    owner.fd()
+                }
+                _ => None,
+            };
+            let (Some(fd), Some(slot)) = (fd, self.free.pop()) else {
+                return Err(chunk);
+            };
+            if let Some(owner) = self.slots.get_mut(index as usize) {
+                owner.sends = owner.sends.saturating_add(1);
+            }
+            if let Some(sending) = self.slots.get_mut(slot as usize) {
+                sending.chunk = Some(chunk.id);
+                sending.owner = Some((index, generation));
+            }
+            let work = Work::SendChunk {
+                fd,
+                id: chunk.id,
+                length: chunk.length,
+                sent: 0,
+            };
+            Ok(self.start(slot, key, work, None))
+        }
+
+        /// The bytes of a chunk of this Io; None for another's.
+        #[must_use]
+        pub fn bytes(&self, chunk: &Chunk) -> Option<&[u8]> {
+            (chunk.io == self.id).then(|| self.backend.pool.slice(chunk.id, chunk.length))
+        }
+
+        /// Gives a chunk back for receive_many to fill again; Err for
+        /// another Io's, which is handed back.
+        pub fn give_back(&mut self, chunk: Chunk) -> Result<(), Chunk> {
+            if chunk.io != self.id {
+                return Err(chunk);
+            }
+            self.backend.give_back(chunk.id);
+            Ok(())
+        }
+
         /// Sends buffer to address, as one datagram.
         pub fn send_to(
             &mut self,
@@ -1065,11 +1337,23 @@ mod sys {
         /// The next operation done, which frees its slot.
         #[must_use]
         pub fn next(&mut self) -> Option<Event> {
+            if let Some((key, id, length)) = self.backend.pool.filled.pop_front() {
+                let chunk = Chunk {
+                    io: self.id,
+                    id,
+                    length,
+                };
+                return Some(Event {
+                    key,
+                    done: Done::Chunk(chunk),
+                });
+            }
             let index = self.ready.pop_front()?;
             let slot = self.slots.get_mut(index as usize)?;
             let Work::Finished(done) = mem::replace(&mut slot.work, Work::Idle) else {
                 return None;
             };
+            let (given, owner) = (slot.chunk.take(), slot.owner.take());
             slot.state = State::Free;
             slot.generation = slot.generation.wrapping_add(1) & GENERATIONS;
             slot.canceled = false;
@@ -1079,11 +1363,42 @@ mod sys {
             slot.expired = false;
             slot.limited = false;
             slot.until = 0;
+            slot.sends = 0;
+            slot.ending = None;
             let key = slot.key;
             // rr: escape(bound): a slot is free or taken, and there are as
             // many as its capacity.
             self.free.push(index);
+            if let (Some(id), Some(_)) = (given, owner) {
+                self.backend.give_back(id);
+            }
+            if let Some((owner, generation)) = owner {
+                self.sent_on(owner, generation);
+            }
             Some(Event { key, done })
+        }
+
+        /// A send_chunk on owner's stream is done: the receive_many that
+        /// ended while it ran ends now, with the last.
+        fn sent_on(&mut self, owner: u32, generation: u32) {
+            let Some(slot) = self.slots.get_mut(owner as usize) else {
+                return;
+            };
+            if slot.generation != generation || slot.state != State::Running {
+                return;
+            }
+            slot.sends = slot.sends.saturating_sub(1);
+            if slot.sends > 0 {
+                return;
+            }
+            let Some(result) = slot.ending.take() else {
+                return;
+            };
+            if end_many(slot, result) {
+                // rr: escape(bound): a slot is in ready once, and there are
+                // as many as its capacity.
+                self.ready.push_back(owner);
+            }
         }
 
         fn start(&mut self, index: u32, key: u64, work: Work, limit: Option<Duration>) -> Op {
@@ -1881,6 +2196,7 @@ mod sys {
         pub const TIMED_OUT: i32 = WSAETIMEDOUT;
         /// No system's code: a socket in another Io's completion port.
         pub const FOREIGN: i32 = -1;
+
         const WSAEINTR: i32 = 10004;
         const WSAEACCES: i32 = 10013;
         const WSAEWOULDBLOCK: i32 = 10035;
@@ -2116,13 +2432,16 @@ mod sys {
             EAGAIN, EBUSY, EINVAL, ENOSYS, EPERM, ETIME, MSG_NOSIGNAL, SOCK_CLOEXEC, SOCK_NONBLOCK,
             error,
         };
-        use super::{CANCEL, Error, LIMIT, Slot, State, Unavailable, WAKE, Work, running, settle};
+        use super::{
+            CANCEL, Error, LIMIT, Pool, Slot, State, Unavailable, WAKE, Work, end_many, running,
+            settle,
+        };
         use alloc::boxed::Box;
         use alloc::collections::VecDeque;
         use alloc::sync::Arc;
         use core::ffi::{c_char, c_int, c_long, c_void};
         use core::ptr::null_mut;
-        use core::sync::atomic::{AtomicU32, Ordering};
+        use core::sync::atomic::{AtomicU16, AtomicU32, Ordering};
         use core::time::Duration;
 
         #[link(name = "c")]
@@ -2185,6 +2504,17 @@ mod sys {
         const OP_LINK_TIMEOUT: u8 = 15;
         const OP_SEND: u8 = 26;
         const IOSQE_IO_LINK: u8 = 1 << 2;
+        const IOSQE_BUFFER_SELECT: u8 = 1 << 5;
+        /// IORING_RECV_MULTISHOT, in ioprio.
+        const RECV_MULTISHOT: u16 = 1 << 1;
+        const CQE_F_BUFFER: u32 = 1 << 0;
+        const CQE_F_MORE: u32 = 1 << 1;
+        const CQE_BUFFER_SHIFT: u32 = 16;
+        const REGISTER_PBUF_RING: c_long = 22;
+        /// errno.h's: the ring of chunks was empty.
+        const ENOBUFS: c_int = 105;
+        /// sys/mman.h's, for the ring of chunks.
+        const MAP_PRIVATE_ANONYMOUS: c_int = 0x02 | 0x20;
         /// time.h's.
         const CLOCK_MONOTONIC: c_int = 1;
         const OP_RECV: u8 = 27;
@@ -2286,7 +2616,27 @@ mod sys {
             count: Box<[u8; 8]>,
             listening: bool,
             closing: bool,
+            /// The chunks, and the ring of them the kernel picks from when a
+            /// multishot receive takes one: struct io_uring_buf entries of 16
+            /// bytes, its tail in the first one's last two, and how many it
+            /// was given.
+            pub pool: Pool,
+            chunk_ring: *mut c_void,
+            chunk_tail: u16,
         }
+
+        /// struct io_uring_buf_reg.
+        #[repr(C)]
+        struct BufReg {
+            ring_addr: u64,
+            ring_entries: u32,
+            bgid: u16,
+            flags: u16,
+            min_left: u32,
+            resv: [u32; 5],
+        }
+
+        const _: () = assert!(size_of::<BufReg>() == 40);
 
         // rr: escape(unsafe): the ring is the process's memory, which no
         // thread owns; an Io is moved whole, never shared, and the kernel
@@ -2384,7 +2734,7 @@ mod sys {
         }
 
         impl Backend {
-            pub fn new(ops: u32) -> Result<Backend, Error> {
+            pub fn new(ops: u32, pool: Pool) -> Result<Backend, Error> {
                 let mut params = Params {
                     sq_entries: 0,
                     // Room for each operation's answer, its linked
@@ -2429,8 +2779,9 @@ mod sys {
                 // rr: escape(shared): the Io and each Waker hold the eventfd.
                 let wake = Arc::new(Wake { fd: event });
                 let mut backend =
-                    Backend::map(fd, &params, wake).inspect_err(|_| close_ring(fd))?;
+                    Backend::map(fd, &params, wake, pool).inspect_err(|_| close_ring(fd))?;
                 backend.arm();
+                backend.chunks()?;
                 Ok(backend)
             }
 
@@ -2462,7 +2813,7 @@ mod sys {
                 self.listening = true;
             }
 
-            fn map(fd: c_int, p: &Params, wake: Arc<Wake>) -> Result<Backend, Error> {
+            fn map(fd: c_int, p: &Params, wake: Arc<Wake>, pool: Pool) -> Result<Backend, Error> {
                 let sq_size = p.sq_off[6] as usize + p.sq_entries as usize * 4;
                 let cq_size = p.cq_off[5] as usize + p.cq_entries as usize * size_of::<Cqe>();
                 let ring_size = sq_size.max(cq_size);
@@ -2502,7 +2853,91 @@ mod sys {
                     count: Box::new([0; 8]),
                     listening: false,
                     closing: false,
+                    pool,
+                    chunk_ring: null_mut(),
+                    chunk_tail: 0,
                 })
+            }
+
+            /// Registers the ring of chunks, group 0, and gives it every chunk.
+            fn chunks(&mut self) -> Result<(), Error> {
+                if self.pool.count == 0 {
+                    return Ok(());
+                }
+                let bytes = self.pool.count.saturating_mul(16);
+                // rr: escape(unsafe): a mapping of the program's own, page
+                // aligned as the kernel asks of the ring.
+                let at = unsafe {
+                    mmap(
+                        null_mut(),
+                        bytes,
+                        PROT_READ_WRITE,
+                        MAP_PRIVATE_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                // rr: escape(sentinel): mmap's MAP_FAILED, (void *) -1.
+                if at.addr() == usize::MAX {
+                    return Err(error(errno()));
+                }
+                self.chunk_ring = at;
+                let reg = BufReg {
+                    ring_addr: pointer(self.chunk_ring.cast()),
+                    ring_entries: u32::try_from(self.pool.count).unwrap_or(0),
+                    bgid: 0,
+                    flags: 0,
+                    min_left: 0,
+                    resv: [0; 5],
+                };
+                // rr: escape(unsafe): reg is a struct io_uring_buf_reg of one
+                // ring the program keeps mapped while the ring lives.
+                let done = unsafe {
+                    syscall(
+                        SYS_REGISTER,
+                        c_long::from(self.fd),
+                        REGISTER_PBUF_RING,
+                        &raw const reg,
+                        c_long::from(1u8),
+                    )
+                };
+                if done < 0 {
+                    return Err(error(errno()));
+                }
+                for id in 0..self.pool.count {
+                    self.give_back(u16::try_from(id).unwrap_or(0));
+                }
+                Ok(())
+            }
+
+            /// Puts chunk id back in the ring, for the kernel to fill again.
+            pub fn give_back(&mut self, id: u16) {
+                if self.chunk_ring.is_null() {
+                    return;
+                }
+                let mask = self.pool.count.saturating_sub(1);
+                let entry = self
+                    .chunk_ring
+                    .wrapping_byte_add((usize::from(self.chunk_tail) & mask) * 16)
+                    .cast::<u8>();
+                let addr = pointer(self.pool.at(id)).to_le_bytes();
+                let size = u32::try_from(self.pool.size)
+                    .unwrap_or(u32::MAX)
+                    .to_le_bytes();
+                let bid = id.to_le_bytes();
+                let mut bytes = [0u8; 14];
+                bytes[..8].copy_from_slice(&addr);
+                bytes[8..12].copy_from_slice(&size);
+                bytes[12..].copy_from_slice(&bid);
+                // rr: escape(unsafe): the entry is within the ring mapped,
+                // one the kernel gave back; its last two bytes are left, as
+                // the first entry's hold the tail.
+                unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), entry, 14) }
+                self.chunk_tail = self.chunk_tail.wrapping_add(1);
+                let tail = self.chunk_ring.wrapping_byte_add(14).cast::<AtomicU16>();
+                // rr: escape(unsafe): the tail is the program's to move, the
+                // kernel's to read.
+                unsafe { (*tail).store(self.chunk_tail, Ordering::Release) }
             }
 
             fn sq_head(&self) -> u32 {
@@ -2685,6 +3120,21 @@ mod sys {
                         sqe.addr = pointer(slot.message.as_ptr().cast());
                         sqe.len = 1;
                     }
+                    Work::ReceiveMany(_) => {
+                        sqe.opcode = OP_RECV;
+                        sqe.ioprio = RECV_MULTISHOT;
+                        sqe.flags = IOSQE_BUFFER_SELECT;
+                        sqe.buf_index = 0;
+                    }
+                    Work::SendChunk {
+                        id, length, sent, ..
+                    } => {
+                        sqe.opcode = OP_SEND;
+                        let at = self.pool.at(*id).wrapping_add(*sent as usize);
+                        sqe.addr = pointer(at);
+                        sqe.len = length.saturating_sub(*sent);
+                        sqe.op_flags = MSG_NOSIGNAL;
+                    }
                     Work::Idle | Work::Run(_) | Work::Finished(_) => return,
                 }
                 let Some(limit) = slot.limit else {
@@ -2778,7 +3228,7 @@ mod sys {
                     let Cqe {
                         user_data: data,
                         res,
-                        ..
+                        flags,
                     } = unsafe { entry.read() };
                     head = head.wrapping_add(1);
                     if data == WAKE {
@@ -2791,6 +3241,10 @@ mod sys {
                     let Some((index, slot)) = running(slots, data) else {
                         continue;
                     };
+                    if let Work::ReceiveMany(_) = slot.work {
+                        self.many(slot, index, ready, data, res, flags);
+                        continue;
+                    }
                     if let Work::ReceiveFrom(..) = slot.work {
                         // The msg_namelen recvmsg wrote, the low half of the
                         // second word on a little-endian target.
@@ -2810,6 +3264,39 @@ mod sys {
                 // rr: escape(unsafe): the head is the program's to
                 // move, the kernel's to read.
                 unsafe { (*self.cq_head).store(head, Ordering::Release) }
+            }
+
+            /// A multishot receive's answer: a chunk it filled, and, without
+            /// IORING_CQE_F_MORE, its end, or its start again when the kernel
+            /// stopped it with more to come.
+            fn many(
+                &mut self,
+                slot: &mut Slot,
+                index: usize,
+                ready: &mut VecDeque<u32>,
+                data: u64,
+                res: i32,
+                flags: u32,
+            ) {
+                if res > 0 && flags & CQE_F_BUFFER != 0 {
+                    let id = u16::try_from(flags >> CQE_BUFFER_SHIFT).unwrap_or(0);
+                    self.pool.fill(slot.key, id, res.cast_unsigned());
+                }
+                if flags & CQE_F_MORE != 0 {
+                    return;
+                }
+                if res > 0 && !slot.canceled {
+                    self.submit(data, slot);
+                    return;
+                }
+                let result = match res {
+                    0.. => Ok(()),
+                    _ if res == -ENOBUFS => Err(Error::NoChunks),
+                    _ => Err(error(res.saturating_neg())),
+                };
+                if end_many(slot, result) {
+                    ready.push_back(u32::try_from(index).unwrap_or(0));
+                }
             }
 
             /// Cancels every operation and waits until the kernel answered
@@ -2848,13 +3335,19 @@ mod sys {
                         // rr: escape(unsafe): the entry is within those mapped,
                         // which the kernel wrote before it moved the tail.
                         let Cqe {
-                            user_data: data, ..
+                            user_data: data,
+                            flags,
+                            ..
                         } = unsafe { entry.read() };
                         head = head.wrapping_add(1);
                         if data == WAKE {
                             self.listening = false;
                         } else if let Some((_, slot)) = running(slots, data) {
-                            slot.state = State::Ready;
+                            // A multishot receive holds its chunks until its
+                            // last answer, which says no more.
+                            if flags & CQE_F_MORE == 0 {
+                                slot.state = State::Ready;
+                            }
                         } else {
                             // A cancel's own answer, or one already taken.
                         }
@@ -2908,6 +3401,9 @@ mod sys {
                 unmap(self.sqes.cast(), self.sqes_size);
                 unmap(self.ring, self.ring_size);
                 close_ring(self.fd);
+                if !self.chunk_ring.is_null() {
+                    unmap(self.chunk_ring, self.pool.count.saturating_mul(16));
+                }
             }
         }
     }
@@ -2919,7 +3415,7 @@ mod sys {
     mod backend {
         use super::os::c::{self, errno};
         use super::os::{EAGAIN, EINPROGRESS, F_SETFD, FD_CLOEXEC, SO_ERROR, SOL_SOCKET, error};
-        use super::{Answer, Error, Slot, WAKE, Work, running, settle};
+        use super::{Answer, Error, Pool, Slot, WAKE, Work, end_many, running, settle};
         use alloc::collections::VecDeque;
         use alloc::sync::Arc;
         use alloc::vec::Vec;
@@ -2968,6 +3464,8 @@ mod sys {
         const EVFILT_WRITE: i16 = -2;
         const EVFILT_TIMER: i16 = -7;
         const EVFILT_USER: i16 = -10;
+        /// sys/socket.h's.
+        const MSG_PEEK: c_int = 0x2;
         const EV_ADD: u16 = 0x1;
         const EV_CLEAR: u16 = 0x20;
         const NOTE_TRIGGER: u32 = 0x0100_0000;
@@ -3039,10 +3537,12 @@ mod sys {
             changes: Vec<Kevent>,
             /// What a wait takes from the kqueue: BATCH entries.
             events: Vec<Kevent>,
+            /// The chunks receive_many reads into.
+            pub pool: Pool,
         }
 
         impl Backend {
-            pub fn new(ops: u32) -> Result<Backend, Error> {
+            pub fn new(ops: u32, pool: Pool) -> Result<Backend, Error> {
                 // rr: escape(unsafe): kqueue takes nothing.
                 let kq = unsafe { kqueue() };
                 if kq < 0 {
@@ -3070,6 +3570,7 @@ mod sys {
                     trying: VecDeque::with_capacity(ops),
                     changes: Vec::with_capacity(ops),
                     events,
+                    pool,
                 })
             }
 
@@ -3107,6 +3608,85 @@ mod sys {
                 self.pending.push_back(data);
             }
 
+            pub fn give_back(&mut self, id: u16) {
+                self.pool.put(id);
+            }
+
+            /// Reads what a receive_many's socket has into free chunks, at
+            /// most TRIES of them a turn, as other operations are tried; its
+            /// filter stays (not EV_ONESHOT) until it is over.
+            fn drain_many(
+                &mut self,
+                slot: &mut Slot,
+                index: usize,
+                ready: &mut VecDeque<u32>,
+                data: u64,
+            ) {
+                let fd = slot.fd().unwrap_or(-1);
+                for _ in 0..TRIES {
+                    let Some(id) = self.pool.take() else {
+                        // No chunk: over only once something came, as io_uring
+                        // says ENOBUFS then; the peer's end without data is the
+                        // end.
+                        let mut byte = [0u8; 1];
+                        // rr: escape(unsafe): byte holds the one byte peeked.
+                        let got = unsafe { c::recv(fd, byte.as_mut_ptr().cast(), 1, MSG_PEEK) };
+                        match got {
+                            1.. => self.end(slot, index, ready, data, Err(Error::NoChunks)),
+                            0 => self.end(slot, index, ready, data, Ok(())),
+                            _ => break,
+                        }
+                        return;
+                    };
+                    let (at, size) = (self.pool.at(id), self.pool.size);
+                    // rr: escape(unsafe): the chunk holds size bytes, and is
+                    // nobody else's while it is out of the pool.
+                    let got = unsafe { c::recv(fd, at.cast(), size, 0) };
+                    if let Ok(count) = u32::try_from(got) {
+                        if count == 0 {
+                            self.pool.put(id);
+                            self.end(slot, index, ready, data, Ok(()));
+                            return;
+                        }
+                        self.pool.fill(slot.key, id, count);
+                        continue;
+                    }
+                    let code = errno();
+                    self.pool.put(id);
+                    if !super::os::again(code) {
+                        self.end(slot, index, ready, data, Err(error(code)));
+                        return;
+                    }
+                    break;
+                }
+                if slot.armed.is_none() {
+                    slot.armed = Some(EVFILT_READ);
+                    // rr: escape(bound): one change for each running operation
+                    // at most.
+                    self.changes
+                        .push(change(ident(fd), EVFILT_READ, EV_ADD, data));
+                }
+            }
+
+            /// Ends a receive_many: its filter goes, and it is over now or
+            /// once the sends on its stream are done.
+            fn end(
+                &mut self,
+                slot: &mut Slot,
+                index: usize,
+                ready: &mut VecDeque<u32>,
+                data: u64,
+                result: Result<(), Error>,
+            ) {
+                if let (Some(armed), Some(fd)) = (slot.armed.take(), slot.fd()) {
+                    self.delete(ident(fd), armed, data);
+                    self.changes.retain(|c| c.udata.addr() as u64 != data);
+                }
+                if end_many(slot, result) {
+                    push_ready(ready, index);
+                }
+            }
+
             /// Deletes what the kqueue waits on for an operation, at once.
             fn delete(&self, ident: usize, filter: i16, data: u64) {
                 let delete = change(ident, filter, EV_DELETE, data);
@@ -3132,6 +3712,13 @@ mod sys {
             /// is deleted; one pending is passed over.
             #[must_use]
             pub fn cancel(&mut self, data: u64, slot: &mut Slot) -> bool {
+                if let Work::ReceiveMany(_) = slot.work {
+                    if let (Some(armed), Some(fd)) = (slot.armed.take(), slot.fd()) {
+                        self.delete(ident(fd), armed, data);
+                        self.changes.retain(|c| c.udata.addr() as u64 != data);
+                    }
+                    return end_many(slot, Err(Error::Canceled));
+                }
                 if let Some(filter) = slot.armed.take() {
                     let ident = if filter == EVFILT_TIMER {
                         slot_ident(data)
@@ -3198,6 +3785,16 @@ mod sys {
                     let Some((index, slot)) = running(slots, data) else {
                         continue;
                     };
+                    if let Work::ReceiveMany(_) = slot.work {
+                        if flags & EV_ERROR != 0 {
+                            slot.armed = None;
+                            let result = Err(error(i32::try_from(code).unwrap_or(0)));
+                            self.end(slot, index, ready, data, result);
+                        } else {
+                            self.drain_many(slot, index, ready, data);
+                        }
+                        continue;
+                    }
                     if filter == EVFILT_TIMER && !matches!(slot.work, Work::Timeout(_)) {
                         // The operation's time ran out: what it waits on goes,
                         // and it ends as timed out.
@@ -3232,16 +3829,22 @@ mod sys {
                 let Some((index, slot)) = running(slots, data) else {
                     return;
                 };
+                if let Work::ReceiveMany(_) = slot.work {
+                    self.drain_many(slot, index, ready, data);
+                    return;
+                }
                 for _ in 0..TRIES {
-                    let answer = perform(slot);
+                    let answer = perform(slot, &mut self.pool);
                     if let Err(EAGAIN) = answer {
                         let filter = match slot.work {
-                            Work::Accept(_) | Work::Receive(..) | Work::ReceiveFrom(..) => {
-                                EVFILT_READ
-                            }
+                            Work::Accept(_)
+                            | Work::Receive(..)
+                            | Work::ReceiveFrom(..)
+                            | Work::ReceiveMany(_) => EVFILT_READ,
                             Work::Idle
                             | Work::Connect(_)
                             | Work::Send(..)
+                            | Work::SendChunk { .. }
                             | Work::SendTo(..)
                             | Work::Timeout(_)
                             | Work::Run(_)
@@ -3295,7 +3898,7 @@ mod sys {
 
         /// The operation's system call, as it stands: EAGAIN when the
         /// socket is not ready.
-        fn perform(slot: &mut Slot) -> Answer {
+        fn perform(slot: &mut Slot, pool: &mut Pool) -> Answer {
             let fd = slot.fd().unwrap_or(-1);
             match &mut slot.work {
                 Work::Accept(_) => {
@@ -3364,7 +3967,21 @@ mod sys {
                     };
                     answer(got)
                 }
-                Work::Idle | Work::Timeout(_) | Work::Run(_) | Work::Finished(_) => Ok(0),
+                Work::SendChunk {
+                    id, length, sent, ..
+                } => {
+                    let at = pool.at(*id).wrapping_add(*sent as usize);
+                    let rest = length.saturating_sub(*sent) as usize;
+                    // rr: escape(unsafe): the chunk holds length bytes, the
+                    // program's while it is out of the pool.
+                    let got = unsafe { c::send(fd, at.cast(), rest, 0) };
+                    answer(got)
+                }
+                Work::Idle
+                | Work::Timeout(_)
+                | Work::Run(_)
+                | Work::ReceiveMany(_)
+                | Work::Finished(_) => Ok(0),
             }
         }
 
@@ -3410,7 +4027,9 @@ mod sys {
     mod backend {
         use super::os::c::{self, WsaBuf};
         use super::os::{ABORTED, FOREIGN, SOL_SOCKET, WSA_IO_PENDING, last, socket};
-        use super::{Answer, Error, Raw, Slot, State, Work, running, settle, user_data};
+        use super::{
+            Answer, Error, Pool, Raw, Slot, State, Work, end_many, running, settle, user_data,
+        };
         use crate::base::thread::INFINITE;
         use alloc::collections::VecDeque;
         use alloc::sync::Arc;
@@ -3581,6 +4200,8 @@ mod sys {
             timers: Vec<(u64, u64)>,
             /// QueryPerformanceFrequency's ticks a second.
             frequency: u64,
+            /// The chunks receive_many reads into, one WSARecv at a time.
+            pub pool: Pool,
         }
 
         /// The extension function that guid names, from a socket of the
@@ -3609,7 +4230,7 @@ mod sys {
         }
 
         impl Backend {
-            pub fn new(ops: u32) -> Result<Backend, Error> {
+            pub fn new(ops: u32, pool: Pool) -> Result<Backend, Error> {
                 let probe = super::Fd::new(
                     socket(super::os::AF_INET, super::Kind::Stream).map_err(super::os::error)?,
                 );
@@ -3653,7 +4274,12 @@ mod sys {
                     retried: VecDeque::with_capacity(ops),
                     timers: Vec::with_capacity(ops),
                     frequency: u64::try_from(frequency).unwrap_or(1).max(1),
+                    pool,
                 })
+            }
+
+            pub fn give_back(&mut self, id: u16) {
+                self.pool.put(id);
             }
 
             pub fn waker(&self) -> Arc<Wake> {
@@ -3882,6 +4508,54 @@ mod sys {
                             )
                         }
                     }
+                    Work::ReceiveMany(stream) => {
+                        self.associate(&mut stream.fd)?;
+                        // No chunk free: a receive of no bytes, which answers
+                        // once something came.
+                        let id = self.pool.take();
+                        slot.chunk = id;
+                        let parts = match id {
+                            Some(id) => WsaBuf {
+                                len: u32::try_from(self.pool.size).unwrap_or(u32::MAX),
+                                buf: self.pool.at(id),
+                            },
+                            None => WsaBuf {
+                                len: 0,
+                                buf: null_mut(),
+                            },
+                        };
+                        let mut flags = 0u32;
+                        // rr: escape(unsafe): the WSABUF names a chunk out of
+                        // the pool, the operation's until its answer.
+                        unsafe {
+                            c::WSARecv(
+                                stream.fd.raw,
+                                &raw const parts,
+                                1,
+                                null_mut(),
+                                &raw mut flags,
+                                overlapped,
+                                null(),
+                            )
+                        }
+                    }
+                    Work::SendChunk {
+                        fd,
+                        id,
+                        length,
+                        sent,
+                    } => {
+                        let parts = WsaBuf {
+                            len: length.saturating_sub(*sent),
+                            buf: self.pool.at(*id).wrapping_add(*sent as usize),
+                        };
+                        // rr: escape(unsafe): the WSABUF names the rest of a
+                        // chunk out of the pool, the operation's until its
+                        // answer.
+                        unsafe {
+                            c::WSASend(*fd, &raw const parts, 1, null_mut(), 0, overlapped, null())
+                        }
+                    }
                     Work::Idle | Work::Timeout(_) | Work::Run(_) | Work::Finished(_) => {
                         return Ok(());
                     }
@@ -4000,6 +4674,10 @@ mod sys {
                 let Some((index, slot)) = running(slots, data) else {
                     return;
                 };
+                if let Work::ReceiveMany(_) = slot.work {
+                    self.many(slot, index, ready, data, answer);
+                    return;
+                }
                 if settle(slot, answer) {
                     self.submit(data, slot);
                     return;
@@ -4009,6 +4687,45 @@ mod sys {
                     self.timers.retain(|&(_, d)| d != data);
                 }
                 ready.push_back(u32::try_from(index).unwrap_or(0));
+            }
+
+            /// A receive_many's answer: its chunk filled and the next started,
+            /// or its end, the chunk given back.
+            fn many(
+                &mut self,
+                slot: &mut Slot,
+                index: usize,
+                ready: &mut VecDeque<u32>,
+                data: u64,
+                answer: Answer,
+            ) {
+                let id = slot.chunk.take();
+                let result = match (answer, id) {
+                    // The receive of no bytes: something came; a chunk now
+                    // free takes it, or it was more than there was room for.
+                    (Ok(_), None) if self.pool.free.is_empty() => Err(Error::NoChunks),
+                    (Ok(_), None) if !slot.canceled => {
+                        self.submit(data, slot);
+                        return;
+                    }
+                    (Ok(count), Some(id)) if count > 0 => {
+                        self.pool
+                            .fill(slot.key, id, u32::try_from(count).unwrap_or(u32::MAX));
+                        if !slot.canceled {
+                            self.submit(data, slot);
+                            return;
+                        }
+                        Err(Error::Canceled)
+                    }
+                    (Ok(_), _) => Ok(()),
+                    (Err(code), _) => Err(super::os::error(code)),
+                };
+                if let Some(id) = slot.chunk.take().or(id) {
+                    self.pool.put(id);
+                }
+                if end_many(slot, result) {
+                    ready.push_back(u32::try_from(index).unwrap_or(0));
+                }
             }
 
             /// Ends the timeouts whose deadlines passed, soonest first.
@@ -4176,6 +4893,8 @@ mod sys {
                 | Work::Send(..)
                 | Work::SendTo(..)
                 | Work::ReceiveFrom(..)
+                | Work::ReceiveMany(_)
+                | Work::SendChunk { .. }
                 | Work::Timeout(_)
                 | Work::Run(_)
                 | Work::Finished(_) => Ok(transferred as usize),
@@ -4662,6 +5381,100 @@ mod tests {
         fn run(&mut self) {
             self.found.store((1..=self.up_to).sum(), Ordering::Release);
         }
+    }
+
+    /// What a peer sends comes in chunks of the Io's, as it comes, which
+    /// send_chunk sends back; the peer's end stops the receive, after the
+    /// send, with the stream.
+    #[test]
+    fn chunks_echo() {
+        let mut io = Io::with_chunks(8, 8, 64).unwrap();
+        let (server, client, _listener) = pair(&mut io, v4());
+        let Ok(receiving) = io.receive_many(server, SERVER) else {
+            panic!("full");
+        };
+        send(&mut io, client, b"hello", CLIENT);
+        let mut back = None;
+        let mut sent = false;
+        while !sent || back.is_none() {
+            let event = next(&mut io);
+            if let Done::Chunk(chunk) = event.done {
+                assert_eq!(io.bytes(&chunk), Some(&b"hello"[..]));
+                assert!(io.send_chunk(&receiving, chunk, 7).is_ok());
+            } else if let Done::SentChunk(result) = event.done {
+                assert_eq!(event.key, 7);
+                result.unwrap();
+                sent = true;
+            } else if let Done::Sent { stream, .. } = event.done {
+                back = Some(stream);
+            } else {
+                panic!("another operation");
+            }
+        }
+        receive(&mut io, back.unwrap(), 16, CLIENT);
+        let (peer, buffer) = received(next(&mut io));
+        assert_eq!(buffer, b"hello");
+        drop(peer);
+        let Done::Stopped { result, .. } = next(&mut io).done else {
+            panic!("not the end");
+        };
+        assert_eq!(result, Ok(()));
+    }
+
+    /// Chunks smaller than what came take it in turn, in order, each given
+    /// back; with none free for what still comes, the receive stops, as
+    /// io_uring's ENOBUFS does.
+    #[test]
+    fn chunks_in_turn_and_none_free() {
+        let mut io = Io::with_chunks(8, 4, 4).unwrap();
+        let (server, client, _listener) = pair(&mut io, v4());
+        assert!(io.receive_many(server, SERVER).is_ok());
+        send(&mut io, client, b"0123456789", CLIENT);
+        let mut got = Vec::new();
+        let mut sender = None;
+        while got.len() < 10 || sender.is_none() {
+            let event = next(&mut io);
+            if let Done::Chunk(chunk) = event.done {
+                got.extend_from_slice(io.bytes(&chunk).unwrap());
+                assert!(io.give_back(chunk).is_ok());
+            } else if let Done::Sent { stream, .. } = event.done {
+                sender = Some(stream);
+            } else {
+                panic!("another operation");
+            }
+        }
+        assert_eq!(got, b"0123456789");
+        send(&mut io, sender.unwrap(), b"ab", CLIENT);
+        let mut held = Vec::new();
+        loop {
+            let event = next(&mut io);
+            if let Done::Chunk(chunk) = event.done {
+                held.push(chunk);
+            } else if let Done::Sent { stream, .. } = event.done {
+                send(&mut io, stream, b"cdefghijklmnop", CLIENT);
+            } else if let Done::Stopped { result, .. } = event.done {
+                assert_eq!(result, Err(Error::NoChunks));
+                break;
+            } else {
+                panic!("another operation");
+            }
+        }
+        for chunk in held {
+            assert!(io.give_back(chunk).is_ok());
+        }
+    }
+
+    /// An Io without chunks stops a receive_many at once; a chunk of
+    /// another Io is refused.
+    #[test]
+    fn chunks_refused() {
+        let mut io = io(8);
+        let (server, _client, _listener) = pair(&mut io, v4());
+        assert!(io.receive_many(server, SERVER).is_ok());
+        let Done::Stopped { result, .. } = next(&mut io).done else {
+            panic!("not the end");
+        };
+        assert_eq!(result, Err(Error::NoChunks));
     }
 
     /// A wake ends a wait with nothing running, and wakes before it are
