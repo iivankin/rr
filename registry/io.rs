@@ -1,12 +1,18 @@
-//! Completion I/O for a loop on each thread, after TigerBeetle's: an Io
-//! takes operations (accept, connect, receive, send, a timeout), each with a
-//! key the loop picks, runs them on io_uring (Linux 6.1 and later; nothing
-//! else there) or kqueue (macOS), and hands each back once, done, as an
-//! Event the loop takes by next; what an operation works on (a Listener, a
-//! Stream, a buffer) is moved in and comes back in its Event, so nothing
-//! the system still writes is in the loop's hands; a table of operations
-//! fixed when the Io is made, which refuses one more by handing it back;
-//! an Op that cancel takes; errors by kind, IPv4 and IPv6.
+//! Completion I/O for a loop on each core, after TigerBeetle's: an Io takes
+//! operations, each with a key the loop picks, and hands each back once,
+//! done, as an Event the loop takes by next: TCP (accept, connect, receive,
+//! send, each within a time if asked), receive_many into the Io's own
+//! chunks (io_uring's multishot receive into a ring of buffers) with
+//! send_chunk, UDP, timeouts, files (open, read_at, write_at, sync), and
+//! work that blocks on thread's pool (run, as tokio's spawn_blocking). It
+//! runs on io_uring (Linux 6.1 and later; nothing else there), kqueue
+//! (macOS) or an I/O completion port (Windows). What an operation works on
+//! (a Listener, a Stream, a File, a buffer) is moved in and comes back in
+//! its Event, so nothing the system still writes is in the loop's hands; a
+//! table of operations fixed when the Io is made refuses one more by
+//! handing it back; an Op that cancel takes; a Waker for other threads;
+//! listeners that share an address on Linux (bind_shared); the slowest turn
+//! of the loop, which says what belongs on run; errors by kind.
 //!
 //! A loop makes one Io, or has it made and moved to its thread before its
 //! first wait (it stays there from then on), starts what it wants, and
@@ -108,8 +114,8 @@ compile_error!("rr add cut io without windows: add it again with windows in --op
 
 pub use crate::base::thread::Work;
 pub use sys::{
-    AF_INET, AF_INET6, Chunk, Done, Error, Event, Io, Listener, Op, SOCK_STREAM, Stream, Turn, Udp,
-    Unavailable, Waker,
+    AF_INET, AF_INET6, Chunk, Done, Error, Event, File, Io, Listener, Op, Open, SOCK_STREAM,
+    Stream, Turn, Udp, Unavailable, Waker,
 };
 
 // rr: section(os = linux macos)
@@ -167,6 +173,12 @@ mod sys {
         /// receive_many: no chunk was free for what came (or the Io has
         /// none): give chunks back and receive again.
         NoChunks,
+        /// No such file or directory.
+        NotFound,
+        /// The system denies it: a file's permissions.
+        Denied,
+        /// A path with a NUL in it, or not UTF-8 on Windows.
+        BadPath,
         /// Listener::bind_shared where the system does not spread
         /// connections among listeners of one address: macOS gives them all
         /// to the one bound last, Windows shares none.
@@ -297,6 +309,28 @@ mod sys {
         Datagram,
     }
 
+    /// A file, closed when it is dropped: io.open makes one, read_at,
+    /// write_at and sync work on it, each handing it back.
+    pub struct File {
+        raw: Raw,
+    }
+
+    impl Drop for File {
+        fn drop(&mut self) {
+            os::close_file(self.raw);
+        }
+    }
+
+    /// How io.open opens a file.
+    pub enum Open {
+        /// To read, as it is.
+        Read,
+        /// To write, made empty, or new.
+        Create,
+        /// To read and write, as it is.
+        Update,
+    }
+
     /// A descriptor this owns, closed when it is dropped.
     struct Fd {
         raw: Raw,
@@ -398,6 +432,30 @@ mod sys {
         /// A send_chunk is done, all of the chunk sent unless it failed; the
         /// chunk is the Io's again.
         SentChunk(Result<(), Error>),
+        /// The path, and the file opened.
+        Opened {
+            path: Vec<u8>,
+            result: Result<File, Error>,
+        },
+        /// The file, and its buffer with so many bytes read after what it
+        /// held; Ok(0) is the end of the file.
+        Read {
+            file: File,
+            buffer: Vec<u8>,
+            result: Result<usize, Error>,
+        },
+        /// The file and its buffer, all of which was written, unless it
+        /// failed.
+        Written {
+            file: File,
+            buffer: Vec<u8>,
+            result: Result<(), Error>,
+        },
+        /// The file, what was written to it on the disk, unless it failed.
+        Synced {
+            file: File,
+            result: Result<(), Error>,
+        },
         /// The work, back from thread's pool once it ran, or never run when
         /// canceled in line.
         Ran {
@@ -439,6 +497,16 @@ mod sys {
             length: u32,
             sent: u32,
         },
+        /// A file's operation, the kernel's on io_uring: the path with its
+        /// NUL and how; the file, the buffer, the offset (and how much a
+        /// write wrote).
+        Open(Vec<u8>, Open),
+        Read(File, Vec<u8>, u64),
+        Write(File, Vec<u8>, u64, usize),
+        Sync(File),
+        /// A file's operation on thread's pool (macOS, Windows): the job,
+        /// and what it and the Io share.
+        FileRun(Job, Arc<FileCell>),
         /// Done: what the next Event hands back.
         Finished(Done),
     }
@@ -555,8 +623,14 @@ mod sys {
                 }
                 Work::SendTo(udp, _) | Work::ReceiveFrom(udp, _) => Some(udp.fd.raw),
                 Work::ReceiveMany(stream) => Some(stream.fd.raw),
+                Work::Read(file, ..) | Work::Write(file, ..) | Work::Sync(file) => Some(file.raw),
                 Work::SendChunk { fd, .. } => Some(*fd),
-                Work::Idle | Work::Timeout(_) | Work::Run(_) | Work::Finished(_) => None,
+                Work::Idle
+                | Work::Timeout(_)
+                | Work::Run(_)
+                | Work::Open(..)
+                | Work::FileRun(..)
+                | Work::Finished(_) => None,
             }
         }
     }
@@ -778,9 +852,82 @@ mod sys {
             (Work::SendChunk { .. }, Err(code)) => {
                 (Work::Finished(Done::SentChunk(Err(os::error(code)))), false)
             }
-            (other @ (Work::Idle | Work::Run(_) | Work::ReceiveMany(_) | Work::Finished(_)), _) => {
-                (other, false)
+            (Work::Open(mut path, _), answer) => {
+                path.pop();
+                let result = answer
+                    .map(|fd| File { raw: os::raw(fd) })
+                    .map_err(os::error);
+                (Work::Finished(Done::Opened { path, result }), false)
             }
+            (Work::Read(file, buffer, offset), Err(code)) if os::again(code) && !canceled => {
+                (Work::Read(file, buffer, offset), true)
+            }
+            (Work::Read(file, mut buffer, _), answer) => {
+                if let Ok(count) = answer {
+                    os::filled(&mut buffer, count);
+                }
+                let result = answer.map_err(os::error);
+                (
+                    Work::Finished(Done::Read {
+                        file,
+                        buffer,
+                        result,
+                    }),
+                    false,
+                )
+            }
+            (Work::Write(file, buffer, offset, written), Ok(count)) => {
+                let written = written.saturating_add(count);
+                if written < buffer.len() && count > 0 && !canceled {
+                    (Work::Write(file, buffer, offset, written), true)
+                } else {
+                    let result = if written < buffer.len() {
+                        Err(if canceled {
+                            Error::Canceled
+                        } else {
+                            Error::Other(0)
+                        })
+                    } else {
+                        Ok(())
+                    };
+                    (
+                        Work::Finished(Done::Written {
+                            file,
+                            buffer,
+                            result,
+                        }),
+                        false,
+                    )
+                }
+            }
+            (Work::Write(file, buffer, offset, written), Err(code))
+                if os::again(code) && !canceled =>
+            {
+                (Work::Write(file, buffer, offset, written), true)
+            }
+            (Work::Write(file, buffer, ..), Err(code)) => {
+                let result = Err(os::error(code));
+                (
+                    Work::Finished(Done::Written {
+                        file,
+                        buffer,
+                        result,
+                    }),
+                    false,
+                )
+            }
+            (Work::Sync(file), answer) => {
+                let result = answer.map(|_| ()).map_err(os::error);
+                (Work::Finished(Done::Synced { file, result }), false)
+            }
+            (
+                other @ (Work::Idle
+                | Work::Run(_)
+                | Work::ReceiveMany(_)
+                | Work::FileRun(..)
+                | Work::Finished(_)),
+                _,
+            ) => (other, false),
         };
         slot.work = work;
         if !again {
@@ -944,6 +1091,95 @@ mod sys {
             // rr: escape(unsafe): the lock is held: no one else touches the
             // list.
             mem::swap(unsafe { &mut *self.list.get() }, into);
+        }
+    }
+
+    /// A file's operation, as Io::open, read_at, write_at and sync start
+    /// it: the path with its NUL and how; the file, the buffer, the offset.
+    enum FileOp {
+        Open(Vec<u8>, Open),
+        Read(File, Vec<u8>, u64),
+        Write(File, Vec<u8>, u64),
+        Sync(File),
+    }
+
+    impl FileOp {
+        /// What the operation hands back when it does not run.
+        fn failed(self, error: Error) -> Done {
+            match self {
+                FileOp::Open(mut path, _) => {
+                    path.pop();
+                    Done::Opened {
+                        path,
+                        result: Err(error),
+                    }
+                }
+                FileOp::Read(file, buffer, _) => Done::Read {
+                    file,
+                    buffer,
+                    result: Err(error),
+                },
+                FileOp::Write(file, buffer, _) => Done::Written {
+                    file,
+                    buffer,
+                    result: Err(error),
+                },
+                FileOp::Sync(file) => Done::Synced {
+                    file,
+                    result: Err(error),
+                },
+            }
+        }
+    }
+
+    /// A file's operation on thread's pool: waiting, or done.
+    enum FileState {
+        Waiting(FileOp),
+        Done(Done),
+    }
+
+    /// What a file's job on the pool and its Io share, under a lock.
+    pub struct FileCell {
+        lock: Lock,
+        state: UnsafeCell<Option<FileState>>,
+    }
+
+    // rr: escape(unsafe): state is reached only under lock (FileCell::take,
+    // FileWork::run); what it holds is Send.
+    unsafe impl Sync for FileCell {}
+
+    impl FileCell {
+        #[must_use]
+        fn take(&self) -> Option<FileState> {
+            let _held = self.lock.lock();
+            // rr: escape(unsafe): the lock is held: no one else touches it.
+            unsafe { (*self.state.get()).take() }
+        }
+
+        /// What it hands back with error, when it never ran.
+        fn done(&self, error: Error) -> Done {
+            match self.take() {
+                Some(FileState::Waiting(op)) => op.failed(error),
+                Some(FileState::Done(done)) => done,
+                None => Done::Elapsed(Err(error)),
+            }
+        }
+    }
+
+    /// The pool's side of a file operation: it runs the call, blocking,
+    /// and leaves what it did in the cell.
+    struct FileWork {
+        cell: Arc<FileCell>,
+    }
+
+    impl Blocking for FileWork {
+        fn run(&mut self) {
+            let _held = self.cell.lock.lock();
+            // rr: escape(unsafe): the lock is held: no one else touches it.
+            let state = unsafe { &mut *self.cell.state.get() };
+            if let Some(FileState::Waiting(op)) = state.take() {
+                *state = Some(FileState::Done(os::file_blocking(op)));
+            }
         }
     }
 
@@ -1236,6 +1472,125 @@ mod sys {
             Ok(())
         }
 
+        /// Opens the file at path (UTF-8 on Windows), as how says: on
+        /// io_uring the kernel's openat, which may block in its own threads;
+        /// on macOS and Windows, on thread's pool.
+        pub fn open(&mut self, path: Vec<u8>, how: Open, key: u64) -> Result<Op, Vec<u8>> {
+            let Some(index) = self.free.pop() else {
+                return Err(path);
+            };
+            if path.contains(&0) {
+                let result = Err(Error::BadPath);
+                return Ok(self.finish(index, key, Done::Opened { path, result }));
+            }
+            let mut named = path;
+            named.push(0);
+            Ok(self.file(index, key, FileOp::Open(named, how)))
+        }
+
+        /// Reads the file at offset into the room buffer has beyond its
+        /// length, as receive reads a stream; Ok(0) is its end.
+        pub fn read_at(
+            &mut self,
+            file: File,
+            buffer: Vec<u8>,
+            offset: u64,
+            key: u64,
+        ) -> Result<Op, (File, Vec<u8>)> {
+            let Some(index) = self.free.pop() else {
+                return Err((file, buffer));
+            };
+            if buffer.len() == buffer.capacity() {
+                let result = Err(Error::NoRoom);
+                return Ok(self.finish(
+                    index,
+                    key,
+                    Done::Read {
+                        file,
+                        buffer,
+                        result,
+                    },
+                ));
+            }
+            Ok(self.file(index, key, FileOp::Read(file, buffer, offset)))
+        }
+
+        /// Writes all of buffer to the file at offset.
+        pub fn write_at(
+            &mut self,
+            file: File,
+            buffer: Vec<u8>,
+            offset: u64,
+            key: u64,
+        ) -> Result<Op, (File, Vec<u8>)> {
+            let Some(index) = self.free.pop() else {
+                return Err((file, buffer));
+            };
+            Ok(self.file(index, key, FileOp::Write(file, buffer, offset)))
+        }
+
+        /// Puts what was written to the file on the disk: fsync.
+        pub fn sync(&mut self, file: File, key: u64) -> Result<Op, File> {
+            let Some(index) = self.free.pop() else {
+                return Err(file);
+            };
+            Ok(self.file(index, key, FileOp::Sync(file)))
+        }
+
+        // rr: section(os = linux)
+        /// A file's operation: the kernel's own, on io_uring.
+        #[cfg(target_os = "linux")]
+        fn file(&mut self, index: u32, key: u64, op: FileOp) -> Op {
+            let work = match op {
+                FileOp::Open(path, how) => Work::Open(path, how),
+                FileOp::Read(file, buffer, offset) => Work::Read(file, buffer, offset),
+                FileOp::Write(file, buffer, offset) => Work::Write(file, buffer, offset, 0),
+                FileOp::Sync(file) => Work::Sync(file),
+            };
+            self.start(index, key, work, None)
+        }
+        // rr: end(os = linux)
+
+        // rr: section(os = macos windows)
+        /// A file's operation: on thread's pool, as kqueue waits for no file
+        /// and Windows's is a blocking call there too; its Event comes as a
+        /// run's does.
+        #[cfg(not(target_os = "linux"))]
+        fn file(&mut self, index: u32, key: u64, op: FileOp) -> Op {
+            let generation = self
+                .slots
+                .get(index as usize)
+                .map_or(0, |slot| slot.generation);
+            // rr: escape(shared): the job and the Io hold it.
+            let cell = Arc::new(FileCell {
+                lock: Lock::new(),
+                state: UnsafeCell::new(Some(FileState::Waiting(op))),
+            });
+            // rr: escape(shared): the pool's thread tells the Io through it.
+            let returned = Arc::new(Returned {
+                // rr: escape(copy): the run's holder of the list.
+                finished: Arc::clone(&self.finished),
+                wake: self.backend.waker(),
+                data: user_data(index, generation),
+            });
+            // rr: escape(copy): the job's holder of what it works on.
+            let filing = FileWork {
+                cell: Arc::clone(&cell),
+            };
+            let Ok(job) = thread::spawn(Box::new(filing), returned) else {
+                // No thread could start: what it works on comes back.
+                let done = cell.done(Error::Other(0));
+                return self.finish(index, key, done);
+            };
+            if let Some(slot) = self.slots.get_mut(index as usize) {
+                slot.key = key;
+                slot.work = Work::FileRun(job, cell);
+                slot.state = State::Running;
+            }
+            Op { index, generation }
+        }
+        // rr: end(os = macos windows)
+
         /// Sends buffer to address, as one datagram.
         pub fn send_to(
             &mut self,
@@ -1338,7 +1693,7 @@ mod sys {
             if slot.state != State::Running || slot.generation != generation || slot.canceled {
                 return false;
             }
-            if let Work::Run(_) = slot.work {
+            if let Work::Run(_) | Work::FileRun(..) = slot.work {
                 return self.unrun(index);
             }
             slot.canceled = true;
@@ -1500,8 +1855,42 @@ mod sys {
             let Some(slot) = self.slots.get_mut(index as usize) else {
                 return false;
             };
-            let Work::Run(job) = mem::replace(&mut slot.work, Work::Idle) else {
-                return false;
+            let job = match mem::replace(&mut slot.work, Work::Idle) {
+                Work::Run(job) => job,
+                Work::FileRun(job, cell) => {
+                    let _never = match job.cancel() {
+                        Ok(never) => never,
+                        Err(running) => {
+                            // A thread took it: it runs to its end.
+                            slot.work = Work::FileRun(running, cell);
+                            return false;
+                        }
+                    };
+                    slot.work = Work::Finished(cell.done(Error::Canceled));
+                    slot.state = State::Ready;
+                    // rr: escape(bound): a slot is in ready once, and there
+                    // are as many as its capacity.
+                    self.ready.push_back(index);
+                    return true;
+                }
+                other @ (Work::Idle
+                | Work::Accept(_)
+                | Work::Connect(_)
+                | Work::Receive(..)
+                | Work::Send(..)
+                | Work::Timeout(_)
+                | Work::SendTo(..)
+                | Work::ReceiveFrom(..)
+                | Work::ReceiveMany(_)
+                | Work::SendChunk { .. }
+                | Work::Open(..)
+                | Work::Read(..)
+                | Work::Write(..)
+                | Work::Sync(_)
+                | Work::Finished(_)) => {
+                    slot.work = other;
+                    return false;
+                }
             };
             match job.cancel() {
                 Ok(work) => {
@@ -1527,8 +1916,41 @@ mod sys {
                 let Some((index, slot)) = running(&mut self.slots, data) else {
                     continue;
                 };
-                let Work::Run(job) = mem::replace(&mut slot.work, Work::Idle) else {
-                    continue;
+                let job = match mem::replace(&mut slot.work, Work::Idle) {
+                    Work::Run(job) => job,
+                    Work::FileRun(job, cell) => {
+                        // The work ran: what it found is in the cell.
+                        let Ok(_ran) = job.take() else {
+                            continue;
+                        };
+                        let Some(FileState::Done(done)) = cell.take() else {
+                            continue;
+                        };
+                        slot.work = Work::Finished(done);
+                        slot.state = State::Ready;
+                        // rr: escape(bound): a slot is in ready once, and there
+                        // are as many as its capacity.
+                        self.ready.push_back(u32::try_from(index).unwrap_or(0));
+                        continue;
+                    }
+                    other @ (Work::Idle
+                    | Work::Accept(_)
+                    | Work::Connect(_)
+                    | Work::Receive(..)
+                    | Work::Send(..)
+                    | Work::Timeout(_)
+                    | Work::SendTo(..)
+                    | Work::ReceiveFrom(..)
+                    | Work::ReceiveMany(_)
+                    | Work::SendChunk { .. }
+                    | Work::Open(..)
+                    | Work::Read(..)
+                    | Work::Write(..)
+                    | Work::Sync(_)
+                    | Work::Finished(_)) => {
+                        slot.work = other;
+                        continue;
+                    }
                 };
                 match job.take() {
                     Ok(work) => {
@@ -1747,6 +2169,19 @@ mod sys {
                 pub fn shutdown(fd: c_int, how: c_int) -> c_int;
                 #[must_use]
                 pub fn close(fd: c_int) -> c_int;
+                #[must_use]
+                pub fn open(path: *const core::ffi::c_char, flags: c_int, ...) -> c_int;
+                #[must_use]
+                pub fn pread(fd: c_int, buffer: *mut c_void, length: usize, offset: i64) -> isize;
+                #[must_use]
+                pub fn pwrite(
+                    fd: c_int,
+                    buffer: *const c_void,
+                    length: usize,
+                    offset: i64,
+                ) -> isize;
+                #[must_use]
+                pub fn fsync(fd: c_int) -> c_int;
                 // rr: section(os = macos)
                 #[cfg(target_os = "macos")]
                 #[must_use]
@@ -1794,6 +2229,12 @@ mod sys {
         const SHUT_WR: c_int = 1;
         const EPIPE: c_int = 32;
         pub const EINTR: c_int = 4;
+        const ENOENT: c_int = 2;
+        const EACCES: c_int = 13;
+        /// EPERM, the same on Linux and macOS.
+        const EPERM_: c_int = 1;
+        /// fcntl.h's mode of a file open makes: rw-r--r--.
+        pub const MODE: u32 = 0o644;
         pub const EINVAL: c_int = 22;
         // rr: section(os = linux)
         #[cfg(target_os = "linux")]
@@ -1807,6 +2248,11 @@ mod sys {
             pub const SOL_SOCKET: c_int = 1;
             pub const SO_REUSEADDR: c_int = 2;
             pub const SO_REUSEPORT: c_int = 15;
+            pub const O_WRONLY: c_int = 1;
+            pub const O_RDWR: c_int = 2;
+            pub const O_CREAT: c_int = 0x40;
+            pub const O_TRUNC: c_int = 0x200;
+            pub const O_CLOEXEC: c_int = 0x8_0000;
             pub const IPV6_V6ONLY: c_int = 26;
             pub const SOCK_NONBLOCK: c_int = 0x800;
             pub const SOCK_CLOEXEC: c_int = 0x8_0000;
@@ -1850,6 +2296,11 @@ mod sys {
             pub const SO_ERROR: c_int = 0x1007;
             pub const SO_REUSEADDR: c_int = 0x4;
             pub const SO_NOSIGPIPE: c_int = 0x1022;
+            pub const O_WRONLY: c_int = 1;
+            pub const O_RDWR: c_int = 2;
+            pub const O_CREAT: c_int = 0x200;
+            pub const O_TRUNC: c_int = 0x400;
+            pub const O_CLOEXEC: c_int = 0x100_0000;
             pub const IPV6_V6ONLY: c_int = 27;
             pub const F_GETFL: c_int = 3;
             pub const F_SETFL: c_int = 4;
@@ -1876,6 +2327,8 @@ mod sys {
 
         pub fn error(code: c_int) -> Error {
             match code {
+                ENOENT => Error::NotFound,
+                EACCES | EPERM_ => Error::Denied,
                 ECONNREFUSED => Error::Refused,
                 ECONNRESET | EPIPE | ECONNABORTED | ENETRESET => Error::Reset,
                 ETIMEDOUT => Error::TimedOut,
@@ -2140,6 +2593,96 @@ mod sys {
             // rr: escape(unsafe): the system wrote count bytes after the
             // length, within the capacity it was given.
             unsafe { buffer.set_len(length) }
+        }
+
+        /// open's flags for how, closed on exec.
+        pub fn open_flags(how: &super::Open) -> c_int {
+            let flags = match how {
+                super::Open::Read => 0,
+                super::Open::Create => O_WRONLY | O_CREAT | O_TRUNC,
+                super::Open::Update => O_RDWR,
+            };
+            flags | O_CLOEXEC
+        }
+
+        pub fn close_file(fd: c_int) {
+            close(fd);
+        }
+
+        /// A file's operation, blocking, for thread's pool: what macOS's
+        /// kqueue cannot wait for.
+        pub fn file_blocking(op: super::FileOp) -> super::Done {
+            use super::{Done, File, FileOp};
+            match op {
+                FileOp::Open(mut path, how) => {
+                    // rr: escape(unsafe): path holds its NUL.
+                    let fd = unsafe { c::open(path.as_ptr().cast(), open_flags(&how), MODE) };
+                    path.pop();
+                    let result = if fd < 0 {
+                        Err(error(c::errno()))
+                    } else {
+                        Ok(File { raw: fd })
+                    };
+                    Done::Opened { path, result }
+                }
+                FileOp::Read(file, mut buffer, offset) => {
+                    let room = buffer.spare_capacity_mut();
+                    let at = i64::try_from(offset).unwrap_or(i64::MAX);
+                    // rr: escape(unsafe): room is the buffer's spare capacity.
+                    let got =
+                        unsafe { c::pread(file.raw, room.as_mut_ptr().cast(), room.len(), at) };
+                    let result = match usize::try_from(got) {
+                        Ok(count) => {
+                            filled(&mut buffer, count);
+                            Ok(count)
+                        }
+                        Err(_) => Err(error(c::errno())),
+                    };
+                    Done::Read {
+                        file,
+                        buffer,
+                        result,
+                    }
+                }
+                FileOp::Write(file, buffer, offset) => {
+                    let mut written = 0usize;
+                    let mut result = Ok(());
+                    while written < buffer.len() {
+                        let rest = buffer.get(written..).unwrap_or_default();
+                        let at = i64::try_from(offset.saturating_add(written as u64)).unwrap_or(0);
+                        // rr: escape(unsafe): rest holds its length.
+                        let got =
+                            unsafe { c::pwrite(file.raw, rest.as_ptr().cast(), rest.len(), at) };
+                        match usize::try_from(got) {
+                            Ok(0) => {
+                                result = Err(Error::Other(0));
+                                break;
+                            }
+                            Ok(count) => written += count,
+                            Err(_) if c::errno() == EINTR => {}
+                            Err(_) => {
+                                result = Err(error(c::errno()));
+                                break;
+                            }
+                        }
+                    }
+                    Done::Written {
+                        file,
+                        buffer,
+                        result,
+                    }
+                }
+                FileOp::Sync(file) => {
+                    // rr: escape(unsafe): the file is open.
+                    let done = unsafe { c::fsync(file.raw) };
+                    let result = if done == 0 {
+                        Ok(())
+                    } else {
+                        Err(error(c::errno()))
+                    };
+                    Done::Synced { file, result }
+                }
+            }
         }
 
         pub fn close(fd: c_int) {
@@ -2530,6 +3073,213 @@ mod sys {
             unsafe { buffer.set_len(length) }
         }
 
+        /// OVERLAPPED, from minwinbase.h: here only the offset of a read or
+        /// write on a handle opened for synchronous I/O.
+        #[repr(C)]
+        struct Overlapped {
+            internal: usize,
+            internal_high: usize,
+            offset: u32,
+            offset_high: u32,
+            event: *mut core::ffi::c_void,
+        }
+
+        #[link(name = "kernel32", kind = "raw-dylib")]
+        // rr: escape(unsafe): each signature is kernel32's, from its documentation.
+        unsafe extern "system" {
+            #[must_use]
+            fn CreateFileW(
+                name: *const u16,
+                access: u32,
+                share: u32,
+                security: *const core::ffi::c_void,
+                disposition: u32,
+                flags: u32,
+                template: *mut core::ffi::c_void,
+            ) -> usize;
+            #[must_use]
+            fn ReadFile(
+                file: *mut core::ffi::c_void,
+                buffer: *mut u8,
+                length: u32,
+                read: *mut u32,
+                overlapped: *mut core::ffi::c_void,
+            ) -> i32;
+            #[must_use]
+            fn WriteFile(
+                file: *mut core::ffi::c_void,
+                buffer: *const u8,
+                length: u32,
+                written: *mut u32,
+                overlapped: *mut core::ffi::c_void,
+            ) -> i32;
+            #[must_use]
+            fn FlushFileBuffers(file: *mut core::ffi::c_void) -> i32;
+            #[must_use]
+            fn CloseHandle(handle: *mut core::ffi::c_void) -> i32;
+            #[must_use]
+            fn GetLastError() -> u32;
+        }
+
+        // winnt.h's, fileapi.h's and winerror.h's.
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        /// FILE_SHARE_READ, WRITE and DELETE, as Rust's std shares a file.
+        const SHARE_ALL: u32 = 0x7;
+        const CREATE_ALWAYS: u32 = 2;
+        const OPEN_EXISTING: u32 = 3;
+        const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+        const ERROR_FILE_NOT_FOUND: u32 = 2;
+        const ERROR_PATH_NOT_FOUND: u32 = 3;
+        const ERROR_ACCESS_DENIED: u32 = 5;
+        const ERROR_HANDLE_EOF: u32 = 38;
+
+        /// A HANDLE as kernel32 takes it.
+        fn handle(raw: usize) -> *mut core::ffi::c_void {
+            core::ptr::without_provenance_mut(raw)
+        }
+
+        /// The thread's last error, for a file.
+        #[must_use]
+        fn file_error() -> Error {
+            // rr: escape(unsafe): the thread's last error.
+            match unsafe { GetLastError() } {
+                ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => Error::NotFound,
+                ERROR_ACCESS_DENIED => Error::Denied,
+                code => Error::Other(i32::try_from(code).unwrap_or(0)),
+            }
+        }
+
+        /// The OVERLAPPED that names offset.
+        fn at(offset: u64) -> Overlapped {
+            Overlapped {
+                internal: 0,
+                internal_high: 0,
+                offset: u32::try_from(offset & 0xffff_ffff).unwrap_or(0),
+                offset_high: u32::try_from(offset >> 32).unwrap_or(0),
+                event: core::ptr::null_mut(),
+            }
+        }
+
+        pub fn close_file(file: usize) {
+            // rr: escape(unsafe): the handle is its File's, closed once, by
+            // its drop.
+            unsafe {
+                // rr: escape(discard): CloseHandle releases the handle whatever
+                // it answers; no one is left to tell.
+                let _: i32 = CloseHandle(handle(file));
+            }
+        }
+
+        /// A file's operation, blocking, for thread's pool.
+        pub fn file_blocking(op: super::FileOp) -> super::Done {
+            use super::{Done, File, FileOp, Open};
+            match op {
+                FileOp::Open(mut path, how) => {
+                    path.pop();
+                    let Ok(text) = core::str::from_utf8(&path) else {
+                        let result = Err(Error::BadPath);
+                        return Done::Opened { path, result };
+                    };
+                    let mut name: Vec<u16> = Vec::with_capacity(text.len() + 1);
+                    for unit in text.encode_utf16() {
+                        name.push(unit);
+                    }
+                    name.push(0);
+                    let (access, disposition) = match how {
+                        Open::Read => (GENERIC_READ, OPEN_EXISTING),
+                        Open::Create => (GENERIC_WRITE, CREATE_ALWAYS),
+                        Open::Update => (GENERIC_READ | GENERIC_WRITE, OPEN_EXISTING),
+                    };
+                    // rr: escape(unsafe): name is NUL-terminated UTF-16.
+                    let file = unsafe {
+                        CreateFileW(
+                            name.as_ptr(),
+                            access,
+                            SHARE_ALL,
+                            core::ptr::null(),
+                            disposition,
+                            FILE_ATTRIBUTE_NORMAL,
+                            core::ptr::null_mut(),
+                        )
+                    };
+                    // rr: escape(sentinel): INVALID_HANDLE_VALUE, Windows's
+                    // word for none.
+                    let result = if file == usize::MAX {
+                        Err(file_error())
+                    } else {
+                        Ok(File { raw: file })
+                    };
+                    Done::Opened { path, result }
+                }
+                FileOp::Read(file, mut buffer, offset) => {
+                    let room = buffer.spare_capacity_mut();
+                    let length = u32::try_from(room.len()).unwrap_or(u32::MAX);
+                    let (mut read, mut place) = (0u32, at(offset));
+                    // rr: escape(unsafe): room is the buffer's spare capacity;
+                    // place names the offset of a synchronous read.
+                    let done = unsafe {
+                        ReadFile(
+                            handle(file.raw),
+                            room.as_mut_ptr().cast(),
+                            length,
+                            &raw mut read,
+                            (&raw mut place).cast(),
+                        )
+                    };
+                    // rr: escape(unsafe): the thread's last error.
+                    let result = if done != 0 || unsafe { GetLastError() } == ERROR_HANDLE_EOF {
+                        filled(&mut buffer, read as usize);
+                        Ok(read as usize)
+                    } else {
+                        Err(file_error())
+                    };
+                    Done::Read {
+                        file,
+                        buffer,
+                        result,
+                    }
+                }
+                FileOp::Write(file, buffer, offset) => {
+                    let mut written = 0usize;
+                    let mut result = Ok(());
+                    while written < buffer.len() {
+                        let rest = buffer.get(written..).unwrap_or_default();
+                        let length = u32::try_from(rest.len()).unwrap_or(u32::MAX);
+                        let mut place = at(offset.saturating_add(written as u64));
+                        let mut count = 0u32;
+                        // rr: escape(unsafe): rest holds length bytes; place
+                        // names the offset of a synchronous write.
+                        let done = unsafe {
+                            WriteFile(
+                                handle(file.raw),
+                                rest.as_ptr(),
+                                length,
+                                &raw mut count,
+                                (&raw mut place).cast(),
+                            )
+                        };
+                        if done == 0 || count == 0 {
+                            result = Err(file_error());
+                            break;
+                        }
+                        written += count as usize;
+                    }
+                    Done::Written {
+                        file,
+                        buffer,
+                        result,
+                    }
+                }
+                FileOp::Sync(file) => {
+                    // rr: escape(unsafe): the file is open.
+                    let done = unsafe { FlushFileBuffers(handle(file.raw)) };
+                    let result = if done != 0 { Ok(()) } else { Err(file_error()) };
+                    Done::Synced { file, result }
+                }
+            }
+        }
+
         pub fn close(socket: usize) {
             // rr: escape(unsafe): the socket is its owner's, closed once, by
             // its drop.
@@ -2617,7 +3367,12 @@ mod sys {
         const OP_ACCEPT: u8 = 13;
         const OP_ASYNC_CANCEL: u8 = 14;
         const OP_CONNECT: u8 = 16;
+        const OP_FSYNC: u8 = 3;
+        const OP_OPENAT: u8 = 18;
         const OP_READ: u8 = 22;
+        const OP_WRITE: u8 = 23;
+        /// fcntl.h's: a path relative to the working directory.
+        const AT_FDCWD: i32 = -100;
         const OP_SENDMSG: u8 = 9;
         const OP_RECVMSG: u8 = 10;
         const OP_LINK_TIMEOUT: u8 = 15;
@@ -3245,6 +4000,28 @@ mod sys {
                         sqe.addr = pointer(slot.message.as_ptr().cast());
                         sqe.len = 1;
                     }
+                    Work::Open(path, how) => {
+                        sqe.opcode = OP_OPENAT;
+                        sqe.fd = AT_FDCWD;
+                        sqe.addr = pointer(path.as_ptr());
+                        sqe.len = super::os::MODE;
+                        sqe.op_flags = super::os::open_flags(how).cast_unsigned();
+                    }
+                    Work::Read(_, buffer, offset) => {
+                        sqe.opcode = OP_READ;
+                        let room = buffer.spare_capacity_mut();
+                        sqe.addr = pointer(room.as_mut_ptr().cast());
+                        sqe.len = u32::try_from(room.len().min(CHUNK)).unwrap_or(0);
+                        sqe.off = *offset;
+                    }
+                    Work::Write(_, buffer, offset, written) => {
+                        sqe.opcode = OP_WRITE;
+                        let rest = buffer.get(*written..).unwrap_or_default();
+                        sqe.addr = pointer(rest.as_ptr());
+                        sqe.len = u32::try_from(rest.len().min(CHUNK)).unwrap_or(0);
+                        sqe.off = offset.saturating_add(*written as u64);
+                    }
+                    Work::Sync(_) => sqe.opcode = OP_FSYNC,
                     Work::ReceiveMany(_) => {
                         sqe.opcode = OP_RECV;
                         sqe.ioprio = RECV_MULTISHOT;
@@ -3260,7 +4037,7 @@ mod sys {
                         sqe.len = length.saturating_sub(*sent);
                         sqe.op_flags = MSG_NOSIGNAL;
                     }
-                    Work::Idle | Work::Run(_) | Work::Finished(_) => return,
+                    Work::Idle | Work::Run(_) | Work::FileRun(..) | Work::Finished(_) => return,
                 }
                 let Some(limit) = slot.limit else {
                     self.push(sqe);
@@ -3984,6 +4761,11 @@ mod sys {
                             | Work::SendTo(..)
                             | Work::Timeout(_)
                             | Work::Run(_)
+                            | Work::Open(..)
+                            | Work::Read(..)
+                            | Work::Write(..)
+                            | Work::Sync(_)
+                            | Work::FileRun(..)
                             | Work::Finished(_) => EVFILT_WRITE,
                         };
                         let ident = ident(slot.fd().unwrap_or(-1));
@@ -4117,6 +4899,11 @@ mod sys {
                 | Work::Timeout(_)
                 | Work::Run(_)
                 | Work::ReceiveMany(_)
+                | Work::Open(..)
+                | Work::Read(..)
+                | Work::Write(..)
+                | Work::Sync(_)
+                | Work::FileRun(..)
                 | Work::Finished(_) => Ok(0),
             }
         }
@@ -4686,7 +5473,15 @@ mod sys {
                             c::WSASend(*fd, &raw const parts, 1, null_mut(), 0, overlapped, null())
                         }
                     }
-                    Work::Idle | Work::Timeout(_) | Work::Run(_) | Work::Finished(_) => {
+                    Work::Idle
+                    | Work::Timeout(_)
+                    | Work::Run(_)
+                    | Work::Open(..)
+                    | Work::Read(..)
+                    | Work::Write(..)
+                    | Work::Sync(_)
+                    | Work::FileRun(..)
+                    | Work::Finished(_) => {
                         return Ok(());
                     }
                 };
@@ -5027,6 +5822,11 @@ mod sys {
                 | Work::SendChunk { .. }
                 | Work::Timeout(_)
                 | Work::Run(_)
+                | Work::Open(..)
+                | Work::Read(..)
+                | Work::Write(..)
+                | Work::Sync(_)
+                | Work::FileRun(..)
                 | Work::Finished(_) => Ok(transferred as usize),
             }
         }
@@ -5040,7 +5840,7 @@ mod tests {
     //! io's tests on real sockets: TCP over loopback, a server and its
     //! clients in one Io, as a loop runs them.
 
-    use super::{Done, Error, Event, Io, Listener, Stream, Udp, Unavailable, Work};
+    use super::{Done, Error, Event, File, Io, Listener, Open, Stream, Udp, Unavailable, Work};
     use alloc::boxed::Box;
     use alloc::sync::Arc;
     use alloc::vec::Vec;
@@ -5643,6 +6443,67 @@ mod tests {
         assert!(turn.took >= Duration::from_millis(20), "{:?}", turn.took);
         assert_eq!(turn.key, 3);
         assert!(io.slowest_turn().is_none());
+    }
+
+    fn opened(io: &mut Io) -> Result<File, Error> {
+        let Done::Opened { result, .. } = next(io).done else {
+            panic!("not an open");
+        };
+        result
+    }
+
+    fn read(io: &mut Io) -> (File, Vec<u8>, Result<usize, Error>) {
+        let Done::Read {
+            file,
+            buffer,
+            result,
+        } = next(io).done
+        else {
+            panic!("not a read");
+        };
+        (file, buffer, result)
+    }
+
+    /// A file written at an offset, put on the disk, and read back from
+    /// another: what was written, and Ok(0) at its end.
+    #[test]
+    fn files() {
+        let mut io = io(8);
+        assert!(io.open(Vec::from(*b"io-test.tmp"), Open::Create, 1).is_ok());
+        let created = opened(&mut io).unwrap();
+        assert!(
+            io.write_at(created, Vec::from(*b"hello world"), 0, 2)
+                .is_ok()
+        );
+        let Done::Written { file, result, .. } = next(&mut io).done else {
+            panic!("not a write");
+        };
+        result.unwrap();
+        assert!(io.sync(file, 3).is_ok());
+        let Done::Synced { result: synced, .. } = next(&mut io).done else {
+            panic!("not a sync");
+        };
+        synced.unwrap();
+        assert!(io.open(Vec::from(*b"io-test.tmp"), Open::Read, 4).is_ok());
+        let reading = opened(&mut io).unwrap();
+        assert!(io.read_at(reading, Vec::with_capacity(64), 6, 5).is_ok());
+        let (again, buffer, got) = read(&mut io);
+        assert_eq!((got, &buffer[..]), (Ok(5), &b"world"[..]));
+        assert!(io.read_at(again, Vec::with_capacity(8), 11, 6).is_ok());
+        assert_eq!(read(&mut io).2, Ok(0));
+    }
+
+    /// A file that is not there is NotFound; a path with a NUL, BadPath.
+    #[test]
+    fn files_refused() {
+        let mut io = io(8);
+        assert!(
+            io.open(Vec::from(*b"no-such-dir/no-such-file"), Open::Read, 1)
+                .is_ok()
+        );
+        assert_eq!(opened(&mut io).err(), Some(Error::NotFound));
+        assert!(io.open(Vec::from(*b"a\0b"), Open::Read, 2).is_ok());
+        assert_eq!(opened(&mut io).err(), Some(Error::BadPath));
     }
 
     /// A wake ends a wait with nothing running, and wakes before it are
